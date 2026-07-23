@@ -11,7 +11,7 @@ use crate::auth::AdminUser;
 use crate::db::now_ms;
 use crate::error::ApiError;
 
-use super::{audit, clamp_limit, parse_cursor, ActionQuery};
+use super::{audit, clamp_limit, parse_cursor, require_role, ActionQuery};
 
 // ---------------- 风控 ----------------
 
@@ -25,9 +25,10 @@ pub(super) struct RiskQuery {
 /// GET /admin/risk-events?kind=&cursor=：风险事件流（注入/伪造状态/越权/滥用等）。
 pub(super) async fn list_risk_events(
     State(state): State<AppState>,
-    _admin: AdminUser,
+    admin: AdminUser,
     Query(q): Query<RiskQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    require_role(&admin, &["operator", "reviewer", "support"])?;
     let page = clamp_limit(q.limit);
     let mut sql = String::from(
         "SELECT id, user_id, world_id, kind, detail_json, created_at FROM risk_events WHERE 1=1",
@@ -89,9 +90,10 @@ pub(super) struct DataReqQuery {
 /// GET /admin/data-requests?status=&cursor=：数据导出/删除工单列表。
 pub(super) async fn list_data_requests(
     State(state): State<AppState>,
-    _admin: AdminUser,
+    admin: AdminUser,
     Query(q): Query<DataReqQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    require_role(&admin, &["support"])?;
     let page = clamp_limit(q.limit);
     let mut sql = String::from(
         "SELECT id, user_id, kind, status, result_key, created_at, updated_at \
@@ -150,6 +152,7 @@ pub(super) async fn run_data_request(
     Path(id): Path<String>,
     Query(q): Query<ActionQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    require_role(&admin, &["support"])?;
     let row = sqlx::query("SELECT kind, status FROM data_requests WHERE id = ?")
         .bind(&id)
         .fetch_optional(&state.db)
@@ -163,8 +166,28 @@ pub(super) async fn run_data_request(
         return Ok(Json(json!({ "id": id, "status": "done", "kind": kind, "note": "already_done" })));
     }
 
-    let result_key: Option<String> =
-        if kind == "export" { Some(format!("export/{id}.json")) } else { None };
+    // 合规：delete 工单的真实级联删除尚未实现——绝不能标记 done（等于谎报已删除）。
+    // 保持 pending，登记一次尝试审计，返回未实现说明，留待真实删除管线接入后处理。
+    if kind == "delete" {
+        audit(
+            &state.db,
+            &admin.0,
+            "data_request.run_deferred",
+            &id,
+            &format!("kind=delete not_implemented {}", q.reason()),
+        )
+        .await?;
+        return Ok(Json(json!({
+            "id": id,
+            "status": "pending",
+            "kind": kind,
+            "note": "delete_execution_not_implemented",
+            "message": "真实级联删除未实现，工单保持 pending 不标记完成（合规）。",
+        })));
+    }
+
+    // export：占位实现（生成占位 result_key）→ 标记 done。
+    let result_key = format!("export/{id}.json");
     sqlx::query("UPDATE data_requests SET status = 'done', result_key = ?, updated_at = ? WHERE id = ?")
         .bind(&result_key)
         .bind(now_ms())

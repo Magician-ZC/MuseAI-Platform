@@ -2,8 +2,8 @@
 //!
 //! 待实现端点（平台规格 §2.3 / §9.1）：
 //! POST   /assets/characters            发布不可变版本：card_json + rightsDeclaration(original|public_domain_adaptation)
-//!                                      → 机审(moderation provider + safety::detect_injection) → cloud_characters(pending|approved)
-//!                                      → 命中风险进 audit_queue；Idempotency-Key 必须
+//!                                      → 机审 safety::moderate_and_queue(唯一入队/记险方) → cloud_characters(pending|approved)
+//!                                      → audit_queue / risk_events 由 moderate_and_queue 统一落库，本模块不二次写；Idempotency-Key 必须
 //! GET    /assets/characters/mine       我的云端版本列表（含审核态）
 //! GET    /assets/characters/{id}/status
 //! POST   /assets/characters/{id}/withdraw   停止后续投放（withdrawn=1；运行中世界按入场协议处理，S3 消费）
@@ -24,7 +24,7 @@ use crate::db::{new_id, now_ms};
 use crate::error::ApiError;
 use crate::idempotency;
 use crate::providers::ModerationVerdict;
-use crate::safety::{self, InjectionHit};
+use crate::safety;
 
 /// card_json 上限（防滥用）；最小发布清单只需角色版本 + 权利元数据（§2.3）。
 const MAX_CARD_BYTES: usize = 256 * 1024;
@@ -79,17 +79,9 @@ fn valid_rights(s: &str) -> bool {
     matches!(s, "original" | "public_domain_adaptation")
 }
 
-/// 机审裁决 + 注入命中 → cloud_characters.moderation（服务端权威，不信客户端声明）。
-/// 注入命中即便 provider 直过也强制转人审（保守阈值，§14 最高优先级威胁）。
-fn decide_moderation(verdict: ModerationVerdict, hits: &[InjectionHit]) -> &'static str {
-    match verdict {
-        ModerationVerdict::Rejected => "rejected",
-        ModerationVerdict::Pending => "pending",
-        ModerationVerdict::Approved if !hits.is_empty() => "pending",
-        ModerationVerdict::Approved => "approved",
-    }
-}
-
+/// 机审裁决 → cloud_characters.moderation（服务端权威，不信客户端声明）。
+/// 裁决由 safety::moderate_and_queue 统一给出：注入命中即便 provider 直过也已折叠为 Pending
+/// （保守阈值，§14 最高优先级威胁），此处只做字符串映射，不重复判定/落库。
 fn verdict_str(verdict: ModerationVerdict) -> &'static str {
     match verdict {
         ModerationVerdict::Approved => "approved",
@@ -152,11 +144,12 @@ async fn publish(
     let id = new_id("cchar");
     let now = now_ms();
 
-    // 机审：provider 裁决 + 注入静态检测（当前 S3 stub 安全默认；接线即用）。
-    let verdict = safety::moderate_and_queue(&state, "character", &id, &card_text).await?;
-    let hits = safety::detect_injection(&card_text);
-    let hits_value = serde_json::to_value(&hits).unwrap_or_else(|_| serde_json::json!([]));
-    let moderation = decide_moderation(verdict, &hits);
+    // 机审 + 注入检测由 safety::moderate_and_queue 统一完成——它是唯一的入队(audit_queue)/
+    // 记险(risk_events)方；此处只取其返回裁决，绝不再自行落库（消除命中卡 2 条 open + 2 条 risk 的双写）。
+    // 检测在「语义拼接文本」（卡片各字段值）而非序列化 JSON 串上进行，绕过跨字段/跨元素分段绕过。
+    let scan_text = safety::card_scan_text(&req.card_json);
+    let verdict = safety::moderate_and_queue(&state, "character", &id, &scan_text).await?;
+    let moderation = verdict_str(verdict);
 
     sqlx::query(
         "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, rights_declaration, moderation, withdrawn, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)",
@@ -171,25 +164,6 @@ async fn publish(
     .bind(now)
     .execute(&state.db)
     .await?;
-
-    // 待人审 → 进审核队列（人审 open）。
-    if moderation == "pending" {
-        sqlx::query(
-            "INSERT INTO audit_queue (id, subject_kind, subject_id, machine_verdict, machine_hits, status, created_at) VALUES (?, 'character', ?, ?, ?, 'open', ?)",
-        )
-        .bind(new_id("aq"))
-        .bind(&id)
-        .bind(verdict_str(verdict))
-        .bind(hits_value.to_string())
-        .bind(now)
-        .execute(&state.db)
-        .await?;
-    }
-    // 注入命中 → 记 risk_event（§14 最高优先级威胁留痕）。
-    if !hits.is_empty() {
-        let detail = serde_json::json!({ "cloudCharacterId": id.as_str(), "hits": hits_value });
-        safety::record_risk(&state.db, Some(&user.user_id), None, "injection", detail).await?;
-    }
 
     let resp = CharacterView {
         id,

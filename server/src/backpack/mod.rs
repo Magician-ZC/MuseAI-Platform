@@ -14,7 +14,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sqlx::{AnyPool, Row};
+use sqlx::{Any, AnyPool, Row, Transaction};
 
 use crate::admission::{self, AdmissionDecision, ItemDefinition, ItemOrigin, WorldAdmissionPolicy};
 use crate::app::AppState;
@@ -22,6 +22,7 @@ use crate::auth::AuthUser;
 use crate::db::{new_id, now_ms};
 use crate::error::ApiError;
 use crate::idempotency;
+use crate::worlds::load_world;
 
 // ---------- items 表 ↔ ItemDefinition 映射 ----------
 
@@ -72,22 +73,26 @@ pub async fn load_admission_policy(db: &AnyPool, world_id: &str) -> Result<World
 
 // ---------- 唯一合法写入路径之一：通关结算入包 ----------
 
-/// 通关结算入包（runtime/chapters 调）：物品定义 upsert 到 items + 新增 backpacks 归属行（owned）。
-/// 这是 §9.6 两条合法写入路径之一（另一条是支付履约）。返回 backpack 行 id。
-pub async fn grant_item(
-    db: &AnyPool,
+/// 通关结算入包（tx 版；chapters::finish 在 CAS 事务内调）：
+/// 物品定义 upsert 到 items + 新增 backpacks 归属行（owned）。
+/// `reward_hook_key` 非空时作为 (user_id, reward_hook_key) DB 幂等键——命中唯一约束即「已发货」，
+/// 返回 `Ok(None)`（不二次发货）；成功写入返回 `Ok(Some(bp_id))`。为 None 时不参与去重（多行并存）。
+/// 这是 §9.6 两条合法写入路径之一（另一条是支付履约）。
+pub(crate) async fn grant_item_tx(
+    tx: &mut Transaction<'_, Any>,
     user_id: &str,
     item: &ItemDefinition,
     acquired_world_id: &str,
-) -> Result<String, ApiError> {
-    // 物品定义按 id 共享；已存在则跳过写入。
+    reward_hook_key: Option<&str>,
+) -> Result<Option<String>, ApiError> {
+    // 物品定义按 id 共享；已存在则跳过写入（SELECT-exists 守住常见路径，事务内避免不可移植的 upsert）。
     let exists = sqlx::query("SELECT 1 AS x FROM items WHERE id = ?")
         .bind(&item.id)
-        .fetch_optional(db)
+        .fetch_optional(&mut **tx)
         .await?
         .is_some();
     if !exists {
-        let res = sqlx::query(
+        sqlx::query(
             "INSERT INTO items (id, narrative, effect_tags, origin_world_template_id, cosmology_json, power_tier, created_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
@@ -98,31 +103,46 @@ pub async fn grant_item(
         .bind(serde_json::to_string(&item.origin.cosmology).unwrap_or_else(|_| "[]".into()))
         .bind(item.origin.power_tier as i64)
         .bind(now_ms())
-        .execute(db)
-        .await;
-        // 并发下唯一键兜底：定义已被他人写入即忽略。
-        if let Err(sqlx::Error::Database(e)) = &res {
-            if !e.is_unique_violation() {
-                res?;
-            }
-        } else {
-            res?;
-        }
+        .execute(&mut **tx)
+        .await?;
     }
 
     let bp_id = new_id("bp");
-    sqlx::query(
-        "INSERT INTO backpacks (id, user_id, item_id, acquired_world_id, status, carried_world_id, acquired_at) \
-         VALUES (?, ?, ?, ?, 'owned', NULL, ?)",
+    let res = sqlx::query(
+        "INSERT INTO backpacks (id, user_id, item_id, acquired_world_id, status, carried_world_id, reward_hook_key, acquired_at) \
+         VALUES (?, ?, ?, ?, 'owned', NULL, ?, ?)",
     )
     .bind(&bp_id)
     .bind(user_id)
     .bind(&item.id)
     .bind(acquired_world_id)
+    .bind(reward_hook_key)
     .bind(now_ms())
-    .execute(db)
-    .await?;
-    Ok(bp_id)
+    .execute(&mut **tx)
+    .await;
+
+    match res {
+        Ok(_) => Ok(Some(bp_id)),
+        // (user_id, reward_hook_key) 唯一键命中：该钩子已发货 → 幂等，不二次发货。
+        Err(sqlx::Error::Database(e)) if reward_hook_key.is_some() && e.is_unique_violation() => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// 通关结算入包（pool 版，供测试/支付履约等非事务调用者）：包一个事务委托 grant_item_tx。
+/// reward_hook_key = None → 不去重，必得 backpack 行 id。
+/// （§9.6 合法写入路径的对外 API；本 crate 内目前由测试与后续 billing 履约消费。）
+#[allow(dead_code)]
+pub async fn grant_item(
+    db: &AnyPool,
+    user_id: &str,
+    item: &ItemDefinition,
+    acquired_world_id: &str,
+) -> Result<String, ApiError> {
+    let mut tx = db.begin().await?;
+    let bp = grant_item_tx(&mut tx, user_id, item, acquired_world_id, None).await?;
+    tx.commit().await?;
+    Ok(bp.unwrap_or_default())
 }
 
 // ---------- GET /me/backpack ----------
@@ -201,10 +221,11 @@ async fn carry(
         return Ok(Json(serde_json::from_str(cached).unwrap_or(json!({}))));
     }
 
-    // 世界必须存在（并借此拿到准入策略）。
+    // 世界必须存在（并借此拿到准入策略 + 世界态）。
+    let world = load_world(&state.db, &world_id).await?;
     let policy = load_admission_policy(&state.db, &world_id).await?;
 
-    // 第一遍：归属校验（发现伪造立即整单拒绝，不产生任何副作用）。
+    // 第一遍：归属校验（发现伪造立即整单拒绝并记风控；先于成员/世界态校验，保留伪造证据）。
     struct Owned {
         backpack_id: String,
         item: ItemDefinition,
@@ -237,10 +258,33 @@ async fn carry(
         owned.push(Owned { backpack_id, item });
     }
 
-    // 第二遍：逐件准入判定并落地背包状态。
+    // 携带随入场：世界须处可加入态且本人角色在场（否则不得携带）。
+    if !matches!(world.status.as_str(), "open" | "running") {
+        return Err(ApiError::Conflict("world_not_joinable".into()));
+    }
+    let is_member = sqlx::query(
+        "SELECT 1 AS x FROM world_members WHERE world_id = ? AND user_id = ? AND status = 'active' LIMIT 1",
+    )
+    .bind(&world_id)
+    .bind(&user.user_id)
+    .fetch_optional(&state.db)
+    .await?
+    .is_some();
+    if !is_member {
+        return Err(ApiError::Forbidden);
+    }
+
+    // 第二遍：逐件准入判定并落地背包状态（含 S-5 转译降档持久化）。
     let mut results = Vec::new();
     for o in &owned {
         let decision = admission::check_admission(&policy, &o.item)?; // 非法标签 → BadRequest
+        // S-5：per-carry 降档覆盖。转译入场把降档后的 powerTier/effectTags 落库（未来强度仲裁读覆盖值），
+        // 非转译入场写 NULL 清除历史覆盖，堵住「转译只进响应」的 maxPowerTier 后门。
+        let translated = if decision == AdmissionDecision::Translated {
+            Some(admission::translate_item(&policy, &o.item))
+        } else {
+            None
+        };
         let (new_status, carried, carried_world): (&str, bool, Option<&str>) = match decision {
             AdmissionDecision::Admitted | AdmissionDecision::Translated => {
                 ("carried", true, Some(world_id.as_str()))
@@ -249,20 +293,28 @@ async fn carry(
             // 拒收：留账号背包，不随角色入场。
             AdmissionDecision::Rejected => ("owned", false, None),
         };
-        sqlx::query("UPDATE backpacks SET status = ?, carried_world_id = ? WHERE id = ?")
-            .bind(new_status)
-            .bind(carried_world)
-            .bind(&o.backpack_id)
-            .execute(&state.db)
-            .await?;
+        let pt_override: Option<i64> = translated.as_ref().map(|t| t.origin.power_tier as i64);
+        let et_override: Option<String> = translated
+            .as_ref()
+            .map(|t| serde_json::to_string(&t.effect_tags).unwrap_or_else(|_| "[]".into()));
+        sqlx::query(
+            "UPDATE backpacks SET status = ?, carried_world_id = ?, power_tier_override = ?, \
+             effect_tags_override = ? WHERE id = ?",
+        )
+        .bind(new_status)
+        .bind(carried_world)
+        .bind(pt_override)
+        .bind(et_override.as_deref())
+        .bind(&o.backpack_id)
+        .execute(&state.db)
+        .await?;
         let mut result = json!({
             "itemId": o.item.id,
             "decision": decision_str(decision),
             "carried": carried,
         });
         // 转译入场：给出结构化降档后的 effectTags/powerTier（叙事外皮重写由装配器生成）。
-        if decision == AdmissionDecision::Translated {
-            let t = admission::translate_item(&policy, &o.item);
+        if let Some(t) = &translated {
             result["translatedTo"] = json!({ "powerTier": t.origin.power_tier, "effectTags": t.effect_tags });
         }
         results.push(result);

@@ -45,8 +45,9 @@ pub struct WorldRow {
     pub tick_per_day: i64,
     pub state_revision: i64,
     /// 当前叙事状态快照（E4 联编后由 worker 读取用于回合恢复/上下文）。
-    #[allow(dead_code)]
     pub narrative_state_json: String,
+    /// 开局装配结果（钉住）：runtime 首 tick 从中提取硬节点/禁止谓词种子（E-1）。
+    pub assembled_json: Option<String>,
 }
 
 fn map_world(row: &sqlx::any::AnyRow) -> Result<WorldRow, ApiError> {
@@ -66,6 +67,7 @@ fn map_world(row: &sqlx::any::AnyRow) -> Result<WorldRow, ApiError> {
         tick_per_day: row.try_get("tick_per_day")?,
         state_revision: row.try_get("state_revision")?,
         narrative_state_json: row.try_get("narrative_state_json")?,
+        assembled_json: row.try_get("assembled_json")?,
     })
 }
 
@@ -77,16 +79,6 @@ pub async fn load_world(db: &AnyPool, id: &str) -> Result<WorldRow, ApiError> {
         .await?
         .ok_or(ApiError::NotFound)?;
     map_world(&row)
-}
-
-async fn active_member_count(db: &AnyPool, world_id: &str) -> Result<i64, ApiError> {
-    let row = sqlx::query(
-        "SELECT COUNT(*) AS n FROM world_members WHERE world_id = ? AND status = 'active'",
-    )
-    .bind(world_id)
-    .fetch_one(db)
-    .await?;
-    Ok(row.try_get::<i64, _>("n")?)
 }
 
 // ---------- 大厅列表 ----------
@@ -294,33 +286,40 @@ async fn join_world(
     .fetch_optional(&state.db)
     .await?;
 
+    // C-4：人数上限原子化。旧实现是 count→check→insert 的 TOCTOU（唯一索引只挡同角色重复，挡不住并发凑满）。
+    // 改为「带人数子查询守卫的条件写」：limit 判定与写入在同一条语句里求值，rows_affected==0 即满员。
+    // （sqlite 语句级原子；postgres 同快照下将 TOCTOU 窗口收敛到单语句，配合唯一索引把越额上限收敛到并发不同角色数。）
     let membership_id: String = if let Some(m) = existing {
         let mid: String = m.try_get("id")?;
         let mstatus: String = m.try_get("status")?;
         if mstatus != "active" {
-            // 复活前校验人数上限。
-            if active_member_count(&state.db, &id).await? >= world.member_limit {
-                return Err(ApiError::Conflict("world_full".into()));
-            }
-            sqlx::query(
-                "UPDATE world_members SET status='active', user_id=?, boundary_json=?, joined_at=? WHERE id=?",
+            // 复活：仅当仍有空位时置 active（人数守卫内嵌）；已满 → world_full。
+            let res = sqlx::query(
+                "UPDATE world_members SET status='active', user_id=?, boundary_json=?, joined_at=? \
+                 WHERE id=? AND status != 'active' \
+                 AND (SELECT COUNT(*) FROM world_members WHERE world_id=? AND status='active') < ?",
             )
             .bind(&user.user_id)
             .bind(body.boundary.to_string())
             .bind(now_ms())
             .bind(&mid)
+            .bind(&id)
+            .bind(world.member_limit)
             .execute(&state.db)
             .await?;
+            if res.rows_affected() == 0 {
+                return Err(ApiError::Conflict("world_full".into()));
+            }
         }
+        // 已 active：幂等，无需再判上限。
         mid
     } else {
-        if active_member_count(&state.db, &id).await? >= world.member_limit {
-            return Err(ApiError::Conflict("world_full".into()));
-        }
         let mid = new_id("wm");
-        sqlx::query(
+        // 条件插入：仅当活跃人数 < 上限时落一行（SELECT 常量 + WHERE 子查询守卫）。
+        let res = sqlx::query(
             "INSERT INTO world_members (id, world_id, user_id, cloud_character_id, boundary_json, status, joined_at) \
-             VALUES (?, ?, ?, ?, ?, 'active', ?)",
+             SELECT ?, ?, ?, ?, ?, 'active', ? \
+             WHERE (SELECT COUNT(*) FROM world_members WHERE world_id=? AND status='active') < ?",
         )
         .bind(&mid)
         .bind(&id)
@@ -328,8 +327,17 @@ async fn join_world(
         .bind(&body.cloud_character_id)
         .bind(body.boundary.to_string())
         .bind(now_ms())
+        .bind(&id)
+        .bind(world.member_limit)
         .execute(&state.db)
-        .await?;
+        .await;
+        match res {
+            Ok(r) if r.rows_affected() == 0 => return Err(ApiError::Conflict("world_full".into())),
+            Ok(_) => {}
+            // 并发下同角色抢插：唯一索引兜底 → 视为已在场（幂等成功）。
+            Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {}
+            Err(e) => return Err(e.into()),
+        }
         mid
     };
 
@@ -401,6 +409,7 @@ pub struct CreateWorldParams {
 #[allow(dead_code)]
 impl CreateWorldParams {
     /// 官方放置世界最小参数（其余默认）。
+    /// B-2：官方建房必须带非零 token 预算 + 非零 cny 上限——否则 world_budgets 视为无上限（成本失控）。
     pub fn official(template_id: impl Into<String>, template_version: i64, title: impl Into<String>) -> Self {
         Self {
             template_id: template_id.into(),
@@ -411,8 +420,10 @@ impl CreateWorldParams {
             host_user_id: None,
             member_limit: 10,
             tick_per_day: 3,
-            daily_token_budget: 0,
-            daily_cny_budget_cents: 0,
+            // 非零默认预算（daily_token_budget=0 会被 runtime 当作"无上限"）：给官方房一个保守的日 token 上限
+            // 与 cny 熔断维度。运营可在 admin 建房时覆盖为具体额度。
+            daily_token_budget: 200_000,
+            daily_cny_budget_cents: 2_000,
             status: None,
             engine_version: None,
             prompt_set_version: None,

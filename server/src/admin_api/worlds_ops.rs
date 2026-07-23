@@ -12,7 +12,7 @@ use crate::db::{new_id, now_ms};
 use crate::error::ApiError;
 use crate::worlds::{create_world as create_world_inner, load_world, CreateWorldParams};
 
-use super::{audit, clamp_limit, parse_cursor, ActionQuery};
+use super::{audit, clamp_limit, parse_cursor, require_role, ActionQuery};
 
 // ---------------- 世界监控列表 ----------------
 
@@ -26,9 +26,10 @@ pub(super) struct WorldListQuery {
 /// GET /admin/worlds?status=&cursor=：全量世界监控（含预算/熔断态；不限可见性）。
 pub(super) async fn list_worlds(
     State(state): State<AppState>,
-    _admin: AdminUser,
+    admin: AdminUser,
     Query(q): Query<WorldListQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    require_role(&admin, &["operator"])?;
     let page = clamp_limit(q.limit);
     let mut sql = String::from(
         "SELECT w.id, w.title, w.room_type, w.status, w.visibility, w.member_limit, \
@@ -101,9 +102,10 @@ pub(super) async fn list_worlds(
 /// 不返回任何私密叙事内容（public/private 投影一律不暴露，§10）。
 pub(super) async fn diagnostics(
     State(state): State<AppState>,
-    _admin: AdminUser,
+    admin: AdminUser,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
+    require_role(&admin, &["operator"])?;
     let world = load_world(&state.db, &id).await?; // 不存在 → NotFound
 
     // 最近 10 个 tick 的元数据（含错误码），不含叙事产物。
@@ -210,6 +212,7 @@ pub(super) async fn pause(
     Path(id): Path<String>,
     Query(q): Query<ActionQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    require_role(&admin, &["operator"])?;
     let world = load_world(&state.db, &id).await?;
     if !matches!(world.status.as_str(), "open" | "running") {
         return Err(ApiError::Conflict("world_not_pausable".into()));
@@ -224,6 +227,7 @@ pub(super) async fn resume(
     Path(id): Path<String>,
     Query(q): Query<ActionQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    require_role(&admin, &["operator"])?;
     let world = load_world(&state.db, &id).await?;
     if world.status != "paused" {
         return Err(ApiError::Conflict("world_not_paused".into()));
@@ -277,6 +281,7 @@ pub(super) async fn create_world(
     admin: AdminUser,
     Json(req): Json<CreateWorldReq>,
 ) -> Result<Json<Value>, ApiError> {
+    require_role(&admin, &["operator"])?;
     if req.title.trim().is_empty() || req.template_id.trim().is_empty() {
         return Err(ApiError::BadRequest("title 与 templateId 必填".into()));
     }
@@ -288,6 +293,10 @@ pub(super) async fn create_world(
         p.room_type = rt;
     }
     if let Some(v) = req.visibility {
+        // 枚举校验（对齐 worlds.visibility 约定），避免自由文本落库污染大厅可见性过滤。
+        if !matches!(v.as_str(), "official" | "public" | "private") {
+            return Err(ApiError::BadRequest("visibility 非法".into()));
+        }
         p.visibility = v;
     }
     if let Some(m) = req.member_limit {
@@ -303,6 +312,10 @@ pub(super) async fn create_world(
         p.daily_cny_budget_cents = c;
     }
     if let Some(s) = req.status {
+        // 建房仅允许起始态（open/running）；paused/ended 非法（避免建出不可调度的僵尸房）。
+        if !matches!(s.as_str(), "open" | "running") {
+            return Err(ApiError::BadRequest("status 非法（建房仅允许 open/running）".into()));
+        }
         p.status = Some(s);
     }
 
@@ -323,9 +336,10 @@ pub(super) struct TemplateListQuery {
 /// GET /admin/world-templates?moderation=&cursor=
 pub(super) async fn list_templates(
     State(state): State<AppState>,
-    _admin: AdminUser,
+    admin: AdminUser,
     Query(q): Query<TemplateListQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    require_role(&admin, &["operator", "reviewer"])?;
     let page = clamp_limit(q.limit);
     let mut sql = String::from(
         "SELECT id, title, room_type, skeleton_json, admission_json, official, version, \
@@ -395,6 +409,7 @@ pub(super) async fn create_template(
     admin: AdminUser,
     Json(req): Json<CreateTemplateReq>,
 ) -> Result<Json<Value>, ApiError> {
+    require_role(&admin, &["operator"])?;
     if req.title.trim().is_empty() {
         return Err(ApiError::BadRequest("title 必填".into()));
     }

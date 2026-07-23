@@ -147,6 +147,48 @@ export interface MyWorldEntry {
   latestReportDay?: string;
 }
 
+// ---------- 赛事房契约镜像（P6，FE1 追加；GET /arena/{id}/report 形态） ----------
+
+export type ArenaPhase = 'lobby' | 'running' | 'concluded' | string;
+
+/** 透明战报的单条事件：只出结果摘要 + 判定依据 ruleRefs，绝不含模型隐藏推理（§9.4）。 */
+export interface ArenaRuleEvent {
+  sequence: number;
+  type: string;
+  actors: string[];
+  summary: string;
+  ruleRefs: string[];
+}
+
+/** 环境 / 礼物事件（观众礼物经网关映射为环境通道，不走玩家道具干预）。 */
+export interface ArenaEnvEvent {
+  appliedTick: number | null;
+  kind: string;
+  payload: Record<string, unknown>;
+  aggregatedCount: number;
+}
+
+export interface ArenaRound {
+  tick: number;
+  events: ArenaRuleEvent[];
+  env: ArenaEnvEvent[];
+}
+
+export interface ArenaMatchState {
+  phase: ArenaPhase;
+  alliances: unknown[];
+  eliminations: string[];
+  winnerCharId: string | null;
+}
+
+export interface ArenaReport {
+  worldId: string;
+  match: ArenaMatchState;
+  rounds: ArenaRound[];
+  environment: ArenaEnvEvent[];
+  compliance?: { arbitrationPublic: boolean; aiGenerated: boolean };
+}
+
 // ---------- 错误友好化（所有平台页面复用；键在稳定 error code + Conflict 子原因） ----------
 
 /**
@@ -203,6 +245,20 @@ export function roomTypeLabel(rt: string): string {
       return '赛事房';
     default:
       return rt;
+  }
+}
+
+/** 赛事赛制阶段 → 展示标签与色彩（§2.5 唯一胜者赛制）。 */
+export function arenaPhaseMeta(phase: string): { label: string; color: string } {
+  switch (phase) {
+    case 'lobby':
+      return { label: '待开赛', color: 'default' };
+    case 'running':
+      return { label: '进行中', color: 'processing' };
+    case 'concluded':
+      return { label: '已结束', color: 'success' };
+    default:
+      return { label: phase, color: 'default' };
   }
 }
 

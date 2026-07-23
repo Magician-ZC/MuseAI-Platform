@@ -50,6 +50,10 @@ fn user_token(state: &AppState) -> String {
     crate::auth::issue_access(&state.config.jwt_secret, "usr1", "user", 3600).unwrap()
 }
 
+fn role_token(state: &AppState, role: &str) -> String {
+    crate::auth::issue_access(&state.config.jwt_secret, &format!("actor_{role}"), role, 3600).unwrap()
+}
+
 async fn get(app: &axum::Router, uri: &str, token: Option<&str>) -> (StatusCode, Value) {
     let mut b = Request::builder().method("GET").uri(uri);
     if let Some(t) = token {
@@ -138,6 +142,67 @@ async fn dev_login_issues_admin_token() {
     // 用换来的 token 访问受保护端点 → 200
     let (st, _) = get(&app, "/api/admin/metrics/overview", Some(token)).await;
     assert_eq!(st, StatusCode::OK);
+}
+
+// ---------------- S-6：后台最小权限 role→action 矩阵 ----------------
+
+#[tokio::test]
+async fn role_matrix_enforces_least_privilege() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    seed_user(&state, "u_ban", Some("13800000000"), "user", "active").await;
+
+    let reviewer = role_token(&state, "reviewer");
+    let finance = role_token(&state, "finance");
+    let operator = role_token(&state, "operator");
+    let support = role_token(&state, "support");
+    let admin = admin_token(&state);
+
+    // reviewer：内容审核队列可读；用户/经济/建房越权 403。
+    assert_eq!(get(&app, "/api/admin/audit-queue", Some(&reviewer)).await.0, StatusCode::OK);
+    assert_eq!(get(&app, "/api/admin/users", Some(&reviewer)).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(get(&app, "/api/admin/economy/overview", Some(&reviewer)).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(
+        post(&app, "/api/admin/worlds", Some(&reviewer), json!({ "templateId": "t", "title": "x" })).await.0,
+        StatusCode::FORBIDDEN
+    );
+
+    // finance：经济/看板只读；审核/用户越权 403。
+    assert_eq!(get(&app, "/api/admin/economy/overview", Some(&finance)).await.0, StatusCode::OK);
+    assert_eq!(get(&app, "/api/admin/metrics/overview", Some(&finance)).await.0, StatusCode::OK);
+    assert_eq!(get(&app, "/api/admin/audit-queue", Some(&finance)).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(get(&app, "/api/admin/users", Some(&finance)).await.0, StatusCode::FORBIDDEN);
+
+    // operator：世界运营可；用户/治理写越权 403。
+    assert_eq!(get(&app, "/api/admin/worlds", Some(&operator)).await.0, StatusCode::OK);
+    assert_eq!(
+        post(&app, "/api/admin/worlds", Some(&operator), json!({ "templateId": "t", "templateVersion": 1, "title": "x", "roomType": "idle" })).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(get(&app, "/api/admin/users", Some(&operator)).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(
+        post(&app, "/api/admin/prompts", Some(&operator), json!({ "scope": "director", "version": "v1", "content": "x" })).await.0,
+        StatusCode::FORBIDDEN,
+        "治理写操作仅 admin"
+    );
+
+    // support：用户管理/工单可；审核/建房越权 403。
+    assert_eq!(get(&app, "/api/admin/users", Some(&support)).await.0, StatusCode::OK);
+    assert_eq!(post(&app, "/api/admin/users/u_ban/ban", Some(&support), json!({})).await.0, StatusCode::OK);
+    assert_eq!(get(&app, "/api/admin/data-requests", Some(&support)).await.0, StatusCode::OK);
+    assert_eq!(get(&app, "/api/admin/audit-queue", Some(&support)).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(
+        post(&app, "/api/admin/worlds", Some(&support), json!({ "templateId": "t", "title": "x" })).await.0,
+        StatusCode::FORBIDDEN
+    );
+
+    // admin：全权（抽查建房 / 审核 / 经济）。
+    assert_eq!(
+        post(&app, "/api/admin/worlds", Some(&admin), json!({ "templateId": "t", "templateVersion": 1, "title": "x", "roomType": "idle" })).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(get(&app, "/api/admin/audit-queue", Some(&admin)).await.0, StatusCode::OK);
+    assert_eq!(get(&app, "/api/admin/economy/overview", Some(&admin)).await.0, StatusCode::OK);
 }
 
 // ---------------- 用户管理 + audit_logs ----------------
@@ -445,16 +510,115 @@ async fn metrics_overview_aggregates() {
     assert_eq!(m["tokenCostByWorld"][0]["tokens"], 150);
 }
 
-// ---------------- 经济运营占位 ----------------
+// ---------------- 经济运营：真实只读聚合 ----------------
 
 #[tokio::test]
-async fn economy_overview_is_p4a_placeholder() {
+async fn economy_overview_empty_reports_zeros_and_disabled() {
+    // 无任何计费/礼物数据时：全 0、billingEnabled=false（阶段由数据体现，非写死）。
     let state = test_state().await;
     let app = build_router(state.clone());
     let (st, e) = get(&app, "/api/admin/economy/overview", Some(&admin_token(&state))).await;
     assert_eq!(st, StatusCode::OK);
-    assert_eq!(e["stage"], "P4a");
     assert_eq!(e["billingEnabled"], false);
+    assert_eq!(e["recharge"]["totalCents"], 0);
+    assert_eq!(e["refund"]["totalCents"], 0);
+    assert_eq!(e["balance"]["totalCents"], 0);
+    assert_eq!(e["orders"]["total"], 0);
+    assert_eq!(e["gifts"]["events"], 0);
+    // 订单状态桶恒含五态，缺省 0。
+    assert_eq!(e["orders"]["byStatus"]["fulfilled"], 0);
+    assert_eq!(e["orders"]["byStatus"]["refunded"], 0);
+    // 创作者结算不在本聚合内（另一套账，§2.6）。
+    assert_eq!(e["creatorSettlement"]["enabled"], false);
+}
+
+#[tokio::test]
+async fn economy_overview_aggregates_orders_ledger_balances_gifts() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+
+    // 两笔充值（100 + 300 = 400）各配一条 +ledger；其中一笔（300）后被退款：
+    // orders: 1 fulfilled + 1 refunded；ledger: +100 recharge, +300 recharge, -300 refund；
+    // billing_balances: 用户净额 100。恒等式 充值400 - 退款300 = 余额100。
+    let now = now_ms();
+    for (oid, amt, status) in [("o_keep", 100i64, "fulfilled"), ("o_ref", 300i64, "refunded")] {
+        sqlx::query(
+            "INSERT INTO orders (id, user_id, kind, amount_cents, status, created_at, updated_at) \
+             VALUES (?, 'u_pay', 'recharge', ?, ?, ?, ?)",
+        )
+        .bind(oid).bind(amt).bind(status).bind(now).bind(now)
+        .execute(&state.db).await.unwrap();
+    }
+    // 另加一笔 created 订单（未履约，进状态计数但不入账本）。
+    sqlx::query(
+        "INSERT INTO orders (id, user_id, kind, amount_cents, status, created_at, updated_at) \
+         VALUES ('o_new', 'u_pay', 'recharge', 50, 'created', ?, ?)",
+    )
+    .bind(now).bind(now).execute(&state.db).await.unwrap();
+
+    for (lid, oid, delta, reason) in [
+        ("l1", "o_keep", 100i64, "recharge"),
+        ("l2", "o_ref", 300i64, "recharge"),
+        ("l3", "o_ref", -300i64, "refund"),
+    ] {
+        sqlx::query(
+            "INSERT INTO ledger_entries (id, user_id, order_id, delta_cents, reason, created_at) \
+             VALUES (?, 'u_pay', ?, ?, ?, ?)",
+        )
+        .bind(lid).bind(oid).bind(delta).bind(reason).bind(now)
+        .execute(&state.db).await.unwrap();
+    }
+    sqlx::query("INSERT INTO billing_balances (user_id, balance_cents, updated_at) VALUES ('u_pay', 100, ?)")
+        .bind(now).execute(&state.db).await.unwrap();
+
+    // 礼物流水：两世界共 3 条事件、礼物量 1+2+5=8。
+    for (gid, world, cnt) in [("g1", "w1", 1i64), ("g2", "w1", 2i64), ("g3", "w2", 5i64)] {
+        sqlx::query(
+            "INSERT INTO gift_events (id, world_id, sku, gift_count, mapped, created_at) \
+             VALUES (?, ?, 'rose', ?, 1, ?)",
+        )
+        .bind(gid).bind(world).bind(cnt).bind(now)
+        .execute(&state.db).await.unwrap();
+    }
+
+    let (st, e) = get(&app, "/api/admin/economy/overview", Some(&admin_token(&state))).await;
+    assert_eq!(st, StatusCode::OK);
+
+    // 有充值 → billingEnabled=true。
+    assert_eq!(e["billingEnabled"], true);
+    // 资金：充值 400 / 退款 300（正表示）/ 余额 100。
+    assert_eq!(e["recharge"]["totalCents"], 400);
+    assert_eq!(e["recharge"]["count"], 2);
+    assert_eq!(e["refund"]["totalCents"], 300);
+    assert_eq!(e["refund"]["count"], 1);
+    assert_eq!(e["balance"]["totalCents"], 100);
+    assert_eq!(e["balance"]["wallets"], 1);
+    // 双录不变量：充值 - 退款 == 余额。
+    assert_eq!(e["ledgerNetCents"], 100);
+    assert_eq!(e["ledgerNetCents"].as_i64().unwrap(), e["balance"]["totalCents"].as_i64().unwrap());
+    // 订单：3 总数，按状态计数正确。
+    assert_eq!(e["orders"]["total"], 3);
+    assert_eq!(e["orders"]["byStatus"]["fulfilled"], 1);
+    assert_eq!(e["orders"]["byStatus"]["refunded"], 1);
+    assert_eq!(e["orders"]["byStatus"]["created"], 1);
+    assert_eq!(e["orders"]["byStatus"]["paid"], 0);
+    // 礼物：3 事件 / 礼物量 8 / 覆盖 2 世界。
+    assert_eq!(e["gifts"]["events"], 3);
+    assert_eq!(e["gifts"]["giftCount"], 8);
+    assert_eq!(e["gifts"]["worlds"], 2);
+}
+
+#[tokio::test]
+async fn economy_overview_role_gate_finance_and_admin_only() {
+    // finance/admin 放行；operator/reviewer/support/user 越权。
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    assert_eq!(get(&app, "/api/admin/economy/overview", Some(&admin_token(&state))).await.0, StatusCode::OK);
+    assert_eq!(get(&app, "/api/admin/economy/overview", Some(&role_token(&state, "finance"))).await.0, StatusCode::OK);
+    assert_eq!(get(&app, "/api/admin/economy/overview", Some(&role_token(&state, "operator"))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(get(&app, "/api/admin/economy/overview", Some(&role_token(&state, "support"))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(get(&app, "/api/admin/economy/overview", Some(&user_token(&state))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(get(&app, "/api/admin/economy/overview", None).await.0, StatusCode::UNAUTHORIZED);
 }
 
 // ---------------- 风控 + 工单 ----------------
@@ -497,4 +661,27 @@ async fn risk_events_and_data_requests() {
     let (st, body) = post(&app, "/api/admin/data-requests/dq1/run", Some(&admin), json!({})).await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(body["note"], "already_done");
+}
+
+// ---------------- Low：delete 工单在真实删除实现前保持 pending（合规，不谎报已删除） ----------------
+
+#[tokio::test]
+async fn delete_data_request_stays_pending_not_marked_done() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+    sqlx::query("INSERT INTO data_requests (id, user_id, kind, status, created_at, updated_at) VALUES ('dq_del','u1','delete','pending',?,?)")
+        .bind(now_ms()).bind(now_ms()).execute(&state.db).await.unwrap();
+
+    let (st, body) = post(&app, "/api/admin/data-requests/dq_del/run", Some(&admin), json!({})).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body["status"], "pending", "delete 工单在真实级联删除实现前不得标 done");
+    assert_eq!(body["note"], "delete_execution_not_implemented");
+
+    // 库内仍为 pending（未谎报完成）。
+    let s = sqlx::query("SELECT status FROM data_requests WHERE id='dq_del'")
+        .fetch_one(&state.db).await.unwrap().try_get::<String, _>("status").unwrap();
+    assert_eq!(s, "pending");
+    // 但尝试有审计留痕。
+    assert_eq!(count(&state, "SELECT COUNT(*) AS n FROM audit_logs WHERE action='data_request.run_deferred'").await, 1);
 }

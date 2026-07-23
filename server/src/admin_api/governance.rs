@@ -11,7 +11,7 @@ use crate::auth::AdminUser;
 use crate::db::{new_id, now_ms};
 use crate::error::ApiError;
 
-use super::{audit, ActionQuery};
+use super::{audit, require_role, ActionQuery};
 
 /// Prompt 作用域（对应 muse-engine 各环节，migration 注释）。
 const PROMPT_SCOPES: &[&str] = &["director", "decide", "arbiter", "writer", "critic", "report"];
@@ -26,9 +26,10 @@ pub(super) struct PromptListQuery {
 /// GET /admin/prompts?scope=：列出各场景 prompt 版本（含 content 供 diff 视图 + 灰度名单）。
 pub(super) async fn list_prompts(
     State(state): State<AppState>,
-    _admin: AdminUser,
+    admin: AdminUser,
     Query(q): Query<PromptListQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    require_role(&admin, &["operator"])?;
     let mut sql = String::from(
         "SELECT id, scope, version, content, active, canary_world_ids, created_at \
          FROM prompt_versions WHERE 1=1",
@@ -73,6 +74,7 @@ pub(super) async fn create_prompt(
     admin: AdminUser,
     Json(req): Json<CreatePromptReq>,
 ) -> Result<Json<Value>, ApiError> {
+    require_role(&admin, &[])?; // 治理写操作 admin 专属。
     if !PROMPT_SCOPES.contains(&req.scope.as_str()) {
         return Err(ApiError::BadRequest("scope 非法".into()));
     }
@@ -110,6 +112,7 @@ pub(super) async fn activate_prompt(
     Path(id): Path<String>,
     Query(q): Query<ActionQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    require_role(&admin, &[])?; // 治理写操作 admin 专属。
     let row = sqlx::query("SELECT scope, version FROM prompt_versions WHERE id = ?")
         .bind(&id)
         .fetch_optional(&state.db)
@@ -118,13 +121,11 @@ pub(super) async fn activate_prompt(
     let scope: String = row.try_get("scope")?;
     let version: String = row.try_get("version")?;
 
-    // 互斥：先把同 scope 全置 inactive，再激活目标。
-    sqlx::query("UPDATE prompt_versions SET active = 0 WHERE scope = ?")
-        .bind(&scope)
-        .execute(&state.db)
-        .await?;
-    sqlx::query("UPDATE prompt_versions SET active = 1 WHERE id = ?")
+    // 互斥激活：单语句原子切换（同 scope 内目标置 active，其余置 inactive），
+    // 避免「先全 inactive 再激活」两步之间读到零 active 的窗口。CASE 表达式双库可移植。
+    sqlx::query("UPDATE prompt_versions SET active = CASE WHEN id = ? THEN 1 ELSE 0 END WHERE scope = ?")
         .bind(&id)
+        .bind(&scope)
         .execute(&state.db)
         .await?;
 
@@ -153,6 +154,7 @@ pub(super) async fn canary_prompt(
     Path(id): Path<String>,
     Json(req): Json<CanaryReq>,
 ) -> Result<Json<Value>, ApiError> {
+    require_role(&admin, &[])?; // 治理写操作 admin 专属。
     let exists = sqlx::query("SELECT 1 AS x FROM prompt_versions WHERE id = ?")
         .bind(&id)
         .fetch_optional(&state.db)
@@ -183,8 +185,9 @@ pub(super) async fn canary_prompt(
 /// GET /admin/model-routes：列出模型路由版本（stage→ModelProfile 映射）。
 pub(super) async fn list_routes(
     State(state): State<AppState>,
-    _admin: AdminUser,
+    admin: AdminUser,
 ) -> Result<Json<Value>, ApiError> {
+    require_role(&admin, &["operator"])?;
     let rows = sqlx::query(
         "SELECT id, version, routes_json, active, created_at FROM model_routes \
          ORDER BY created_at DESC",
@@ -218,6 +221,7 @@ pub(super) async fn create_route(
     admin: AdminUser,
     Json(req): Json<CreateRouteReq>,
 ) -> Result<Json<Value>, ApiError> {
+    require_role(&admin, &[])?; // 治理写操作 admin 专属。
     if req.version.trim().is_empty() {
         return Err(ApiError::BadRequest("version 必填".into()));
     }
@@ -246,6 +250,7 @@ pub(super) async fn activate_route(
     Path(id): Path<String>,
     Query(q): Query<ActionQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    require_role(&admin, &[])?; // 治理写操作 admin 专属。
     let row = sqlx::query("SELECT version FROM model_routes WHERE id = ?")
         .bind(&id)
         .fetch_optional(&state.db)
@@ -253,9 +258,8 @@ pub(super) async fn activate_route(
         .ok_or(ApiError::NotFound)?;
     let version: String = row.try_get("version")?;
 
-    // 全局单活跃路由：先全置 inactive，再激活目标。
-    sqlx::query("UPDATE model_routes SET active = 0").execute(&state.db).await?;
-    sqlx::query("UPDATE model_routes SET active = 1 WHERE id = ?")
+    // 全局单活跃路由：单语句原子切换（目标置 active，其余全 inactive），消除零 active 窗口。
+    sqlx::query("UPDATE model_routes SET active = CASE WHEN id = ? THEN 1 ELSE 0 END")
         .bind(&id)
         .execute(&state.db)
         .await?;

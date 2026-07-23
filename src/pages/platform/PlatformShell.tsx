@@ -8,6 +8,7 @@ import {
   CloudUploadOutlined,
   AppstoreOutlined,
   ReadOutlined,
+  WalletOutlined,
   UserOutlined,
   LogoutOutlined,
   RollbackOutlined,
@@ -25,6 +26,7 @@ const NAV_ITEMS = [
   { key: '/platform/publish', icon: <CloudUploadOutlined />, label: '发布角色' },
   { key: '/platform/my', icon: <AppstoreOutlined />, label: '我的世界' },
   { key: '/platform/reports', icon: <ReadOutlined />, label: '日报' },
+  { key: '/platform/wallet', icon: <WalletOutlined />, label: '钱包' },
 ];
 
 /** 当前高亮的导航项：取匹配的最长前缀。 */

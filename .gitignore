@@ -16,6 +16,15 @@ dist-ssr/
 out/
 build/
 
+# Rust build artifacts（server / crates；Cargo.lock 仍纳入版本控制）
+target/
+
+# 运行时对象存储 / dev 数据库（LocalObjectStore 产物、切片、SQLite 文件）
+muse-objects/
+*.db
+*.db-journal
+*.db-wal
+
 # Local env files
 .env
 .env.local

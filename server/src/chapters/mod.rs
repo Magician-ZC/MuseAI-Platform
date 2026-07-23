@@ -15,10 +15,11 @@ use axum::{Json, Router};
 use serde_json::{json, Value};
 use sqlx::{AnyPool, Row};
 
+use crate::admission::ItemDefinition;
 use crate::app::AppState;
 use crate::assembly::{self, AssembledInstance};
 use crate::auth::AuthUser;
-use crate::backpack::grant_item;
+use crate::backpack::grant_item_tx;
 use crate::error::ApiError;
 use crate::idempotency;
 use crate::worlds::load_world;
@@ -180,66 +181,122 @@ async fn chapter_finish(
         .await?
         .ok_or(ApiError::Forbidden)?;
 
-    let mut wrapper = assembly::load_wrapper(&state.db, &world_id).await?;
-    let assembled = assembly_of(&wrapper)
-        .ok_or_else(|| ApiError::BadRequest("chapter_not_started".into()))?;
-    let mut cs = chapter_state_of(&wrapper);
+    // C-3：finish 全流程包一个事务 + worlds.state_revision CAS，grant 与 grantedHookIds 原子写入。
+    // 崩溃后重放 / 并发结算只发一次货——三重防线：① 事务原子性（grant 与已兑现标记同生共死）；
+    // ② state_revision CAS（并发/tick 推进则 0 行命中 → 回滚重试，重读最新 grantedHookIds 不二次发货）；
+    // ③ backpacks (user_id, reward_hook_key) 唯一约束下沉幂等（最后一道 DB 防线）。
+    const MAX_CAS_RETRIES: usize = 8;
+    let mut attempt = 0usize;
+    let response = loop {
+        attempt += 1;
 
-    // 已兑现钩子集合（跨重复结算幂等，不二次发货）。
-    let mut granted_ids: Vec<String> = cs["grantedHookIds"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-        .unwrap_or_default();
+        // 每次重试重读最新 assembled_json + state_revision（CAS 基准）。
+        let row = sqlx::query("SELECT assembled_json, state_revision FROM worlds WHERE id = ?")
+            .bind(&world_id)
+            .fetch_optional(&state.db)
+            .await?
+            .ok_or(ApiError::NotFound)?;
+        let raw: Option<String> = row.try_get("assembled_json")?;
+        let base_revision: i64 = row.try_get("state_revision")?;
+        let mut wrapper = raw
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            .filter(|v| v.is_object())
+            .unwrap_or_else(|| json!({ "assembly": Value::Null, "chapterState": assembly::empty_chapter_state() }));
 
-    // 兑现隐藏道具：仅本人角色、携带 reward_item、且未兑现过的钩子。
-    // grant_item 是 §9.6 两条合法写入路径之一（tick 结算侧）。
-    let mut granted_items = Vec::new();
-    for hook in &assembled.per_character_hooks {
-        if hook.character_id != cid {
+        let assembled = assembly_of(&wrapper)
+            .ok_or_else(|| ApiError::BadRequest("chapter_not_started".into()))?;
+        let mut cs = chapter_state_of(&wrapper);
+
+        // 已兑现钩子集合（章内幂等）。
+        let mut granted_ids: Vec<String> = cs["grantedHookIds"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+
+        // 待兑现隐藏道具：仅本人角色、携带 reward_item、且未兑现过的钩子。预先把 key 记入 grantedHookIds，
+        // 实际发货在 CAS 命中后于同一事务内执行。reward_hook_key 世界作用域，DB 唯一去重。
+        let mut to_grant: Vec<(&ItemDefinition, String)> = Vec::new();
+        for hook in &assembled.per_character_hooks {
+            if hook.character_id != cid {
+                continue;
+            }
+            let Some(reward) = &hook.reward_item else {
+                continue;
+            };
+            let key = format!("{}:{}", hook.character_id, hook.pool_item_id);
+            if granted_ids.contains(&key) {
+                continue;
+            }
+            let hook_key = format!("{}:{}:{}", world_id, hook.character_id, hook.pool_item_id);
+            to_grant.push((reward, hook_key));
+            granted_ids.push(key);
+        }
+
+        // 主线推进 + 通关判定。
+        let total_nodes = mainline_node_count(&state.db, &world.template_id).await?;
+        let next_node = cs["currentNode"].as_i64().unwrap_or(0) + 1;
+        let cleared = total_nodes > 0 && next_node as usize >= total_nodes;
+
+        // 离线夹层启动：为本人角色追加一条离线收益（自动训练摘要，回来领取）。
+        let mut offline_gains: Vec<Value> = cs["offlineGains"].as_array().cloned().unwrap_or_default();
+        let summary = format!(
+            "章节结算后角色于离线夹层自动训练：巩固第 {next_node} 幕经历{}。",
+            if cleared { "，副本主线通关" } else { "" }
+        );
+        offline_gains.push(assembly::build_offline_gain(&cid, "training", &summary));
+
+        // 写回 chapterState（assembly 段不动，含更新后的 grantedHookIds）。
+        cs["currentNode"] = json!(next_node);
+        cs["cleared"] = json!(cleared);
+        cs["grantedHookIds"] = json!(granted_ids);
+        cs["offlineGains"] = json!(offline_gains);
+        wrapper["chapterState"] = cs;
+
+        // 事务：CAS 占位（推进 state_revision + 写 chapterState）→ 命中后发货，全成或全败。
+        let mut tx = state.db.begin().await?;
+        let cas = sqlx::query(
+            "UPDATE worlds SET assembled_json = ?, state_revision = ?, updated_at = ? \
+             WHERE id = ? AND state_revision = ?",
+        )
+        .bind(wrapper.to_string())
+        .bind(base_revision + 1)
+        .bind(crate::db::now_ms())
+        .bind(&world_id)
+        .bind(base_revision)
+        .execute(&mut *tx)
+        .await?;
+        if cas.rows_affected() == 0 {
+            // 并发结算 / tick 已推进 state_revision → 回滚重试（重读最新态，已发货钩子不再列入 to_grant）。
+            tx.rollback().await?;
+            if attempt >= MAX_CAS_RETRIES {
+                return Err(ApiError::Conflict("chapter_finish_conflict".into()));
+            }
             continue;
         }
-        let Some(reward) = &hook.reward_item else {
-            continue;
-        };
-        let key = format!("{}:{}", hook.character_id, hook.pool_item_id);
-        if granted_ids.contains(&key) {
-            continue;
+
+        // CAS 命中后在同一事务内发货；DB (user_id, reward_hook_key) 唯一约束为最后一道防线。
+        let mut granted_items = Vec::new();
+        for (reward, hook_key) in &to_grant {
+            let inserted =
+                grant_item_tx(&mut tx, &user.user_id, reward, &world_id, Some(hook_key)).await?;
+            if inserted.is_some() {
+                granted_items.push(json!({ "itemId": reward.id, "narrative": reward.narrative }));
+            }
         }
-        grant_item(&state.db, &user.user_id, reward, &world_id).await?;
-        granted_ids.push(key);
-        granted_items.push(json!({ "itemId": reward.id, "narrative": reward.narrative }));
-    }
+        tx.commit().await?;
 
-    // 主线推进 + 通关判定。
-    let total_nodes = mainline_node_count(&state.db, &world.template_id).await?;
-    let next_node = cs["currentNode"].as_i64().unwrap_or(0) + 1;
-    let cleared = total_nodes > 0 && next_node as usize >= total_nodes;
+        break json!({
+            "worldId": world_id,
+            "characterId": cid,
+            "advancedTo": next_node,
+            "totalNodes": total_nodes,
+            "cleared": cleared,
+            "grantedItems": granted_items,
+            "offlineStarted": true,
+        });
+    };
 
-    // 离线夹层启动：为本人角色追加一条离线收益（自动训练摘要，回来领取）。
-    let mut offline_gains: Vec<Value> = cs["offlineGains"].as_array().cloned().unwrap_or_default();
-    let summary = format!(
-        "章节结算后角色于离线夹层自动训练：巩固第 {next_node} 幕经历{}。",
-        if cleared { "，副本主线通关" } else { "" }
-    );
-    offline_gains.push(assembly::build_offline_gain(&cid, "training", &summary));
-
-    // 写回 chapterState（assembly 段不动）。
-    cs["currentNode"] = json!(next_node);
-    cs["cleared"] = json!(cleared);
-    cs["grantedHookIds"] = json!(granted_ids);
-    cs["offlineGains"] = json!(offline_gains);
-    wrapper["chapterState"] = cs;
-    assembly::save_wrapper(&state.db, &world_id, &wrapper).await?;
-
-    let response = json!({
-        "worldId": world_id,
-        "characterId": cid,
-        "advancedTo": next_node,
-        "totalNodes": total_nodes,
-        "cleared": cleared,
-        "grantedItems": granted_items,
-        "offlineStarted": true,
-    });
     guard.store_response(&state.db, &response.to_string()).await?;
     Ok(Json(response))
 }

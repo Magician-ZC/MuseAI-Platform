@@ -11,7 +11,7 @@ use crate::auth::{AdminUser, AuthUser};
 use crate::db::now_ms;
 use crate::error::ApiError;
 
-use super::{audit, clamp_limit, parse_cursor, ActionQuery};
+use super::{audit, clamp_limit, parse_cursor, require_role, ActionQuery};
 
 #[derive(Debug, Deserialize)]
 pub(super) struct UserQuery {
@@ -50,9 +50,10 @@ fn mask_email(email: &str) -> String {
 /// 展示身份验证「状态」（identity_verification_refs.status），绝不展示 reference_id/原始证件。
 pub(super) async fn list_users(
     State(state): State<AppState>,
-    _admin: AdminUser,
+    admin: AdminUser,
     Query(q): Query<UserQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    require_role(&admin, &["support"])?;
     let page = clamp_limit(q.limit);
     let term = q.query.as_deref().map(str::trim).filter(|s| !s.is_empty());
 
@@ -120,6 +121,7 @@ pub(super) async fn ban_user(
     Path(id): Path<String>,
     Query(q): Query<ActionQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    require_role(&admin, &["support"])?;
     set_status(&state, &admin.0, &id, "banned", "user.ban", q.reason()).await
 }
 
@@ -130,6 +132,7 @@ pub(super) async fn unban_user(
     Path(id): Path<String>,
     Query(q): Query<ActionQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    require_role(&admin, &["support"])?;
     set_status(&state, &admin.0, &id, "active", "user.unban", q.reason()).await
 }
 

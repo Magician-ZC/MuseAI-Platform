@@ -7,7 +7,7 @@
 //!   内容审核：GET /admin/audit-queue?status=、POST /admin/audit-queue/{id}/approve|reject（回写主体 moderation）
 //!   世界运营：GET /admin/worlds?status=、GET /admin/worlds/{id}/diagnostics（脱敏诊断）、
 //!            POST /admin/worlds/{id}/pause|resume、POST /admin/worlds（官方建房）、GET/POST /admin/world-templates
-//!   经济运营：GET /admin/economy/overview（P4a 占位，不建结算）
+//!   经济运营：GET /admin/economy/overview（真实只读聚合：充值/退款/余额/礼物/订单状态，不建结算）
 //!   数据看板：GET /admin/metrics/overview（SQL 聚合）
 //!   治理：    GET/POST /admin/prompts、POST /admin/prompts/{id}/activate|canary、
 //!            GET/POST /admin/model-routes、POST /admin/model-routes/{id}/activate（一键回滚=激活旧版本）
@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 use sqlx::AnyPool;
 
 use crate::app::AppState;
-use crate::auth::{issue_access, AuthUser};
+use crate::auth::{issue_access, AdminUser, AuthUser};
 use crate::db::{new_id, now_ms};
 use crate::error::ApiError;
 
@@ -64,7 +64,7 @@ pub fn router() -> Router<AppState> {
             "/admin/world-templates",
             get(worlds_ops::list_templates).post(worlds_ops::create_template),
         )
-        // 经济运营（P4a 占位）
+        // 经济运营（真实只读聚合）
         .route("/admin/economy/overview", get(dashboards::economy_overview))
         // 数据看板
         .route("/admin/metrics/overview", get(dashboards::metrics_overview))
@@ -85,6 +85,22 @@ pub fn router() -> Router<AppState> {
 }
 
 // ---------------- 共享设施（子模块经 super:: 复用） ----------------
+
+/// S-6 最小权限：端点级 role→action 矩阵。AdminUser 提取器只做粗粒度守卫（是否后台角色），
+/// 各 handler 在其上调用本函数做细粒度授权——`admin` 为超级用户放行一切；其余角色须在
+/// `allowed` 白名单内，否则 403。矩阵（admin 全权，此处列其余角色）：
+///   operator：世界运营（worlds/templates/metrics/governance 只读）
+///   reviewer：内容审核（audit-queue、模板/风控只读）
+///   support ：客服（用户管理、工单、风控只读）
+///   finance ：经济只读（economy/metrics）
+pub(super) fn require_role(admin: &AdminUser, allowed: &[&str]) -> Result<(), ApiError> {
+    let role = admin.0.role.as_str();
+    if role == "admin" || allowed.contains(&role) {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden)
+    }
+}
 
 /// 审计留痕：所有写操作统一调用，落 audit_logs。
 pub(super) async fn audit(

@@ -311,6 +311,9 @@ async fn carry_applies_admission_decisions_per_policy() {
     // 魔法世界拒收 tech 体系（denylist），拒收留背包。
     seed_template(&state, "tpl", "chapter", CHAPTER_SKELETON, r#"{"mode":"denylist","cosmologies":["tech"],"rejectedHandling":"stay_in_backpack"}"#).await;
     let wid = make_chapter_world(&state, "tpl").await;
+    // 携带随入场：本人角色须在场（Low 加固：carry 成员/世界态校验）。
+    seed_char(&state, "chA", "usrA", &make_card("chA", "甲", "恐惧", &[], None, false)).await;
+    seed_member(&state, &wid, "usrA", "chA").await;
 
     grant_item(&state.db, "usrA", &item_def("magic_wand", &["magic"], 2), "w0").await.unwrap();
     grant_item(&state.db, "usrA", &item_def("laser_gun", &["tech"], 2), "w0").await.unwrap();
@@ -360,6 +363,8 @@ async fn carry_translate_mode_marks_translated_and_carries() {
     // translate 世界：tech 被拒 → 转译入场。
     seed_template(&state, "tpl", "chapter", CHAPTER_SKELETON, r#"{"mode":"denylist","cosmologies":["tech"],"maxPowerTier":3,"rejectedHandling":"translate"}"#).await;
     let wid = make_chapter_world(&state, "tpl").await;
+    seed_char(&state, "chA", "usrA", &make_card("chA", "甲", "恐惧", &[], None, false)).await;
+    seed_member(&state, &wid, "usrA", "chA").await;
     grant_item(&state.db, "usrA", &item_def("laser_gun", &["tech"], 5), "w0").await.unwrap();
 
     let (st, body) = post(
@@ -476,4 +481,223 @@ async fn chapter_endpoints_reject_non_chapter_room() {
 
     let (st, _) = post(&app, &format!("/api/worlds/{wid}/chapters/start"), &token(&state, "usrA"), None, json!({})).await;
     assert_eq!(st, StatusCode::CONFLICT, "非章节房应拒绝（room_type 开关）");
+}
+
+// ---------- C-3：并发 finish 只发一次货（事务 + state_revision CAS + DB 唯一约束） ----------
+
+#[tokio::test]
+async fn concurrent_finish_grants_reward_exactly_once() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    seed_user(&state, "usrA").await;
+    let card = make_card("chA", "苏未央", "害怕被遗忘", &["寻找失散的姐姐"], Some(("src_novel", "测试小说")), true);
+    seed_char(&state, "chA", "usrA", &card).await;
+    seed_template(&state, "tpl_chapter", "chapter", CHAPTER_SKELETON, r#"{"mode":"open"}"#).await;
+    let wid = make_chapter_world(&state, "tpl_chapter").await;
+    seed_member(&state, &wid, "usrA", "chA").await;
+    let ta = token(&state, "usrA");
+
+    // start：一次性装配。
+    let (st, _) = post(&app, &format!("/api/worlds/{wid}/chapters/start"), &ta, None, json!({})).await;
+    assert_eq!(st, StatusCode::OK);
+
+    // 两个并发 finish（无幂等键，均越过 guard）：竞争兑现同一隐藏道具。
+    let uri = format!("/api/worlds/{wid}/chapters/finish");
+    let f1 = post(&app, &uri, &ta, None, json!({}));
+    let f2 = post(&app, &uri, &ta, None, json!({}));
+    let ((s1, b1), (s2, b2)) = tokio::join!(f1, f2);
+    assert_eq!(s1, StatusCode::OK, "{b1}");
+    assert_eq!(s2, StatusCode::OK, "{b2}");
+
+    // 跨两个并发响应，item_relic 至多被发一次（另一方为空发货）。
+    let granted_count = |b: &Value| -> usize {
+        b["grantedItems"].as_array().map(|a| a.iter().filter(|g| g["itemId"] == "item_relic").count()).unwrap_or(0)
+    };
+    assert_eq!(
+        granted_count(&b1) + granted_count(&b2),
+        1,
+        "并发 finish 隐藏道具只应发一次货: b1={b1} b2={b2}"
+    );
+
+    // DB 权威：item_relic 背包行恰好 1 条（资产复制被下沉到 (user_id, reward_hook_key) 唯一约束堵死）。
+    assert_eq!(
+        count(&state.db, "SELECT COUNT(*) FROM backpacks WHERE user_id='usrA' AND item_id='item_relic'").await,
+        1,
+        "并发/重放 finish 只入包一次"
+    );
+
+    // 幂等重放（第三次 finish）仍不二次发货。
+    let (st3, b3) = post(&app, &format!("/api/worlds/{wid}/chapters/finish"), &ta, None, json!({})).await;
+    assert_eq!(st3, StatusCode::OK, "{b3}");
+    assert_eq!(b3["grantedItems"].as_array().unwrap().len(), 0, "已兑现不二次发货");
+    assert_eq!(
+        count(&state.db, "SELECT COUNT(*) FROM backpacks WHERE user_id='usrA' AND item_id='item_relic'").await,
+        1
+    );
+}
+
+// ---------- S-5：carry 转译降档持久化到 backpacks 覆盖列（未来仲裁读覆盖值） ----------
+
+#[tokio::test]
+async fn carry_translate_persists_downgrade_override_and_clears_on_readmit() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    seed_user(&state, "usrA").await;
+    // world1：denylist tech + maxPowerTier=3 + translate → tech tier5 转译降档到 3。
+    seed_template(&state, "tpl_t", "chapter", CHAPTER_SKELETON, r#"{"mode":"denylist","cosmologies":["tech"],"maxPowerTier":3,"rejectedHandling":"translate"}"#).await;
+    let w1 = make_chapter_world(&state, "tpl_t").await;
+    seed_char(&state, "chA", "usrA", &make_card("chA", "甲", "恐惧", &[], None, false)).await;
+    seed_member(&state, &w1, "usrA", "chA").await;
+    grant_item(&state.db, "usrA", &item_def("laser_gun", &["tech"], 5), "w0").await.unwrap();
+
+    let (st, body) = post(&app, &format!("/api/worlds/{w1}/carry"), &token(&state, "usrA"), None, json!({ "itemIds": ["laser_gun"] })).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(body["results"][0]["decision"], "translated");
+
+    // 覆盖列已落库：powerTier 降档到 3，effectTags 快照持久化（不再只进响应）。
+    let row = sqlx::query("SELECT power_tier_override, effect_tags_override FROM backpacks WHERE user_id='usrA' AND item_id='laser_gun'")
+        .fetch_one(&state.db).await.unwrap();
+    assert_eq!(row.try_get::<Option<i64>, _>("power_tier_override").unwrap(), Some(3), "转译降档 powerTier 应持久化为 3");
+    let et: Option<String> = row.try_get("effect_tags_override").unwrap();
+    assert!(et.as_deref().unwrap_or("").contains("advantage:combat"), "effectTags 覆盖应落库: {et:?}");
+
+    // 再携带进一个放行世界（open 全收，无强度上限）→ admitted，覆盖列清 NULL（不残留历史降档）。
+    seed_template(&state, "tpl_open", "chapter", CHAPTER_SKELETON, r#"{"mode":"open"}"#).await;
+    let w2 = make_chapter_world(&state, "tpl_open").await;
+    seed_member(&state, &w2, "usrA", "chA").await;
+    let (st2, body2) = post(&app, &format!("/api/worlds/{w2}/carry"), &token(&state, "usrA"), None, json!({ "itemIds": ["laser_gun"] })).await;
+    assert_eq!(st2, StatusCode::OK, "{body2}");
+    assert_eq!(body2["results"][0]["decision"], "admitted");
+    let pt: Option<i64> = sqlx::query("SELECT power_tier_override FROM backpacks WHERE user_id='usrA' AND item_id='laser_gun'")
+        .fetch_one(&state.db).await.unwrap().try_get("power_tier_override").unwrap();
+    assert_eq!(pt, None, "非转译入场应清除历史降档覆盖");
+}
+
+// ---------- S-5 / Low：carry 需世界可加入态 + 本人在场成员 ----------
+
+#[tokio::test]
+async fn carry_requires_active_membership() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    seed_user(&state, "usrA").await;
+    seed_template(&state, "tpl", "chapter", CHAPTER_SKELETON, r#"{"mode":"open"}"#).await;
+    let wid = make_chapter_world(&state, "tpl").await;
+    grant_item(&state.db, "usrA", &item_def("magic_wand", &["magic"], 2), "w0").await.unwrap();
+
+    // 非成员携带自有物品 → 403（携带随入场，须先在场）。
+    let (st, _) = post(&app, &format!("/api/worlds/{wid}/carry"), &token(&state, "usrA"), None, json!({ "itemIds": ["magic_wand"] })).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "非成员不得携带");
+
+    // 成为在场成员后 → 放行。
+    seed_char(&state, "chA", "usrA", &make_card("chA", "甲", "恐惧", &[], None, false)).await;
+    seed_member(&state, &wid, "usrA", "chA").await;
+    let (st2, body2) = post(&app, &format!("/api/worlds/{wid}/carry"), &token(&state, "usrA"), None, json!({ "itemIds": ["magic_wand"] })).await;
+    assert_eq!(st2, StatusCode::OK, "{body2}");
+    assert_eq!(body2["results"][0]["decision"], "admitted");
+}
+
+// ---------- C-7：首次装配并发保护——第二次装配不覆盖已推进的 chapterState ----------
+
+#[tokio::test]
+async fn duplicate_assembly_preserves_chapter_state() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    seed_user(&state, "usrA").await;
+    let card = make_card("chA", "苏未央", "害怕被遗忘", &["寻找失散的姐姐"], Some(("src_novel", "测试小说")), true);
+    seed_char(&state, "chA", "usrA", &card).await;
+    seed_template(&state, "tpl_chapter", "chapter", CHAPTER_SKELETON, r#"{"mode":"open"}"#).await;
+    let wid = make_chapter_world(&state, "tpl_chapter").await;
+    seed_member(&state, &wid, "usrA", "chA").await;
+    let ta = token(&state, "usrA");
+
+    // start 装配 + finish 推进（currentNode→1，兑现 item_relic）。
+    post(&app, &format!("/api/worlds/{wid}/chapters/start"), &ta, None, json!({})).await;
+    let (stf, _) = post(&app, &format!("/api/worlds/{wid}/chapters/finish"), &ta, None, json!({})).await;
+    assert_eq!(stf, StatusCode::OK);
+
+    // 模拟并发/重复装配：再次 assemble_instance——C-7 修复后应「仅当 assembly 为 null 才写」，
+    // 已装配则复用，不覆盖 → chapterState（currentNode/grantedHookIds）完好。
+    let _ = assemble_instance(&state, &wid).await.unwrap();
+
+    let raw: String = sqlx::query("SELECT assembled_json FROM worlds WHERE id=?")
+        .bind(&wid).fetch_one(&state.db).await.unwrap().try_get("assembled_json").unwrap();
+    let v: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(v["chapterState"]["currentNode"], json!(1), "重复装配不得重置章节推进");
+    assert_eq!(
+        v["chapterState"]["grantedHookIds"].as_array().map(|a| a.len()).unwrap_or(0),
+        1,
+        "重复装配不得清空已兑现钩子集"
+    );
+    // 背包仍只有 1 件 item_relic（重复装配未导致后续 finish 二次发货）。
+    let (stf2, bf2) = post(&app, &format!("/api/worlds/{wid}/chapters/finish"), &ta, None, json!({})).await;
+    assert_eq!(stf2, StatusCode::OK, "{bf2}");
+    assert_eq!(bf2["grantedItems"].as_array().unwrap().len(), 0);
+    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM backpacks WHERE item_id='item_relic'").await, 1);
+}
+
+#[tokio::test]
+async fn concurrent_assemble_instance_writes_single_consistent_assembly() {
+    let state = test_state().await;
+    seed_user(&state, "usrA").await;
+    let card = make_card("chA", "苏未央", "害怕被遗忘", &["寻找失散的姐姐"], Some(("src_novel", "测试小说")), true);
+    seed_char(&state, "chA", "usrA", &card).await;
+    seed_template(&state, "tpl_chapter", "chapter", CHAPTER_SKELETON, r#"{"mode":"open"}"#).await;
+    let wid = make_chapter_world(&state, "tpl_chapter").await;
+    seed_member(&state, &wid, "usrA", "chA").await;
+
+    // 两个并发装配：CAS 占位保证只有一个落库，另一个复用同一结果。
+    let (a1, a2) = tokio::join!(assemble_instance(&state, &wid), assemble_instance(&state, &wid));
+    let a1 = a1.unwrap();
+    let a2 = a2.unwrap();
+    assert_eq!(a1.per_character_hooks.len(), 1);
+    assert_eq!(a2.per_character_hooks.len(), 1);
+    assert_eq!(a1.per_character_hooks[0].pool_item_id, a2.per_character_hooks[0].pool_item_id, "并发装配应返回一致实例");
+
+    // DB 内恰好一份 assembly，且 chapterState 为初值（未被并发覆盖损坏）。
+    let raw: String = sqlx::query("SELECT assembled_json FROM worlds WHERE id=?")
+        .bind(&wid).fetch_one(&state.db).await.unwrap().try_get("assembled_json").unwrap();
+    let v: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(v["assembly"]["perCharacterHooks"].as_array().unwrap().len(), 1);
+    assert_eq!(v["chapterState"]["currentNode"], json!(0));
+}
+
+// ---------- S-3：Pending（机审未过/注入命中）钩子不嵌入，换下一候选 ----------
+
+const FLAGGED_SKELETON: &str = r#"{
+  "sourceWork": { "sourceId": "src_novel", "title": "测试小说" },
+  "mainlineNodes": [ { "id": "n1", "fated": true } ],
+  "endingPool": [ { "id": "e1", "affinity": null, "baseWeight": 0.6 } ],
+  "hiddenContentPool": [
+    { "id": "hc_flagged", "themes": ["遗忘"], "template": "测试敏感词：{name} 面对 {fear}。", "difficultyBase": 0.5 },
+    { "id": "hc_clean", "themes": ["遗忘"], "template": "{name} 静静面对 {fear}。", "difficultyBase": 0.3 }
+  ],
+  "assemblyRules": { "hiddenPerCharacter": 1 }
+}"#;
+
+#[tokio::test]
+async fn pending_moderation_hook_is_skipped_for_next_candidate() {
+    let state = test_state().await;
+    seed_user(&state, "usrA").await;
+    // 恐惧含「遗忘」→ 两个候选都命中主题；平手按池序 hc_flagged 排前。
+    let card = make_card("chA", "苏未央", "害怕被遗忘", &[], Some(("src_novel", "测试小说")), false);
+    seed_char(&state, "chA", "usrA", &card).await;
+    seed_template(&state, "tpl_flagged", "chapter", FLAGGED_SKELETON, r#"{"mode":"open"}"#).await;
+    let wid = make_chapter_world(&state, "tpl_flagged").await;
+    seed_member(&state, &wid, "usrA", "chA").await;
+
+    let assembled = assemble_instance(&state, &wid).await.unwrap();
+
+    // hc_flagged 文本含 DevModeration 敏感词 → Pending → 不嵌入；换下一候选 hc_clean 过审嵌入。
+    assert_eq!(assembled.per_character_hooks.len(), 1, "应只嵌入过审的那个候选");
+    assert_eq!(assembled.per_character_hooks[0].pool_item_id, "hc_clean", "Pending 候选应被跳过，换下一候选");
+    assert!(
+        !assembled.per_character_hooks.iter().any(|h| h.pool_item_id == "hc_flagged"),
+        "未复核（Pending）内容不得钉进实例"
+    );
+
+    // Pending 候选已进人审队列（moderate_and_queue 的分层管道），供后台复核。
+    assert!(
+        count(&state.db, "SELECT COUNT(*) FROM audit_queue WHERE subject_kind='assembly_hook' AND status='open'").await >= 1,
+        "Pending 装配钩子应入人审队列"
+    );
 }

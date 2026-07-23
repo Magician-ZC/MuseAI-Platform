@@ -11,7 +11,7 @@ use crate::auth::{AdminUser, AuthUser};
 use crate::db::now_ms;
 use crate::error::ApiError;
 
-use super::{audit, clamp_limit, parse_cursor, ActionQuery};
+use super::{audit, clamp_limit, parse_cursor, require_role, ActionQuery};
 
 #[derive(Debug, Deserialize)]
 pub(super) struct QueueQuery {
@@ -23,9 +23,10 @@ pub(super) struct QueueQuery {
 /// GET /admin/audit-queue?status=（默认 open）：机审预标注 + 待人审列表。
 pub(super) async fn list_queue(
     State(state): State<AppState>,
-    _admin: AdminUser,
+    admin: AdminUser,
     Query(q): Query<QueueQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    require_role(&admin, &["reviewer"])?;
     let page = clamp_limit(q.limit);
     let status = q.status.unwrap_or_else(|| "open".into());
 
@@ -83,6 +84,7 @@ pub(super) async fn approve(
     Path(id): Path<String>,
     Query(q): Query<ActionQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    require_role(&admin, &["reviewer"])?;
     review(&state, &admin.0, &id, "approved", q.reason()).await
 }
 
@@ -93,6 +95,7 @@ pub(super) async fn reject(
     Path(id): Path<String>,
     Query(q): Query<ActionQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    require_role(&admin, &["reviewer"])?;
     review(&state, &admin.0, &id, "rejected", q.reason()).await
 }
 

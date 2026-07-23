@@ -190,18 +190,17 @@ async fn respond(
 
     expire_stale_consents(&state.db).await?;
 
-    let c: Option<(String, String, String, String)> = sqlx::query_as(
-        "SELECT world_id, subject_character_ids, status, responses_json FROM consent_requests WHERE id = ?",
-    )
-    .bind(&cid)
-    .fetch_optional(&state.db)
-    .await?;
-    let (c_world, subjects_json, status, responses_json) = c.ok_or(ApiError::NotFound)?;
+    // 当事人校验（读，非并发关键路径）：subject 集合在 consent 创建后不可变，成员关系稳定，故先读判权限；
+    // 真正的状态推进在下方事务内串行完成。
+    let pre: Option<(String, String)> =
+        sqlx::query_as("SELECT world_id, subject_character_ids FROM consent_requests WHERE id = ?")
+            .bind(&cid)
+            .fetch_optional(&state.db)
+            .await?;
+    let (c_world, subjects_json) = pre.ok_or(ApiError::NotFound)?;
     if c_world != world_id {
         return Err(ApiError::NotFound);
     }
-
-    // 当事人校验：用户在本世界的角色 ∩ subjects。
     let my_chars: Vec<(String,)> =
         sqlx::query_as("SELECT cloud_character_id FROM world_members WHERE world_id = ? AND user_id = ?")
             .bind(&world_id)
@@ -215,23 +214,60 @@ async fn respond(
         return Err(ApiError::Forbidden);
     }
 
-    // 已解决 → 幂等返回当前状态。
+    // C-5：事务 + 行锁串行化，响应落独立表 consent_responses（UNIQUE(consent_id, subject) 幂等去重），
+    // 锁内重算裁决，消除 responses_json 读改写丢更新。
+    let now = crate::db::now_ms();
+    let verdict = if req.approve { "approved" } else { "declined" };
+    let mut tx = state.db.begin().await?;
+
+    // 取同一 consent 的行锁：Postgres 下自赋值 UPDATE 等价 SELECT...FOR UPDATE，序列化并发响应；
+    // SQLite 下单连接事务本就互斥，此语句为无害占位。
+    sqlx::query("UPDATE consent_requests SET status = status WHERE id = ?")
+        .bind(&cid)
+        .execute(&mut *tx)
+        .await?;
+
+    // 锁内重读权威状态；已解决 → 幂等返回，不重复写响应。
+    let cur: Option<(String,)> = sqlx::query_as("SELECT status FROM consent_requests WHERE id = ?")
+        .bind(&cid)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let status = cur.ok_or(ApiError::NotFound)?.0;
     if status != "pending" {
+        tx.commit().await?;
         let resp = json!({"consentId": cid, "status": status});
         guard.store_response(&state.db, &resp.to_string()).await?;
         return Ok(Json(resp));
     }
 
-    let mut resp_map: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_str(&responses_json).unwrap_or_default();
-    let verdict = if req.approve { "approved" } else { "declined" };
+    // 落每个当事角色的响应（冲突则更新为最新裁决，等价原 resp_map.insert 覆盖语义）。
     for s in &my_subjects {
-        resp_map.insert(s.clone(), json!(verdict));
+        sqlx::query(
+            "INSERT INTO consent_responses (id, consent_id, subject_character_id, user_id, verdict, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(consent_id, subject_character_id) DO UPDATE SET verdict = excluded.verdict, updated_at = excluded.updated_at",
+        )
+        .bind(crate::db::new_id("cr"))
+        .bind(&cid)
+        .bind(s)
+        .bind(&user.user_id)
+        .bind(verdict)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
     }
 
-    // 任一拒绝 → declined；全部当事角色 approved → approved；否则仍 pending。
-    let any_declined = resp_map.values().any(|v| v == "declined");
-    let all_approved = subjects.iter().all(|s| resp_map.get(s).map(|v| v == "approved").unwrap_or(false));
+    // 锁内读全部响应，重算裁决：任一 declined → declined；全部当事角色 approved → approved；否则 pending。
+    let resp_rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT subject_character_id, verdict FROM consent_responses WHERE consent_id = ?")
+            .bind(&cid)
+            .fetch_all(&mut *tx)
+            .await?;
+    let any_declined = resp_rows.iter().any(|(_, v)| v == "declined");
+    let all_approved = subjects
+        .iter()
+        .all(|s| resp_rows.iter().any(|(sub, v)| sub == s && v == "approved"));
     let new_status = if any_declined {
         "declined"
     } else if all_approved {
@@ -239,15 +275,21 @@ async fn respond(
     } else {
         "pending"
     };
-    let resolved_at = if new_status == "pending" { None } else { Some(crate::db::now_ms()) };
+    let resolved_at = if new_status == "pending" { None } else { Some(now) };
+
+    // 同步维护 responses_json（锁内从独立表派生，始终一致），供 my_consents 等读路径继续使用。
+    let resp_map: serde_json::Map<String, serde_json::Value> =
+        resp_rows.iter().map(|(s, v)| (s.clone(), json!(v))).collect();
 
     sqlx::query("UPDATE consent_requests SET responses_json = ?, status = ?, resolved_at = ? WHERE id = ?")
         .bind(serde_json::to_string(&resp_map).unwrap_or_else(|_| "{}".into()))
         .bind(new_status)
         .bind(resolved_at)
         .bind(&cid)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
+
+    tx.commit().await?;
 
     let resp = json!({"consentId": cid, "status": new_status, "responded": my_subjects});
     guard.store_response(&state.db, &resp.to_string()).await?;
@@ -373,5 +415,43 @@ mod tests {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["consents"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_responses_no_lost_update() {
+        // C-5：两个当事人并发同意 —— 旧的 responses_json 读改写会丢一条、卡在 pending（审计失真）；
+        // 新实现响应落独立表 + 事务串行重算 → 两条都在，最终 approved。
+        let state = test_state().await;
+        seed_user(&state.db, "u1").await;
+        seed_user(&state.db, "u2").await;
+        seed_world(&state.db, "w1", 0, "running").await;
+        seed_member(&state.db, "m1", "w1", "u1", "c1", "active").await;
+        seed_member(&state.db, "m2", "w1", "u2", "c2", "active").await;
+        let cid = create_consent(
+            &state,
+            "w1",
+            "relationship",
+            &["c1".into(), "c2".into()],
+            "c1 与 c2 结为永久羁绊",
+            3_600_000,
+        )
+        .await
+        .unwrap();
+
+        // 同一任务内并发交错两条响应 future（在各 await 点互相穿插，正是读改写丢更新的窗口）。
+        let (r1, r2) = tokio::join!(
+            respond_via_http(&state, "u1", "w1", &cid, true),
+            respond_via_http(&state, "u2", "w1", &cid, true),
+        );
+        assert_eq!(r1.0, StatusCode::OK, "body={:?}", r1.1);
+        assert_eq!(r2.0, StatusCode::OK, "body={:?}", r2.1);
+
+        assert_eq!(status_of(&state.db, &cid).await, "approved", "并发双同意应最终 approved，不丢更新");
+        let n = count(
+            &state.db,
+            &format!("SELECT COUNT(*) FROM consent_responses WHERE consent_id = '{cid}'"),
+        )
+        .await;
+        assert_eq!(n, 2, "两条当事人响应都应落独立表");
     }
 }

@@ -22,6 +22,9 @@ import MyWorlds from './pages/platform/MyWorlds';
 import WorldRoom from './pages/platform/WorldRoom';
 import WorldSpectate from './pages/platform/WorldSpectate';
 import DailyReport from './pages/platform/DailyReport';
+import Wallet from './pages/platform/Wallet';
+import ArenaHost from './pages/platform/ArenaHost';
+import ArenaSpectate from './pages/platform/ArenaSpectate';
 
 // Mobile components
 import MobileShell from './components/MobileShell';
@@ -108,6 +111,10 @@ function App() {
               <Route path="worlds/:id/spectate" element={<RequireAuth><WorldSpectate /></RequireAuth>} />
               <Route path="reports" element={<RequireAuth><DailyReport /></RequireAuth>} />
               <Route path="reports/:id" element={<RequireAuth><DailyReport /></RequireAuth>} />
+              {/* P4b 钱包 + P6 赛事房（独立平台页；本地页面不受影响） */}
+              <Route path="wallet" element={<RequireAuth><Wallet /></RequireAuth>} />
+              <Route path="arena/:worldId/host" element={<RequireAuth><ArenaHost /></RequireAuth>} />
+              <Route path="arena/:worldId/spectate" element={<RequireAuth><ArenaSpectate /></RequireAuth>} />
             </Route>
           </>
         )}

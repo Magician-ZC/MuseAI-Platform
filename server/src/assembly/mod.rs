@@ -208,13 +208,16 @@ pub async fn assemble_instance(state: &AppState, world_id: &str) -> Result<Assem
     let mut home_advantages: Vec<HomeAdvantage> = Vec::new();
 
     for (cid, card) in &cards {
-        // 1) per-character 钩子：从隐藏内容池按执念/恐惧重叠度选择并参数化。
+        // 1) per-character 钩子：从隐藏内容池按执念/恐惧重叠度排序，逐个过机审，只嵌入通过者直到配额。
         let terms = obsession_terms(card);
-        let selected = select_pool_items(&skeleton.hidden_content_pool, &terms, rules.hidden_per_character);
-        let mut character_got_hook = false;
-        for (pool_item, matches, matched_term) in selected {
-            let text = parameterize(&pool_item, cid, card, matched_term.as_deref());
-            // 装配连接文本过机审后才生效；被拒则跳过该钩子（换下一候选）。
+        let candidates = rank_pool_items(&skeleton.hidden_content_pool, &terms);
+        let quota = rules.hidden_per_character.max(1);
+        let mut embedded = 0usize;
+        for (pool_item, matches, matched_term) in candidates {
+            if embedded >= quota {
+                break;
+            }
+            let text = parameterize(pool_item, cid, card, matched_term.as_deref());
             let verdict = crate::safety::moderate_and_queue(
                 state,
                 "assembly_hook",
@@ -222,7 +225,9 @@ pub async fn assemble_instance(state: &AppState, world_id: &str) -> Result<Assem
                 &text,
             )
             .await?;
-            if verdict == ModerationVerdict::Rejected {
+            // S-3：仅 Approved 才嵌入并钉住；Rejected/Pending（含注入命中）一律跳过换下一候选——
+            // 不把未复核内容钉进实例（moderate_and_queue 已将 Pending 入人审队列 + 记 risk_events）。
+            if verdict != ModerationVerdict::Approved {
                 continue;
             }
             let difficulty = (pool_item.difficulty_base + 0.15 * matches as f32).clamp(0.0, 1.0);
@@ -237,9 +242,9 @@ pub async fn assemble_instance(state: &AppState, world_id: &str) -> Result<Assem
                 difficulty_score: difficulty,
                 reward_item: pool_item.reward_item.clone(),
             });
-            character_got_hook = true;
+            embedded += 1;
         }
-        let _ = character_got_hook; // ≥1 目标：池非空且非全拒时自然满足（见 select_pool_items 保底取 1）。
+        // ≥1 目标为 best-effort：池非空且存在过审候选时满足；候选全 Pending/Rejected 时该角色无钩子（安全优先）。
 
         // 2) 主场优劣势标注：本书角色挂预知知识包 + 原作宿命硬节点。
         if is_home_character(card, skeleton.source_work.as_ref()) {
@@ -285,7 +290,30 @@ pub async fn assemble_instance(state: &AppState, world_id: &str) -> Result<Assem
         "templateVersion": world.template_version,
         "assembledAt": now_ms(),
     });
-    save_wrapper(&state.db, world_id, &wrapper).await?;
+
+    // C-7：首次装配并发保护——仅当尚未装配（assembled_json IS NULL）时占位写入（CAS）。
+    // 输了竞争（已被并发 start 装配写入）→ 复用已持久化结果，避免覆盖导致 chapterState 重置 / 装配发散。
+    let claimed = sqlx::query(
+        "UPDATE worlds SET assembled_json = ?, updated_at = ? WHERE id = ? AND assembled_json IS NULL",
+    )
+    .bind(wrapper.to_string())
+    .bind(now_ms())
+    .bind(world_id)
+    .execute(&state.db)
+    .await?;
+    if claimed.rows_affected() == 0 {
+        // 已有装配：读回并复用（两个并发 start 得到一致实例，不重复覆盖）。
+        let existing = load_wrapper(&state.db, world_id).await?;
+        if let Some(a) = existing
+            .get("assembly")
+            .filter(|v| v.is_object())
+            .and_then(|v| serde_json::from_value::<AssembledInstance>(v.clone()).ok())
+        {
+            return Ok(a);
+        }
+        // 兜底：assembled_json 非空但无 assembly 段（非常规路径）→ 强制落本次结果，避免房间卡死。
+        save_wrapper(&state.db, world_id, &wrapper).await?;
+    }
 
     Ok(assembled)
 }
@@ -385,15 +413,12 @@ fn score_pool_item(pool_item: &PoolItem, terms: &[String]) -> (usize, Option<Str
     (matches, matched_term)
 }
 
-/// 选择绑定执念的隐藏内容：按命中数降序取前 N；池非空则至少保底取 1（满足「每角色 ≥1」）。
-fn select_pool_items<'a>(
+/// 按命中执念数降序排列全部候选（稳定序保留池内原顺序作平手）；池空 → 空。
+/// 不预截断——调用方按配额 + 机审逐个嵌入，Pending/Rejected 跳过换下一候选（S-3）。
+fn rank_pool_items<'a>(
     pool: &'a [PoolItem],
     terms: &[String],
-    n: usize,
 ) -> Vec<(&'a PoolItem, usize, Option<String>)> {
-    if pool.is_empty() {
-        return Vec::new();
-    }
     let mut scored: Vec<(&PoolItem, usize, Option<String>)> = pool
         .iter()
         .map(|p| {
@@ -403,8 +428,7 @@ fn select_pool_items<'a>(
         .collect();
     // 命中数降序；稳定排序保留池内原顺序作为平手序。
     scored.sort_by(|a, b| b.1.cmp(&a.1));
-    let take = n.max(1).min(scored.len());
-    scored.into_iter().take(take).collect()
+    scored
 }
 
 /// 参数化连接文本：填充模板并显式嵌入绑定的执念词条（保证可验证的执念绑定）。

@@ -90,6 +90,9 @@ pub struct RoundRequestDto {
     pub temperature_writer: Option<f32>,
     pub max_output_tokens: Option<u32>,
     pub budget: RoundBudget,
+    /// 已获批的不可逆结果 subject（可选；桌面壳默认空 = 全部门控，需显式授权才落定）
+    #[serde(default)]
+    pub approved_consents: Option<Vec<String>>,
 }
 
 #[derive(serde::Serialize)]
@@ -128,6 +131,7 @@ pub async fn start_narrative_round(app: AppHandle, request: RoundRequestDto) -> 
             temperature_writer: request.temperature_writer.unwrap_or(0.8),
             max_output_tokens: request.max_output_tokens.unwrap_or(8192),
             budget: request.budget,
+            approved_consents: request.approved_consents.unwrap_or_default(),
         };
         let result = engine.run_round(&routes, &prompts, input, &flag).await;
         let payload = match &result {

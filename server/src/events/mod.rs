@@ -28,7 +28,9 @@ use crate::auth::{verify_access, AuthUser};
 use crate::db::{new_id, now_ms};
 use crate::error::ApiError;
 
-use muse_engine::narrative::types::{DomainEvent, DomainEventType, EventVisibility};
+use muse_engine::narrative::types::{
+    CharacterState, DomainEvent, DomainEventType, EventVisibility, NarrativeState,
+};
 
 /// 每世界一个广播通道；载荷为(投影后)WorldEvent JSON 字符串 + 受众列表。
 #[derive(Default)]
@@ -459,8 +461,252 @@ async fn stream_loop(
     }
 }
 
+// ---------- GET /worlds/{id}/state-summary（#6a：权威关系/状态快照，按 principal 过滤 / REMEDIATION #6 / §11） ----------
+
+/// 角色公共活跃度：目标 + 计划 + 情绪条数之和（粗粒度投入度量，仅暴露数量不暴露私密内容）。
+fn character_activity(cs: &CharacterState) -> i64 {
+    (cs.goals.len() + cs.plans.len() + cs.emotions.len()) as i64
+}
+
+/// 权威关系/状态快照：从 worlds.narrative_state_json 派生，按 principal 过滤。
+/// - 资格：AuthUser + 成员/观战资格（can_view_world，与事件流一致）。
+/// - 关系（信息边界，§9.4）：仅 `from == viewer 的本世界角色` 或 `knownTo 含之` 的有向边可见；
+///   非当事、非知情者（含仅作为 `to` 目标者）看不到。观战者(无本世界角色)只见公共角色摘要、零关系。
+/// - 角色：公共摘要 `{id, arcStage, activity}`（不下发目标/秘密/情绪等私密内容）。
+async fn world_state_summary(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    if !can_view_world(&state.db, &id, &user.user_id).await? {
+        return Err(ApiError::Forbidden);
+    }
+    let world = crate::worlds::load_world(&state.db, &id).await?;
+
+    // viewer 在本世界持有的角色（成员）；观战者为空集 → 见不到任何私有关系。
+    let rows = sqlx::query(
+        "SELECT cloud_character_id FROM world_members WHERE world_id = ? AND user_id = ? AND status = 'active'",
+    )
+    .bind(&id)
+    .bind(&user.user_id)
+    .fetch_all(&state.db)
+    .await?;
+    let mut mine: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for r in &rows {
+        mine.insert(r.try_get("cloud_character_id")?);
+    }
+
+    // 从权威叙事状态派生；首 tick 前（"{}" / 不可解析）优雅退化为空快照，不报错。
+    let st: NarrativeState = serde_json::from_str(&world.narrative_state_json).unwrap_or_default();
+
+    let relations: Vec<Value> = st
+        .relations
+        .iter()
+        .filter(|rel| {
+            mine.contains(&rel.from) || rel.known_to.iter().any(|k| mine.contains(k))
+        })
+        .map(|rel| {
+            json!({
+                "from": rel.from,
+                "to": rel.to,
+                "trust": rel.trust,
+                "affinity": rel.affinity,
+                "fear": rel.fear,
+                "debt": rel.debt,
+            })
+        })
+        .collect();
+
+    let characters: Vec<Value> = st
+        .characters
+        .iter()
+        .map(|(cid, cs)| {
+            json!({
+                "id": cid,
+                "arcStage": cs.arc_stage,
+                "activity": character_activity(cs),
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({ "relations": relations, "characters": characters })))
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/worlds/{id}/events", get(list_events))
         .route("/worlds/{id}/stream", get(stream))
+        .route("/worlds/{id}/state-summary", get(world_state_summary))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::safety::testkit::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use std::collections::BTreeSet;
+    use tower::ServiceExt;
+
+    /// 一份权威叙事状态（camelCase 与引擎 serde 对齐）：3 角色 + 3 条有向关系，known_to 各异，用于 principal 过滤。
+    fn sample_state_json() -> String {
+        json!({
+            "schemaVersion": 1,
+            "runId": "w1",
+            "revision": 3,
+            "characters": {
+                "c1": { "arcStage": "rising", "goals": ["夺权", "复仇"], "plans": ["结盟"], "emotions": [{"name": "愤怒", "intensity": 0.8}] },
+                "c2": { "arcStage": "setup", "goals": ["自保"] },
+                "c3": { "arcStage": "", "goals": [] }
+            },
+            "relations": [
+                // c1→c2：仅 c1 知情（from==c1）。
+                { "from": "c1", "to": "c2", "trust": 60, "affinity": 40, "fear": 0, "debt": 0, "knownTo": ["c1"] },
+                // c2→c1：c1、c2 皆知情。
+                { "from": "c2", "to": "c1", "trust": 20, "affinity": 10, "fear": 50, "debt": 0, "knownTo": ["c2", "c1"] },
+                // c2→c3：仅 c2 知情（c3 作为 to 不获可见权）。
+                { "from": "c2", "to": "c3", "trust": 30, "affinity": 30, "fear": 0, "debt": 0, "knownTo": ["c2"] }
+            ]
+        })
+        .to_string()
+    }
+
+    async fn set_state(db: &AnyPool, world: &str, s: &str) {
+        sqlx::query("UPDATE worlds SET narrative_state_json = ? WHERE id = ?")
+            .bind(s)
+            .bind(world)
+            .execute(db)
+            .await
+            .unwrap();
+    }
+
+    async fn get_summary(state: &AppState, bearer: Option<&str>, world: &str) -> (StatusCode, Value) {
+        let app = crate::app::build_router(state.clone());
+        let mut builder =
+            Request::builder().method("GET").uri(format!("/api/worlds/{world}/state-summary"));
+        if let Some(tk) = bearer {
+            builder = builder.header("authorization", format!("Bearer {tk}"));
+        }
+        let resp = app.oneshot(builder.body(Body::empty()).unwrap()).await.unwrap();
+        let s = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (s, serde_json::from_slice(&bytes).unwrap_or(json!(null)))
+    }
+
+    fn edges(v: &Value) -> BTreeSet<(String, String)> {
+        v["relations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| (r["from"].as_str().unwrap().into(), r["to"].as_str().unwrap().into()))
+            .collect()
+    }
+
+    fn activity_of(v: &Value, id: &str) -> i64 {
+        v["characters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == id)
+            .and_then(|c| c["activity"].as_i64())
+            .unwrap()
+    }
+
+    fn arc_of(v: &Value, id: &str) -> String {
+        v["characters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == id)
+            .and_then(|c| c["arcStage"].as_str())
+            .unwrap()
+            .into()
+    }
+
+    #[tokio::test]
+    async fn state_summary_relations_filtered_by_principal() {
+        let state = test_state().await;
+        // official 世界 → 允许观战；u1 持 c1、u2 持 c2、u3 无角色（观战者）。
+        seed_user(&state.db, "u1").await;
+        seed_user(&state.db, "u2").await;
+        seed_user(&state.db, "u3").await;
+        seed_world(&state.db, "w1", 3, "running").await;
+        seed_member(&state.db, "m1", "w1", "u1", "c1", "active").await;
+        seed_member(&state.db, "m2", "w1", "u2", "c2", "active").await;
+        set_state(&state.db, "w1", &sample_state_json()).await;
+
+        // u1（持 c1）：仅见 from==c1 或 known_to 含 c1 的边 → {c1→c2, c2→c1}，不见 c2→c3。
+        let (s1, v1) = get_summary(&state, Some(&token(&state, "u1")), "w1").await;
+        assert_eq!(s1, StatusCode::OK, "body={v1}");
+        assert_eq!(
+            edges(&v1),
+            BTreeSet::from([("c1".into(), "c2".into()), ("c2".into(), "c1".into())]),
+            "c1 应见其为 from 或知情的关系，不见 c2→c3"
+        );
+
+        // u2（持 c2）：见 {c2→c1, c2→c3}；关键：不见 c1→c2（c2 仅是 to、不在 known_to → 非当事非知情看不到）。
+        let (_, v2) = get_summary(&state, Some(&token(&state, "u2")), "w1").await;
+        assert_eq!(
+            edges(&v2),
+            BTreeSet::from([("c2".into(), "c1".into()), ("c2".into(), "c3".into())]),
+            "作为 to 目标但不在 known_to 的 c1→c2 对 c2 不可见"
+        );
+        assert!(!edges(&v2).contains(&("c1".into(), "c2".into())));
+
+        // u3（观战者，无本世界角色）：零私有关系，但仍见公共角色摘要。
+        let (_, v3) = get_summary(&state, Some(&token(&state, "u3")), "w1").await;
+        assert!(edges(&v3).is_empty(), "非当事非知情的观战者看不到任何关系");
+        assert_eq!(v3["characters"].as_array().unwrap().len(), 3, "观战者仍见公共角色摘要");
+
+        // 公共角色摘要（对所有资格 viewer 一致）：arcStage + activity(=goals+plans+emotions 计数)。
+        assert_eq!(arc_of(&v1, "c1"), "rising");
+        assert_eq!(activity_of(&v1, "c1"), 4, "c1 活跃度 = 目标2 + 计划1 + 情绪1");
+        assert_eq!(activity_of(&v1, "c2"), 1, "c2 活跃度 = 目标1");
+        assert_eq!(activity_of(&v1, "c3"), 0, "c3 活跃度 = 0");
+    }
+
+    #[tokio::test]
+    async fn state_summary_empty_state_degrades_gracefully() {
+        // 首 tick 前 narrative_state_json 为 "{}"（seed 默认）→ 空快照而非报错。
+        let state = test_state().await;
+        seed_user(&state.db, "u1").await;
+        seed_world(&state.db, "w1", 0, "running").await;
+        seed_member(&state.db, "m1", "w1", "u1", "c1", "active").await;
+        let (s, v) = get_summary(&state, Some(&token(&state, "u1")), "w1").await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(v["relations"].as_array().unwrap().is_empty());
+        assert!(v["characters"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn state_summary_private_world_requires_membership() {
+        let state = test_state().await;
+        seed_user(&state.db, "u1").await;
+        seed_user(&state.db, "u2").await;
+        seed_world(&state.db, "w1", 3, "running").await;
+        // 收敛为 private：观战不再开放，仅成员/房主可见。
+        sqlx::query("UPDATE worlds SET visibility='private' WHERE id=?")
+            .bind("w1")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        seed_member(&state.db, "m1", "w1", "u1", "c1", "active").await;
+        set_state(&state.db, "w1", &sample_state_json()).await;
+
+        // 成员 u1 → 200。
+        let (s1, _) = get_summary(&state, Some(&token(&state, "u1")), "w1").await;
+        assert_eq!(s1, StatusCode::OK);
+        // 非成员 u2 → 403（成员/观战资格守卫）。
+        let (s2, _) = get_summary(&state, Some(&token(&state, "u2")), "w1").await;
+        assert_eq!(s2, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn state_summary_requires_auth() {
+        let state = test_state().await;
+        seed_world(&state.db, "w1", 0, "running").await;
+        let (s, _) = get_summary(&state, None, "w1").await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "AuthUser 守卫：缺凭证应 401");
+    }
 }

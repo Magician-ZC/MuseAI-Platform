@@ -1,6 +1,7 @@
 //! P4b 计费集成测试（sqlite::memory + axum oneshot，feature=billing）。
 //! 覆盖：充值→账本双录+余额；同 key 幂等不双记（+异载荷 409）；退款逆向+状态机（含幂等重退/非 fulfilled 拒退/越权/不存在）；
-//! 未成年拒充；账本恒等式 SUM(ledger)==balance；无提现/转账端点（路由不存在）；余额端点无行视为 0 + 鉴权守卫。
+//! 保守拒充（未声明 0 / 未成年 2 均 403，声明成年后可充）；账本恒等式 SUM(ledger)==balance；
+//! 无提现/转账端点（路由不存在）；余额端点无行视为 0 + 鉴权守卫。
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
@@ -239,6 +240,50 @@ async fn minor_recharge_forbidden() {
     assert_eq!(orders_count(&state.db, "kid").await, 0);
     assert_eq!(ledger_count(&state.db, "kid").await, 0);
     assert_eq!(count(&state.db, "SELECT COUNT(*) FROM billing_balances WHERE user_id = ?", "kid").await, 0);
+}
+
+/// 保守拒充：未声明年龄（age_declared==0，注册默认）→ 403，零账务副作用。
+/// §2.2 无法可靠判断年龄前保守限充——默认（未声明）也拦，堵住"仅拦 2"的空防。
+#[tokio::test]
+async fn undeclared_recharge_forbidden() {
+    let state = test_state().await;
+    seed_user(&state, "u0", 0).await; // 注册默认未声明
+    let app = build_router(state.clone());
+    let tk = token(&state, "u0");
+
+    let (st, _) = post(&app, "/api/billing/orders", &tk, Some("u0-1"), json!({"kind":"recharge","amountCents":5000})).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    // 无订单 / 无账本 / 无余额行
+    assert_eq!(orders_count(&state.db, "u0").await, 0);
+    assert_eq!(ledger_count(&state.db, "u0").await, 0);
+    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM billing_balances WHERE user_id = ?", "u0").await, 0);
+}
+
+/// 端到端：未声明 → 拒充；经 /auth/age-declaration 声明成年（age_declared=1）后 → 可充。
+/// 证明保守 gate 与年龄声明入口贯通——"声明成年"是放行充值的唯一途径。
+#[tokio::test]
+async fn declaring_adult_unlocks_recharge() {
+    let state = test_state().await;
+    seed_user(&state, "u7", 0).await;
+    let app = build_router(state.clone());
+    let tk = token(&state, "u7");
+
+    // 未声明 → 拒充
+    let (st0, _) = post(&app, "/api/billing/orders", &tk, Some("u7-0"), json!({"kind":"recharge","amountCents":5000})).await;
+    assert_eq!(st0, StatusCode::FORBIDDEN);
+    assert_eq!(orders_count(&state.db, "u7").await, 0);
+
+    // 声明成年 → age_declared=1
+    let (sta, adecl) = post(&app, "/api/auth/age-declaration", &tk, None, json!({"isAdult": true})).await;
+    assert_eq!(sta, StatusCode::OK);
+    assert_eq!(adecl["ageDeclared"], 1);
+
+    // 再充 → 成功入账（账本双录）
+    let (st1, body) = post(&app, "/api/billing/orders", &tk, Some("u7-1"), json!({"kind":"recharge","amountCents":5000})).await;
+    assert_eq!(st1, StatusCode::OK);
+    assert_eq!(body["balanceCents"], 5000);
+    assert_eq!(balance_row(&state.db, "u7").await, 5000);
+    assert_double_entry(&state.db, "u7").await;
 }
 
 /// 账本恒等式：多次充值 + 退款混合后，SUM(ledger.delta_cents) == balance_cents 恒成立。

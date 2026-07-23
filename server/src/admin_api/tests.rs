@@ -291,6 +291,100 @@ async fn audit_approve_writes_back_character_moderation() {
     assert_eq!(count(&state, "SELECT COUNT(*) AS n FROM audit_logs WHERE action='audit.approved'").await, 1);
 }
 
+// ---------------- #10a 审核详情：卡片全文 + 同作者历史 ----------------
+
+#[tokio::test]
+async fn audit_detail_returns_card_full_text_manifest_and_author_history() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+    let now = now_ms();
+
+    // 同一 owner 两张卡：chC 待审（当前主体），chH 历史；另有他人卡 chOther 不应出现在历史里。
+    sqlx::query(
+        "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, \
+         rights_declaration, moderation, withdrawn, manifest_json, created_at) \
+         VALUES ('chH','ownerX','locH',2,'{\"identity\":{\"name\":\"历史卡\"}}','original','approved',0,'{\"fields\":[]}',?)",
+    )
+    .bind(now - 1000)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, \
+         rights_declaration, moderation, withdrawn, manifest_json, created_at) \
+         VALUES ('chC','ownerX','locC',1,'{\"identity\":{\"name\":\"当前卡\"},\"dramaticCore\":{\"coreContradiction\":\"忠诚与自由\"}}','original','pending',0,'{\"purpose\":\"叙事决策\"}',?)",
+    )
+    .bind(now)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, \
+         rights_declaration, moderation, withdrawn, created_at) \
+         VALUES ('chOther','ownerY','locO',1,'{}','original','approved',0,?)",
+    )
+    .bind(now)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO audit_queue (id, subject_kind, subject_id, machine_verdict, machine_hits, status, created_at) \
+         VALUES ('aqD','character','chC','flagged','[{\"rule\":\"imperative_override\"}]','open',?)",
+    )
+    .bind(now)
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    let (st, body) = get(&app, "/api/admin/audit-queue/aqD", Some(&admin)).await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+    assert_eq!(body["subjectId"], "chC");
+    assert_eq!(body["subjectKind"], "character");
+    // 卡片全文（原文，非第三人称摘要）。
+    assert_eq!(body["cardJson"]["identity"]["name"], "当前卡");
+    assert_eq!(body["cardJson"]["dramaticCore"]["coreContradiction"], "忠诚与自由");
+    // manifest 内联。
+    assert_eq!(body["manifest"]["purpose"], "叙事决策");
+    // 机审命中点透传。
+    assert_eq!(body["machineHits"][0]["rule"], "imperative_override");
+    // 同作者历史：含 chH，不含当前主体 chC，不含他人 chOther。
+    let hist = body["authorHistory"].as_array().unwrap();
+    assert_eq!(hist.len(), 1, "只出同作者其他卡: {hist:?}");
+    assert_eq!(hist[0]["id"], "chH");
+    assert_eq!(hist[0]["version"], 2);
+    assert_eq!(hist[0]["moderation"], "approved");
+    assert!(hist[0]["createdAt"].is_number());
+}
+
+#[tokio::test]
+async fn audit_detail_role_gate_and_not_found() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    sqlx::query(
+        "INSERT INTO audit_queue (id, subject_kind, subject_id, machine_verdict, status, created_at) \
+         VALUES ('aqR','character','x','ok','open',?)",
+    )
+    .bind(now_ms())
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    // 无 token → 401；user → 403；finance 越权 → 403；reviewer/admin 放行。
+    assert_eq!(get(&app, "/api/admin/audit-queue/aqR", None).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(get(&app, "/api/admin/audit-queue/aqR", Some(&user_token(&state))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(
+        get(&app, "/api/admin/audit-queue/aqR", Some(&role_token(&state, "finance"))).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        get(&app, "/api/admin/audit-queue/aqR", Some(&role_token(&state, "reviewer"))).await.0,
+        StatusCode::OK
+    );
+    // 不存在 → 404。
+    assert_eq!(get(&app, "/api/admin/audit-queue/nope", Some(&admin_token(&state))).await.0, StatusCode::NOT_FOUND);
+}
+
 // ---------------- 模板创建 + 审核回写 ----------------
 
 #[tokio::test]

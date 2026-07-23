@@ -1,7 +1,9 @@
-// 内容审核：审核队列（机审预标注 + 人审）+ 详情抽屉（机审命中全文）+ approve/reject。
-// 说明：S6 队列返回主体引用与机审命中；主体原文需另行授权，抽屉展示可得信息并给出脱敏说明。
-import { useEffect, useState } from 'react';
-import { Button, Descriptions, Drawer, message, Select, Space, Table, Tag, Typography } from 'antd';
+// 内容审核：审核队列（机审预标注 + 人审）+ 详情抽屉 + approve/reject。
+// #10b（§10）：详情抽屉展示「卡片全文 cardJson + 机审命中点 + 同作者历史」。
+// 卡片全文/历史由审核详情端点（G-ASSETS #10a 契约）提供；端点未就绪时优雅降级——
+// 仍展示机审命中并标注「卡片全文需后端支持」，不崩溃。
+import { useEffect, useRef, useState } from 'react';
+import { Alert, Button, Descriptions, Drawer, message, Select, Space, Spin, Table, Tag, Typography } from 'antd';
 import type { TableColumnsType } from 'antd';
 import { adminFetch } from '../api';
 import { ErrorAlert, formatTime, friendlyError, ReasonModal, usePagedList } from '../components/shared';
@@ -16,6 +18,20 @@ interface AuditRow {
   reviewerId: string | null;
   reviewedAt: number | null;
   createdAt: number;
+}
+
+/** 同作者历史发布项（G-ASSETS 契约：authorHistory:[{id,version,moderation,createdAt}]）。 */
+interface AuthorHistoryEntry {
+  id: string;
+  version?: number | string | null;
+  moderation?: string | null;
+  createdAt?: number | null;
+}
+
+/** 审核详情（列表行 + 卡片全文 + 同作者历史）。cardJson/authorHistory 端点未就绪时缺省。 */
+interface AuditDetail extends AuditRow {
+  cardJson?: unknown;
+  authorHistory?: AuthorHistoryEntry[];
 }
 
 const STATUS_OPTIONS = [
@@ -44,6 +60,14 @@ const STATUS_TAG: Record<string, { color: string; text: string }> = {
   rejected: { color: 'red', text: '已驳回' },
 };
 
+const MODERATION_TAG: Record<string, { color: string; text: string }> = {
+  approved: { color: 'green', text: '已通过' },
+  rejected: { color: 'red', text: '已驳回' },
+  pending: { color: 'gold', text: '待审核' },
+  open: { color: 'blue', text: '待审核' },
+  draft: { color: 'default', text: '草稿' },
+};
+
 /** 机审命中：兼容字符串数组或对象数组，统一渲染。 */
 function MachineHits({ hits }: { hits: unknown }) {
   if (!Array.isArray(hits) || hits.length === 0) {
@@ -65,11 +89,46 @@ function MachineHits({ hits }: { hits: unknown }) {
   );
 }
 
+/** 卡片全文：对象序列化为 JSON，字符串原样展示。 */
+function CardFullText({ cardJson }: { cardJson: unknown }) {
+  if (cardJson == null || (typeof cardJson === 'object' && Object.keys(cardJson as object).length === 0)) {
+    return <Typography.Text type="secondary">该主体无卡片全文，或后端未随详情返回。</Typography.Text>;
+  }
+  const text = typeof cardJson === 'string' ? cardJson : JSON.stringify(cardJson, null, 2);
+  return (
+    <pre style={{ maxHeight: 340, overflow: 'auto', background: '#0000000a', padding: 12, borderRadius: 6, margin: 0, whiteSpace: 'pre-wrap' }}>
+      {text}
+    </pre>
+  );
+}
+
+const HISTORY_COLUMNS: TableColumnsType<AuthorHistoryEntry> = [
+  { title: '版本', dataIndex: 'version', key: 'version', width: 90, render: (v: AuthorHistoryEntry['version']) => v ?? '—' },
+  {
+    title: '审核状态',
+    dataIndex: 'moderation',
+    key: 'moderation',
+    width: 100,
+    render: (m: AuthorHistoryEntry['moderation']) => {
+      if (!m) return '—';
+      const t = MODERATION_TAG[m] ?? { color: 'default', text: m };
+      return <Tag color={t.color}>{t.text}</Tag>;
+    },
+  },
+  { title: '提交时间', dataIndex: 'createdAt', key: 'createdAt', render: (v: AuthorHistoryEntry['createdAt']) => formatTime(v) },
+  { title: 'ID', dataIndex: 'id', key: 'id', render: (v: string) => <Typography.Text code>{v}</Typography.Text> },
+];
+
 export default function Audit() {
   const [status, setStatus] = useState('open');
   const [detail, setDetail] = useState<AuditRow | null>(null);
+  const [enriched, setEnriched] = useState<AuditDetail | null>(null);
+  const [enrichLoading, setEnrichLoading] = useState(false);
+  const [enrichUnavailable, setEnrichUnavailable] = useState(false);
   const [action, setAction] = useState<{ row: AuditRow; kind: 'approve' | 'reject' } | null>(null);
   const [acting, setActing] = useState(false);
+  // 当前打开详情的 id，用于丢弃切换后到达的过期响应。
+  const openIdRef = useRef<string | null>(null);
 
   const list = usePagedList<AuditRow>(async (cursor) => {
     const qs = new URLSearchParams({ status });
@@ -87,6 +146,47 @@ export default function Audit() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status]);
 
+  const closeDetail = () => {
+    openIdRef.current = null;
+    setDetail(null);
+    setEnriched(null);
+    setEnrichUnavailable(false);
+    setEnrichLoading(false);
+  };
+
+  const openDetail = (row: AuditRow) => {
+    setAction(null);
+    setDetail(row);
+    openIdRef.current = row.id;
+
+    // 后端可能已在列表行内联返回卡片全文/历史；有则直接用，免二次请求。
+    const inline = row as AuditDetail;
+    if (inline.cardJson !== undefined || inline.authorHistory !== undefined) {
+      setEnriched(inline);
+      setEnrichUnavailable(false);
+      setEnrichLoading(false);
+      return;
+    }
+
+    // 否则拉取审核详情端点（G-ASSETS #10a 契约）。端点未就绪 → 优雅降级。
+    setEnriched(null);
+    setEnrichUnavailable(false);
+    setEnrichLoading(true);
+    adminFetch<AuditDetail>(`/admin/audit-queue/${row.id}`)
+      .then((d) => {
+        if (openIdRef.current !== row.id) return; // 期间已切换详情，丢弃过期响应
+        setEnriched(d);
+      })
+      .catch(() => {
+        if (openIdRef.current !== row.id) return;
+        setEnrichUnavailable(true); // 端点未就绪 / 404 / 网络失败 → 降级
+      })
+      .finally(() => {
+        if (openIdRef.current !== row.id) return;
+        setEnrichLoading(false);
+      });
+  };
+
   const doAction = async (reason: string) => {
     if (!action) return;
     setActing(true);
@@ -97,7 +197,7 @@ export default function Audit() {
       );
       message.success(action.kind === 'approve' ? '已通过' : '已驳回');
       setAction(null);
-      setDetail(null);
+      closeDetail();
       reload();
     } catch (e) {
       message.error(friendlyError(e));
@@ -144,12 +244,14 @@ export default function Audit() {
       fixed: 'right',
       width: 90,
       render: (_, r) => (
-        <Button size="small" onClick={() => setDetail(r)}>
+        <Button size="small" onClick={() => openDetail(r)}>
           详情
         </Button>
       ),
     },
   ];
+
+  const machineHits = enriched?.machineHits ?? detail?.machineHits;
 
   return (
     <div>
@@ -180,9 +282,9 @@ export default function Audit() {
 
       <Drawer
         title="审核详情"
-        width={640}
+        width={680}
         open={!!detail}
-        onClose={() => setDetail(null)}
+        onClose={closeDetail}
         extra={
           detail?.status === 'open' && (
             <Space>
@@ -208,11 +310,52 @@ export default function Audit() {
                 { key: 'createdAt', label: '提交时间', children: formatTime(detail.createdAt) },
               ]}
             />
+
             <Typography.Title level={5} style={{ marginTop: 20 }}>机审命中点</Typography.Title>
-            <MachineHits hits={detail.machineHits} />
-            <Typography.Paragraph type="secondary" style={{ marginTop: 20 }}>
-              主体原文（如角色卡全文 / 同作者历史）默认脱敏，查看必要内容需另行授权（§10）。此处仅呈现机审命中与主体引用，供人审裁决。
-            </Typography.Paragraph>
+            <MachineHits hits={machineHits} />
+
+            {/* #10b 卡片全文 + 同作者历史（§10）。端点未就绪时优雅降级。 */}
+            {enrichLoading && (
+              <div style={{ marginTop: 20 }}>
+                <Spin size="small" />{' '}
+                <Typography.Text type="secondary">加载卡片全文与同作者历史…</Typography.Text>
+              </div>
+            )}
+
+            {enrichUnavailable && (
+              <Alert
+                type="info"
+                showIcon
+                style={{ marginTop: 20 }}
+                message="卡片全文需后端支持"
+                description="审核详情端点（卡片全文 + 同作者历史）尚未就绪，当前仅展示机审命中与主体引用。端点上线后此处将自动呈现完整内容（§10）。"
+              />
+            )}
+
+            {enriched && !enrichLoading && (
+              <>
+                <Typography.Title level={5} style={{ marginTop: 20 }}>卡片全文</Typography.Title>
+                <CardFullText cardJson={enriched.cardJson} />
+
+                <Typography.Title level={5} style={{ marginTop: 20 }}>同作者历史</Typography.Title>
+                {Array.isArray(enriched.authorHistory) && enriched.authorHistory.length > 0 ? (
+                  <Table
+                    rowKey="id"
+                    size="small"
+                    columns={HISTORY_COLUMNS}
+                    dataSource={enriched.authorHistory}
+                    pagination={false}
+                    scroll={{ x: 420 }}
+                  />
+                ) : (
+                  <Typography.Text type="secondary">无同作者历史发布记录。</Typography.Text>
+                )}
+
+                <Typography.Paragraph type="secondary" style={{ marginTop: 20 }}>
+                  卡片全文与同作者历史仅供人审裁决使用，访问记录已纳入审计（§10 / §14）。
+                </Typography.Paragraph>
+              </>
+            )}
           </>
         )}
       </Drawer>

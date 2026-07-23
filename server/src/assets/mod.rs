@@ -34,6 +34,7 @@ pub fn router() -> Router<AppState> {
         .route("/assets/characters", post(publish))
         .route("/assets/characters/mine", get(list_mine))
         .route("/assets/characters/{id}/status", get(status))
+        .route("/assets/characters/{id}/manifest", get(manifest))
         .route("/assets/characters/{id}/withdraw", post(withdraw))
         .route("/assets/characters/{id}", delete(delete_character))
 }
@@ -77,6 +78,65 @@ fn idem_key(headers: &HeaderMap) -> Option<String> {
 
 fn valid_rights(s: &str) -> bool {
     matches!(s, "original" | "public_domain_adaptation")
+}
+
+/// 逐字段用途映射（§2.3 可审计 manifest 的「用途」维度，落到字段粒度）。
+/// 已知 CharacterCardV2 顶层字段给明确用途，未知字段回落到通用叙事用途。
+fn field_purpose(field: &str) -> &'static str {
+    match field {
+        "schemaVersion" => "卡片结构版本标识",
+        "id" | "localCardId" => "本地卡片标识（关联用户私有模板）",
+        "lifecycle" => "卡片生命周期状态（draft/reviewed/ready）",
+        "identity" => "角色身份设定（姓名/外观/背景）",
+        "dramaticCore" => "戏剧核心（核心矛盾与欲望）",
+        "decisionModel" => "决策模型（价值排序与行为倾向）",
+        "perception" => "感知与信息获取设定",
+        "emotionDynamics" => "情绪动力学",
+        "relationGrammar" => "关系语法（与他人交互规则）",
+        "expressionFingerprint" => "表达指纹（文风与口癖）",
+        "agency" => "能动性与目标设定",
+        "growthArc" => "成长弧线",
+        "worldAdaptation" => "世界适配设定",
+        "evidenceIndex" => "证据索引（引用完整性校验）",
+        "revision" | "createdAt" | "updatedAt" => "版本与时间元数据",
+        _ => "角色运行所需字段",
+    }
+}
+
+/// 构造可审计 manifest（§2.3）：列明「字段清单 / 用途 / 可见范围 / 删除策略」。
+/// 字段清单只列卡片实际上传的顶层字段，兑现「最小发布清单」——不额外声明未上传内容。
+fn build_manifest(card: &serde_json::Value, rights: &str, version: i64) -> serde_json::Value {
+    let fields: Vec<serde_json::Value> = card
+        .as_object()
+        .map(|obj| {
+            obj.keys()
+                .map(|k| serde_json::json!({ "name": k, "purpose": field_purpose(k) }))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    serde_json::json!({
+        "schemaVersion": 1,
+        "assetKind": "character",
+        "version": version,
+        "rightsDeclaration": rights,
+        "generatedAt": now_ms(),
+        // 字段清单：逐字段用途（只含实际上传字段）
+        "fields": fields,
+        // 用途：整体使用边界
+        "purpose": "作为不可变角色快照投放于世界，仅用于叙事决策生成与安全审核；不用于模型训练，不回写本地模板",
+        // 可见范围
+        "visibility": {
+            "scope": "world_participants",
+            "note": "仅所投放世界的参与者按受众投影可见；私密房仅降低发现与传播范围，不改变平台审核与版权义务"
+        },
+        // 删除策略
+        "deletionPolicy": {
+            "onWithdraw": "撤回后停止后续投放；运行中世界引用的不可变快照按入场协议处理",
+            "onDelete": "从未投放立即删除；已投放登记异步删除任务并停止后续投放",
+            "retention": "依法或履约必须保留的最小履约日志按期限留存后清除"
+        }
+    })
 }
 
 /// 机审裁决 → cloud_characters.moderation（服务端权威，不信客户端声明）。
@@ -151,8 +211,12 @@ async fn publish(
     let verdict = safety::moderate_and_queue(&state, "character", &id, &scan_text).await?;
     let moderation = verdict_str(verdict);
 
+    // 可审计 manifest（§2.3）：随快照物化，供后台审核 / 合规核对最小发布清单。
+    let manifest = build_manifest(&req.card_json, &req.rights_declaration, version);
+    let manifest_text = manifest.to_string();
+
     sqlx::query(
-        "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, rights_declaration, moderation, withdrawn, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)",
+        "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, rights_declaration, moderation, withdrawn, manifest_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
     )
     .bind(&id)
     .bind(&user.user_id)
@@ -161,6 +225,7 @@ async fn publish(
     .bind(&card_text)
     .bind(&req.rights_declaration)
     .bind(moderation)
+    .bind(&manifest_text)
     .bind(now)
     .execute(&state.db)
     .await?;
@@ -204,21 +269,43 @@ async fn list_mine(State(state): State<AppState>, user: AuthUser) -> Result<Resp
 }
 
 /// GET /assets/characters/{id}/status：审核态查询（owner 隔离，非本人 → 404 不泄露存在性）。
+/// 内联可审计 manifest（§2.3），发布方可直接预览云端副本的字段/用途/可见范围/删除策略。
 async fn status(State(state): State<AppState>, user: AuthUser, Path(id): Path<String>) -> Result<Response, ApiError> {
-    let row: Option<(String, i64, i64)> =
-        sqlx::query_as("SELECT moderation, version, withdrawn FROM cloud_characters WHERE id = ? AND owner_id = ?")
-            .bind(&id)
-            .bind(&user.user_id)
-            .fetch_optional(&state.db)
-            .await?;
-    let (moderation, version, withdrawn) = row.ok_or(ApiError::NotFound)?;
+    let row: Option<(String, i64, i64, Option<String>)> = sqlx::query_as(
+        "SELECT moderation, version, withdrawn, manifest_json FROM cloud_characters WHERE id = ? AND owner_id = ?",
+    )
+    .bind(&id)
+    .bind(&user.user_id)
+    .fetch_optional(&state.db)
+    .await?;
+    let (moderation, version, withdrawn, manifest_json) = row.ok_or(ApiError::NotFound)?;
+    let manifest = manifest_json
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .unwrap_or(serde_json::Value::Null);
     let resp = serde_json::json!({
         "id": id,
         "moderation": moderation,
         "version": version,
         "withdrawn": withdrawn != 0,
+        "manifest": manifest,
     });
     Ok(json_response(serde_json::to_string(&resp).unwrap()))
+}
+
+/// GET /assets/characters/{id}/manifest：可审计 manifest（§2.3，owner 隔离）。
+/// 独立端点便于发布前预览与合规审计取用；非本人 → 404 不泄露存在性。
+async fn manifest(State(state): State<AppState>, user: AuthUser, Path(id): Path<String>) -> Result<Response, ApiError> {
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT manifest_json FROM cloud_characters WHERE id = ? AND owner_id = ?")
+            .bind(&id)
+            .bind(&user.user_id)
+            .fetch_optional(&state.db)
+            .await?;
+    let (manifest_json,) = row.ok_or(ApiError::NotFound)?;
+    let manifest = manifest_json
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .unwrap_or(serde_json::Value::Null);
+    Ok(json_response(serde_json::to_string(&manifest).unwrap()))
 }
 
 /// POST /assets/characters/{id}/withdraw：停止后续投放（owner 校验 → withdrawn=1；天然幂等）。

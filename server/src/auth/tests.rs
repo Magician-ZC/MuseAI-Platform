@@ -198,6 +198,52 @@ async fn identity_verification_stores_reference_only() {
 }
 
 #[tokio::test]
+async fn age_declaration_writes_adult_then_minor() {
+    let (app, state) = build_app().await;
+    let (access, _r, uid) = login_new_user(&app, "13800000007").await;
+
+    // 注册默认未声明（age_declared=0）
+    let age0 = sqlx::query_scalar::<_, i64>("SELECT age_declared FROM users WHERE id = ?")
+        .bind(&uid)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(age0, 0, "注册应默认未声明");
+
+    // 声明成年 → age_declared=1
+    let (st, resp) =
+        send(&app, "POST", "/api/auth/age-declaration", Some(&access), None, Some(json!({ "isAdult": true }))).await;
+    assert_eq!(st, StatusCode::OK, "{resp:?}");
+    assert_eq!(resp["ageDeclared"], 1);
+    let age1 = sqlx::query_scalar::<_, i64>("SELECT age_declared FROM users WHERE id = ?")
+        .bind(&uid)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(age1, 1, "声明成年应写入 1");
+
+    // 改声明未成年 → age_declared=2（保守方向可回退）
+    let (st, resp) =
+        send(&app, "POST", "/api/auth/age-declaration", Some(&access), None, Some(json!({ "isAdult": false }))).await;
+    assert_eq!(st, StatusCode::OK, "{resp:?}");
+    assert_eq!(resp["ageDeclared"], 2);
+    let age2 = sqlx::query_scalar::<_, i64>("SELECT age_declared FROM users WHERE id = ?")
+        .bind(&uid)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(age2, 2, "声明未成年应写入 2");
+}
+
+#[tokio::test]
+async fn age_declaration_requires_auth() {
+    let (app, _s) = build_app().await;
+    let (st, _) =
+        send(&app, "POST", "/api/auth/age-declaration", None, None, Some(json!({ "isAdult": true }))).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn login_idempotency_key_returns_cached() {
     let (app, _s) = build_app().await;
     let phone = "13800000006";

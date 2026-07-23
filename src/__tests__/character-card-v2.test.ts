@@ -10,8 +10,18 @@ import {
 import {
   isSameCardContent,
   cardContentHash,
+  buildSwapTestRequest,
+  buildStressTestRequest,
+  type EvalConfig,
 } from '../utils/characterEvaluation';
 import type { PartnerItem } from '../stores/usePartnerStore';
+
+const EVAL_CONFIG: EvalConfig = {
+  profile: { interface: 'OpenAI-compatible', baseUrl: 'https://x/v1', apiKey: 'k', model: 'gpt-4o' },
+  swapPrompt: 'SWAP-SYS',
+  stressPrompt: 'STRESS-SYS',
+  promptVersion: 'v1',
+};
 
 const makeEvidence = (id: string, overrides: Partial<EvidenceRef> = {}): EvidenceRef => ({
   id,
@@ -216,5 +226,37 @@ describe('isSameCardContent / cardContentHash', () => {
       // 打乱构造顺序不应影响内容判定
     };
     expect(isSameCardContent(a, reordered)).toBe(true);
+  });
+});
+
+describe('buildSwapTestRequest / buildStressTestRequest（完整 DTO：补 profile + 两段 prompt）', () => {
+  it('互换请求含 profile/swapPrompt/stressPrompt + cardA/cardB/scenario', () => {
+    const a = makeReadyCard();
+    const b = makeReadyCard();
+    const req = buildSwapTestRequest(EVAL_CONFIG, a, b, '盟友背叛');
+    expect(req.profile).toEqual(EVAL_CONFIG.profile);
+    expect(req.swapPrompt).toBe('SWAP-SYS');
+    expect(req.stressPrompt).toBe('STRESS-SYS');
+    expect(req.promptVersion).toBe('v1');
+    expect(req.cardA).toBe(a);
+    expect(req.cardB).toBe(b);
+    expect(req.scenario).toBe('盟友背叛');
+    // 互换不带 scenarios
+    expect(req.scenarios).toBeUndefined();
+  });
+
+  it('压力请求含 profile/两段 prompt + cardA/scenarios（拷贝而非引用）', () => {
+    const a = makeReadyCard();
+    const scenarios = ['情境一', '情境二'];
+    const req = buildStressTestRequest(EVAL_CONFIG, a, scenarios);
+    expect(req.profile).toEqual(EVAL_CONFIG.profile);
+    expect(req.swapPrompt).toBe('SWAP-SYS');
+    expect(req.stressPrompt).toBe('STRESS-SYS');
+    expect(req.cardA).toBe(a);
+    expect(req.scenarios).toEqual(['情境一', '情境二']);
+    expect(req.scenarios).not.toBe(scenarios);
+    // 压力不带 cardB/scenario
+    expect(req.cardB).toBeUndefined();
+    expect(req.scenario).toBeUndefined();
   });
 });

@@ -196,12 +196,30 @@ impl KnowledgeSystem {
     }
 
     /// 检索（MVP：关键词倒排 + 简单 BM25 风格打分；无 embedding 依赖）。
-    /// 只在传入 pack_ids 内检索；时间边界过滤由调用方（叙事组装器）依 pack.time_boundary 处理提示词层。
+    /// 只在传入 pack_ids 内检索。向后兼容包装：不做时间边界过滤（等价 `search_as_of(.., None)`）。
     pub fn search(
         &self,
         pack_ids: &[String],
         query: &str,
         limit: usize,
+    ) -> Result<Vec<RetrievedFragment>, EngineError> {
+        self.search_as_of(pack_ids, query, limit, None)
+    }
+
+    /// 带时间边界确定性过滤的检索（规格 §4.3 第 5 条 / §11.4「时间边界过滤生效」）。
+    ///
+    /// `as_of` = 当前叙事时代（由调用方按在场角色所处时代传入）。若某包带 `time_boundary`
+    /// 且其时代**晚于** `as_of`，则该整包不返回——角色不应引用晚于其所处时代的知识
+    /// （越界次数目标 0）。这是引擎侧的强制过滤，不再下放提示词层。
+    ///
+    /// 比较策略（确定性、可测）：`time_boundary` 与 `as_of` 均可解析为整数（年份/纪元序，
+    /// 支持负数表示公元前）时按数值比较；否则退回字典序比较。切块无时代元数据，故按整包过滤。
+    pub fn search_as_of(
+        &self,
+        pack_ids: &[String],
+        query: &str,
+        limit: usize,
+        as_of: Option<&str>,
     ) -> Result<Vec<RetrievedFragment>, EngineError> {
         let fs = self.host.fs.as_ref();
         let mut all: Vec<RetrievedFragment> = Vec::new();
@@ -211,6 +229,12 @@ impl KnowledgeSystem {
                 Ok(p) => p,
                 Err(_) => continue,
             };
+            // 时间边界确定性过滤：包时代晚于当前叙事时代 → 整包不可引用。
+            if let (Some(as_of), Some(boundary)) = (as_of, pack.time_boundary.as_deref()) {
+                if era_after(boundary, as_of) {
+                    continue;
+                }
+            }
             let idx: ChunkIndex = match read_json(fs, Path::new(&pack.chunk_index_store_key)) {
                 Ok(i) => i,
                 Err(_) => continue,
@@ -369,6 +393,17 @@ impl KnowledgeSystem {
         }
         out.sort_by(|a, b| a.id.cmp(&b.id)); // 确定性顺序
         Ok(out)
+    }
+}
+
+/// 时代序比较：`boundary` 是否严格晚于 `as_of`。两者均能解析为整数（年份/纪元序，负数=公元前）
+/// 时按数值比较，否则退回字典序。纯函数、确定性，供时间边界过滤复用。
+fn era_after(boundary: &str, as_of: &str) -> bool {
+    let b = boundary.trim();
+    let a = as_of.trim();
+    match (b.parse::<i64>(), a.parse::<i64>()) {
+        (Ok(bn), Ok(an)) => bn > an,
+        _ => b > a,
     }
 }
 
@@ -573,6 +608,52 @@ mod tests {
             .collect();
         assert!(packs_x2.is_empty());
         assert!(ks.search(&packs_x2, "战术", 5).unwrap().is_empty());
+    }
+
+    // ---- 时间边界确定性过滤（§4.3 第 5 条 / §11.4）----
+
+    #[test]
+    fn search_filters_pack_beyond_character_era() {
+        let (host, _) = make_host(vec![]);
+        put_source(&host, "modern.txt", "量子计算与互联网时代的战术推演与信息作战分析。");
+        let ks = KnowledgeSystem::new(host.clone());
+        let (mut pack, _) = ks
+            .import_source("modern.txt", "现代科技", RightsBasis::Owned, vec![AllowedUse::Retrieve], Retention::IndexOnly)
+            .unwrap();
+        // 标注该包内容时代为公元 2000 年（晚于身处 1800 年的角色）。
+        pack.time_boundary = Some("2000".into());
+        write_json(host.fs.as_ref(), &pack_path(&pack.id), &pack).unwrap();
+        let ids = vec![pack.id.clone()];
+
+        // as_of=1800：包时代 2000 晚于角色时代 1800 → 整包不返回（越界 0）。
+        assert!(ks.search_as_of(&ids, "战术", 5, Some("1800")).unwrap().is_empty());
+        // as_of=2100：包时代 2000 不晚于 2100 → 正常返回。
+        assert!(!ks.search_as_of(&ids, "战术", 5, Some("2100")).unwrap().is_empty());
+        // 无 as_of（向后兼容 search）：不过滤 → 正常返回。
+        assert!(!ks.search(&ids, "战术", 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn search_as_of_pack_without_boundary_never_filtered_and_partial_filter() {
+        let (host, _) = make_host(vec![]);
+        // A 无时间边界；B 时代晚于角色。
+        put_source(&host, "a.txt", "古代兵法中的战术与阵法。");
+        put_source(&host, "b.txt", "近代火器战术的革新历程。");
+        let ks = KnowledgeSystem::new(host.clone());
+        let (a, _) = ks
+            .import_source("a.txt", "A", RightsBasis::Owned, vec![AllowedUse::Retrieve], Retention::IndexOnly)
+            .unwrap();
+        let (mut b, _) = ks
+            .import_source("b.txt", "B", RightsBasis::Owned, vec![AllowedUse::Retrieve], Retention::IndexOnly)
+            .unwrap();
+        b.time_boundary = Some("1900".into());
+        write_json(host.fs.as_ref(), &pack_path(&b.id), &b).unwrap();
+
+        // as_of=1600：A（无边界）保留，B（1900>1600）被过滤——只返回 A 的片段。
+        let ids = vec![a.id.clone(), b.id.clone()];
+        let frags = ks.search_as_of(&ids, "战术", 5, Some("1600")).unwrap();
+        assert!(!frags.is_empty());
+        assert!(frags.iter().all(|f| f.pack_id == a.id), "B 应被时间边界过滤");
     }
 
     // ---- 使用日志追加 / 溯源 ----

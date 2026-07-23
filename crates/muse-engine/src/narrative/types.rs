@@ -101,6 +101,21 @@ pub struct NarrativeLayer {
     pub foreshadowing: Vec<String>,
     #[serde(default)]
     pub pacing_notes: Vec<String>,
+    /// 待审批的不可逆结果（角色死亡/永久退场/永久关系变更）。引擎门控元数据：不经 reducer
+    /// 白名单，由 run_round 在门控未获批的不可逆结果时记入；获批后经 RoundInput.approved_consents
+    /// 落定并清除（REMEDIATION #3 / 规格 §2.4）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_consents: Vec<PendingConsent>,
+}
+
+/// 待审批的不可逆结果条目（每个当事角色一条）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingConsent {
+    /// 当事角色 id（其主人需授权）
+    pub subject: String,
+    /// 不可逆事件类别：`death` | `permanent_exit` | `permanent_relation_change`
+    pub event_kind: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

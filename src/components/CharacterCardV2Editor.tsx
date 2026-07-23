@@ -15,7 +15,7 @@ import {
   Divider,
   Empty,
 } from 'antd';
-import { ExperimentOutlined, SafetyCertificateOutlined } from '@ant-design/icons';
+import { ExperimentOutlined, SafetyCertificateOutlined, ThunderboltOutlined } from '@ant-design/icons';
 import {
   validateCard,
   type CharacterCardV2,
@@ -25,22 +25,33 @@ import {
 } from '../utils/characterCardV2';
 import {
   buildSwapTestRequest,
+  buildStressTestRequest,
   isSameCardContent,
   buildIdenticalSwapReport,
   SWAP_TEST_COMMAND,
+  STRESS_TEST_COMMAND,
   type SwapTestReport,
+  type StressTestReport,
+  type SwapTestRequestDto,
+  type EvalConfig,
 } from '../utils/characterEvaluation';
 import { appInvoke } from '../utils/runtime';
+import { useSettingsStore } from '../stores/useSettingsStore';
 
 const { Text, Paragraph } = Typography;
 const { TextArea } = Input;
 
-// 注册互换/压力测试命令签名（与 crates/muse-engine 薄壳对齐；其它命令由各 store 声明）。
+// 注册互换/压力测试命令签名：两命令共用 SwapTestRequestDto，均以 { request } 包裹
+// （与 src-tauri/src/commands/character_v2.rs 的 tauri command 形参对齐）。其它命令由各 store 声明。
 declare module '../utils/runtime' {
   interface AppInvokeCommands {
     run_character_swap_test: {
-      args: { cardA: CharacterCardV2; cardB: CharacterCardV2; scenario: string };
+      args: { request: SwapTestRequestDto };
       result: SwapTestReport;
+    };
+    run_character_stress_test: {
+      args: { request: SwapTestRequestDto };
+      result: StressTestReport;
     };
   }
 }
@@ -127,6 +138,24 @@ const CharacterCardV2Editor: React.FC<CharacterCardV2EditorProps> = ({
   const [scenario, setScenario] = React.useState('');
   const [swapReport, setSwapReport] = React.useState<SwapTestReport | null>(null);
   const [testing, setTesting] = React.useState(false);
+  const [stressText, setStressText] = React.useState('');
+  const [stressReport, setStressReport] = React.useState<StressTestReport | null>(null);
+  const [stressTesting, setStressTesting] = React.useState(false);
+
+  // 评测前置配置：取选中模型 profile（interface/baseUrl/apiKey/model）+ 两段测试提示词。
+  const models = useSettingsStore((s) => s.models);
+  const selectedModelId = useSettingsStore((s) => s.selectedModelId);
+  const swapPrompt = useSettingsStore((s) => s.characterSwapTestPrompt);
+  const stressPrompt = useSettingsStore((s) => s.characterStressTestPrompt);
+  const evalConfig = React.useMemo<EvalConfig | null>(() => {
+    const m = models?.find((x) => x.id === selectedModelId) ?? models?.[0];
+    if (!m) return null;
+    return {
+      profile: { interface: m.modelInterface, baseUrl: m.baseUrl, apiKey: m.apiKey, model: m.model },
+      swapPrompt,
+      stressPrompt,
+    };
+  }, [models, selectedModelId, swapPrompt, stressPrompt]);
 
   React.useEffect(() => {
     setDraft(card);
@@ -171,15 +200,46 @@ const CharacterCardV2Editor: React.FC<CharacterCardV2EditorProps> = ({
       setSwapReport(buildIdenticalSwapReport(draft, target, scenario));
       return;
     }
+    if (!evalConfig) {
+      message.error('尚未配置模型，请先在「设置」中添加并选择一个模型');
+      return;
+    }
     setTesting(true);
     try {
-      const request = buildSwapTestRequest(draft, target, scenario);
-      const report = await appInvoke(SWAP_TEST_COMMAND, request);
+      // 组装完整 request（profile + 两段 prompt + 两卡 + scenario），并以 { request } 包裹。
+      const request = buildSwapTestRequest(evalConfig, draft, target, scenario);
+      const report = await appInvoke(SWAP_TEST_COMMAND, { request });
       setSwapReport(report);
     } catch (e) {
       message.error(`互换测试失败：${String(e)}`);
     } finally {
       setTesting(false);
+    }
+  };
+
+  // 压力测试（§3.2）：把多条极端情境交给同一张卡，看抉择是否始终贴合不可变内核。
+  const handleStressTest = async () => {
+    const scenarios = stressText
+      .split('\n')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (scenarios.length === 0) {
+      message.warning('请至少输入一条测试情境（每行一条）');
+      return;
+    }
+    if (!evalConfig) {
+      message.error('尚未配置模型，请先在「设置」中添加并选择一个模型');
+      return;
+    }
+    setStressTesting(true);
+    try {
+      const request = buildStressTestRequest(evalConfig, draft, scenarios);
+      const report = await appInvoke(STRESS_TEST_COMMAND, { request });
+      setStressReport(report);
+    } catch (e) {
+      message.error(`压力测试失败：${String(e)}`);
+    } finally {
+      setStressTesting(false);
     }
   };
 
@@ -461,6 +521,48 @@ const CharacterCardV2Editor: React.FC<CharacterCardV2EditorProps> = ({
               <Paragraph style={{ marginBottom: 0, marginTop: 4 }}>
                 甲：{f.aBehavior}　乙：{f.bBehavior}
               </Paragraph>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* 压力测试（§3.2） */}
+      <Divider titlePlacement="start" style={{ marginTop: 20 }}>压力测试</Divider>
+      <Paragraph type="secondary">
+        给同一张卡连续抛出多种极端情境（每行一条），看它的抉择是否始终贴合不可变内核——偏离即暴露人设裂缝。
+      </Paragraph>
+      <Space direction="vertical" style={{ width: '100%' }} size={8}>
+        <TextArea
+          placeholder={'每行一条情境，例如：\n必须在救挚友与守承诺之间二选一\n唯一退路要求背叛信念\n手握足以摧毁宿敌的秘密'}
+          value={stressText}
+          onChange={(e) => setStressText(e.target.value)}
+          autoSize={{ minRows: 3, maxRows: 6 }}
+          aria-label="压力测试情境"
+        />
+        <Button icon={<ThunderboltOutlined />} loading={stressTesting} onClick={handleStressTest}>
+          运行压力测试
+        </Button>
+      </Space>
+
+      {stressReport && (
+        <div style={{ marginTop: 16 }}>
+          <Alert
+            type={stressReport.consistent ? 'success' : 'warning'}
+            showIcon
+            message={stressReport.consistent ? '抉择稳定贴合内核' : '存在偏离内核的抉择'}
+            description={stressReport.summary}
+            style={{ marginBottom: 8 }}
+          />
+          {stressReport.scenarios.map((s, i) => (
+            <div key={i} style={{ padding: 8, background: '#faf9f5', borderRadius: 6, marginBottom: 6 }}>
+              <Space wrap>
+                <Text strong>{s.scenario}</Text>
+                <Tag color={s.consistentWithCore ? 'green' : 'red'}>
+                  {s.consistentWithCore ? '贴合内核' : '偏离内核'}
+                </Tag>
+              </Space>
+              <Paragraph style={{ marginBottom: 0, marginTop: 4 }}>抉择：{s.predictedChoice}</Paragraph>
+              <Text type="secondary">理由：{s.rationale}</Text>
             </div>
           ))}
         </div>

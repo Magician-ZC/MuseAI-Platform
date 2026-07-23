@@ -30,8 +30,8 @@ use muse_engine::character::types::CharacterCardV2;
 use muse_engine::host::{CancelFlag, EngineEvent, EngineHost, HostEvents, HostFs, StdFs, SystemClock};
 use muse_engine::model::{HttpModelClient, ModelClient, ModelProfile};
 use muse_engine::narrative::types::{
-    CharacterState, ConstraintLevel, ForbiddenPredicate, NarrativeState, NodeStatus, OutlineNode,
-    RoundBudget, RunMode,
+    CharacterState, ConstraintLevel, DomainEvent, DomainEventType, ForbiddenPredicate,
+    NarrativeState, NodeStatus, OutlineNode, RoundBudget, RunMode,
 };
 use muse_engine::narrative::{ModelRoutes, NarrativeEngine, NarrativePrompts, RoundInput};
 
@@ -51,6 +51,8 @@ const RECLAIM_PENDING_MIN_MS: i64 = 30_000;
 const WORKER_BACKOFF_BASE_MS: u64 = 200;
 /// worker 单 job 的错误重试上限（C-9）。
 const WORKER_MAX_RETRIES: u32 = 3;
+/// #3b 同意请求 TTL（毫秒）：不可逆行动的当事人确认窗口（24h）；超时由 expire_stale_consents 保守过期。
+const CONSENT_TTL_MS: i64 = 86_400_000;
 
 fn token_cny_cents_per_1k() -> i64 {
     std::env::var("MUSE_TOKEN_CNY_CENTS_PER_1K")
@@ -511,6 +513,81 @@ async fn mark_tick_failed_and_pause(
     Ok(())
 }
 
+// ---------- #3b 不可逆同意：消费 ConsentRequested + 已获批 subject 回灌（规格 §2.4 / REMEDIATION #3） ----------
+
+/// 回灌：本世界已获批(approved)的不可逆同意 → subject 角色 id 列表。
+/// 喂入引擎 `RoundInput.approved_consents`，本回合命中的 subject 可落定其不可逆结果
+/// （death/permanent_exit/permanent_relation_change）；未命中一律门控不落定（保守安全默认）。
+async fn load_approved_consent_subjects(db: &AnyPool, world_id: &str) -> Result<Vec<String>, ApiError> {
+    let rows = sqlx::query(
+        "SELECT subject_character_ids FROM consent_requests \
+         WHERE world_id = ? AND status = 'approved' \
+         AND event_kind IN ('death', 'permanent_exit', 'permanent_relation_change')",
+    )
+    .bind(world_id)
+    .fetch_all(db)
+    .await?;
+    let mut subjects: Vec<String> = Vec::new();
+    for r in &rows {
+        let raw: String = r.try_get("subject_character_ids")?;
+        if let Ok(list) = serde_json::from_str::<Vec<String>>(&raw) {
+            subjects.extend(list);
+        }
+    }
+    subjects.sort();
+    subjects.dedup();
+    Ok(subjects)
+}
+
+/// 消费：把本回合引擎产出的 ConsentRequested 域事件落成同意请求（consents::create_consent），
+/// 并通知当事角色主人。幂等：同 world+event_kind+subject 集合已有 pending 同意时不重复建
+/// （引擎在获批前每回合都会重发该门控事件）。非事务关键路径：失败仅告警，不回滚已提交的 tick。
+async fn create_consents_for_round(state: &AppState, world_id: &str, events: &[DomainEvent]) {
+    for ev in events {
+        if ev.event_type != DomainEventType::ConsentRequested {
+            continue;
+        }
+        let event_kind = ev.fact.get("eventKind").and_then(Value::as_str).unwrap_or("");
+        let detail = ev.fact.get("detail").and_then(Value::as_str).unwrap_or("");
+        let mut subjects: Vec<String> = ev
+            .fact
+            .get("subjectCharacterIds")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        subjects.sort();
+        subjects.dedup();
+        if event_kind.is_empty() || subjects.is_empty() {
+            continue;
+        }
+        // 幂等去重：规范化(排序去重)后的 subjects_json 与写入口径一致，精确匹配同 world+kind+subjects 的未决同意。
+        let subjects_json = serde_json::to_string(&subjects).unwrap_or_else(|_| "[]".into());
+        let dup = sqlx::query(
+            "SELECT 1 AS x FROM consent_requests \
+             WHERE world_id = ? AND event_kind = ? AND subject_character_ids = ? AND status = 'pending' LIMIT 1",
+        )
+        .bind(world_id)
+        .bind(event_kind)
+        .bind(&subjects_json)
+        .fetch_optional(&state.db)
+        .await;
+        match dup {
+            Ok(Some(_)) => continue, // 已有未决同意，勿重复建/重复通知
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(world_id, error = %e, "consent 幂等检查失败，跳过本条");
+                continue;
+            }
+        }
+        if let Err(e) =
+            crate::consents::create_consent(state, world_id, event_kind, &subjects, detail, CONSENT_TTL_MS)
+                .await
+        {
+            tracing::warn!(world_id, event_kind, error = %e, "创建同意请求失败（非事务关键路径）");
+        }
+    }
+}
+
 // ---------- 核心：处理一个 tick ----------
 
 /// 处理一个 tick（生产入口：内部构建 HttpModelClient）。幂等：重复投递被吸收。
@@ -735,6 +812,11 @@ async fn process_tick_inner(
     };
     let prompts = resolve_prompts(db, &world.prompt_set_version).await?;
 
+    // 9.5) #3b 回灌：本世界已获批(approved)的不可逆同意 subject → 引擎门控白名单。
+    //     命中的 subject 本回合可落定其不可逆结果（death/permanent_exit/permanent_relation_change）；
+    //     其余一律门控不落定并（重新）产 ConsentRequested。空 = 保守安全默认（全部门控）。
+    let approved_consents = load_approved_consent_subjects(db, world_id).await?;
+
     // 10) run_round（失败重试一次）；每次尝试独立 TokenMeter，取成功尝试的实测 token 计费（B-1）。
     let mut last_err: Option<ApiError> = None;
     for attempt in 0..2u32 {
@@ -757,6 +839,8 @@ async fn process_tick_inner(
             temperature_writer: 0.8,
             max_output_tokens: 1024,
             budget: RoundBudget { max_total_tokens: remaining_tokens, spent_tokens: 0, max_scenes: 1 },
+            // #3b：已获批不可逆同意 subject 回灌；命中者本回合门控放行落定。
+            approved_consents: approved_consents.clone(),
         };
         let cancel = CancelFlag::new();
         match engine.run_round(&routes, &prompts, input, &cancel).await {
@@ -881,8 +965,10 @@ async fn commit_tick(
     }
 
     // 集成接线（跨模块，非事务关键路径，失败不回滚 tick）：
-    // ① 每 tick 清理超时未决同意（保守默认，见 consents 状态机）；
-    // ② 幂等生成当日日报——放置房北极星，daily_reports 按 (world,character,day) 唯一去重。
+    // ① #3b 消费本回合 ConsentRequested → 建同意请求（放置房不可逆行动的同意触发源，幂等去重）；
+    // ② 每 tick 清理超时未决同意（保守默认，见 consents 状态机）；
+    // ③ 幂等生成当日日报——放置房北极星，daily_reports 按 (world,character,day) 唯一去重。
+    create_consents_for_round(state, world_id, &outcome.scene.events).await;
     let _ = crate::consents::expire_stale_consents(&state.db).await;
     let today = day_string(now);
     for m in members {

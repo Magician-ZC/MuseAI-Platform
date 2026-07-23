@@ -53,6 +53,7 @@ pub fn router() -> Router<AppState> {
         .route("/admin/users/{id}/unban", post(users::unban_user))
         // 内容审核
         .route("/admin/audit-queue", get(audit::list_queue))
+        .route("/admin/audit-queue/{id}", get(audit::detail))
         .route("/admin/audit-queue/{id}/approve", post(audit::approve))
         .route("/admin/audit-queue/{id}/reject", post(audit::reject))
         // 世界运营

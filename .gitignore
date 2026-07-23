@@ -10,11 +10,11 @@ lerna-debug.log*
 # Node
 node_modules/
 
-# Build output
+# Build output（/build 锚定根目录，避免误伤 docs/build 等嵌套目录）
 dist/
 dist-ssr/
 out/
-build/
+/build/
 
 # Rust build artifacts（server / crates；Cargo.lock 仍纳入版本控制）
 target/

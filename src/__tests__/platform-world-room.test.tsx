@@ -131,13 +131,51 @@ describe('WorldRoom', () => {
     ).toBe(true);
   });
 
-  it('切换到关系图谱：渲染 echarts 力导向图', async () => {
+  it('切换到关系图谱：渲染 echarts 力导向图（state-summary 未就绪时回退启发式）', async () => {
+    // happyPath 对 state-summary 抛未知路径 → 优雅降级，图谱仍以事件共现渲染。
     fetchMock.mockImplementation(happyPath);
     renderRoom();
     await screen.findByText('云州世界');
 
     fireEvent.click(screen.getByText('关系图谱'));
     expect(await screen.findByTestId('echarts-graph')).toBeInTheDocument();
+    expect(await screen.findByText(/由观测事件共现推导/)).toBeInTheDocument();
+  });
+
+  it('切换到势力地图：渲染 echarts + 阵营聚合 seam 说明', async () => {
+    fetchMock.mockImplementation(happyPath);
+    renderRoom();
+    await screen.findByText('云州世界');
+
+    fireEvent.click(screen.getByText('势力地图'));
+    expect(await screen.findByTestId('echarts-graph')).toBeInTheDocument();
+    expect(screen.getByText('按阵营聚合呈现')).toBeInTheDocument();
+  });
+
+  it('关系图谱/状态面板：消费 state-summary 权威 relations/characters（#6b）', async () => {
+    const withSummary = async (path: string, opts?: { method?: string }) => {
+      if (path === '/api/worlds/w1/state-summary') {
+        return {
+          relations: [{ from: 'cMine', to: 'cOther', trust: 60, affinity: 40, fear: 0, debt: 0 }],
+          characters: [
+            { id: 'cMine', arcStage: 'rising', activity: 5 },
+            { id: 'cOther', arcStage: 'setup', activity: 2 },
+          ],
+        };
+      }
+      return happyPath(path, opts);
+    };
+    fetchMock.mockImplementation(withSummary);
+    renderRoom();
+    await screen.findByText('云州世界');
+
+    // 关系图谱标注为权威数据源
+    fireEvent.click(screen.getByText('关系图谱'));
+    expect(await screen.findByText(/权威关系状态/)).toBeInTheDocument();
+
+    // 状态面板展示权威弧光阶段（rising → 上升）
+    fireEvent.click(screen.getByText('状态面板'));
+    expect(await screen.findByText('弧光 · 上升')).toBeInTheDocument();
   });
 
   it('世界加载失败：优雅降级为「连接平台失败」', async () => {

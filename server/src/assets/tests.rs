@@ -237,6 +237,69 @@ async fn injection_hit_card_writes_single_audit_and_single_risk() {
     assert_eq!(risk, 1, "命中卡应恰好 1 条 risk_event（消除双写）");
 }
 
+// ---------------- #11 可审计 manifest（§2.3） ----------------
+
+/// 发布产生可审计 manifest：含字段清单（逐字段用途）+ 用途 + 可见范围 + 删除策略。
+/// status 端点内联返回，发布方可预览云端副本清单。
+#[tokio::test]
+async fn publish_stores_auditable_manifest_returned_by_status() {
+    let (app, _s) = build_app().await;
+    let (access, _r, _u) = login_new_user(&app, "13900000012").await;
+    let (st, v) =
+        send(&app, "POST", "/api/assets/characters", Some(&access), Some("man1"), Some(publish_body("card-M", "审计者"))).await;
+    assert_eq!(st, StatusCode::OK, "{v:?}");
+    let id = v["id"].as_str().unwrap().to_string();
+
+    let (st, s) = send(&app, "GET", &format!("/api/assets/characters/{id}/status"), Some(&access), None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    let m = &s["manifest"];
+    assert!(m.is_object(), "status 应内联 manifest: {s:?}");
+
+    // 字段清单：逐字段用途，且只列实际上传字段（含 identity/dramaticCore）。
+    let fields = m["fields"].as_array().expect("manifest.fields 应为数组");
+    let identity = fields.iter().find(|f| f["name"] == "identity").expect("字段清单含 identity");
+    assert!(identity["purpose"].as_str().map(|p| !p.is_empty()).unwrap_or(false), "identity 字段应有用途");
+    assert!(fields.iter().any(|f| f["name"] == "dramaticCore"), "字段清单含 dramaticCore");
+    assert!(!fields.iter().any(|f| f["name"] == "evidenceIndex"), "未上传字段不应出现（最小发布清单）");
+
+    // 用途 / 可见范围 / 删除策略（§2.3 四要素）。
+    assert!(m["purpose"].as_str().map(|p| !p.is_empty()).unwrap_or(false), "manifest.purpose 必填");
+    assert!(m["visibility"].is_object(), "manifest.visibility 必填");
+    assert!(m["deletionPolicy"].is_object(), "manifest.deletionPolicy 必填");
+    assert!(
+        m["deletionPolicy"]["onDelete"].as_str().map(|p| !p.is_empty()).unwrap_or(false),
+        "删除策略含 onDelete"
+    );
+    assert!(
+        m["deletionPolicy"]["onWithdraw"].as_str().map(|p| !p.is_empty()).unwrap_or(false),
+        "删除策略含 onWithdraw"
+    );
+    assert_eq!(m["rightsDeclaration"], "original");
+    assert_eq!(m["assetKind"], "character");
+    assert_eq!(m["version"], 1);
+}
+
+/// 独立 manifest 端点：owner 可取；他人 → 404 硬隔离。
+#[tokio::test]
+async fn manifest_endpoint_owner_scoped() {
+    let (app, _s) = build_app().await;
+    let (access, _r, _u) = login_new_user(&app, "13900000013").await;
+    let (_st, v) =
+        send(&app, "POST", "/api/assets/characters", Some(&access), Some("man2"), Some(publish_body("card-N", "范围"))).await;
+    let id = v["id"].as_str().unwrap().to_string();
+
+    let (st, m) = send(&app, "GET", &format!("/api/assets/characters/{id}/manifest"), Some(&access), None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(m["fields"].is_array(), "manifest 含字段清单");
+    assert!(m["deletionPolicy"].is_object(), "manifest 含删除策略");
+    assert!(m["visibility"]["scope"].is_string(), "manifest 含可见范围");
+
+    // 他人访问 → 404（owner 硬隔离，不泄露存在性）。
+    let (access2, _r, _u) = login_new_user(&app, "13900000098").await;
+    let (st, _) = send(&app, "GET", &format!("/api/assets/characters/{id}/manifest"), Some(&access2), None, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
 /// 正常卡（provider Approved 且无注入）→ 直过 approved，不入队、不记险。
 #[tokio::test]
 async fn approved_card_writes_no_audit_no_risk() {

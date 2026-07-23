@@ -5,6 +5,7 @@
 //! POST /auth/login      {phone, code} → 校验+消费 challenge → upsert users → 返回 {accessToken, refreshToken, user}
 //! POST /auth/refresh    {refreshToken} → 旋转 refresh（旧 token revoke）→ 新对
 //! POST /auth/logout     revoke 当前用户全部 refresh
+//! POST /auth/age-declaration {isAdult} → 写 users.age_declared（成年=1 / 未成年=2），支撑 §2.2 未成年默认保护（billing 保守拒充）
 //! POST /identity/verification {provider, referenceId, status} → 仅存第三方返回状态（不存原始证件）
 //! 全部副作用端点支持 Idempotency-Key（idempotency 模块工具）。
 
@@ -96,6 +97,7 @@ pub fn router() -> Router<AppState> {
         .route("/auth/login", post(login))
         .route("/auth/refresh", post(refresh))
         .route("/auth/logout", post(logout))
+        .route("/auth/age-declaration", post(age_declaration))
         .route("/identity/verification", post(identity_verification))
 }
 
@@ -156,6 +158,12 @@ struct IdentityReq {
     provider: String,
     reference_id: String,
     status: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgeDeclarationReq {
+    is_adult: bool,
 }
 
 // ---------------- 辅助 ----------------
@@ -445,6 +453,40 @@ async fn identity_verification(
     .await?;
     let resp = serde_json::json!({ "id": id, "status": req.status });
     let body = serde_json::to_string(&resp).unwrap();
+    guard.store_response(&state.db, &body).await?;
+    Ok(json_response(body))
+}
+
+/// POST /auth/age-declaration：用户自我年龄声明 → 写 users.age_declared（成年=1 / 未成年=2）。
+/// 支撑 §2.2 未成年人默认保护：billing 充值仅放行"已声明成年"（==1）；未声明(0)/未成年(2)一律保守拒充。
+/// 自我声明 ≠ 实名认证；真正的实名/防沉迷走 /identity/verification（仅存第三方状态）。
+async fn age_declaration(
+    State(state): State<AppState>,
+    user: AuthUser,
+    headers: HeaderMap,
+    Json(req): Json<AgeDeclarationReq>,
+) -> Result<Response, ApiError> {
+    // 成年声明=1，未成年声明=2（与 users.age_declared 语义一致；0 保留给"未声明"）。
+    let age_value: i64 = if req.is_adult { 1 } else { 2 };
+    let payload_hash = idempotency::hash_payload(&serde_json::to_vec(&req).unwrap_or_default());
+    let key = idem_key(&headers);
+    let guard =
+        idempotency::guard(&state.db, &user.user_id, "POST /auth/age-declaration", key.as_deref(), &payload_hash).await?;
+    if let Some(cached) = guard.cached_response {
+        return Ok(json_response(cached));
+    }
+    let affected = sqlx::query("UPDATE users SET age_declared = ?, updated_at = ? WHERE id = ?")
+        .bind(age_value)
+        .bind(now_ms())
+        .bind(&user.user_id)
+        .execute(&state.db)
+        .await?
+        .rows_affected();
+    if affected == 0 {
+        return Err(ApiError::NotFound); // token 有效但用户行不存在（已注销）
+    }
+    let resp = serde_json::json!({ "ageDeclared": age_value });
+    let body = serde_json::to_string(&resp).map_err(ApiError::internal)?;
     guard.store_response(&state.db, &body).await?;
     Ok(json_response(body))
 }

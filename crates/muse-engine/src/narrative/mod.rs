@@ -18,6 +18,7 @@ pub mod types;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use regex::Regex;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -75,6 +76,28 @@ pub struct RoundInput {
     pub temperature_writer: f32,
     pub max_output_tokens: u32,
     pub budget: RoundBudget,
+    /// 已获批的不可逆结果 subject（角色 id）；本回合命中的 subject 可落定其不可逆结果
+    /// （角色死亡/永久退场/永久关系变更），未命中的产 ConsentRequested 并门控不落定（REMEDIATION #3）。
+    /// 默认空 = 无授权（所有不可逆结果一律门控，保守安全）；平台由 runtime 回灌，桌面壳默认空。
+    pub approved_consents: Vec<String>,
+}
+
+impl Default for RoundInput {
+    fn default() -> Self {
+        Self {
+            run_id: String::new(),
+            mode: RunMode::Observe,
+            active_cards: BTreeMap::new(),
+            other_cards_brief: BTreeMap::new(),
+            whispers: BTreeMap::new(),
+            fragments: BTreeMap::new(),
+            temperature_decide: 0.0,
+            temperature_writer: 0.0,
+            max_output_tokens: 0,
+            budget: RoundBudget { max_total_tokens: 0, spent_tokens: 0, max_scenes: 0 },
+            approved_consents: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -253,9 +276,19 @@ impl NarrativeEngine {
         )
         .await?;
 
+        // 4.5) 不可逆结果同意门控（REMEDIATION #3 / 规格 §2.4）：
+        // 分类不可逆结果（角色死亡/永久退场/永久关系变更，由 ArbiterResult 成功 + 行动语义判定）；
+        // subject 全部命中 approved_consents → 正常落定并清除对应 pending；否则门控——
+        // 产 ConsentRequested、剔出落定集（不落定该不可逆结果）、记 narrative.pending_consents。
+        let (committing_outcomes, consent_requests, newly_pending, approved_landed) =
+            gate_consents(&decisions, &outcomes, &input.approved_consents);
+
         // 5) reducer 生成 StatePatch + DomainEvent（事件引用 patch.id，供 I3 校验）。
-        let patch = build_patch(current.revision, &decisions, &outcomes, &current);
-        let events = build_events(&run_id, &patch.id, &decisions, &outcomes);
+        // 落定集已剔除被门控的不可逆结果 → 其后果不进入 StatePatch/ActionResolved。
+        let patch = build_patch(current.revision, &decisions, &committing_outcomes, &current);
+        let mut events = build_events(&run_id, &patch.id, &decisions, &committing_outcomes);
+        // 门控的不可逆结果追加 ConsentRequested（可见性 Private→当事角色），续接事件序号。
+        events.extend(build_consent_events(&run_id, &patch.id, events.len() as u64, &consent_requests));
 
         // 6) 确定性不变量（失败即阻断，不提交任何状态）。
         let violations =
@@ -311,7 +344,12 @@ impl NarrativeEngine {
         };
         let new_state = store.commit_scene(&run_id, &scene, &patch)?;
 
-        // 9) 产出 DomainEvent（宿主决定投递通道）。
+        // 8.5) 门控账回写：清除本回合已落定的 pending，追加未获批的新 pending。
+        // pending_consents 不经 reducer 白名单（引擎门控元数据，类比 appliedPatchIds），故直接重写状态。
+        let new_state =
+            persist_pending_consents(host, &run_id, new_state, &newly_pending, &approved_landed)?;
+
+        // 9) 产出 DomainEvent（宿主决定投递通道；含门控产生的 ConsentRequested）。
         for ev in &scene.events {
             host.events
                 .emit(EngineEvent::Narrative { run_id: run_id.clone(), payload: serde_json::to_value(ev)? });
@@ -564,6 +602,192 @@ fn build_events(
     events
 }
 
+// ---------- 不可逆结果同意门控（REMEDIATION #3 / 规格 §2.4） ----------
+
+/// 一个待授权的不可逆结果（用于生成 ConsentRequested 域事件）。
+struct ConsentRequest {
+    /// 发起该不可逆行动的角色（事件 actor）
+    actor: String,
+    decision_id: String,
+    /// death | permanent_exit | permanent_relation_change
+    event_kind: String,
+    /// 当事角色 id（其主人需授权）
+    subjects: Vec<String>,
+    detail: String,
+}
+
+/// 门控编排：对每个仲裁结果分类不可逆性；当事角色全部命中 approved_consents → 留在落定集并记入
+/// 待清除 pending；否则剔出落定集、生成 ConsentRequest、记入新增 pending。非不可逆结果原样落定。
+/// 返回 (落定用 outcomes, 待生成 ConsentRequested, 新增 pending, 已落定待清除 pending)。
+fn gate_consents(
+    decisions: &[RoleDecision],
+    outcomes: &[ArbiterOutcome],
+    approved_consents: &[String],
+) -> (Vec<ArbiterOutcome>, Vec<ConsentRequest>, Vec<PendingConsent>, Vec<PendingConsent>) {
+    let rules = IrreversibleRules::new();
+    let approved: std::collections::BTreeSet<&str> =
+        approved_consents.iter().map(|s| s.as_str()).collect();
+    let dmap: BTreeMap<&str, &RoleDecision> =
+        decisions.iter().map(|d| (d.decision_id.as_str(), d)).collect();
+
+    let mut committing: Vec<ArbiterOutcome> = Vec::with_capacity(outcomes.len());
+    let mut requests: Vec<ConsentRequest> = Vec::new();
+    let mut newly_pending: Vec<PendingConsent> = Vec::new();
+    let mut approved_landed: Vec<PendingConsent> = Vec::new();
+
+    for o in outcomes {
+        match dmap.get(o.decision_id.as_str()).and_then(|d| rules.classify(o, d)) {
+            None => committing.push(o.clone()), // 非不可逆：正常落定
+            Some((event_kind, subjects)) => {
+                // 全部当事角色均获批 → 落定；否则门控不落定。
+                let all_approved =
+                    !subjects.is_empty() && subjects.iter().all(|s| approved.contains(s.as_str()));
+                if all_approved {
+                    committing.push(o.clone());
+                    for s in &subjects {
+                        approved_landed
+                            .push(PendingConsent { subject: s.clone(), event_kind: event_kind.clone() });
+                    }
+                } else {
+                    for s in &subjects {
+                        newly_pending
+                            .push(PendingConsent { subject: s.clone(), event_kind: event_kind.clone() });
+                    }
+                    requests.push(ConsentRequest {
+                        actor: o.character_id.clone(),
+                        decision_id: o.decision_id.clone(),
+                        event_kind,
+                        subjects,
+                        detail: o.consequence.clone(),
+                    });
+                }
+            }
+        }
+    }
+    (committing, requests, newly_pending, approved_landed)
+}
+
+/// 由 ConsentRequest 生成 ConsentRequested 域事件（可见性 Private→当事角色∪发起者）；
+/// 事件序号从 start_seq 续接（与 build_events 共用一条序号轴）。
+fn build_consent_events(
+    run_id: &str,
+    patch_id: &str,
+    start_seq: u64,
+    requests: &[ConsentRequest],
+) -> Vec<DomainEvent> {
+    let mut out: Vec<DomainEvent> = Vec::with_capacity(requests.len());
+    for (i, r) in requests.iter().enumerate() {
+        let seq = start_seq + i as u64;
+        let mut audience: Vec<String> = r.subjects.clone();
+        if !audience.contains(&r.actor) {
+            audience.push(r.actor.clone());
+        }
+        audience.sort();
+        audience.dedup();
+        out.push(DomainEvent {
+            schema_version: 1,
+            id: format!("{patch_id}-ev-{seq}"),
+            run_id: run_id.to_string(),
+            sequence: seq,
+            event_type: DomainEventType::ConsentRequested,
+            actor_ids: vec![r.actor.clone()],
+            target_ids: None, // 当事角色放 fact.subjectCharacterIds，避免 I3 在场校验误伤
+            fact: json!({
+                "eventKind": r.event_kind,
+                "subjectCharacterIds": r.subjects,
+                "detail": r.detail,
+            }),
+            state_patch_id: patch_id.to_string(),
+            caused_by: vec![r.decision_id.clone()],
+            visibility: EventVisibility::Private { audience_character_ids: audience },
+        });
+    }
+    out
+}
+
+/// 门控账回写：清除已落定的 pending、去重追加新增 pending；有变更则重写状态落盘（revision 不变）。
+/// pending_consents 不经 reducer 白名单（引擎门控元数据），故直接重写。
+fn persist_pending_consents(
+    host: &EngineHost,
+    run_id: &str,
+    mut new_state: NarrativeState,
+    newly_pending: &[PendingConsent],
+    approved_landed: &[PendingConsent],
+) -> Result<NarrativeState, EngineError> {
+    if newly_pending.is_empty() && approved_landed.is_empty() {
+        return Ok(new_state);
+    }
+    for landed in approved_landed {
+        new_state.narrative.pending_consents.retain(|p| p != landed);
+    }
+    for np in newly_pending {
+        if !new_state.narrative.pending_consents.contains(np) {
+            new_state.narrative.pending_consents.push(np.clone());
+        }
+    }
+    crate::store::write_json(host.fs.as_ref(), &state::state_path(run_id), &new_state)?;
+    Ok(new_state)
+}
+
+/// 不可逆行动语义分类器（预编译正则）：区分角色死亡 / 永久退场 / 永久关系变更。
+/// 与 arbiter 的 irreversible_re 家族同源，但细分类别并聚焦「角色级」不可逆（不含单纯物件损毁）。
+struct IrreversibleRules {
+    death: Regex,
+    self_death: Regex,
+    exit: Regex,
+    relation: Regex,
+}
+
+impl IrreversibleRules {
+    fn new() -> Self {
+        Self {
+            death: Regex::new(r"(杀死|杀掉|杀了|杀害|处死|赐死|斩杀|毒死|勒死|绞死|自尽|自刎|殉|同归于尽)").unwrap(),
+            self_death: Regex::new(r"(自尽|自刎|殉|同归于尽)").unwrap(),
+            exit: Regex::new(r"(流放|放逐|逐出|驱逐|永远离开|远走高飞|退隐|归隐|遁入空门|出走|永别)").unwrap(),
+            relation: Regex::new(r"(背叛|叛变|叛逃|反目成仇|反目|决裂|绝交|断绝)").unwrap(),
+        }
+    }
+
+    /// 仅「实际发生」（Success/PartialSuccess）的结果才产生不可逆后果。
+    /// 返回 (eventKind, subjectCharacterIds)，非不可逆返回 None。死亡优先级最高。
+    fn classify(&self, o: &ArbiterOutcome, d: &RoleDecision) -> Option<(String, Vec<String>)> {
+        if !matches!(o.result, ArbiterResult::Success | ArbiterResult::PartialSuccess) {
+            return None;
+        }
+        let action = d.action.as_str();
+        let actor = d.character_id.as_str();
+
+        if self.death.is_match(action) {
+            let mut subjects = d.targets.clone();
+            // 自尽/同归于尽：行动者本人亦为当事；无目标时同样归为行动者。
+            if subjects.is_empty() || self.self_death.is_match(action) {
+                subjects.push(actor.to_string());
+            }
+            return Some(("death".to_string(), dedup_sorted(subjects)));
+        }
+        if self.exit.is_match(action) {
+            let mut subjects = d.targets.clone();
+            if subjects.is_empty() {
+                subjects.push(actor.to_string());
+            }
+            return Some(("permanent_exit".to_string(), dedup_sorted(subjects)));
+        }
+        if self.relation.is_match(action) {
+            // 关系变更：行动者与目标皆为当事。
+            let mut subjects = d.targets.clone();
+            subjects.push(actor.to_string());
+            return Some(("permanent_relation_change".to_string(), dedup_sorted(subjects)));
+        }
+        None
+    }
+}
+
+fn dedup_sorted(mut v: Vec<String>) -> Vec<String> {
+    v.sort();
+    v.dedup();
+    v
+}
+
 /// 阻断前的诊断场景（空 patch / 空 events，未提交）。
 fn stub_scene(
     tick: u64,
@@ -699,6 +923,7 @@ mod tests {
             temperature_writer: 0.7,
             max_output_tokens: 100,
             budget,
+            approved_consents: Vec::new(),
         }
     }
 
@@ -828,6 +1053,122 @@ mod tests {
         assert!(out.blocked.as_deref().unwrap().contains("I1"), "应因 I1 阻断：{:?}", out.blocked);
         assert_eq!(out.new_state.revision, 0);
         assert!(NarrativeStore::new(host.fs.clone()).list_scene_ids("run-1").unwrap().is_empty());
+    }
+
+    // ===== 不可逆结果同意门控（REMEDIATION #3 / §2.4）=====
+
+    fn kill_decision(target: &str) -> String {
+        format!(
+            r#"{{"intent":"除掉隐患","action":"拔剑当场杀死叛徒","speak":{{"willSpeak":false,"purpose":""}},"targets":["{target}"],"acceptableCosts":[],"predictions":[]}}"#
+        )
+    }
+
+    #[tokio::test]
+    async fn run_round_gates_irreversible_without_approval() {
+        // 无硬节点 → 「杀死」判 Success（clean），进入门控分类。
+        let responses = vec![
+            Ok(r#"{"situation":"对峙时刻"}"#.to_string()),
+            Ok(kill_decision("wang")), // decide li：杀死 wang（不可逆·死亡）
+            Ok(benign_decision()),     // decide wang
+            Ok(r#"{"prose":"局势骤变，刀光一闪。"}"#.to_string()),
+            Ok(r#"{"characterConsistencyIssues":[],"causalIssues":[],"revisionSuggestions":[]}"#.to_string()),
+        ];
+        let (host, ev) = host_with(responses);
+        init_run(host.as_ref(), "run-1", false);
+        let engine = NarrativeEngine::new(host.clone());
+
+        // approved_consents 空 → wang 的死亡未获批。
+        let out = engine
+            .run_round(&routes(), &prompts(), round_input("run-1", big_budget()), &CancelFlag::new())
+            .await
+            .unwrap();
+
+        assert!(out.blocked.is_none());
+        assert_eq!(out.new_state.revision, 1); // 场景仍提交（其余角色行动落定）
+
+        // ① 产出 ConsentRequested：fact.eventKind=death、subjectCharacterIds=[wang]、可见性 Private 含 wang。
+        let cr: Vec<&DomainEvent> = out
+            .scene
+            .events
+            .iter()
+            .filter(|e| e.event_type == DomainEventType::ConsentRequested)
+            .collect();
+        assert_eq!(cr.len(), 1);
+        assert_eq!(cr[0].fact["eventKind"], "death");
+        assert_eq!(cr[0].fact["subjectCharacterIds"], serde_json::json!(["wang"]));
+        match &cr[0].visibility {
+            EventVisibility::Private { audience_character_ids } => {
+                assert!(audience_character_ids.contains(&"wang".to_string()));
+            }
+            _ => panic!("ConsentRequested 应为 Private→当事角色"),
+        }
+
+        // ② 不落定：li 的不可逆结果未进入 StatePatch（无 li 节拍记录）；wang 正常落定。
+        assert!(
+            !out.new_state.narrative.pacing_notes.iter().any(|n| n.starts_with("li｜")),
+            "li 的不可逆结果不应落定"
+        );
+        assert!(out.new_state.narrative.pacing_notes.iter().any(|n| n.starts_with("wang｜")));
+
+        // ③ 记入 pending_consents。
+        assert!(out
+            .new_state
+            .narrative
+            .pending_consents
+            .iter()
+            .any(|p| p.subject == "wang" && p.event_kind == "death"));
+
+        // ConsentRequested 也经领域事件通道发射。
+        let emitted = ev
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, EngineEvent::Narrative { payload, .. }
+                if payload.get("type").and_then(|v| v.as_str()) == Some("consent_requested")))
+            .count();
+        assert_eq!(emitted, 1);
+    }
+
+    #[tokio::test]
+    async fn run_round_lands_irreversible_when_approved_and_clears_pending() {
+        let responses = vec![
+            Ok(r#"{"situation":"对峙时刻"}"#.to_string()),
+            Ok(kill_decision("wang")), // li 杀死 wang
+            Ok(benign_decision()),     // wang
+            Ok(r#"{"prose":"尘埃落定。"}"#.to_string()),
+            Ok(r#"{"characterConsistencyIssues":[],"causalIssues":[],"revisionSuggestions":[]}"#.to_string()),
+        ];
+        let (host, _ev) = host_with(responses);
+        // 预置状态：li/wang + 一条既有待审批 {wang, death}（模拟上一回合已请求）。
+        let mut s = NarrativeState { schema_version: 1, run_id: "run-1".into(), ..Default::default() };
+        s.characters.insert("li".into(), CharacterState::default());
+        s.characters.insert("wang".into(), CharacterState::default());
+        s.narrative
+            .pending_consents
+            .push(PendingConsent { subject: "wang".into(), event_kind: "death".into() });
+        NarrativeStore::new(host.fs.clone()).init(&s).unwrap();
+        let engine = NarrativeEngine::new(host.clone());
+
+        // approved_consents 含 wang → 本回合可落定 wang 的死亡。
+        let mut input = round_input("run-1", big_budget());
+        input.approved_consents = vec!["wang".to_string()];
+        let out = engine.run_round(&routes(), &prompts(), input, &CancelFlag::new()).await.unwrap();
+
+        assert!(out.blocked.is_none());
+        // 已获批 → 无 ConsentRequested。
+        assert_eq!(
+            out.scene
+                .events
+                .iter()
+                .filter(|e| e.event_type == DomainEventType::ConsentRequested)
+                .count(),
+            0
+        );
+        // li 的不可逆结果落定（节拍记录含 li）。
+        assert!(out.new_state.narrative.pacing_notes.iter().any(|n| n.starts_with("li｜")));
+        // 既有 pending 被清除。
+        assert!(out.new_state.narrative.pending_consents.is_empty(), "获批落定后应清除对应 pending");
     }
 
     // ===== 取消：不提交 =====

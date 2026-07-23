@@ -69,6 +69,31 @@ export interface WorldEventItem {
   occurredAt: number;
 }
 
+// ---------- 世界权威状态快照（#6b；GET /worlds/{id}/state-summary，由 narrative_state 派生、按 principal 过滤） ----------
+
+/** 一条权威关系边（有向）：数值区间由服务端定义，前端只按相对量/符号呈现（scale 无关）。 */
+export interface WorldRelation {
+  from: string;
+  to: string;
+  trust: number;
+  affinity: number;
+  fear: number;
+  debt: number;
+}
+
+/** 一名角色的权威状态：弧光阶段 + 活跃度。 */
+export interface WorldCharacterState {
+  id: string;
+  arcStage: string;
+  activity: number;
+}
+
+/** state-summary 端点返回体：权威关系 + 角色状态。 */
+export interface WorldStateSummary {
+  relations: WorldRelation[];
+  characters: WorldCharacterState[];
+}
+
 export interface CloudCharacter {
   id: string;
   localCardId: string;
@@ -320,7 +345,7 @@ export function provenanceMeta(kind: ProvenanceKind): { label: string; color: st
 
 // ---------- store ----------
 
-export type RoomView = 'stream' | 'cards' | 'graph' | 'status';
+export type RoomView = 'stream' | 'cards' | 'graph' | 'map' | 'status';
 
 interface PlatformState {
   // 世界大厅

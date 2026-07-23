@@ -1,6 +1,7 @@
 // 角色测试：互换/压力测试的报告类型 + invoke 参数组装 + 同卡短路判断。
 // 报告类型与 crates/muse-engine/src/character/types.rs 的 camelCase 序列化形态一致。
 import type { CharacterCardV2 } from './characterCardV2';
+import type { ModelProfile } from '../stores/useExtractionStore';
 
 // ---------- 报告类型（镜像 types.rs） ----------
 
@@ -41,32 +42,64 @@ export interface StressTestReport {
 export const SWAP_TEST_COMMAND = 'run_character_swap_test' as const;
 export const STRESS_TEST_COMMAND = 'run_character_stress_test' as const;
 
-export interface SwapTestRequest {
+/**
+ * 互换/压力测试共用的完整请求 DTO，与 Rust `SwapTestRequestDto`
+ * （src-tauri/src/commands/character_v2.rs:138-149）camelCase 逐字段对齐。
+ * 两个命令都要求携带模型 profile 与两段评测 system prompt（swap/stress）；
+ * 互换用 cardA/cardB/scenario，压力用 cardA/scenarios。
+ * 调用时须以 `{ request }` 包裹（tauri command 形参名为 `request`）。
+ */
+export interface SwapTestRequestDto {
+  profile: ModelProfile;
+  swapPrompt: string;
+  stressPrompt: string;
+  promptVersion?: string;
   cardA: CharacterCardV2;
-  cardB: CharacterCardV2;
-  scenario: string;
+  cardB?: CharacterCardV2;
+  scenario?: string;
+  scenarios?: string[];
 }
 
-export interface StressTestRequest {
-  card: CharacterCardV2;
-  scenarios: string[];
+/** 评测前置配置：从 useSettingsStore 取选中模型 profile + 两段测试提示词。 */
+export interface EvalConfig {
+  profile: ModelProfile;
+  swapPrompt: string;
+  stressPrompt: string;
+  promptVersion?: string;
 }
 
-/** 组装 run_character_swap_test 的 invoke 参数对象。 */
+/** 组装 run_character_swap_test 的完整 request（补齐 profile + 两段 prompt）。 */
 export function buildSwapTestRequest(
+  config: EvalConfig,
   cardA: CharacterCardV2,
   cardB: CharacterCardV2,
   scenario: string,
-): SwapTestRequest {
-  return { cardA, cardB, scenario };
+): SwapTestRequestDto {
+  return {
+    profile: config.profile,
+    swapPrompt: config.swapPrompt,
+    stressPrompt: config.stressPrompt,
+    promptVersion: config.promptVersion,
+    cardA,
+    cardB,
+    scenario,
+  };
 }
 
-/** 组装 run_character_stress_test 的 invoke 参数对象。 */
+/** 组装 run_character_stress_test 的完整 request（补齐 profile + 两段 prompt）。 */
 export function buildStressTestRequest(
+  config: EvalConfig,
   card: CharacterCardV2,
   scenarios: string[],
-): StressTestRequest {
-  return { card, scenarios: [...scenarios] };
+): SwapTestRequestDto {
+  return {
+    profile: config.profile,
+    swapPrompt: config.swapPrompt,
+    stressPrompt: config.stressPrompt,
+    promptVersion: config.promptVersion,
+    cardA: card,
+    scenarios: [...scenarios],
+  };
 }
 
 // ---------- 同卡短路判断 ----------

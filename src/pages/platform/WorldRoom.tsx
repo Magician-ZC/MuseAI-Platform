@@ -44,6 +44,9 @@ import {
   type InterventionRecord,
   type CloudCharacter,
   type RoomView,
+  type WorldStateSummary,
+  type WorldRelation,
+  type WorldCharacterState,
 } from '../../stores/usePlatformStore';
 
 const { Title, Text, Paragraph } = Typography;
@@ -112,6 +115,49 @@ export function useWorldEvents(worldId: string | undefined): {
   }, [worldId]);
 
   return { events, loading, error };
+}
+
+// ---------- 权威状态快照（#6b）：relations / characters ----------
+
+/**
+ * 拉取世界权威状态快照（GET /worlds/{id}/state-summary，server 端 G-RUNTIME 提供）。
+ * 端点未就绪（尚未上线）或云端故障时优雅降级为 null——由消费组件回退到事件共现启发式，页面不崩。
+ */
+export function useWorldStateSummary(worldId: string | undefined): {
+  summary: WorldStateSummary | null;
+  loading: boolean;
+  error: string | null;
+} {
+  const [summary, setSummary] = useState<WorldStateSummary | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!worldId) return;
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    setSummary(null);
+
+    cloudFetch<WorldStateSummary>(`/api/worlds/${worldId}/state-summary`)
+      .then((data) => {
+        if (cancelled) return;
+        setSummary({ relations: data.relations ?? [], characters: data.characters ?? [] });
+      })
+      .catch((e) => {
+        // 权威快照非关键：端点未就绪 / 网络失败时保持 null，组件回退启发式。
+        if (!cancelled) setError(describeCloudError(e));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [worldId]);
+
+  return { summary, loading, error };
 }
 
 // ---------- L0 文字流 ----------
@@ -191,7 +237,7 @@ export const EventCards: React.FC<{ events: WorldEventItem[] }> = ({ events }) =
   );
 };
 
-// ---------- L1 关系图谱（echarts 力导向图；由观测到的共同参与事件推导） ----------
+// ---------- L1 关系图谱（echarts 力导向图；优先权威 relations，缺失时退回事件共现启发式） ----------
 
 interface GraphNode {
   id: string;
@@ -200,11 +246,19 @@ interface GraphNode {
   mine: boolean;
 }
 
+/** value=连线强度（启发式为共现次数，权威为 |trust/affinity/fear| 峰值）；affinity 仅权威边有（决定盟好/敌对配色）。 */
+interface GraphLink {
+  source: string;
+  target: string;
+  value: number;
+  affinity?: number;
+}
+
 function buildGraph(
   roster: WorldRosterEntry[],
   events: WorldEventItem[],
   myIds: Set<string>,
-): { nodes: GraphNode[]; links: Array<{ source: string; target: string; value: number }> } {
+): { nodes: GraphNode[]; links: GraphLink[] } {
   const nodes = new Map<string, GraphNode>();
   const nameOf = new Map<string, string>();
   for (const r of roster) {
@@ -239,18 +293,64 @@ function buildGraph(
   return { nodes: [...nodes.values()], links: [...linkMap.values()] };
 }
 
+/** 由权威 relations 构图（#6b）：节点取阵容 + 关系端点，连线强度取 |trust/affinity/fear| 峰值。 */
+function buildAuthoritativeGraph(
+  roster: WorldRosterEntry[],
+  relations: WorldRelation[],
+  myIds: Set<string>,
+): { nodes: GraphNode[]; links: GraphLink[] } {
+  const nodes = new Map<string, GraphNode>();
+  const nameOf = new Map<string, string>();
+  for (const r of roster) {
+    nameOf.set(r.cloudCharacterId, r.name || r.cloudCharacterId);
+    nodes.set(r.cloudCharacterId, {
+      id: r.cloudCharacterId,
+      name: r.name || r.cloudCharacterId,
+      weight: 1,
+      mine: myIds.has(r.cloudCharacterId),
+    });
+  }
+  const ensure = (id: string): GraphNode => {
+    let n = nodes.get(id);
+    if (!n) {
+      n = { id, name: nameOf.get(id) || id, weight: 1, mine: myIds.has(id) };
+      nodes.set(id, n);
+    }
+    return n;
+  };
+  const links: GraphLink[] = [];
+  for (const rel of relations) {
+    ensure(rel.from).weight += 1;
+    ensure(rel.to).weight += 1;
+    const value = Math.max(Math.abs(rel.trust), Math.abs(rel.affinity), Math.abs(rel.fear));
+    links.push({ source: rel.from, target: rel.to, value, affinity: rel.affinity });
+  }
+  return { nodes: [...nodes.values()], links };
+}
+
 export const RelationGraph: React.FC<{
   roster: WorldRosterEntry[];
   events: WorldEventItem[];
+  /** 权威关系（#6b）；提供且非空时优先使用，否则退回事件共现启发式。 */
+  relations?: WorldRelation[];
   myIds?: Set<string>;
-}> = ({ roster, events, myIds }) => {
+}> = ({ roster, events, relations, myIds }) => {
   const mine = myIds ?? new Set<string>();
-  const { nodes, links } = useMemo(() => buildGraph(roster, events, mine), [roster, events, mine]);
+  const authoritative = !!relations && relations.length > 0;
+  const { nodes, links } = useMemo(
+    () =>
+      authoritative
+        ? buildAuthoritativeGraph(roster, relations as WorldRelation[], mine)
+        : buildGraph(roster, events, mine),
+    [authoritative, roster, relations, events, mine],
+  );
 
   if (nodes.length === 0) {
     return <Empty description="暂无角色，无法绘制关系图谱" />;
   }
 
+  // 连线宽度按当前集合归一到 1~6，避免对未知数值区间做硬编码缩放。
+  const maxVal = Math.max(1, ...links.map((l) => Math.abs(l.value)));
   const option = {
     tooltip: {},
     series: [
@@ -272,7 +372,10 @@ export const RelationGraph: React.FC<{
         links: links.map((l) => ({
           source: l.source,
           target: l.target,
-          lineStyle: { width: Math.min(1 + l.value, 6) },
+          lineStyle: {
+            width: 1 + (Math.abs(l.value) / maxVal) * 5,
+            color: l.affinity === undefined ? '#cbb7a3' : l.affinity >= 0 ? '#7cae7a' : '#d98b8b',
+          },
         })),
       },
     ],
@@ -281,7 +384,7 @@ export const RelationGraph: React.FC<{
   return (
     <div>
       <ReactECharts option={option} style={{ height: 380 }} notMerge />
-      <Space size={16} style={{ marginTop: 8 }}>
+      <Space size={16} style={{ marginTop: 8 }} wrap>
         <Text type="secondary" style={{ fontSize: 12 }}>
           <span style={{ color: '#d97757' }}>●</span> 你的角色
         </Text>
@@ -289,7 +392,9 @@ export const RelationGraph: React.FC<{
           <span style={{ color: '#8b7355' }}>●</span> 其他角色
         </Text>
         <Text type="secondary" style={{ fontSize: 12 }}>
-          连线粗细 = 共同参与事件次数（由观测事件推导）
+          {authoritative
+            ? '数据源：权威关系状态（连线粗细=信任/亲和强度，绿=盟好 红=敌对）'
+            : '数据源：由观测事件共现推导（连线粗细=共同参与次数）'}
         </Text>
       </Space>
     </div>
@@ -298,11 +403,31 @@ export const RelationGraph: React.FC<{
 
 // ---------- L1 状态面板 ----------
 
+/** 弧光阶段代码 → 中文标签（未知值回退原文）。 */
+function arcStageLabel(stage: string): string {
+  switch (stage) {
+    case 'setup':
+      return '铺垫';
+    case 'rising':
+      return '上升';
+    case 'climax':
+      return '高潮';
+    case 'falling':
+      return '回落';
+    case 'resolution':
+      return '收束';
+    default:
+      return stage;
+  }
+}
+
 export const StatusPanel: React.FC<{
   roster: WorldRosterEntry[];
   events: WorldEventItem[];
+  /** 权威角色状态（#6b）；提供时以 arcStage/activity 为准，事件派生仅作近况补充。 */
+  characters?: WorldCharacterState[];
   myIds?: Set<string>;
-}> = ({ roster, events, myIds }) => {
+}> = ({ roster, events, characters, myIds }) => {
   const mine = myIds ?? new Set<string>();
   const stats = useMemo(() => {
     const map = new Map<string, { count: number; lastSummary?: string; lastTick?: number }>();
@@ -318,21 +443,33 @@ export const StatusPanel: React.FC<{
     return map;
   }, [events]);
 
+  const authMap = useMemo(() => {
+    const m = new Map<string, WorldCharacterState>();
+    for (const c of characters ?? []) m.set(c.id, c);
+    return m;
+  }, [characters]);
+  const hasAuthoritative = (characters?.length ?? 0) > 0;
+
   if (roster.length === 0) return <Empty description="暂无角色阵容" />;
 
   return (
     <Space direction="vertical" size={12} style={{ width: '100%' }}>
+      <Text type="secondary" style={{ fontSize: 12 }}>
+        {hasAuthoritative ? '数据源：权威状态快照（弧光阶段 / 活跃度）' : '数据源：由观测事件推导（尚无权威状态快照）'}
+      </Text>
       {roster.map((r) => {
         const s = stats.get(r.cloudCharacterId);
+        const a = authMap.get(r.cloudCharacterId);
         return (
           <Card key={r.cloudCharacterId} size="small" style={{ borderRadius: 10, border: '1px solid #eae6df' }}>
             <Space style={{ justifyContent: 'space-between', width: '100%' }} align="start">
-              <Space size={8}>
+              <Space size={8} wrap>
                 <Text strong>{r.name || r.cloudCharacterId}</Text>
                 {mine.has(r.cloudCharacterId) && <Tag color="orange">我的角色</Tag>}
+                {a && <Tag color="blue">弧光 · {arcStageLabel(a.arcStage)}</Tag>}
               </Space>
               <Text type="secondary" style={{ fontSize: 12 }}>
-                活跃 {s?.count ?? 0} 次
+                {a ? `活跃度 ${a.activity}` : `活跃 ${s?.count ?? 0} 次`}
               </Text>
             </Space>
             {s?.lastSummary && (
@@ -347,12 +484,214 @@ export const StatusPanel: React.FC<{
   );
 };
 
+// ---------- L1 势力地图（§2.7/§11） ----------
+// 数据 seam：世界模板的「地点拓扑 + 角色坐标」当前未由服务端下发（world-template 级拓扑数据未接通）。
+// 因此此处退化为「按阵营聚合」呈现：以结盟事件（+ 权威关系正亲和）经并查集把角色聚成势力簇，
+// 冲突事件 / 负亲和 / 高恐惧作为跨簇敌对连线。待拓扑数据就绪，可切换为真实地点布局。
+
+interface FactionMember {
+  id: string;
+  name: string;
+  mine: boolean;
+}
+interface FactionNode {
+  id: string;
+  name: string;
+  category: number;
+  mine: boolean;
+  weight: number;
+}
+interface FactionLink {
+  source: string;
+  target: string;
+  kind: 'alliance' | 'conflict';
+}
+
+function buildFactionMap(
+  roster: WorldRosterEntry[],
+  events: WorldEventItem[],
+  relations: WorldRelation[] | undefined,
+  myIds: Set<string>,
+): {
+  factions: Array<{ id: number; members: FactionMember[] }>;
+  nodes: FactionNode[];
+  links: FactionLink[];
+} {
+  const nameOf = new Map<string, string>();
+  const ids: string[] = [];
+  const parent = new Map<string, string>();
+  const weight = new Map<string, number>();
+  const add = (id: string, name?: string) => {
+    if (!parent.has(id)) {
+      parent.set(id, id);
+      ids.push(id);
+      weight.set(id, 1);
+    }
+    if (name && !nameOf.has(id)) nameOf.set(id, name);
+    else if (!nameOf.has(id)) nameOf.set(id, id);
+  };
+  const find = (x: string): string => {
+    let root = x;
+    while (parent.get(root) !== root) root = parent.get(root) as string;
+    let cur = x;
+    while (parent.get(cur) !== root) {
+      const nxt = parent.get(cur) as string;
+      parent.set(cur, root);
+      cur = nxt;
+    }
+    return root;
+  };
+  const union = (a: string, b: string) => {
+    add(a);
+    add(b);
+    const ra = find(a);
+    const rb = find(b);
+    if (ra !== rb) parent.set(ra, rb);
+  };
+
+  for (const r of roster) add(r.cloudCharacterId, r.name || r.cloudCharacterId);
+
+  const links: FactionLink[] = [];
+  for (const ev of events) {
+    for (const a of ev.actors) {
+      add(a);
+      weight.set(a, (weight.get(a) ?? 1) + 1);
+    }
+    if (ev.type === 'alliance' || ev.type === 'conflict') {
+      for (let i = 0; i < ev.actors.length; i += 1) {
+        for (let j = i + 1; j < ev.actors.length; j += 1) {
+          if (ev.type === 'alliance') {
+            union(ev.actors[i], ev.actors[j]);
+            links.push({ source: ev.actors[i], target: ev.actors[j], kind: 'alliance' });
+          } else {
+            links.push({ source: ev.actors[i], target: ev.actors[j], kind: 'conflict' });
+          }
+        }
+      }
+    }
+  }
+  // 权威关系（若有）：正亲和视为同阵营（scale 无关，只看符号）；负亲和 / 高恐惧为敌对。
+  for (const rel of relations ?? []) {
+    add(rel.from);
+    add(rel.to);
+    if (rel.affinity > 0) {
+      union(rel.from, rel.to);
+      links.push({ source: rel.from, target: rel.to, kind: 'alliance' });
+    } else if (rel.affinity < 0 || rel.fear > 0) {
+      links.push({ source: rel.from, target: rel.to, kind: 'conflict' });
+    }
+  }
+
+  const rootToFaction = new Map<string, number>();
+  const factions: Array<{ id: number; members: FactionMember[] }> = [];
+  for (const id of ids) {
+    const root = find(id);
+    let fi = rootToFaction.get(root);
+    if (fi === undefined) {
+      fi = factions.length;
+      rootToFaction.set(root, fi);
+      factions.push({ id: fi, members: [] });
+    }
+    factions[fi].members.push({ id, name: nameOf.get(id) as string, mine: myIds.has(id) });
+  }
+  const nodes: FactionNode[] = ids.map((id) => ({
+    id,
+    name: nameOf.get(id) as string,
+    category: rootToFaction.get(find(id)) as number,
+    mine: myIds.has(id),
+    weight: weight.get(id) ?? 1,
+  }));
+  return { factions, nodes, links };
+}
+
+export const FactionMap: React.FC<{
+  roster: WorldRosterEntry[];
+  events: WorldEventItem[];
+  relations?: WorldRelation[];
+  myIds?: Set<string>;
+}> = ({ roster, events, relations, myIds }) => {
+  const mine = myIds ?? new Set<string>();
+  const { factions, nodes, links } = useMemo(
+    () => buildFactionMap(roster, events, relations, mine),
+    [roster, events, relations, mine],
+  );
+
+  if (nodes.length === 0) {
+    return <Empty description="暂无角色，无法绘制势力地图" />;
+  }
+
+  const palette = ['#d97757', '#8b7355', '#6f8fae', '#7cae7a', '#b58bbf', '#c9a15a', '#7a9a9a', '#a9736b'];
+  const categories = factions.map((f) => ({ name: `势力 ${f.id + 1}` }));
+  const option = {
+    color: palette,
+    tooltip: {},
+    legend: [{ data: categories.map((c) => c.name), bottom: 0, textStyle: { color: '#8c857b' } }],
+    series: [
+      {
+        type: 'graph',
+        layout: 'force',
+        roam: true,
+        draggable: true,
+        force: { repulsion: 220, edgeLength: 90, gravity: 0.08 },
+        categories,
+        label: { show: true, position: 'right', color: '#33312e', formatter: (p: { data: { name?: string } }) => p.data.name ?? '' },
+        data: nodes.map((n) => ({
+          id: n.id,
+          name: n.name,
+          category: n.category,
+          symbolSize: Math.min(18 + n.weight * 3, 46),
+          itemStyle: n.mine ? { borderColor: '#d97757', borderWidth: 3 } : undefined,
+        })),
+        links: links.map((l) => ({
+          source: l.source,
+          target: l.target,
+          lineStyle: {
+            color: l.kind === 'alliance' ? '#7cae7a' : '#d98b8b',
+            width: l.kind === 'alliance' ? 2 : 1.5,
+            type: l.kind === 'conflict' ? 'dashed' : 'solid',
+            curveness: 0.1,
+          },
+        })),
+      },
+    ],
+  };
+
+  return (
+    <div>
+      <Alert
+        type="info"
+        showIcon
+        style={{ marginBottom: 12 }}
+        message="按阵营聚合呈现"
+        description="世界模板的地点拓扑与角色坐标尚未由服务端下发（拓扑数据 seam）；当前依据结盟/冲突与权威关系将角色聚合为势力簇。"
+      />
+      <ReactECharts option={option} style={{ height: 380 }} notMerge />
+      <Space direction="vertical" size={8} style={{ width: '100%', marginTop: 8 }}>
+        {factions.map((f) => (
+          <Space key={f.id} size={6} wrap>
+            <Tag color="geekblue">势力 {f.id + 1}</Tag>
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              {f.members.length} 名成员
+            </Text>
+            {f.members.map((m) => (
+              <Tag key={m.id} color={m.mine ? 'orange' : 'default'}>
+                {m.name}
+              </Tag>
+            ))}
+          </Space>
+        ))}
+      </Space>
+    </div>
+  );
+};
+
 // ---------- L1 视图容器（房间与观战席共用） ----------
 
 const L1_OPTIONS = [
   { label: '事件流', value: 'stream' as RoomView },
   { label: '事件卡', value: 'cards' as RoomView },
   { label: '关系图谱', value: 'graph' as RoomView },
+  { label: '势力地图', value: 'map' as RoomView },
   { label: '状态面板', value: 'status' as RoomView },
 ];
 
@@ -362,9 +701,11 @@ export const WorldViewPanel: React.FC<{
   events: WorldEventItem[];
   roster: WorldRosterEntry[];
   myIds?: Set<string>;
+  /** 权威状态快照（#6b）；缺省（如观战席未拉取）时 L1 组件回退事件启发式。 */
+  summary?: WorldStateSummary | null;
   loading?: boolean;
   error?: string | null;
-}> = ({ view, onViewChange, events, roster, myIds, loading, error }) => {
+}> = ({ view, onViewChange, events, roster, myIds, summary, loading, error }) => {
   return (
     <Card
       style={{ borderRadius: 12, border: 'none', boxShadow: '0 1px 3px rgba(0,0,0,0.05)' }}
@@ -384,9 +725,11 @@ export const WorldViewPanel: React.FC<{
       ) : view === 'cards' ? (
         <EventCards events={events} />
       ) : view === 'graph' ? (
-        <RelationGraph roster={roster} events={events} myIds={myIds} />
+        <RelationGraph roster={roster} events={events} relations={summary?.relations} myIds={myIds} />
+      ) : view === 'map' ? (
+        <FactionMap roster={roster} events={events} relations={summary?.relations} myIds={myIds} />
       ) : (
-        <StatusPanel roster={roster} events={events} myIds={myIds} />
+        <StatusPanel roster={roster} events={events} characters={summary?.characters} myIds={myIds} />
       )}
     </Card>
   );
@@ -806,6 +1149,8 @@ const WorldRoom: React.FC = () => {
   const [myCloudChars, setMyCloudChars] = useState<CloudCharacter[]>([]);
 
   const { events, loading: eventsLoading, error: eventsError } = useWorldEvents(id);
+  // 权威状态快照（#6b）：驱动关系图谱/势力地图/状态面板；端点未就绪时组件自动回退启发式。
+  const { summary } = useWorldStateSummary(id);
 
   const loadWorld = async () => {
     if (!id) return;
@@ -896,6 +1241,7 @@ const WorldRoom: React.FC = () => {
             events={events}
             roster={world.roster}
             myIds={myIds}
+            summary={summary}
             loading={eventsLoading}
             error={eventsError}
           />

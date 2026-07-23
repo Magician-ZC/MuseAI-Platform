@@ -4,12 +4,13 @@
 //! - 余额**不可提现、不可转账**：本模块只提供 orders / balance / refunds，**绝无** withdraw / transfer 端点。
 //! - 账本**双录**：每一次余额变动都写一条 `ledger_entries`，恒有 `SUM(ledger.delta_cents) == balance_cents`。
 //! - 订单 / 退款**幂等**：副作用端点走 `idempotency::guard`（同 key 不双扣不双记）；退款另有状态机防重复退。
-//! - **未成年拒充**：`users.age_declared == 2` → 403（保守保护，规格 §2.2 未成年人默认保护）。
+//! - **保守拒充**：仅 `users.age_declared == 1`（已声明成年）放行；未声明(0)/未成年(2)/无用户行 → 403
+//!   （规格 §2.2 未成年人默认保护：无法可靠判断年龄前保守限制付费）。年龄声明入口见 `POST /auth/age-declaration`。
 //! - 用户钱包与创作者结算是两套账，本模块只做用户侧（不碰创作者结算 / 不碰世界胜负结果）。
 //!
 //! 端点（全部 AuthUser 守卫，挂 /api 前缀，见 app.rs 的 #[cfg(feature="billing")] merge）：
 //! - POST /billing/orders   {kind:"recharge", amountCents} + Idempotency-Key
-//!     → 未成年拒充 → DevPayment 履约（dev 立即成功）
+//!     → 保守拒充（仅已声明成年放行）→ DevPayment 履约（dev 立即成功）
 //!     → **单事务** orders(created→paid→fulfilled) + ledger(+amount) + billing_balances(+amount upsert)
 //!     → {orderId, balanceCents}
 //! - GET  /billing/balance  → {balanceCents}（无行视为 0）
@@ -114,12 +115,14 @@ async fn create_order(
         return Err(ApiError::BadRequest("充值金额无效（须为正且不超过限额）".into()));
     }
 
-    // 红线：未成年拒充（age_declared==2）。放在履约前，未成年请求不产生任何账务副作用。
+    // 红线：保守拒充（规格 §2.2 未成年人默认保护）。仅"已声明成年"（age_declared==1）放行；
+    // 未声明(0)、未成年(2)、用户行缺失一律 403——无法可靠判断年龄前保守限制付费（堵住"仅拦 2"的空防）。
+    // 置于履约前：被拒请求零账务副作用（无 order / 无 ledger / 无 balance）。声明入口：POST /auth/age-declaration。
     let age: Option<(i64,)> = sqlx::query_as("SELECT age_declared FROM users WHERE id = ?")
         .bind(&user.user_id)
         .fetch_optional(&state.db)
         .await?;
-    if matches!(age, Some((2,))) {
+    if !matches!(age, Some((1,))) {
         return Err(ApiError::Forbidden);
     }
 

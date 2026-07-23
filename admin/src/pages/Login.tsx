@@ -3,8 +3,9 @@
 import { useState } from 'react';
 import { Alert, Button, Card, Form, Input, message } from 'antd';
 import { useNavigate } from 'react-router-dom';
-import { adminFetch, setToken } from '../api';
+import { adminFetch, setRole, setToken } from '../api';
 import { friendlyError } from '../components/shared';
+import { firstModuleKey } from '../rbac';
 
 const DEFAULT_SECRET = 'muse-dev-admin';
 
@@ -15,14 +16,18 @@ export default function Login() {
   const onFinish = async (values: { secret: string }) => {
     setLoading(true);
     try {
-      const res = await adminFetch<{ accessToken: string; role: string }>(
+      const res = await adminFetch<{ accessToken: string; role: string; userId?: string }>(
         '/admin/dev-login',
         'POST',
         { secret: values.secret },
       );
       setToken(res.accessToken);
+      // #9 RBAC：保存后端返回的 role，前端据此收敛可见模块。
+      setRole(res.role);
       message.success('登录成功');
-      navigate('/metrics');
+      // 落到该角色的首个可见模块（避免落在无权模块吃 403）。
+      const landing = firstModuleKey(res.role);
+      navigate(landing ? `/${landing}` : '/', { replace: true });
     } catch (e) {
       message.error(friendlyError(e));
     } finally {

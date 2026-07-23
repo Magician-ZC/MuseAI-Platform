@@ -1,7 +1,7 @@
 //! DNA 合成（规格 §10.2 阶段 6–7）：每角色 1–2 次调用；矛盾审查在合成 prompt 内完成。
 //! 文件所有权：agent-E1。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -67,10 +67,20 @@ pub async fn synthesize_character(
     let value: serde_json::Value = json_call(host.model.as_ref(), host.events.as_ref(), &spec, cancel).await?;
     let layers = SynthLayers::from_model(&value);
 
-    let card = assemble_card(entry, ledger, source_title, host.clock.now_ms(), layers);
+    // 矛盾证据对回写（§9.1）：模型识别出的「真实矛盾」组写回账本 EvidenceRef.conflictsWith（组内互指），
+    // 只对账本中确实存在的证据 id 生效；有变更则以与 build_ledgers 一致的字节重写账本落盘，
+    // 保证卡内 evidenceIndex.contentHash 与落盘账本一致。
+    let mut effective_ledger = ledger.clone();
+    let groups = parse_conflict_groups(&value);
+    if apply_conflicts(&mut effective_ledger, &groups) {
+        let bytes = serde_json::to_vec_pretty(&effective_ledger)?;
+        host.fs.write_atomic(&ledger_path(&effective_ledger.character_id), &bytes)?;
+    }
+
+    let card = assemble_card(entry, &effective_ledger, source_title, host.clock.now_ms(), layers);
 
     // 引用完整性：卡内 evidenceIds ⊆ 账本 id 集。
-    let ledger_ids: BTreeSet<&str> = ledger.evidence.iter().map(|e| e.id.as_str()).collect();
+    let ledger_ids: BTreeSet<&str> = effective_ledger.evidence.iter().map(|e| e.id.as_str()).collect();
     for rule in &card.decision_model.decision_rules {
         if let Some(ids) = &rule.evidence_ids {
             for id in ids {
@@ -140,6 +150,50 @@ fn evidence_index_of(ledger: &EvidenceLedger) -> EvidenceIndex {
         content_hash: content_hash(&bytes),
         count: ledger.evidence.len() as u32,
     }
+}
+
+/// 从模型输出解析矛盾证据组：顶层 `conflicts` 为「字符串数组」的数组，每组内的证据 id 互相矛盾。
+/// 解析失败或缺省 → 空（无回写）。
+fn parse_conflict_groups(value: &serde_json::Value) -> Vec<Vec<String>> {
+    value
+        .get("conflicts")
+        .and_then(|v| serde_json::from_value::<Vec<Vec<String>>>(v.clone()).ok())
+        .unwrap_or_default()
+}
+
+/// 把矛盾组写回账本 `EvidenceRef.conflictsWith`：组内两两互指，仅对账本中存在的证据 id 生效
+/// （悬空 id 忽略，不报错）。每个 conflictsWith 去重排序（确定性）。返回是否有任何写回。
+fn apply_conflicts(ledger: &mut EvidenceLedger, groups: &[Vec<String>]) -> bool {
+    let valid: BTreeSet<&str> = ledger.evidence.iter().map(|e| e.id.as_str()).collect();
+    // 汇总每个 id 需新增的冲突对端。
+    let mut additions: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for group in groups {
+        let members: Vec<&String> = group.iter().filter(|id| valid.contains(id.as_str())).collect();
+        for a in &members {
+            for b in &members {
+                if a != b {
+                    additions.entry((*a).clone()).or_default().insert((*b).clone());
+                }
+            }
+        }
+    }
+    if additions.is_empty() {
+        return false;
+    }
+    let mut changed = false;
+    for e in ledger.evidence.iter_mut() {
+        if let Some(add) = additions.get(&e.id) {
+            let mut set: BTreeSet<String> =
+                e.conflicts_with.clone().unwrap_or_default().into_iter().collect();
+            let before = set.len();
+            set.extend(add.iter().cloned());
+            if set.len() != before {
+                e.conflicts_with = Some(set.into_iter().collect()); // BTreeSet → 有序 Vec
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 fn tier_to_importance(t: RosterTier) -> Importance {
@@ -231,7 +285,9 @@ fn build_synthesis_prompt(entry: &RosterEntry, source_title: &str, evidence_bloc
 emotionDynamics, relationGrammar, expressionFingerprint, agency, growthArc, worldAdaptation。\n\
 decisionModel.decisionRules 每条形如 {{\"when\":\"..\",\"then\":\"..\",\"because\":\"..\",\"evidenceIds\":[\"..\"]}}，\
 evidenceIds 只能引用上面出现过的证据 id。\n\
-矛盾审查：区分「成长变化 / 叙述者不可靠 / 真实矛盾」，仅依据证据推断，不要编造证据中没有的设定，无法确定的字段留空。",
+矛盾审查：区分「成长变化 / 叙述者不可靠 / 真实矛盾」，仅依据证据推断，不要编造证据中没有的设定，无法确定的字段留空。\
+若证据间存在**真实矛盾**（非成长变化、非叙述视角差异），在顶层输出 \"conflicts\":[[\"ev-a\",\"ev-b\"]]，\
+每组列出互相矛盾的证据 id（须来自上面账本中出现过的 id）。",
         name = entry.canonical_name,
         title = source_title,
         aliases = aliases,
@@ -415,6 +471,30 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.code(), "validation");
+    }
+
+    #[tokio::test]
+    async fn synthesis_writes_back_conflicts_to_ledger() {
+        // 模型识别 ev-1 与 ev-2 为真实矛盾；ev-999 悬空应被忽略；ev-3 无冲突。
+        let resp = r#"{"dramaticCore":{"coreContradiction":"忠义两难"},"conflicts":[["ev-1","ev-2","ev-999"]]}"#;
+        let host = host_with(ScriptedModel::new(vec![Ok(resp.into())]));
+        let ledger = ledger_with(&["ev-1", "ev-2", "ev-3"]);
+        let card = synthesize_character(
+            &host, &profile(), &prompts(), 0.0, 4096, "t", &entry(), &ledger, "水浒传", &CancelFlag::new(),
+        )
+        .await
+        .unwrap();
+
+        // 回读落盘账本：ev-1↔ev-2 互指（证据 id 互相回写），悬空 ev-999 忽略，ev-3 无冲突。
+        let reloaded = crate::character::evidence::load_ledger(&host.fs, &stable_key("林冲")).unwrap();
+        let cw = |id: &str| reloaded.evidence.iter().find(|e| e.id == id).unwrap().conflicts_with.clone();
+        assert_eq!(cw("ev-1"), Some(vec!["ev-2".to_string()]));
+        assert_eq!(cw("ev-2"), Some(vec!["ev-1".to_string()]));
+        assert_eq!(cw("ev-3"), None);
+
+        // 卡内 evidenceIndex.contentHash 与回写后落盘账本字节一致。
+        let bytes = host.fs.read(&ledger_path(&stable_key("林冲"))).unwrap();
+        assert_eq!(card.evidence_index.content_hash, content_hash(&bytes));
     }
 
     #[test]

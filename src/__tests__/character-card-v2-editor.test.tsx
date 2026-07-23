@@ -103,11 +103,64 @@ describe('CharacterCardV2Editor', () => {
     fireEvent.click(screen.getByRole('button', { name: /运行互换测试/ }));
 
     await waitFor(() => {
+      // 修复后：以 { request } 包裹，且 request 内补齐 profile + 两段评测 prompt（与 Rust SwapTestRequestDto 对齐）。
       expect(mockInvoke).toHaveBeenCalledWith(
         'run_character_swap_test',
-        expect.objectContaining({ scenario: '盟友背叛' }),
+        expect.objectContaining({
+          request: expect.objectContaining({
+            scenario: '盟友背叛',
+            profile: expect.objectContaining({
+              interface: expect.any(String),
+              baseUrl: expect.any(String),
+              model: expect.any(String),
+            }),
+            swapPrompt: expect.any(String),
+            stressPrompt: expect.any(String),
+            cardA: expect.objectContaining({ id: a.id }),
+            cardB: expect.objectContaining({ id: b.id }),
+          }),
+        }),
       );
     });
     expect(await screen.findByText(/两角色不可互换/)).toBeInTheDocument();
+  });
+
+  it('压力测试：多情境触发 run_character_stress_test（完整 request）并展示报告', async () => {
+    const card = filledCard('林逸');
+    mockInvoke.mockImplementation(async (cmd: string) =>
+      cmd === 'run_character_stress_test'
+        ? {
+            cardId: card.id,
+            scenarios: [
+              { scenario: '救人还是守密', predictedChoice: '救人', rationale: '底线是护亲', consistentWithCore: true },
+            ],
+            consistent: true,
+            summary: '三条情境均护亲优先，未见裂缝。',
+          }
+        : undefined,
+    );
+    render(<CharacterCardV2Editor card={card} />);
+
+    fireEvent.change(screen.getByLabelText('压力测试情境'), {
+      target: { value: '救人还是守密\n背叛信念换取胜利\n' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /运行压力测试/ }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        'run_character_stress_test',
+        expect.objectContaining({
+          request: expect.objectContaining({
+            // 空行被过滤，逐行成一条情境
+            scenarios: ['救人还是守密', '背叛信念换取胜利'],
+            profile: expect.objectContaining({ model: expect.any(String) }),
+            swapPrompt: expect.any(String),
+            stressPrompt: expect.any(String),
+            cardA: expect.objectContaining({ id: card.id }),
+          }),
+        }),
+      );
+    });
+    expect(await screen.findByText('三条情境均护亲优先，未见裂缝。')).toBeInTheDocument();
   });
 });

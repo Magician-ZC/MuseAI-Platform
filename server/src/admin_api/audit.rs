@@ -77,6 +77,88 @@ pub(super) async fn list_queue(
     Ok(Json(json!({ "items": items, "nextCursor": next_cursor })))
 }
 
+/// GET /admin/audit-queue/{id}：审核详情（§10 审核工作台）。
+/// character 主体附「卡片全文 cardJson + 可审计 manifest + 同作者历史 authorHistory」，
+/// 供人审直接对照，无需再逐字段拉取。reviewer/admin 守卫。
+pub(super) async fn detail(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    require_role(&admin, &["reviewer"])?;
+
+    let row = sqlx::query(
+        "SELECT id, subject_kind, subject_id, machine_verdict, machine_hits, status, \
+         reviewer_id, reviewed_at, created_at FROM audit_queue WHERE id = ?",
+    )
+    .bind(&id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or(ApiError::NotFound)?;
+
+    let subject_kind: String = row.try_get("subject_kind")?;
+    let subject_id: String = row.try_get("subject_id")?;
+    let hits_raw: String = row.try_get("machine_hits")?;
+    let hits: Value = serde_json::from_str(&hits_raw).unwrap_or_else(|_| json!([]));
+
+    // 基础队列字段 + character 专属附加字段占位（非 character 主体保持空值）。
+    let mut out = json!({
+        "id": row.try_get::<String, _>("id")?,
+        "subjectKind": subject_kind,
+        "subjectId": subject_id,
+        "machineVerdict": row.try_get::<String, _>("machine_verdict")?,
+        "machineHits": hits,
+        "status": row.try_get::<String, _>("status")?,
+        "reviewerId": row.try_get::<Option<String>, _>("reviewer_id")?,
+        "reviewedAt": row.try_get::<Option<i64>, _>("reviewed_at")?,
+        "createdAt": row.try_get::<i64, _>("created_at")?,
+        "cardJson": Value::Null,
+        "manifest": Value::Null,
+        "authorHistory": json!([]),
+    });
+
+    if subject_kind == "character" {
+        if let Some(crow) =
+            sqlx::query("SELECT owner_id, card_json, manifest_json FROM cloud_characters WHERE id = ?")
+                .bind(&subject_id)
+                .fetch_optional(&state.db)
+                .await?
+        {
+            let owner_id: String = crow.try_get("owner_id")?;
+            let card_text: String = crow.try_get("card_json")?;
+            let manifest_text: Option<String> = crow.try_get("manifest_json")?;
+            // 卡片全文（非第三人称摘要——人审需看原文判定）。
+            out["cardJson"] = serde_json::from_str(&card_text).unwrap_or(Value::Null);
+            out["manifest"] =
+                manifest_text.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null);
+
+            // 同作者历史：同 owner 的其他云端角色（不含当前主体），供判断作者一贯性。
+            let hist = sqlx::query(
+                "SELECT id, version, moderation, created_at FROM cloud_characters \
+                 WHERE owner_id = ? AND id != ? ORDER BY created_at DESC, version DESC",
+            )
+            .bind(&owner_id)
+            .bind(&subject_id)
+            .fetch_all(&state.db)
+            .await?;
+            let history: Vec<Value> = hist
+                .iter()
+                .map(|r| {
+                    json!({
+                        "id": r.try_get::<String, _>("id").unwrap_or_default(),
+                        "version": r.try_get::<i64, _>("version").unwrap_or_default(),
+                        "moderation": r.try_get::<String, _>("moderation").unwrap_or_default(),
+                        "createdAt": r.try_get::<i64, _>("created_at").unwrap_or_default(),
+                    })
+                })
+                .collect();
+            out["authorHistory"] = json!(history);
+        }
+    }
+
+    Ok(Json(out))
+}
+
 /// POST /admin/audit-queue/{id}/approve?reason=
 pub(super) async fn approve(
     State(state): State<AppState>,

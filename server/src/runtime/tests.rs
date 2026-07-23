@@ -354,3 +354,131 @@ async fn tick_without_model_config_skips_via_public_entry() {
     insert_tick(&state.db, &wid, 0, 0).await.unwrap();
     assert_eq!(process_tick(&state, &wid, 0).await.unwrap(), TickStatus::Skipped("no_model_config"));
 }
+
+// ---------- #3b：不可逆行动同意链（消费 ConsentRequested + 审批回灌落定，规格 §2.4 / REMEDIATION #3） ----------
+
+/// 驱动一个「死亡」不可逆结果的 mock：roleDecide 让活跃角色对 `victim` 施加致命行动，
+/// 触发引擎不可逆分类（death）。模板有待推进硬节点 ⇒ 规则层升级到模型仲裁，mock 空 outcomes
+/// 回退 Success ⇒ 结果「实际发生」并进入门控分类。其余环节返回合法占位 JSON。
+struct IrreversibleMockModel {
+    victim: String,
+}
+
+#[async_trait]
+impl ModelClient for IrreversibleMockModel {
+    async fn complete(&self, spec: &ModelCallSpec, cancel: &CancelFlag) -> Result<ModelOutput, EngineError> {
+        cancel.check()?;
+        let content = match spec.agent.as_str() {
+            "director" => r#"{"situation":"刀光血影，杀机毕露。"}"#.to_string(),
+            "roleDecide" => format!(
+                r#"{{"intent":"取其性命","action":"拔剑当场杀死对手","speak":{{"willSpeak":false,"purpose":""}},"targets":["{}"],"acceptableCosts":[],"predictions":[]}}"#,
+                self.victim
+            ),
+            "arbiter" => r#"{"outcomes":[]}"#.to_string(),
+            "writer" => r#"{"prose":"剑光如雪，一击定生死。"}"#.to_string(),
+            "critic" => r#"{"characterConsistencyIssues":[],"causalIssues":[],"revisionSuggestions":[]}"#.to_string(),
+            _ => "{}".to_string(),
+        };
+        Ok(ModelOutput { content, input_tokens: Some(5), output_tokens: Some(5) })
+    }
+}
+
+#[tokio::test]
+async fn irreversible_action_gates_consent_then_approve_lands() {
+    let state = test_state().await;
+    let wid = running_world_with_two_members(&state).await;
+    // chB 为受害者：本回合活跃角色对 chB 施加致命行动（共享 mock），不可逆主体统一为 chB。
+    let model: Arc<dyn ModelClient> = Arc::new(IrreversibleMockModel { victim: "chB".into() });
+
+    // ===== tick 0：不可逆行动被引擎门控 → 产 ConsentRequested → runtime 建同意；死亡不落定 =====
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(
+        process_tick_with_model(&state, &wid, 0, model.clone()).await.unwrap(),
+        TickStatus::Done,
+        "不可逆结果被门控但场景仍提交（其余行动落定），非 blocked/fail"
+    );
+
+    // runtime 消费本回合 ConsentRequested → 恰好建 1 条 pending 同意（多个同 subject 事件被幂等去重）。
+    let n_pending = i64_one(
+        &state.db,
+        "SELECT COUNT(*) FROM consent_requests WHERE world_id=? AND status='pending'",
+        &wid,
+    )
+    .await;
+    assert_eq!(n_pending, 1, "不可逆行动应触发恰好一条 pending 同意请求");
+    let ck = text_one(
+        &state.db,
+        "SELECT event_kind FROM consent_requests WHERE world_id=? AND status='pending'",
+        &wid,
+    )
+    .await;
+    assert_eq!(ck, "death", "同意事件类别应为 death");
+    let subjects = text_one(
+        &state.db,
+        "SELECT subject_character_ids FROM consent_requests WHERE world_id=? AND status='pending'",
+        &wid,
+    )
+    .await;
+    assert!(subjects.contains("chB"), "当事角色应为受害者 chB，got={subjects}");
+    // 通知已投递给当事角色主人 uB（同意触发源接通）。
+    let n_notif = i64_one(
+        &state.db,
+        "SELECT COUNT(*) FROM notification_outbox WHERE kind='consent_request' AND user_id=?",
+        "uB",
+    )
+    .await;
+    assert!(n_notif >= 1, "应通知当事角色主人来响应");
+
+    // 死亡未落定：narrative_state.pending_consents 记录 chB/death（引擎门控证据）。
+    let st1: NarrativeState =
+        serde_json::from_str(&load_world(&state.db, &wid).await.unwrap().narrative_state_json).unwrap();
+    assert!(
+        st1.narrative.pending_consents.iter().any(|p| p.subject == "chB" && p.event_kind == "death"),
+        "未获批的死亡应记入 pending_consents（门控不落定）"
+    );
+
+    // 幂等：再跑一遍同一 tick（already_done），不得重复建同意。
+    let _ = process_tick_with_model(&state, &wid, 0, model.clone()).await.unwrap();
+    let n_pending_again = i64_one(
+        &state.db,
+        "SELECT COUNT(*) FROM consent_requests WHERE world_id=? AND status='pending'",
+        &wid,
+    )
+    .await;
+    assert_eq!(n_pending_again, 1, "重复 tick 不得重复建同意");
+
+    // ===== 当事人 approve（等价 respond 落定；respond 端点在 consents/tests.rs 另有覆盖） =====
+    let cid = text_one(
+        &state.db,
+        "SELECT id FROM consent_requests WHERE world_id=? AND status='pending'",
+        &wid,
+    )
+    .await;
+    sqlx::query("UPDATE consent_requests SET status='approved', resolved_at=? WHERE id=?")
+        .bind(now_ms())
+        .bind(&cid)
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    // ===== tick 1：approved_consents 回灌 → 引擎落定死亡 + 清 pending =====
+    insert_tick(&state.db, &wid, 1, 1).await.unwrap();
+    assert_eq!(
+        process_tick_with_model(&state, &wid, 1, model.clone()).await.unwrap(),
+        TickStatus::Done
+    );
+    let st2: NarrativeState =
+        serde_json::from_str(&load_world(&state.db, &wid).await.unwrap().narrative_state_json).unwrap();
+    assert!(
+        !st2.narrative.pending_consents.iter().any(|p| p.subject == "chB"),
+        "获批后不可逆结果应落定并清除对应 pending_consents"
+    );
+    // 落定回合不产 ConsentRequested → 不新建、也无残留 pending 同意。
+    let n_pending_after = i64_one(
+        &state.db,
+        "SELECT COUNT(*) FROM consent_requests WHERE world_id=? AND status='pending'",
+        &wid,
+    )
+    .await;
+    assert_eq!(n_pending_after, 0, "落定后不应残留/重复新建 pending 同意");
+}

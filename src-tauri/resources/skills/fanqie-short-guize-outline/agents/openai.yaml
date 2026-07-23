@@ -1,0 +1,4 @@
+interface:
+  display_name: "番茄短篇规则怪谈大纲"
+  short_description: "番茄短篇规则怪谈选题、恐怖副本节奏与全文大纲生成器"
+  default_prompt: "使用 $fanqie-short-guize-outline 生成一个番茄短篇规则怪谈选题和全文大纲。"

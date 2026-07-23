@@ -1,0 +1,2794 @@
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { Button, Tooltip, Tag, Input, message, Modal, Spin, Select, Radio, Empty, Drawer, InputNumber, Space, Alert, Divider, List, Checkbox } from 'antd';
+import {
+  HistoryOutlined,
+  ReloadOutlined,
+  CompassOutlined,
+  StopOutlined,
+  PlayCircleOutlined,
+  DeleteOutlined,
+  UserOutlined,
+  FileProtectOutlined,
+  ProfileOutlined,
+  CommentOutlined,
+  ExperimentOutlined,
+  BranchesOutlined,
+  EditOutlined,
+  LockOutlined,
+  CameraOutlined,
+  BulbOutlined,
+  ThunderboltOutlined
+} from '@ant-design/icons';
+import { invoke } from '@tauri-apps/api/core';
+import { useNavigate } from 'react-router-dom';
+import { listen } from '@tauri-apps/api/event';
+
+
+import { useSettingsStore } from '../stores/useSettingsStore';
+
+import { useStoryStore } from '../stores/useStoryStore';
+import { usePartnerChatStore } from '../stores/usePartnerChatStore';
+import { usePartnerStore } from '../stores/usePartnerStore';
+import { useBookTravelStore, type BookTravelBeat, type BookTravelScene, type BookTravelTurnSnapshot } from '../stores/useBookTravelStore';
+import {
+  useCharacterRuntimeStore,
+  type RunMode,
+  type NarrativeState,
+  type RoundRequestInput,
+} from '../stores/useCharacterRuntimeStore';
+import {
+  parseOutline,
+  validateForbiddenExpression,
+  type OutlineNode,
+  type ConstraintLevel,
+} from '../utils/storyConstraints';
+import { Message, AgentSessionSummary, SessionContextCompaction, AgentToolEntry } from '../stores/useAgentStore';
+import SaveChoiceModal, { type SaveChoiceConfirmPayload } from '../components/SaveChoiceModal';
+import {
+  buildStoryModelMessages,
+  compileStorySystemPrompt,
+  getStoryAllowedTools,
+} from './storyAgent';
+import { formatHistorySavedAt, resolveBookTravelProgressMaterial } from '../utils/sessionHistory';
+import { ensureSessionId } from '../utils/sessionIds';
+import { getEffectiveMessagesForContextStats } from '../utils/contextCompaction';
+import { createStableContentKey } from '../utils/renderKeys';
+import { StylePresetSelector } from '../components/StylePresetSelector';
+import { useStylePresetStore } from '../stores/useStylePresetStore';
+import { prependStylePresets } from '../utils/stylePresets';
+import { buildBookTravelCharacterDetails } from '../utils/bookTravelSaveDetails';
+
+interface ChatStreamEvent {
+  runId: string;
+  eventType: 'start' | 'delta' | 'thinking_delta' | 'thinking_signature' | 'tool_start' | 'tool_output' | 'tool_end' | 'todo_update' | 'context_compacted' | 'done' | 'error';
+  delta?: string;
+  message?: string;
+  toolCallId?: string;
+  toolName?: string;
+  toolStatus?: string;
+  toolArguments?: string;
+  contextCompaction?: SessionContextCompaction;
+}
+
+const estimateContextUsage = (systemPrompt: string, messages: Message[], draft: string) => {
+  let userText = draft;
+  let assistantText = '';
+  for (const message of messages) {
+    if (message.role === 'user') {
+      userText += message.content;
+    }
+    if (message.role === 'agent') {
+      assistantText += message.content;
+    }
+  }
+  const stats = {
+    system: Math.max(0, Math.ceil(systemPrompt.length * 1.5)),
+    user: Math.max(0, Math.ceil(userText.length * 1.5)),
+    assistant: Math.max(0, Math.ceil(assistantText.length * 1.5))
+  };
+  return {
+    ...stats,
+    total: stats.system + stats.user + stats.assistant,
+  };
+};
+
+const formatBookTravelUserInput = (text: string, mode: 'speech' | 'behavior' | 'plot') => {
+  if (mode === 'speech') return `【说话】${text}`;
+  if (mode === 'behavior') return `【行为】${text}`;
+  return `【剧情推进】${text}`;
+};
+
+
+const cleanAndParseJSON = (rawStr: unknown): any => {
+  if (typeof rawStr !== 'string') {
+    if (rawStr && typeof rawStr === 'object') return rawStr;
+    throw new TypeError(`Expected string or object, got ${typeof rawStr}`);
+  }
+  let cleaned = rawStr.trim();
+  if (cleaned.startsWith('`')) {
+    const lines = cleaned.split('\n');
+    if (lines[0].startsWith('`')) lines.shift();
+    if (lines[lines.length - 1]?.trim() === '`') lines.pop();
+    cleaned = lines.join('\n').trim();
+  }
+  const firstBrace = cleaned.indexOf('{');
+  const firstBracket = cleaned.indexOf('[');
+  let startIdx = -1;
+  let isObject = true;
+  if (firstBrace !== -1 && firstBracket !== -1) {
+    if (firstBrace < firstBracket) {
+      startIdx = firstBrace;
+      isObject = true;
+    } else {
+      startIdx = firstBracket;
+      isObject = false;
+    }
+  } else if (firstBrace !== -1) {
+    startIdx = firstBrace;
+    isObject = true;
+  } else if (firstBracket !== -1) {
+    startIdx = firstBracket;
+    isObject = false;
+  }
+  if (startIdx === -1) {
+    throw new Error('No JSON object or array found in response');
+  }
+  let endIdx = cleaned.length;
+  if (isObject) {
+    let braceCount = 0;
+    for (let i = startIdx; i < cleaned.length; i++) {
+      if (cleaned[i] === '{') braceCount++;
+      if (cleaned[i] === '}') braceCount--;
+      if (braceCount === 0) {
+        endIdx = i + 1;
+        break;
+      }
+    }
+  } else {
+    let bracketCount = 0;
+    for (let i = startIdx; i < cleaned.length; i++) {
+      if (cleaned[i] === '[') bracketCount++;
+      if (cleaned[i] === ']') bracketCount--;
+      if (bracketCount === 0) {
+        endIdx = i + 1;
+        break;
+      }
+    }
+  }
+  const jsonStr = cleaned.slice(startIdx, endIdx);
+  return JSON.parse(jsonStr);
+};
+
+const getPlannerSceneGoals = (plannerOutput: unknown): string[] => {
+  if (!plannerOutput || typeof plannerOutput !== 'object') return [];
+  const rawGoals = (plannerOutput as any).sceneGoals || (plannerOutput as any).scene_goals;
+  if (Array.isArray(rawGoals)) {
+    const goals: string[] = [];
+    for (const goal of rawGoals) {
+      const text = String(goal).trim();
+      if (text) goals.push(text);
+    }
+    return goals;
+  }
+  if (typeof rawGoals === 'string' && rawGoals.trim()) {
+    return [rawGoals.trim()];
+  }
+  return [];
+};
+
+const readPlanText = (plan: any, camelKey: string, snakeKey?: string): string => {
+  const value = plan?.[camelKey] ?? (snakeKey ? plan?.[snakeKey] : undefined);
+  return typeof value === 'string' ? value.trim() : '';
+};
+
+const readPlanStringArray = (plan: any, camelKey: string, snakeKey?: string): string[] => {
+  const value = plan?.[camelKey] ?? (snakeKey ? plan?.[snakeKey] : undefined);
+  if (!Array.isArray(value)) return [];
+  const items: string[] = [];
+  for (const item of value) {
+    const text = String(item).trim();
+    if (text) items.push(text);
+  }
+  return items;
+};
+
+const getPlanStateChanges = (plan: any): Record<string, unknown> => {
+  const stateChanges = plan?.stateChanges ?? plan?.state_changes;
+  return stateChanges && typeof stateChanges === 'object' && !Array.isArray(stateChanges)
+    ? stateChanges
+    : {};
+};
+
+const buildCurrentStateFromPlan = (
+  baseState: unknown,
+  plan: any,
+  fallbackTime = '',
+  fallbackLocation = '',
+) => {
+  const stateChanges = getPlanStateChanges(plan);
+  const { time: stateTime, location: stateLocation, ...restStateChanges } = stateChanges as Record<string, unknown>;
+  const base = baseState && typeof baseState === 'object' ? baseState as Record<string, unknown> : {};
+  return {
+    ...base,
+    ...restStateChanges,
+    time: readPlanText(plan, 'time') || String(stateTime || fallbackTime || base.time || ''),
+    location: readPlanText(plan, 'location') || String(stateLocation || fallbackLocation || base.location || ''),
+  };
+};
+
+const buildSceneFromPlan = (
+  plan: any,
+  fallback: {
+    title: string;
+    summary?: string;
+    currentSituation?: string;
+    time?: string;
+    location?: string;
+    index: number;
+  },
+): BookTravelScene => {
+  const stateChanges = getPlanStateChanges(plan);
+  return {
+    id: readPlanText(plan, 'id') || `scene-${Date.now()}`,
+    title: readPlanText(plan, 'title') || fallback.title || `新场景-${fallback.index}`,
+    summary: readPlanText(plan, 'summary') || fallback.summary || '',
+    currentSituation: readPlanText(plan, 'currentSituation', 'current_situation') || fallback.currentSituation || '',
+    time: readPlanText(plan, 'time') || String(stateChanges.time || fallback.time || ''),
+    location: readPlanText(plan, 'location') || String(stateChanges.location || fallback.location || ''),
+    activeCharacters: readPlanStringArray(plan, 'activeCharacters', 'active_characters').length > 0
+      ? readPlanStringArray(plan, 'activeCharacters', 'active_characters')
+      : readPlanStringArray(plan, 'allowedCast', 'allowed_cast'),
+    beats: [],
+  };
+};
+
+const extractWriterBeat = (writerOutput: any): BookTravelBeat | null => {
+  const rawBeat = writerOutput?.beat;
+  if (!rawBeat || typeof rawBeat !== 'object' || !String(rawBeat.content || '').trim()) {
+    return null;
+  }
+  return {
+    id: String(rawBeat.id || `beat-${Date.now()}`),
+    content: String(rawBeat.content || ''),
+  };
+};
+
+const appendWriterBeatToCurrentScene = (writerOutput: any): BookTravelBeat => {
+  const store = useBookTravelStore.getState();
+  const currentScene = store.scenes.find((s) => s.id === store.currentSceneId);
+  if (!currentScene) throw new Error('当前场景不存在');
+  const newBeat = extractWriterBeat(writerOutput);
+  if (!newBeat) throw new Error('场景写手没有返回有效 beat');
+  const existingIds = new Set(currentScene.beats.map((b) => b.id));
+  const beatId = existingIds.has(newBeat.id) ? `beat-${Date.now()}` : newBeat.id;
+  const beat = {
+    id: beatId,
+    content: newBeat.content,
+  };
+  store.addBeatToCurrentScene(beat);
+  store.setCurrentBeatId(beatId);
+  const patch = writerOutput.volatileMemoryPatch || writerOutput.volatile_memory_patch;
+  if (patch && typeof patch === 'object') {
+    store.updateVolatileMemory(patch);
+  }
+  return beat;
+};
+
+const formatElapsed = (ms: number) => {
+  const totalSeconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+};
+
+const extractPartialContent = (jsonStr: string): string | null => {
+  const match = jsonStr.match(/"content"\s*:\s*"([^"]*)/);
+  return match ? match[1] : null;
+};
+
+const savedProgressDateFormatter = new Intl.DateTimeFormat('zh-CN', {
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+});
+
+let bookTravelStreamListenerReady: Promise<void> | null = null;
+const bookTravelStreamResolvers = new Map<string, {
+  resolve: (content: string) => void;
+  reject: (error: string) => void;
+}>();
+
+const ensureBookTravelStreamListener = () => {
+  if (!bookTravelStreamListenerReady) {
+    bookTravelStreamListenerReady = listen<any>('book-travel-stream', (event) => {
+      const { runId, eventType, delta, message: eventMessage } = event.payload;
+      const store = useBookTravelStore.getState();
+      const activeRunId = store.streamRuntime.runId;
+      if (!activeRunId && !bookTravelStreamResolvers.has(runId)) return;
+      if (activeRunId && runId !== activeRunId) return;
+
+      if (eventType === 'delta' && delta) {
+        if (store.streamRuntime.phase === 'planner') {
+          store.setBookTravelStreamPlannerOutput((prev) => prev + delta);
+        } else if (store.streamRuntime.phase === 'writer') {
+          store.setBookTravelStreamWriterOutput((prev) => prev + delta);
+        }
+        return;
+      }
+
+      if (eventType === 'done') {
+        bookTravelStreamResolvers.get(runId)?.resolve(eventMessage || '');
+        bookTravelStreamResolvers.delete(runId);
+        return;
+      }
+
+      if (eventType === 'error') {
+        bookTravelStreamResolvers.get(runId)?.reject(eventMessage || '未知错误');
+        bookTravelStreamResolvers.delete(runId);
+      }
+    }).then(() => undefined);
+  }
+  return bookTravelStreamListenerReady;
+};
+
+const runBookTravelStreamTask = async (commandName: string, request: any, extraArgs?: Record<string, unknown>) => {
+  await ensureBookTravelStreamListener();
+  return new Promise<string>((resolve, reject) => {
+    if (useBookTravelStore.getState().streamRuntime.phase === 'cancelled') {
+      reject('用户中断');
+      return;
+    }
+    invoke<{ runId: string }>(commandName, { request, ...extraArgs })
+      .then((result) => {
+        if (useBookTravelStore.getState().streamRuntime.phase === 'cancelled') {
+          void invoke('stop_book_travel_stream', { runId: result.runId }).catch((error) => {
+            console.error('停止穿书流失败:', error);
+          });
+          reject('用户中断');
+          return;
+        }
+        bookTravelStreamResolvers.set(result.runId, { resolve, reject });
+        useBookTravelStore.getState().setBookTravelStreamRunId(result.runId);
+      })
+      .catch((err) => {
+        reject(String(err));
+      });
+  });
+};
+
+const cancelBookTravelStream = async () => {
+  const store = useBookTravelStore.getState();
+  const runId = store.streamRuntime.runId;
+  store.setBookTravelStreamPhase('cancelled');
+  if (!runId) return;
+  bookTravelStreamResolvers.get(runId)?.reject('用户中断');
+  bookTravelStreamResolvers.delete(runId);
+  await invoke('stop_book_travel_stream', { runId });
+};
+
+const handleCancelStart = async () => {
+  try {
+    await cancelBookTravelStream();
+  } catch (e) {
+    console.error('停止穿书流失败:', e);
+  }
+};
+
+const isBookTravelStreamCancelled = (err?: unknown) => (
+  String(err) === '用户中断' || useBookTravelStore.getState().streamRuntime.phase === 'cancelled'
+);
+
+const useStoryView = () => {
+  const {
+    messages, setMessages,
+    isStreaming, setIsStreaming,
+    selectedWorldBookId,
+    selectedCharacterCardIds,
+    sessionId, setSessionId,
+    sessionTitle, setSessionTitle,
+    activeRun, setActiveRun,
+    isSessionArchived,
+    contextCompaction, setContextCompaction,
+    dynamicRoleLoadingEnabled,
+    createNewSession,
+    setSessions,
+  } = useStoryStore();
+
+  const bookTravelStore = useBookTravelStore();
+  const { input, setInput, inputMode, setInputMode } = bookTravelStore;
+  const navigate = useNavigate();
+  const [isBookTravelHistoryOpen, setIsBookTravelHistoryOpen] = useState(false);
+  // P2 自主叙事引擎抽屉（最小侵入：仅新增入口，不改动现有穿书流程）。
+  const [isNarrativeDrawerOpen, setIsNarrativeDrawerOpen] = useState(false);
+  const [bookTravelMaterialFilter, setBookTravelMaterialFilter] = useState<string | null>(null);
+  const [isBookTravelSaveChoiceOpen, setIsBookTravelSaveChoiceOpen] = useState(false);
+  const [bookTravelSaveTitle, setBookTravelSaveTitle] = useState('');
+
+  const [editingUserId, setEditingUserId] = useState<string | null>(null);
+  const [editingUserText, setEditingUserText] = useState<string>('');
+  const [editingNarrativeId, setEditingNarrativeId] = useState<string | null>(null);
+  const [editingNarrativeText, setEditingNarrativeText] = useState<string>('');
+
+  const startEditUser = (turn: BookTravelTurnSnapshot) => {
+    setEditingUserId(turn.id);
+    setEditingUserText(turn.userInput);
+  };
+  
+  const saveEditUser = async (turn: BookTravelTurnSnapshot) => {
+    const newText = editingUserText.trim();
+    if (!newText) return;
+    
+    useBookTravelStore.getState().updateTurn(turn.id, { userInput: newText });
+    setEditingUserId(null);
+    
+    await retryBookTravelWriter({ ...turn, userInput: newText });
+  };
+  
+  const startEditNarrative = (turn: BookTravelTurnSnapshot) => {
+    setEditingNarrativeId(turn.id);
+    setEditingNarrativeText(turn.narrativeOutput);
+  };
+  
+  const saveEditNarrative = (turn: BookTravelTurnSnapshot) => {
+    const newText = editingNarrativeText.trim();
+    if (!newText) return;
+    
+    useBookTravelStore.getState().updateTurn(turn.id, { narrativeOutput: newText });
+    if (turn.createdSceneId && turn.createdBeatIds && turn.createdBeatIds.length > 0) {
+      useBookTravelStore.getState().updateBeatContent(turn.createdSceneId, turn.createdBeatIds[0], newText);
+    } else if (turn.createdBeatIds && turn.createdBeatIds.length > 0) {
+      const currentSceneId = useBookTravelStore.getState().currentSceneId;
+      if (currentSceneId) {
+        useBookTravelStore.getState().updateBeatContent(currentSceneId, turn.createdBeatIds[0], newText);
+      }
+    }
+    setEditingNarrativeId(null);
+  };
+
+  // Book-travel stream states
+  const [, setIsTransitioningScene] = useState(false);
+  const [streamNowMs, setStreamNowMs] = useState(() => Date.now());
+  const {
+    phase: startProgressPhase,
+    plannerOutput,
+    writerOutput,
+    error: startProgressError,
+    startedAt: startProgressStartedAt,
+    progressOpen: startProgressOpen,
+    isSubmitting: isBookTravelSubmitting,
+  } = bookTravelStore.streamRuntime;
+  const startElapsedMs = startProgressStartedAt ? Math.max(0, streamNowMs - startProgressStartedAt) : 0;
+  const setIsBookTravelSubmitting = bookTravelStore.setBookTravelStreamSubmitting;
+  const setStartProgressPhase = bookTravelStore.setBookTravelStreamPhase;
+  const setPlannerOutput = bookTravelStore.setBookTravelStreamPlannerOutput;
+  const setWriterOutput = bookTravelStore.setBookTravelStreamWriterOutput;
+  const setStartProgressError = bookTravelStore.setBookTravelStreamError;
+  const setStartProgressOpen = bookTravelStore.setBookTravelStreamProgressOpen;
+
+  const buildBookTravelRequest = (
+    role: string,
+    systemPrompt: string,
+    config: {
+      temperature?: number;
+      maxOutputTokens?: number;
+      maxContextTokens?: number;
+      compactionTurnThreshold?: number;
+      thinkingDepth?: string;
+    },
+    materials: {
+      outline: { id: string; title: string; content?: string };
+      worldBook: { id: string; title: string; content?: string };
+      characterCards: Array<{ id: string; title: string; content?: string }>;
+    },
+    state: unknown,
+    previousValidState: unknown = {},
+  ) => ({
+    modelInterface: settings.modelInterface,
+    baseUrl: settings.llmBaseUrl,
+    apiKey: settings.llmApiKey,
+    model: settings.llmModel,
+    role,
+    materials,
+    state,
+    previousValidState,
+    temperature: config.temperature,
+    maxOutputTokens: config.maxOutputTokens,
+    maxContextTokens: config.maxContextTokens,
+    thinkingDepth: 'off',
+    systemPrompt,
+  });
+
+
+  const { userInfo: partnerChatUserInfo } = usePartnerChatStore();
+  const settings = useSettingsStore();
+  const stylePresets = useStylePresetStore((state) => state.presets);
+  const effectiveBookTravelSceneWriterPrompt = prependStylePresets(
+    settings.bookTravelSceneWriterPrompt,
+    stylePresets,
+    bookTravelStore.selectedStylePresetIds,
+  );
+
+  const chatHistoryRef = useRef<HTMLDivElement>(null);
+  const currentThinkingIdRef = useRef<string | null>(null);
+
+  const activeRunRef = useRef(activeRun);
+  const messagesRef = useRef(messages);
+  const sessionIdRef = useRef(sessionId);
+  const sessionTitleRef = useRef(sessionTitle);
+  const isSessionArchivedRef = useRef(isSessionArchived);
+  const selectedWorldBookIdRef = useRef(selectedWorldBookId);
+  const dynamicRoleLoadingEnabledRef = useRef(dynamicRoleLoadingEnabled);
+  const selectedCharacterCardIdsRef = useRef(selectedCharacterCardIds);
+  const contextCompactionRef = useRef<SessionContextCompaction | null>(contextCompaction);
+
+  const refreshSessions = useCallback(async () => {
+    try {
+      const summaries = await invoke<AgentSessionSummary[]>('list_agent_sessions', { prefix: 'story-session-' });
+      setSessions(summaries);
+    } catch (err) {
+      console.error('读取故事会话失败:', err);
+    }
+  }, [setSessions]);
+
+  const ensureCurrentSessionId = useCallback(() => {
+    const nextSessionId = ensureSessionId(sessionIdRef.current, 'story-session');
+    if (nextSessionId !== sessionIdRef.current) {
+      sessionIdRef.current = nextSessionId;
+      setSessionId(nextSessionId);
+    }
+    return nextSessionId;
+  }, [setSessionId]);
+
+  const saveCurrentSession = useCallback(async () => {
+    const userMessages = messagesRef.current.filter(m => m.role === 'user');
+    if (userMessages.length === 0) return false;
+    const currentSessionId = ensureCurrentSessionId();
+
+    try {
+      await invoke<AgentSessionSummary>('save_agent_session', {
+        session: {
+          id: currentSessionId,
+          title: sessionTitleRef.current,
+          savedAt: Date.now(),
+          messages: messagesRef.current,
+          selectedReferenceFiles: [],
+          selectedOutlineFile: null,
+          todos: [],
+          contextCompaction: contextCompactionRef.current,
+          isArchived: isSessionArchivedRef.current,
+          selectedWorldBookId: selectedWorldBookIdRef.current,
+          dynamicRoleLoadingEnabled: dynamicRoleLoadingEnabledRef.current,
+          characterCardIds: selectedCharacterCardIdsRef.current
+        }
+      });
+      await refreshSessions();
+      return true;
+    } catch (err) {
+      console.error('保存故事会话失败:', err);
+      return false;
+    }
+  }, [ensureCurrentSessionId, refreshSessions]);
+
+  useEffect(() => { activeRunRef.current = activeRun; }, [activeRun]);
+  useEffect(() => { messagesRef.current = messages; }, [messages]);
+  useEffect(() => { sessionIdRef.current = sessionId; }, [sessionId]);
+  useEffect(() => { sessionTitleRef.current = sessionTitle; }, [sessionTitle]);
+  useEffect(() => { isSessionArchivedRef.current = isSessionArchived; }, [isSessionArchived]);
+  useEffect(() => { selectedWorldBookIdRef.current = selectedWorldBookId; }, [selectedWorldBookId]);
+  useEffect(() => { dynamicRoleLoadingEnabledRef.current = dynamicRoleLoadingEnabled; }, [dynamicRoleLoadingEnabled]);
+  useEffect(() => { selectedCharacterCardIdsRef.current = selectedCharacterCardIds; }, [selectedCharacterCardIds]);
+  useEffect(() => { contextCompactionRef.current = contextCompaction; }, [contextCompaction]);
+
+  useEffect(() => {
+    void refreshSessions();
+  }, [refreshSessions]);
+
+  // Listen to stream events from tauri backend
+  useEffect(() => {
+    let isMounted = true;
+    let unlistenFn: (() => void) | null = null;
+
+    listen<ChatStreamEvent>('agent-chat-stream', (event) => {
+      if (!isMounted) return;
+      const activeRun = activeRunRef.current;
+      const payload = event.payload;
+
+      if (!activeRun.runId || payload.runId !== activeRun.runId || !activeRun.messageId) {
+        return;
+      }
+
+      if (payload.eventType === 'delta' && payload.delta) {
+        currentThinkingIdRef.current = null;
+        setMessages((prev) => prev.map((msg) => (
+          msg.id === activeRun.messageId
+            ? { ...msg, content: msg.content + payload.delta }
+            : msg
+        )));
+        return;
+      }
+
+      if (payload.eventType === 'thinking_delta' && payload.delta) {
+        setMessages((prev) => prev.map((msg) => {
+          if (msg.id !== activeRun.messageId) return msg;
+          let newContent = msg.content;
+          const newThinkingBlocks = [...(msg.thinkingBlocks ?? [])];
+
+          if (!currentThinkingIdRef.current) {
+            currentThinkingIdRef.current = `thinking-${Date.now()}`;
+            newContent += `\n\n[[THINKING:${currentThinkingIdRef.current}]]\n\n`;
+            newThinkingBlocks.push({ id: currentThinkingIdRef.current, content: payload.delta! });
+          } else {
+            const blockIndex = newThinkingBlocks.findIndex(b => b.id === currentThinkingIdRef.current);
+            if (blockIndex >= 0) {
+              newThinkingBlocks[blockIndex] = {
+                ...newThinkingBlocks[blockIndex],
+                content: newThinkingBlocks[blockIndex].content + payload.delta!
+              };
+            }
+          }
+
+          return {
+            ...msg,
+            content: newContent,
+            thinkingBlocks: newThinkingBlocks,
+            thinking: `${msg.thinking ?? ''}${payload.delta}`
+          };
+        }));
+        return;
+      }
+
+      if (payload.eventType === 'thinking_signature' && payload.delta) {
+        setMessages((prev) => prev.map((msg) => {
+          if (msg.id !== activeRun.messageId) return msg;
+          const newThinkingBlocks = [...(msg.thinkingBlocks ?? [])];
+          if (newThinkingBlocks.length > 0) {
+            newThinkingBlocks[newThinkingBlocks.length - 1] = {
+              ...newThinkingBlocks[newThinkingBlocks.length - 1],
+              signature: payload.delta
+            };
+          }
+          return { ...msg, thinkingBlocks: newThinkingBlocks };
+        }));
+        return;
+      }
+
+      if (payload.eventType === 'tool_start') {
+        currentThinkingIdRef.current = null;
+        const toolId = payload.toolCallId || `tool-${Date.now()}`;
+        setMessages((prev) => {
+          const next = updateMessageTool(prev, activeRun.messageId!, {
+            id: toolId,
+            name: payload.toolName || '未知工具',
+            result: payload.toolName === 'role_play' ? '' : payload.message || '正在执行工具',
+            status: payload.toolStatus || 'running',
+            arguments: payload.toolArguments || '{}',
+          }, 'start');
+          return next.map((msg) =>
+            msg.id === activeRun.messageId
+              ? { ...msg, content: msg.content + `\n\n[[TOOL:${toolId}]]\n\n` }
+              : msg
+          );
+        });
+        return;
+      }
+
+      if (payload.eventType === 'tool_output' || payload.eventType === 'tool_end') {
+        setMessages((prev) => updateMessageTool(prev, activeRun.messageId!, {
+          id: payload.toolCallId,
+          name: payload.toolName || '未知工具',
+          result: payload.message || payload.delta || '',
+          status: payload.toolStatus || (payload.eventType === 'tool_end' ? 'success' : 'running'),
+        }, payload.eventType === 'tool_end' ? 'end' : 'output'));
+        return;
+      }
+
+      if (payload.eventType === 'context_compacted' && payload.contextCompaction) {
+        contextCompactionRef.current = payload.contextCompaction;
+        setContextCompaction(payload.contextCompaction);
+        return;
+      }
+
+      if (payload.eventType === 'error') {
+        currentThinkingIdRef.current = null;
+        setMessages((prev) => prev.map((msg) => (
+          msg.id === activeRun.messageId
+            ? { ...msg, content: payload.message ? `冒险推演失败：${payload.message}` : '冒险推演失败' }
+            : msg
+        )));
+        activeRunRef.current = { runId: null, messageId: null };
+        setActiveRun({ runId: null, messageId: null });
+        setIsStreaming(false);
+        return;
+      }
+
+      if (payload.eventType === 'done') {
+        currentThinkingIdRef.current = null;
+        activeRunRef.current = { runId: null, messageId: null };
+        setActiveRun({ runId: null, messageId: null });
+        setIsStreaming(false);
+        window.setTimeout(() => {
+          void saveCurrentSession();
+        }, 0);
+      }
+    }).then((fn) => {
+      unlistenFn = fn;
+      if (!isMounted) fn();
+    });
+
+    return () => {
+      isMounted = false;
+      if (unlistenFn) unlistenFn();
+    };
+  }, [saveCurrentSession, setActiveRun, setContextCompaction, setIsStreaming, setMessages]);
+
+  const scrollToBottomOnce = () => {
+    window.requestAnimationFrame(() => {
+      if (chatHistoryRef.current) {
+        chatHistoryRef.current.scrollTop = chatHistoryRef.current.scrollHeight;
+      }
+    });
+  };
+
+  useEffect(() => {
+    if (bookTravelStore.turns.length > 0) {
+      scrollToBottomOnce();
+    }
+  }, [bookTravelStore.turns.length]);
+
+  useEffect(() => {
+    if (startProgressPhase !== 'planner' && startProgressPhase !== 'writer') return;
+    setStreamNowMs(Date.now());
+    const timer = window.setInterval(() => setStreamNowMs(Date.now()), 100);
+    return () => window.clearInterval(timer);
+  }, [startProgressPhase]);
+
+  const selectedWorldBook = bookTravelStore.selectedWorldBook || null;
+  const selectedCards = bookTravelStore.selectedCharacterCards || [];
+  const storyAllowedTools = getStoryAllowedTools(dynamicRoleLoadingEnabled);
+  const rolePlayContext = dynamicRoleLoadingEnabled ? {
+    chatSystemPrompt: settings.partnerChatPrompt || '',
+    worldBookContent: selectedWorldBook?.content || '',
+    userInfo: partnerChatUserInfo,
+    characterCards: selectedCards.map((card) => ({
+      id: card.id,
+      name: card.title,
+      content: card.content || '',
+    })),
+  } : null;
+
+  // Compile final Prompt
+  const baseSystemPrompt = dynamicRoleLoadingEnabled
+    ? settings.storyDynamicAgentPrompt || ''
+    : settings.storyAgentPrompt || '';
+  const effectiveSystemPrompt = compileStorySystemPrompt({
+    basePrompt: baseSystemPrompt,
+    worldBookContent: selectedWorldBook?.content || null,
+    characterCards: selectedCards.map((card) => ({ name: card.title, content: card.content || '' })),
+    userInfo: partnerChatUserInfo,
+    dynamicRoleLoadingEnabled,
+  });
+  const storyAgentConfigId = dynamicRoleLoadingEnabled ? 'storyDynamicAgent' : 'storyAgent';
+  const storyAgentConfig = settings.agentConfigs?.[storyAgentConfigId] || {
+    temperature: 0.3,
+    maxOutputTokens: 32000,
+    maxContextTokens: 200000,
+    compactionTurnThreshold: 20,
+    thinkingDepth: 'off',
+  };
+  const isActiveBookTravelScene = bookTravelStore.scenes.length > 0;
+  const isBookTravelBusy = isActiveBookTravelScene && (
+    isBookTravelSubmitting ||
+    startProgressPhase === 'planner' ||
+    startProgressPhase === 'writer'
+  );
+  const currentBookTravelScene = bookTravelStore.scenes.find((s) => s.id === bookTravelStore.currentSceneId);
+  const currentBookTravelSceneTitle = currentBookTravelScene?.title?.trim();
+  const activeBookTravelProgress = bookTravelStore.activeSavedProgressId
+    ? bookTravelStore.savedProgresses.find((progress) => progress.id === bookTravelStore.activeSavedProgressId) || null
+    : null;
+  const savedProgressRows = bookTravelStore.savedProgresses.map((progress) => ({
+    progress,
+    material: resolveBookTravelProgressMaterial(progress, bookTravelStore.assembledMaterials),
+  }));
+  const filteredSavedProgressRows = bookTravelMaterialFilter
+    ? savedProgressRows.filter((row) => row.material?.id === bookTravelMaterialFilter)
+    : savedProgressRows;
+
+  const restartBookTravelAdventure = () => {
+    void cancelBookTravelStream().catch((error) => {
+      console.error('停止穿书流失败:', error);
+    });
+    createNewSession();
+    useBookTravelStore.getState().resetSession();
+    setIsTransitioningScene(false);
+  };
+
+  const openBookTravelSaveChoice = () => {
+    setBookTravelSaveTitle(
+      currentBookTravelSceneTitle || activeBookTravelProgress?.title || `穿书进度 ${new Date().toLocaleString('zh-CN')}`
+    );
+    setIsBookTravelSaveChoiceOpen(true);
+  };
+
+  const handleConfirmBookTravelSave = ({ mode, name, targetId }: SaveChoiceConfirmPayload) => {
+    const title = name || currentBookTravelSceneTitle || activeBookTravelProgress?.title || `穿书进度 ${new Date().toLocaleString('zh-CN')}`;
+    bookTravelStore.saveProgress({
+      mode: mode === 'overwrite' && targetId ? 'overwrite' : 'create',
+      title,
+      targetId: mode === 'overwrite' ? targetId : null,
+    });
+    setBookTravelSaveTitle(title);
+    setIsBookTravelSaveChoiceOpen(false);
+    message.success('进度已保存');
+  };
+
+  const showBookTravelStatusModal = () => {
+    const currentScene = bookTravelStore.scenes.find((s) => s.id === bookTravelStore.currentSceneId);
+    const summary = bookTravelStore.summaryMemory;
+    const turns = bookTravelStore.turns;
+    Modal.info({
+      title: '穿书状态',
+      width: 680,
+      content: (
+        <div style={{ lineHeight: 1.8, color: '#33312e', maxHeight: 520, overflowY: 'auto' }}>
+          <section style={{ marginBottom: 18 }}>
+            <div style={{ fontWeight: 600, marginBottom: 8 }}>当前状态</div>
+            {bookTravelStore.userCharacter && (
+              <div>
+                <strong>扮演身份：</strong>
+                {bookTravelStore.userCharacter.name}（{bookTravelStore.userCharacter.identity}）
+                <br /><strong>目标：</strong>{bookTravelStore.userCharacter.goal}
+              </div>
+            )}
+            <div style={{ marginTop: 8 }}>
+              <strong>时间：</strong>{String((bookTravelStore.currentState as any)?.time || currentScene?.time || '未知')}
+              <br /><strong>地点：</strong>{String((bookTravelStore.currentState as any)?.location || currentScene?.location || '未知')}
+            </div>
+            {bookTravelStore.volatileMemory && (
+              <div style={{ marginTop: 8 }}>
+                {Object.entries(bookTravelStore.volatileMemory).map(([k, v]) => (
+                  <div key={k}><strong>{k}：</strong>{String(v)}</div>
+                ))}
+              </div>
+            )}
+          </section>
+
+          <section>
+            <div style={{ fontWeight: 600, marginBottom: 8 }}>剧情回顾</div>
+            {summary ? (
+              <div style={{ marginBottom: 12, padding: 12, background: '#faf9f5', borderRadius: 8 }}>
+                <strong>剧情摘要：</strong>
+                <div style={{ marginTop: 4, whiteSpace: 'pre-wrap' }}>{String(summary)}</div>
+              </div>
+            ) : null}
+            {turns.length > 0 ? (
+              <div>
+                <strong>近期回合：</strong>
+                {turns.slice(-5).map((turn, idx) => (
+                  <div key={turn.id} style={{ marginTop: 8, padding: 8, background: '#faf9f5', borderRadius: 6 }}>
+                    <div style={{ fontSize: 12, color: '#8c8882', marginBottom: 4 }}>回合 {Math.max(1, turns.length - 5 + idx + 1)}</div>
+                    <div><strong>你：</strong>{turn.userInput}</div>
+                    <div style={{ marginTop: 4 }}><strong>剧情：</strong>{turn.narrativeOutput}</div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div style={{ color: '#8c8882' }}>暂无剧情记录</div>
+            )}
+          </section>
+        </div>
+      ),
+    });
+  };
+
+  const runChangeSceneWriterForPlan = async ({
+    userInput,
+    plan,
+    plannedScene,
+    currentState,
+    turnId,
+    materials,
+    stableMemory,
+    volatileMemory,
+    assembledWorldModel,
+    recentScenes,
+    recentTurns,
+  }: {
+    userInput: string;
+    plan: any;
+    plannedScene: BookTravelScene;
+    currentState: unknown;
+    turnId?: string;
+    materials: any;
+    stableMemory: unknown;
+    volatileMemory: unknown;
+    assembledWorldModel: unknown;
+    recentScenes: BookTravelScene[];
+    recentTurns: BookTravelTurnSnapshot[];
+  }) => {
+    const writerInstructions = readPlanText(plan, 'writerInstructions', 'writer_instructions') || userInput;
+    const writerConfig = settings.agentConfigs?.bookTravelSceneWriter || {};
+    const writerState = {
+      stableMemory,
+      volatileMemory,
+      assembledWorldModel,
+      currentState,
+      summaryMemory: useBookTravelStore.getState().summaryMemory || '',
+      recentScenes,
+      recentTurns,
+      plannedScene,
+      writerInstructions,
+    };
+    const writerRequest = buildBookTravelRequest('scene-writer', effectiveBookTravelSceneWriterPrompt, writerConfig, materials, writerState);
+    const writerOutputStr = await runBookTravelStreamTask(
+      'start_write_book_travel_change_scene_stream',
+      writerRequest,
+      { userInput, allowedSpeakers: plannedScene.activeCharacters || [] },
+    );
+    const writerOutput = cleanAndParseJSON(writerOutputStr);
+    const suggestedChoices = Array.isArray(writerOutput?.suggestedChoices) ? writerOutput.suggestedChoices.map(String) : undefined;
+    const newBeat = appendWriterBeatToCurrentScene(writerOutput);
+    const store = useBookTravelStore.getState();
+    const completedScene = store.scenes.find((scene) => scene.id === plannedScene.id) || {
+      ...plannedScene,
+      beats: [newBeat],
+    };
+    const turnPatch = {
+      classification: 'change-scene' as const,
+      status: 'done' as const,
+      failedStage: undefined,
+      plannerOutput: plan,
+      narrativeOutput: newBeat.content,
+      stateSnapshot: currentState,
+      createdSceneId: plannedScene.id,
+      createdBeatIds: [newBeat.id],
+      suggestedChoices,
+    };
+    const newTurn = { id: turnId || `turn-${Date.now()}`, userInput, ...turnPatch };
+    if (turnId) {
+      store.updateTurn(turnId, turnPatch);
+    } else {
+      store.appendTurn(newTurn);
+    }
+
+    const latestState = useBookTravelStore.getState();
+    const recentTurnsWithoutCurrent = latestState.turns.filter((turn) => turn.id !== newTurn.id);
+    const endingStatus = readPlanText(plan, 'endingStatus', 'ending_status');
+    if (endingStatus && endingStatus !== 'none' && endingStatus !== 'active') {
+      const judgeConfig = settings.agentConfigs?.bookTravelEndingJudge || {};
+      const judgeState = { stableMemory, volatileMemory, assembledWorldModel, currentState, summaryMemory: latestState.summaryMemory || '', recentScenes: [...recentScenes.slice(-3), completedScene], recentTurns: [...recentTurnsWithoutCurrent.slice(-5), newTurn] };
+      const judgeRequest = buildBookTravelRequest('ending-judge', settings.bookTravelEndingJudgePrompt, judgeConfig, materials, judgeState);
+      const endingJsonStr = await invoke<string>('judge_book_travel_ending', { request: judgeRequest });
+      const ending = cleanAndParseJSON(endingJsonStr);
+      useBookTravelStore.getState().finishSession(ending);
+      message.success('已达成穿书结局！');
+    } else {
+      const keeperConfig = settings.agentConfigs?.bookTravelMemoryKeeper || {};
+      const keeperState = { stableMemory, volatileMemory, assembledWorldModel, currentState, summaryMemory: latestState.summaryMemory || '', recentScenes: [...recentScenes.slice(-3), completedScene], recentTurns: [...recentTurnsWithoutCurrent.slice(-5), newTurn] };
+      const keeperRequest = buildBookTravelRequest('memory-keeper', settings.bookTravelMemoryKeeperPrompt, keeperConfig, materials, keeperState);
+      invoke<string>('summarize_book_travel_memory', { request: keeperRequest }).then((resStr) => {
+        try { const res = cleanAndParseJSON(resStr); if (res.summary) useBookTravelStore.getState().updateSummaryMemory(res.summary); }
+        catch (e) { console.error('Failed to parse memory keeper summary:', e); }
+      }).catch((err) => { console.error('Failed to update memory keeper:', err); });
+    }
+
+    return newTurn;
+  };
+
+  const handleInsertBeatStream = async (userInput: string, turnId?: string) => {
+    setIsTransitioningScene(true);
+    setStartProgressPhase('writer');
+    setWriterOutput('');
+    setStartProgressError('');
+    try {
+      const { selectedOutline, selectedWorldBook, selectedCharacterCards, stableMemory, volatileMemory, assembledWorldModel, scenes, turns } = useBookTravelStore.getState();
+      if (!selectedOutline || !selectedWorldBook) throw new Error('素材缺失');
+      const materials = {
+        outline: { id: selectedOutline.id, title: selectedOutline.title, content: selectedOutline.content },
+        worldBook: { id: selectedWorldBook.id, title: selectedWorldBook.title, content: selectedWorldBook.content },
+        characterCards: selectedCharacterCards.map((cc: any) => ({ id: cc.id, title: cc.title, content: cc.content })),
+      };
+      const writerConfig = settings.agentConfigs?.bookTravelSceneWriter || {};
+      const writerState = { stableMemory, volatileMemory, assembledWorldModel, currentState: bookTravelStore.currentState, summaryMemory: bookTravelStore.summaryMemory || '', recentScenes: scenes.slice(-3), recentTurns: turns.slice(-5), writerInstructions: userInput };
+      const writerRequest = buildBookTravelRequest('scene-writer', effectiveBookTravelSceneWriterPrompt, writerConfig, materials, writerState);
+      const currentScene = scenes.find((s) => s.id === bookTravelStore.currentSceneId);
+      const allowedSpeakers = currentScene?.activeCharacters || [];
+      const sceneJsonStr = await runBookTravelStreamTask('start_write_book_travel_insert_beat_stream', writerRequest, { userInput, allowedSpeakers });
+      const writerOutput = cleanAndParseJSON(sceneJsonStr);
+      const suggestedChoices = Array.isArray(writerOutput?.suggestedChoices) ? writerOutput.suggestedChoices.map(String) : undefined;
+      const newBeat = appendWriterBeatToCurrentScene(writerOutput);
+      const turnPatch = {
+        classification: 'insert-beat' as const,
+        status: 'done' as const,
+        failedStage: undefined,
+        narrativeOutput: newBeat?.content || '',
+        stateSnapshot: useBookTravelStore.getState().currentState,
+        createdBeatIds: [newBeat?.id || ''].filter(Boolean),
+        suggestedChoices,
+      };
+      if (turnId) {
+        useBookTravelStore.getState().updateTurn(turnId, turnPatch);
+      } else {
+        bookTravelStore.appendTurn({ id: `turn-${Date.now()}`, userInput, ...turnPatch });
+      }
+      setStartProgressPhase('done');
+    } catch (err: any) {
+      if (isBookTravelStreamCancelled(err)) {
+        message.info('已中断');
+        if (turnId) {
+          useBookTravelStore.getState().updateTurn(turnId, {
+            classification: 'insert-beat',
+            status: 'error',
+            failedStage: undefined,
+            narrativeOutput: '已中断生成',
+          });
+        }
+        setStartProgressPhase('cancelled');
+      }
+      else {
+        const errorMsg = String(err);
+        message.error(`生成失败：${errorMsg}`);
+        if (turnId) {
+          useBookTravelStore.getState().updateTurn(turnId, {
+            classification: 'insert-beat',
+            status: 'error',
+            failedStage: 'writing',
+            narrativeOutput: `写手生成失败：${errorMsg}`,
+          });
+        }
+        setStartProgressError(errorMsg);
+        setStartProgressPhase('error');
+      }
+    } finally {
+      setIsTransitioningScene(false);
+    }
+  };
+
+  const handleChangeSceneStream = async (userInput: string, turnId?: string) => {
+    setIsTransitioningScene(true);
+    setStartProgressOpen(true);
+    setStartProgressPhase('planner');
+    setPlannerOutput('');
+    setStartProgressError('');
+    let failedStage: 'planning' | 'writing' = 'planning';
+    let plan: any = null;
+    let plannedScene: BookTravelScene | null = null;
+    let newCurrentState: unknown = null;
+    try {
+      const { selectedOutline, selectedWorldBook, selectedCharacterCards, stableMemory, volatileMemory, assembledWorldModel, scenes, turns, userCharacter } = useBookTravelStore.getState();
+      if (!selectedOutline || !selectedWorldBook) throw new Error('素材缺失');
+      const materials = {
+        outline: { id: selectedOutline.id, title: selectedOutline.title, content: selectedOutline.content },
+        worldBook: { id: selectedWorldBook.id, title: selectedWorldBook.title, content: selectedWorldBook.content },
+        characterCards: selectedCharacterCards.map((cc: any) => ({ id: cc.id, title: cc.title, content: cc.content })),
+      };
+      const plannerConfig = settings.agentConfigs?.bookTravelScenePlanner || {};
+      const plannerState = { stableMemory, volatileMemory, assembledWorldModel, currentState: bookTravelStore.currentState, summaryMemory: bookTravelStore.summaryMemory || '', recentScenes: scenes.slice(-3), recentTurns: turns.slice(-5), userCharacter };
+      const plannerRequest = buildBookTravelRequest('scene-planner', settings.bookTravelPlotPlannerPrompt, plannerConfig, materials, plannerState);
+      const plannerPlanStr = await runBookTravelStreamTask('start_plan_book_travel_scene_stream', plannerRequest, { userInput });
+      plan = cleanAndParseJSON(plannerPlanStr);
+      newCurrentState = buildCurrentStateFromPlan(useBookTravelStore.getState().currentState, plan);
+      plannedScene = buildSceneFromPlan(plan, {
+        title: `新场景-${scenes.length + 1}`,
+        currentSituation: readPlanText(plan, 'summary'),
+        time: (newCurrentState as any).time || '',
+        location: (newCurrentState as any).location || '',
+        index: scenes.length + 1,
+      });
+      const store = useBookTravelStore.getState();
+      store.setCurrentState(newCurrentState);
+      store.addScene(plannedScene);
+      if (turnId) {
+        store.updateTurn(turnId, {
+          classification: 'change-scene',
+          status: 'writing',
+          failedStage: undefined,
+          plannerOutput: plan,
+          stateSnapshot: newCurrentState,
+          createdSceneId: plannedScene.id,
+        });
+      }
+      scrollToBottomOnce();
+      failedStage = 'writing';
+      setStartProgressOpen(false);
+      setStartProgressPhase('writer');
+      setWriterOutput('');
+      await runChangeSceneWriterForPlan({
+        userInput,
+        plan,
+        plannedScene,
+        currentState: newCurrentState,
+        turnId,
+        materials,
+        stableMemory,
+        volatileMemory,
+        assembledWorldModel,
+        recentScenes: scenes.slice(-3),
+        recentTurns: turns.slice(-5),
+      });
+      setStartProgressPhase('done');
+      message.success('已切换至新场景！');
+    } catch (err: any) {
+      if (isBookTravelStreamCancelled(err)) {
+        message.info('已中断');
+        if (turnId) {
+          useBookTravelStore.getState().updateTurn(turnId, {
+            classification: 'change-scene',
+            status: 'error',
+            failedStage: undefined,
+            narrativeOutput: '已中断生成',
+          });
+        }
+        setStartProgressPhase('cancelled');
+      }
+      else {
+        const errorMsg = String(err);
+        message.error(`切换场景失败：${errorMsg}`);
+        if (turnId) {
+          useBookTravelStore.getState().updateTurn(turnId, {
+            classification: 'change-scene',
+            status: 'error',
+            failedStage,
+            plannerOutput: plan || undefined,
+            stateSnapshot: newCurrentState || useBookTravelStore.getState().currentState,
+            createdSceneId: plannedScene?.id,
+            narrativeOutput: failedStage === 'writing'
+              ? `写手生成失败：${errorMsg}`
+              : `切换场景失败：${errorMsg}`,
+          });
+        }
+        setStartProgressError(errorMsg);
+        setStartProgressPhase('error');
+      }
+    } finally {
+      setIsTransitioningScene(false);
+    }
+  };
+
+  const retryBookTravelWriter = async (turn: BookTravelTurnSnapshot) => {
+    if (isBookTravelBusy) return;
+    
+    if (turn.status === 'done' && turn.createdBeatIds && turn.createdBeatIds.length > 0) {
+      useBookTravelStore.getState().removeLastBeatFromCurrentScene();
+    }
+    
+    setIsBookTravelSubmitting(true);
+    useBookTravelStore.getState().updateTurn(turn.id, {
+      status: 'writing',
+      failedStage: undefined,
+      narrativeOutput: '',
+    });
+
+    if (turn.classification === 'insert-beat') {
+      try {
+        await handleInsertBeatStream(turn.userInput, turn.id);
+      } finally {
+        setIsBookTravelSubmitting(false);
+      }
+      return;
+    }
+
+    setIsTransitioningScene(true);
+    setStartProgressOpen(false);
+    setStartProgressPhase('writer');
+    setWriterOutput('');
+    setStartProgressError('');
+    try {
+      const store = useBookTravelStore.getState();
+      const { selectedOutline, selectedWorldBook, selectedCharacterCards, stableMemory, volatileMemory, assembledWorldModel } = store;
+      if (!selectedOutline || !selectedWorldBook) throw new Error('素材缺失');
+      if (!turn.plannerOutput || !turn.createdSceneId) throw new Error('缺少可重试的场景规划');
+      const plannedScene = store.scenes.find((scene) => scene.id === turn.createdSceneId);
+      if (!plannedScene) throw new Error('找不到规划出的场景');
+      const materials = {
+        outline: { id: selectedOutline.id, title: selectedOutline.title, content: selectedOutline.content },
+        worldBook: { id: selectedWorldBook.id, title: selectedWorldBook.title, content: selectedWorldBook.content },
+        characterCards: selectedCharacterCards.map((cc: any) => ({ id: cc.id, title: cc.title, content: cc.content })),
+      };
+      await runChangeSceneWriterForPlan({
+        userInput: turn.userInput,
+        plan: turn.plannerOutput,
+        plannedScene,
+        currentState: turn.stateSnapshot || store.currentState,
+        turnId: turn.id,
+        materials,
+        stableMemory,
+        volatileMemory,
+        assembledWorldModel,
+        recentScenes: store.scenes.slice(-3),
+        recentTurns: store.turns.slice(-5),
+      });
+      setStartProgressPhase('done');
+      message.success('场景写手已重试完成');
+    } catch (err: any) {
+      if (isBookTravelStreamCancelled(err)) {
+        message.info('已中断');
+        useBookTravelStore.getState().updateTurn(turn.id, {
+          status: 'error',
+          failedStage: undefined,
+          narrativeOutput: '已中断生成',
+        });
+        setStartProgressPhase('cancelled');
+      } else {
+        const errorMsg = String(err);
+        message.error(`写手生成失败：${errorMsg}`);
+        useBookTravelStore.getState().updateTurn(turn.id, {
+          status: 'error',
+          failedStage: 'writing',
+          narrativeOutput: `写手生成失败：${errorMsg}`,
+        });
+        setStartProgressError(errorMsg);
+        setStartProgressPhase('error');
+      }
+    } finally {
+      setIsTransitioningScene(false);
+      setIsBookTravelSubmitting(false);
+    }
+  };
+
+  const startBookTravelAdventure = async () => {
+    const { selectedEntryPointId, userCharacter, assembledWorldModel, stableMemory, volatileMemory, selectedOutline, selectedWorldBook, selectedCharacterCards } = bookTravelStore;
+    if (!selectedEntryPointId) {
+      message.warning('请选择一个入场点');
+      return;
+    }
+    if (!userCharacter || !userCharacter.name.trim()) {
+      message.warning('请选择或填写一个扮演身份');
+      return;
+    }
+    if (!selectedOutline || !selectedWorldBook) {
+      message.warning('素材缺失，请重新装配素材');
+      return;
+    }
+    bookTravelStore.setInitialStylePresetSnapshot(
+      [...bookTravelStore.selectedStylePresetIds],
+      effectiveBookTravelSceneWriterPrompt,
+    );
+
+    setIsTransitioningScene(true);
+    setStartProgressOpen(true);
+    setStartProgressPhase('planner');
+    setPlannerOutput('');
+    setStartProgressError('');
+
+    let openingTurnId: string | null = null;
+    let plannerCompleted = false;
+    try {
+      const entryPoint = bookTravelStore.entryPoints.find(ep => ep.id === selectedEntryPointId);
+      if (!entryPoint) throw new Error('选中的入场点不存在');
+
+      const materials = {
+        outline: { id: selectedOutline.id, title: selectedOutline.title, content: selectedOutline.content },
+        worldBook: { id: selectedWorldBook.id, title: selectedWorldBook.title, content: selectedWorldBook.content },
+        characterCards: selectedCharacterCards.map(cc => ({ id: cc.id, title: cc.title, content: cc.content })),
+      };
+
+      const plannerConfig = settings.agentConfigs?.bookTravelScenePlanner || {};
+      const plannerState = { stableMemory, volatileMemory, assembledWorldModel, currentState: null, summaryMemory: '', recentScenes: [], recentTurns: [], userCharacter, selectedEntryPointId };
+      const plannerRequest = buildBookTravelRequest('scene-planner', settings.bookTravelPlotPlannerPrompt, plannerConfig, materials, plannerState);
+      const plannerInput = `确认以入场点 [${entryPoint.title}] 入场，扮演新身份 [${userCharacter.name}]（${userCharacter.identity}）。\n详细局势：${entryPoint.situation || entryPoint.summary || ''}\n初始目标：${entryPoint.initialGoal || ''}\n面临风险：${entryPoint.risk || ''}`;
+      const plannerPlanStr = await runBookTravelStreamTask('start_plan_book_travel_scene_stream', plannerRequest, { userInput: plannerInput });
+
+      const plan = cleanAndParseJSON(plannerPlanStr);
+      const newCurrentState = buildCurrentStateFromPlan(
+        plannerState.currentState,
+        plan,
+        entryPoint.timeAndLocation || '',
+        entryPoint.timeAndLocation || '',
+      );
+      const plannedScene = buildSceneFromPlan(plan, {
+        title: entryPoint.title,
+        summary: entryPoint.situation || entryPoint.summary,
+        currentSituation: entryPoint.situation,
+        time: (newCurrentState as any).time || entryPoint.timeAndLocation,
+        location: (newCurrentState as any).location || entryPoint.timeAndLocation,
+        index: 1,
+      });
+      const store = useBookTravelStore.getState();
+      store.setCurrentState(newCurrentState);
+      store.addScene(plannedScene);
+      openingTurnId = `turn-${Date.now()}`;
+      plannerCompleted = true;
+      store.appendTurn({
+        id: openingTurnId,
+        userInput: plannerInput,
+        classification: 'change-scene' as const,
+        status: 'writing' as const,
+        plannerOutput: plan,
+        narrativeOutput: '',
+        stateSnapshot: newCurrentState,
+        createdSceneId: plannedScene.id,
+        createdBeatIds: [],
+      });
+      scrollToBottomOnce();
+
+      setStartProgressOpen(false);
+      setStartProgressPhase('writer');
+      setWriterOutput('');
+      const writerConfig = settings.agentConfigs?.bookTravelSceneWriter || {};
+      const writerInstructions = readPlanText(plan, 'writerInstructions', 'writer_instructions') || plannerInput;
+      const writerState = { stableMemory, volatileMemory, assembledWorldModel, currentState: newCurrentState, summaryMemory: '', recentScenes: [], recentTurns: [], plannedScene, writerInstructions };
+      const writerRequest = buildBookTravelRequest('scene-writer', effectiveBookTravelSceneWriterPrompt, writerConfig, materials, writerState);
+      const sceneJsonStr = await runBookTravelStreamTask('start_write_book_travel_change_scene_stream', writerRequest, { userInput: writerInstructions, allowedSpeakers: plannedScene.activeCharacters || [] });
+
+      const writerOutput = cleanAndParseJSON(sceneJsonStr);
+      const suggestedChoices = Array.isArray(writerOutput?.suggestedChoices) ? writerOutput.suggestedChoices.map(String) : undefined;
+      const firstBeat = appendWriterBeatToCurrentScene(writerOutput);
+      useBookTravelStore.getState().updateTurn(openingTurnId, {
+        status: 'done' as const,
+        failedStage: undefined,
+        plannerOutput: plan,
+        narrativeOutput: firstBeat?.content || '',
+        stateSnapshot: newCurrentState,
+        createdSceneId: plannedScene.id,
+        createdBeatIds: [firstBeat?.id || ''],
+        suggestedChoices,
+      });
+      const autoTitle = `${selectedOutline.title}-${entryPoint.title}`;
+      setSessionTitle(autoTitle);
+      sessionTitleRef.current = autoTitle;
+      setStartProgressPhase('done');
+      message.success('穿书冒险已开始！');
+    } catch (err: any) {
+      if (isBookTravelStreamCancelled(err)) {
+        message.info('已中断穿书开始');
+        if (openingTurnId) {
+          useBookTravelStore.getState().updateTurn(openingTurnId, {
+            status: 'error',
+            failedStage: undefined,
+            narrativeOutput: '已中断生成',
+          });
+        }
+        setStartProgressPhase('cancelled');
+      } else {
+        const errorMsg = String(err);
+        if (openingTurnId) {
+          useBookTravelStore.getState().updateTurn(openingTurnId, {
+            status: 'error',
+            failedStage: 'writing',
+            narrativeOutput: `写手生成失败：${errorMsg}`,
+          });
+        }
+        message.error(plannerCompleted ? `写手生成失败：${errorMsg}` : `开始穿书冒险失败：${errorMsg}`);
+        setStartProgressError(errorMsg);
+        setStartProgressPhase('error');
+        console.error(err);
+      }
+    } finally {
+      setIsTransitioningScene(false);
+    }
+  };
+
+  const handleSend = async () => {
+    const trimmed = input.trim();
+    if (!trimmed || isStreaming || isBookTravelBusy) return;
+
+    if (isActiveBookTravelScene) {
+      const formattedBookTravelInput = formatBookTravelUserInput(trimmed, inputMode);
+      setIsBookTravelSubmitting(true);
+      setInput('');
+      const pendingTurnId = `turn-${Date.now()}`;
+      let pendingTurnCreated = false;
+      try {
+        const { selectedOutline, selectedWorldBook, selectedCharacterCards } = useBookTravelStore.getState();
+        if (!selectedOutline || !selectedWorldBook) {
+          message.error('素材缺失，请重新装配素材');
+          return;
+        }
+        useBookTravelStore.getState().appendTurn({
+          id: pendingTurnId,
+          userInput: formattedBookTravelInput,
+          status: 'classifying',
+          narrativeOutput: '',
+          stateSnapshot: useBookTravelStore.getState().currentState,
+          createdBeatIds: [],
+        });
+        pendingTurnCreated = true;
+        scrollToBottomOnce();
+        const materials = {
+          outline: { id: selectedOutline.id, title: selectedOutline.title, content: selectedOutline.content },
+          worldBook: { id: selectedWorldBook.id, title: selectedWorldBook.title, content: selectedWorldBook.content },
+          characterCards: selectedCharacterCards.map((cc: any) => ({ id: cc.id, title: cc.title, content: cc.content })),
+        };
+        const classifierConfig = settings.agentConfigs?.bookTravelInputClassifier || {};
+        const latestBookTravelState = useBookTravelStore.getState();
+        const classifierState = {
+          stableMemory: latestBookTravelState.stableMemory,
+          volatileMemory: latestBookTravelState.volatileMemory,
+          assembledWorldModel: latestBookTravelState.assembledWorldModel,
+          currentState: latestBookTravelState.currentState,
+          summaryMemory: latestBookTravelState.summaryMemory || '',
+          recentScenes: latestBookTravelState.scenes.slice(-3),
+          recentTurns: latestBookTravelState.turns.slice(-5),
+          userCharacter: latestBookTravelState.userCharacter,
+        };
+        const classifierRequest = buildBookTravelRequest(
+          'input-classifier',
+          '你是一个穿书行动分类器。根据用户输入判断其会影响当前场景内的局部互动，还是需要切换到新场景。\n- insert-beat: 在当前场景中继续互动，例如对话、观察、小动作、短暂试探。\n- change-scene: 切换场景，例如离开地点、跳过时间、做出重大决定、触发新事件。\n只输出严格 JSON，classification 只能是 insert-beat 或 change-scene，不要解释。\n正确回复样例：{"classification":"insert-beat"}',
+          { ...classifierConfig, temperature: 0 },
+          materials,
+          classifierState,
+        );
+        const classificationResult = await invoke<{ classification: 'insert-beat' | 'change-scene' }>('classify_book_travel_input', {
+          request: classifierRequest,
+          userInput: formattedBookTravelInput,
+        });
+        switch (classificationResult.classification) {
+          case 'insert-beat':
+            useBookTravelStore.getState().updateTurn(pendingTurnId, { classification: 'insert-beat', status: 'writing', failedStage: undefined });
+            await handleInsertBeatStream(formattedBookTravelInput, pendingTurnId);
+            break;
+          case 'change-scene':
+            useBookTravelStore.getState().updateTurn(pendingTurnId, { classification: 'change-scene', status: 'writing', failedStage: undefined });
+            await handleChangeSceneStream(formattedBookTravelInput, pendingTurnId);
+            break;
+          default: message.warning('无法识别输入意图，请重新输入');
+        }
+      } catch (err) {
+        if (pendingTurnCreated) {
+          useBookTravelStore.getState().updateTurn(pendingTurnId, {
+            status: 'error',
+            failedStage: 'classifying',
+            narrativeOutput: `处理失败：${String(err)}`,
+          });
+        }
+        message.error(`处理失败：${String(err)}`);
+      } finally {
+        setIsBookTravelSubmitting(false);
+      }
+      return;
+    }
+
+    let formattedText = trimmed;
+    if (inputMode === 'speech') {
+      formattedText = `我："${trimmed}"`;
+    } else if (inputMode === 'behavior') {
+      formattedText = `（我 ${trimmed}）`;
+    } else if (inputMode === 'plot') {
+      formattedText = `[剧情推进] ${trimmed}`;
+    }
+    const userMessage: Message = { id: `msg-${Date.now()}`, role: 'user', content: formattedText, tools: [] };
+    const agentMessageId = `msg-${Date.now() + 1}`;
+    const pendingAgentMessage: Message = { id: agentMessageId, role: 'agent', content: '', tools: [] };
+    const nextMessages = [...messages, userMessage, pendingAgentMessage];
+    messagesRef.current = nextMessages;
+    setMessages(nextMessages);
+    setInput('');
+    setIsStreaming(true);
+    scrollToBottomOnce();
+    try {
+      const modelMessages = buildStoryModelMessages(nextMessages.slice(0, -1));
+      const runId = await invoke<string>('start_chat_completion_stream', {
+        request: {
+          agentId: storyAgentConfigId,
+          modelInterface: settings.modelInterface, baseUrl: settings.llmBaseUrl, apiKey: settings.llmApiKey,
+          model: settings.llmModel, temperature: storyAgentConfig.temperature ?? 0.3,
+          maxOutputTokens: storyAgentConfig.maxOutputTokens ?? 32000,
+          maxContextTokens: storyAgentConfig.maxContextTokens ?? 200000,
+          compactionTurnThreshold: storyAgentConfig.compactionTurnThreshold ?? 20,
+          frequencyPenalty: storyAgentConfig.frequencyPenalty ?? 0.3,
+          presencePenalty: storyAgentConfig.presencePenalty ?? 0.2,
+          topP: storyAgentConfig.topP ?? 0.9,
+          thinkingDepth: storyAgentConfig.thinkingDepth ?? 'off',
+          systemPrompt: effectiveSystemPrompt, workspacePath: null, messages: modelMessages,
+          contextCompaction: contextCompactionRef.current, selectedReferenceFiles: [],
+          allowedTools: storyAllowedTools, rolePlayContext,
+        }
+      });
+      activeRunRef.current = { runId, messageId: agentMessageId };
+      setActiveRun({ runId, messageId: agentMessageId });
+    } catch (err) {
+      activeRunRef.current = { runId: null, messageId: null };
+      setActiveRun({ runId: null, messageId: null });
+      setIsStreaming(false);
+      setMessages((prev) => prev.map((msg) => msg.id === agentMessageId ? { ...msg, content: `请求冒险发生故障：${String(err)}` } : msg));
+    }
+  };
+
+  const handleStop = async () => {
+    if (activeRunRef.current.runId) {
+      try {
+        await invoke('stop_chat_stream', { runId: activeRunRef.current.runId });
+      } catch (err) {
+        console.error('停止冒险失败:', err);
+      }
+    }
+    setIsStreaming(false);
+  };
+
+  // Context Stats
+  const effectiveContextMessages = getEffectiveMessagesForContextStats(messages, contextCompaction);
+  const contextStats = estimateContextUsage(effectiveSystemPrompt, effectiveContextMessages, input);
+  const maxContext = storyAgentConfig.maxContextTokens ?? 200000;
+  const contextPercent = maxContext > 0
+    ? Math.min(100, Math.round((contextStats.total / maxContext) * 100))
+    : 0;
+
+  const contextTooltip = (
+    <div className="agent-context-popover">
+      <div className="agent-context-popover__header">
+        <strong>冒险上下文详情</strong>
+      </div>
+      <div className="agent-context-popover__row">
+        <span className="agent-context-popover__label">世界书：</span>
+        <span className="agent-context-popover__value">{selectedWorldBook?.title || '未绑定'}</span>
+      </div>
+      <div className="agent-context-popover__row">
+        <span className="agent-context-popover__label">活跃角色：</span>
+        <span className="agent-context-popover__value">{selectedCards.map(c => c.title).join(', ') || '未绑定'}</span>
+      </div>
+      <div className="agent-context-popover__divider" />
+      <div className="agent-context-popover__row">
+        <span className="agent-context-popover__label">总估 Token：</span>
+        <span className="agent-context-popover__value agent-context-popover__value--highlight">{contextStats.total} / {maxContext}</span>
+      </div>
+    </div>
+  );
+
+
+  const canStartBookTravel = Boolean(
+    bookTravelStore.selectedMaterialId &&
+    bookTravelStore.selectedEntryPointId &&
+    bookTravelStore.userCharacter?.name?.trim()
+  );
+
+  return (
+    <div className="agent-chat book-travel-page">
+
+      <SaveChoiceModal
+        open={isBookTravelSaveChoiceOpen}
+        title="保存进度"
+        nameLabel="进度名称"
+        initialName={bookTravelSaveTitle || currentBookTravelSceneTitle || '穿书进度'}
+        loading={false}
+        overwriteAvailable={bookTravelStore.savedProgresses.length > 0}
+        overwriteTargetLabel="覆盖进度"
+        overwriteTargets={bookTravelStore.savedProgresses.map((progress) => {
+          const material = resolveBookTravelProgressMaterial(progress, bookTravelStore.assembledMaterials);
+          const worldBookTitle = progress.snapshot.selectedWorldBook?.title || material?.materials.worldBook.title || null;
+          const characterDetails = buildBookTravelCharacterDetails(
+            progress.snapshot.selectedCharacterCards.length > 0
+              ? progress.snapshot.selectedCharacterCards
+              : material?.materials.characterCards || []
+          );
+          return {
+            value: progress.id,
+            label: progress.title || '未命名进度',
+            description: `保存于 ${formatHistorySavedAt(progress.savedAt)}`,
+            details: [
+              `穿书素材：${material?.title || '未匹配穿书素材'}`,
+              worldBookTitle ? `世界书：${worldBookTitle}` : '未绑定世界书',
+              ...characterDetails,
+            ],
+          };
+        })}
+        initialOverwriteTargetId={activeBookTravelProgress?.id || bookTravelStore.savedProgresses[0]?.id || null}
+        unavailableOverwriteText="当前没有可覆盖的原记录，将保存为新记录。"
+        onCancel={() => setIsBookTravelSaveChoiceOpen(false)}
+        onConfirm={handleConfirmBookTravelSave}
+      />
+
+      {/* Book Travel Planner Progress Modal */}
+      <Modal
+        open={startProgressOpen}
+        onCancel={() => {
+          if (startProgressPhase === 'error' || startProgressPhase === 'cancelled') {
+            setStartProgressOpen(false);
+            setStartProgressPhase('done');
+          }
+        }}
+        closable={startProgressPhase === 'error' || startProgressPhase === 'cancelled'}
+        maskClosable={startProgressPhase === 'error' || startProgressPhase === 'cancelled'}
+        title={
+          <div className="book-travel-modal-title">
+            <CompassOutlined style={{ color: '#d97757' }} />
+            <span>穿书任务进展</span>
+          </div>
+        }
+        width={680}
+        styles={{ body: { padding: '16px 24px' } }}
+        footer={
+          startProgressPhase === 'planner' ? (
+            <div className="book-travel-modal-footer">
+              <Button size="small" onClick={handleCancelStart}>中断</Button>
+            </div>
+          ) : (
+            <div className="book-travel-modal-footer">
+              <Button onClick={() => { setStartProgressOpen(false); setStartProgressPhase('done'); }}>关闭</Button>
+            </div>
+          )
+        }
+      >
+        <div className="book-travel-progress-body">
+          {startProgressPhase === 'planner' && (
+            <div className="book-travel-progress-stack">
+              <div className="book-travel-progress-line">
+                <Spin size="small" />
+                🧠 剧情规划师正在分析你的行动...
+                <span style={{ fontSize: 12, color: '#b8b3ab', fontFamily: 'monospace', marginLeft: 'auto' }}>
+                  {formatElapsed(startElapsedMs)}
+                </span>
+              </div>
+              <div className="book-travel-planner-output">
+                {plannerOutput}
+                <span style={{ display: 'inline-block', width: 2, height: 14, background: '#d97757', marginLeft: 2, verticalAlign: 'middle', animation: 'blink 1s step-end infinite' }} />
+              </div>
+            </div>
+          )}
+
+          {startProgressPhase === 'error' && (
+            <div className="book-travel-error-notice">
+              生成失败：{startProgressError}
+            </div>
+          )}
+
+          {startProgressPhase === 'cancelled' && (
+            <div className="book-travel-cancel-notice">
+              已中断生成
+            </div>
+          )}
+        </div>
+      </Modal>
+
+      {/* Header */}
+      <div className="agent-chat__header" style={{ borderBottom: '1px solid #eae6df', padding: '16px 24px' }}>
+        <div className="agent-chat__title">
+          <CompassOutlined style={{ color: '#d97757', fontSize: 18 }} />
+          <h3 style={{ margin: 0, fontWeight: 600, color: '#33312e', display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {bookTravelStore.selectedOutline?.title ? `穿书中 · ${bookTravelStore.selectedOutline.title}` : '穿书准备中'}
+            </span>
+            {bookTravelStore.selectedMaterialId || bookTravelStore.scenes.length > 0 ? (
+              <Tag color="#d97757" style={{ marginLeft: 8, borderRadius: 4, flexShrink: 0, whiteSpace: 'nowrap' }}>
+                {bookTravelStore.scenes.length > 0
+                  ? `穿书中 · ${bookTravelStore.scenes.find((s) => s.id === bookTravelStore.currentSceneId)?.title || '场景'}`
+                  : '穿书准备中'}
+              </Tag>
+            ) : (
+              <span style={{ fontSize: 12, color: '#8c8882', fontWeight: 400, flexShrink: 0, whiteSpace: 'nowrap' }}>
+                ({selectedWorldBook?.title || '无世界书'} · {selectedCards.length}个活跃角色)
+              </span>
+            )}
+          </h3>
+        </div>
+
+        <div className="agent-chat__header-actions">
+          {bookTravelStore.scenes.length > 0 && (
+            <Tooltip title="保存当前穿书进度">
+              <Button
+                aria-label="保存进度"
+                type="text"
+                disabled={isStreaming}
+                icon={<FileProtectOutlined />}
+                onClick={openBookTravelSaveChoice}
+                style={{
+                  color: isStreaming ? '#8c8882' : '#d97757',
+                  fontWeight: 500,
+                  fontSize: 13,
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 4
+                }}
+              >
+                保存进度
+              </Button>
+            </Tooltip>
+          )}
+
+          <Tooltip title="重开新冒险">
+            <Button aria-label="重开新冒险" type="text" icon={<ReloadOutlined />} onClick={restartBookTravelAdventure} />
+          </Tooltip>
+
+          <Tooltip title="自主叙事引擎（观察 / 章节草稿）">
+            <Button
+              aria-label="叙事引擎"
+              type="text"
+              icon={<ExperimentOutlined />}
+              onClick={() => setIsNarrativeDrawerOpen(true)}
+            />
+          </Tooltip>
+
+          <Tooltip title="穿书保存进度">
+            <Button
+              aria-label="穿书保存进度"
+              type="text"
+              icon={<HistoryOutlined />}
+              onClick={() => setIsBookTravelHistoryOpen(true)}
+            />
+          </Tooltip>
+        </div>
+      </div>
+
+      <Drawer
+        title="自主叙事引擎"
+        placement="right"
+        width={560}
+        open={isNarrativeDrawerOpen}
+        onClose={() => setIsNarrativeDrawerOpen(false)}
+        destroyOnHidden
+      >
+        {isNarrativeDrawerOpen && <NarrativeRuntimePanel />}
+      </Drawer>
+
+      <Modal
+        open={isBookTravelHistoryOpen}
+        title="穿书进度"
+        footer={null}
+        centered
+        width={720}
+        onCancel={() => setIsBookTravelHistoryOpen(false)}
+      >
+        <Select
+          aria-label="按穿书素材筛选"
+          allowClear
+          placeholder="按穿书素材筛选"
+          value={bookTravelMaterialFilter}
+          onChange={(value) => setBookTravelMaterialFilter(value ?? null)}
+          options={bookTravelStore.assembledMaterials.map((material) => ({ value: material.id, label: material.title }))}
+          style={{ width: '100%', marginBottom: 16 }}
+        />
+        {filteredSavedProgressRows.length === 0 ? (
+          <Empty description={bookTravelMaterialFilter ? '没有符合筛选的穿书进度' : '暂无保存的穿书进度'} />
+        ) : (
+          <div className="book-travel-history-list">
+            {filteredSavedProgressRows.map(({ progress, material }) => (
+              <div
+                key={progress.id}
+                className="book-travel-history-row"
+              >
+                <button
+                  type="button"
+                  aria-label={`打开${progress.title}`}
+                  onClick={() => {
+                    bookTravelStore.loadSavedProgress(progress.id);
+                    setIsBookTravelHistoryOpen(false);
+                  }}
+                  className="book-travel-history-open"
+                >
+                  <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'baseline' }}>
+                    <strong style={{ color: '#33312e', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {progress.title}
+                    </strong>
+                    <span style={{ color: '#9a948c', fontSize: 12, flexShrink: 0 }}>
+                      {savedProgressDateFormatter.format(new Date(progress.savedAt))}
+                    </span>
+                  </div>
+                  <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 }}>
+                    <Tag color={material ? 'orange' : 'default'}>
+                      穿书素材：{material?.title || '未匹配穿书素材'}
+                    </Tag>
+                  </div>
+                </button>
+                <div style={{ display: 'flex', alignItems: 'center', paddingRight: 8 }}>
+                  <Button
+                    type="text"
+                    danger
+                    aria-label={`删除${progress.title}`}
+                    icon={<DeleteOutlined />}
+                    onClick={() => bookTravelStore.deleteSavedProgress(progress.id)}
+                  />
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </Modal>
+
+      {/* Unified scrollable content area */}
+      <div ref={chatHistoryRef} className="book-travel-scroll">
+        {bookTravelStore.scenes.length > 0 ? (
+          <div className="book-travel-turns">
+            {/* Turns history */}
+            {bookTravelStore.turns.map((turn, idx) => {
+              const createdScene = turn.createdSceneId ? bookTravelStore.scenes.find((s) => s.id === turn.createdSceneId) : null;
+              const currentScene = bookTravelStore.scenes.find((s) => s.id === bookTravelStore.currentSceneId);
+              const sceneContext = createdScene || currentScene;
+              const sceneGoals = getPlannerSceneGoals(turn.plannerOutput);
+              const userCharacterLabel = bookTravelStore.userCharacter
+                ? `${bookTravelStore.userCharacter.name}（${bookTravelStore.userCharacter.identity}）`
+                : '';
+              const shouldShowSceneBrief = turn.classification === 'change-scene' && (Boolean(userCharacterLabel) || sceneGoals.length > 0);
+              const shouldShowSituationCard = shouldShowSceneBrief || Boolean(sceneContext?.currentSituation);
+              const canRetryWriter = turn.status === 'error' && turn.failedStage === 'writing';
+              const getSuggestedChoiceKey = createStableContentKey(`${turn.id}-choice`);
+              return (
+                <div key={turn.id} className="book-travel-turn">
+                  <div className="book-travel-user-row">
+                    {editingUserId === turn.id ? (
+                      <div className="book-travel-user-bubble" style={{ width: '100%', padding: 0, background: 'transparent' }}>
+                        <Input.TextArea
+                          value={editingUserText}
+                          onChange={(e) => setEditingUserText(e.target.value)}
+                          autoSize={{ minRows: 2, maxRows: 6 }}
+                          style={{ marginBottom: 8 }}
+                        />
+                        <div style={{ textAlign: 'right' }}>
+                          <Button size="small" onClick={() => setEditingUserId(null)} style={{ marginRight: 8 }}>取消</Button>
+                          <Button size="small" type="primary" onClick={() => void saveEditUser(turn)}>保存并重新生成</Button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
+                        <div className="book-travel-user-bubble">
+                          {turn.userInput}
+                        </div>
+                        {idx === bookTravelStore.turns.length - 1 && !bookTravelStore.isCompleted && !isBookTravelBusy && (
+                          <div style={{ marginTop: 4, textAlign: 'right' }}>
+                            <Button
+                              type="text"
+                              size="small"
+                              icon={<EditOutlined />}
+                              onClick={() => startEditUser(turn)}
+                              style={{ color: '#d97757' }}
+                            >
+                              编辑
+                            </Button>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                  {sceneContext && (
+                    <div className="book-travel-scene-card">
+                      <div style={{ fontSize: 15, fontWeight: 600, color: '#33312e', marginBottom: 6 }}>{sceneContext.title}</div>
+                      <div className="book-travel-scene-meta">
+                        {sceneContext.time && <span>时间：{sceneContext.time}</span>}
+                        {sceneContext.location && <span>地点：{sceneContext.location}</span>}
+                      </div>
+                      {createdScene && createdScene.summary && (
+                        <div style={{ fontSize: 12, color: '#8c8882', marginBottom: 8, fontStyle: 'italic' }}>
+                          {createdScene.summary}
+                        </div>
+                      )}
+                      {shouldShowSituationCard && (
+                        <div data-testid="scene-situation-card" className="book-travel-situation-card">
+                          {userCharacterLabel && (
+                            <div>
+                              <span style={{ color: '#d97757', fontWeight: 600 }}>扮演身份：</span>{userCharacterLabel}
+                            </div>
+                          )}
+                          {sceneGoals.length > 0 && (
+                            <div>
+                              <span style={{ color: '#d97757', fontWeight: 600 }}>场景目标：</span>{sceneGoals.join('、')}
+                            </div>
+                          )}
+                          {sceneContext.currentSituation && (
+                            <div>
+                              <span style={{ color: '#d97757', fontWeight: 600 }}>当前局势：</span>{sceneContext.currentSituation}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      {sceneContext.activeCharacters && sceneContext.activeCharacters.length > 0 && (
+                        <div className="book-travel-character-tags">
+                          {sceneContext.activeCharacters.map((name) => (
+                            <Tag key={name} color="#d97757" style={{ borderRadius: 4, margin: 0 }}>{name}</Tag>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  {turn.narrativeOutput ? (
+                    <div className="book-travel-narrative-row">
+                      {editingNarrativeId === turn.id ? (
+                        <div className="book-travel-narrative-bubble" style={{ width: '100%', padding: 0, background: 'transparent' }}>
+                          <Input.TextArea
+                            value={editingNarrativeText}
+                            onChange={(e) => setEditingNarrativeText(e.target.value)}
+                            autoSize={{ minRows: 3, maxRows: 10 }}
+                            style={{ marginBottom: 8 }}
+                          />
+                          <div style={{ textAlign: 'right' }}>
+                            <Button size="small" onClick={() => setEditingNarrativeId(null)} style={{ marginRight: 8 }}>取消</Button>
+                            <Button size="small" type="primary" onClick={() => saveEditNarrative(turn)}>保存</Button>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="book-travel-narrative-bubble">
+                          {turn.narrativeOutput}
+                        </div>
+                      )}
+                      
+                      <div style={{ marginTop: 6, display: 'flex', alignItems: 'center', gap: 8 }}>
+                        {canRetryWriter && (
+                          <Button
+                            disabled={isBookTravelBusy}
+                            icon={<ReloadOutlined />}
+                            onClick={() => void retryBookTravelWriter(turn)}
+                            size="small"
+                            type="text"
+                            style={{ color: '#d97757', paddingInline: 6 }}
+                          >
+                            重试写手
+                          </Button>
+                        )}
+                        {!canRetryWriter && idx === bookTravelStore.turns.length - 1 && !bookTravelStore.isCompleted && !isBookTravelBusy && (
+                          <>
+                            <Button
+                              type="text"
+                              size="small"
+                              icon={<ReloadOutlined />}
+                              onClick={() => void retryBookTravelWriter(turn)}
+                              style={{ color: '#d97757', paddingInline: 6 }}
+                            >
+                              重新生成
+                            </Button>
+                            <Button
+                              type="text"
+                              size="small"
+                              icon={<EditOutlined />}
+                              onClick={() => startEditNarrative(turn)}
+                              style={{ color: '#d97757', paddingInline: 6 }}
+                            >
+                              编辑
+                            </Button>
+                          </>
+                        )}
+                      </div>
+                      {turn.suggestedChoices && turn.suggestedChoices.length > 0 && !bookTravelStore.isCompleted && idx === bookTravelStore.turns.length - 1 && (
+                        <div className="book-travel-suggested-choices" style={{ marginTop: 12, display: 'flex', flexDirection: 'column', gap: 8 }}>
+                          {turn.suggestedChoices.map((choice) => (
+                            <Button
+                              key={getSuggestedChoiceKey(choice)}
+                              type="dashed"
+                              style={{ textAlign: 'left', height: 'auto', padding: '8px 12px', whiteSpace: 'normal', color: '#d97757', borderColor: '#d97757' }}
+                              onClick={() => {
+                                setInput(choice);
+                                setInputMode('behavior');
+                              }}
+                            >
+                              {choice}
+                            </Button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  ) : turn.status === 'classifying' ? (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: '#8c8882', fontSize: 13, paddingLeft: 4 }}>
+                      <Spin size="small" />
+                      正在识别行动...
+                    </div>
+                  ) : null}
+                </div>
+              );
+            })}
+
+            {/* Streaming progress in message stream */}
+            {startProgressPhase === 'writer' && (
+              <div className="book-travel-stream-card">
+                <div className="book-travel-progress-line">
+                  <Spin size="small" />
+                  ✍️ 场景写手正在书写...
+                  <span style={{ fontSize: 12, color: '#b8b3ab', fontFamily: 'monospace', marginLeft: 'auto' }}>
+                    {formatElapsed(startElapsedMs)}
+                  </span>
+                </div>
+                {(() => {
+                  const partial = extractPartialContent(writerOutput);
+                  return partial !== null ? (
+                    <div className="book-travel-writer-output">
+                      {partial}
+                      <span style={{ display: 'inline-block', width: 2, height: 14, background: '#d97757', marginLeft: 2, verticalAlign: 'middle', animation: 'blink 1s step-end infinite' }} />
+                    </div>
+                  ) : null;
+                })()}
+                <div className="book-travel-modal-footer">
+                  <Button size="small" onClick={handleCancelStart}>中断</Button>
+                </div>
+              </div>
+            )}
+            {startProgressPhase === 'error' && (
+              <div className="book-travel-error-notice">
+                生成失败：{startProgressError}
+              </div>
+            )}
+            {startProgressPhase === 'cancelled' && (
+              <div className="book-travel-cancel-notice">
+                已中断生成
+              </div>
+            )}
+
+          </div>
+        ) : (
+          /* Book Travel Setup Wizard */
+          <div className="book-travel-setup">
+            <div style={{ textAlign: 'center', marginBottom: '32px' }}>
+              <CompassOutlined style={{ fontSize: '56px', color: '#d97757', marginBottom: '16px', opacity: 0.9 }} />
+              <h2 style={{ fontSize: '26px', fontWeight: 600, color: '#33312e', margin: '0 0 8px 0', letterSpacing: '-0.5px' }}>
+                穿书页
+              </h2>
+              <p style={{ color: '#8c8882', fontSize: '15px', margin: 0 }}>
+                选择穿书素材与入场点，进入小说世界展开独一无二的剧情体验
+              </p>
+            </div>
+
+            <div className="book-travel-setup-card">
+              {/* Select Assembled Material */}
+              <div>
+                <div style={{ fontSize: '14px', fontWeight: 600, color: '#33312e', marginBottom: '8px' }}>
+                  选择穿书素材
+                </div>
+                {bookTravelStore.assembledMaterials.length === 0 ? (
+                  <div className="book-travel-empty-card">
+                    暂无已装配素材，请先前往<Button type="link" style={{ padding: 0, height: 'auto' }} onClick={() => navigate('/book-travel-materials')}>穿书素材页</Button>装配素材
+                  </div>
+                ) : (
+                  <Select
+                    placeholder="选择一个已装配素材"
+                    value={bookTravelStore.selectedMaterialId}
+                    onChange={(id) => bookTravelStore.loadAssembledMaterial(id)}
+                    style={{ width: '100%' }}
+                    options={bookTravelStore.assembledMaterials.map((m) => ({ value: m.id, label: m.title }))}
+                  />
+                )}
+              </div>
+
+              {/* Select Entry Point */}
+              {bookTravelStore.selectedMaterialId && bookTravelStore.entryPoints.length > 0 && (
+                <div>
+                  <div style={{ fontSize: '14px', fontWeight: 600, color: '#33312e', marginBottom: '8px' }}>
+                    选择入场点
+                  </div>
+                  <div className="book-travel-entry-list">
+                    {bookTravelStore.entryPoints.map((ep) => {
+                      const selected = bookTravelStore.selectedEntryPointId === ep.id;
+                      return (
+                        <button
+                          type="button"
+                          key={ep.id}
+                          onClick={() => bookTravelStore.setSelectedEntryPointId(ep.id)}
+                          className={`book-travel-entry-button ${selected ? 'is-selected' : ''}`}
+                        >
+                          <div className="book-travel-entry-title">{ep.title}</div>
+                          <div style={{ fontSize: 12, color: '#8c8882', marginTop: 4 }}>{ep.summary}</div>
+                          {ep.risk && <div style={{ fontSize: 12, color: '#ff4d4f', marginTop: 4 }}>风险：{ep.risk}</div>}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {/* Select User Character */}
+              {bookTravelStore.selectedEntryPointId && (
+                <div>
+                  <div style={{ fontSize: '14px', fontWeight: 600, color: '#33312e', marginBottom: '8px' }}>
+                    选择扮演身份
+                  </div>
+                  {bookTravelStore.recommendedUserCharacters.length > 0 && (
+                    <div className="book-travel-character-options">
+                      {bookTravelStore.recommendedUserCharacters.map((uc) => {
+                        const selected = bookTravelStore.userCharacter?.name === uc.name;
+                        return (
+                          <Tag.CheckableTag
+                            key={uc.name}
+                            checked={selected}
+                            onChange={(checked) => {
+                              if (checked) bookTravelStore.setUserCharacter(uc);
+                            }}
+                            className={`book-travel-character-option ${selected ? 'is-selected' : ''}`}
+                          >
+                            <UserOutlined style={{ marginRight: 6 }} />
+                            {uc.name}（{uc.identity}）
+                          </Tag.CheckableTag>
+                        );
+                      })}
+                    </div>
+                  )}
+                  <div style={{ display: 'flex', gap: '8px' }}>
+                    <Input
+                      placeholder="姓名"
+                      value={bookTravelStore.userCharacter?.name || ''}
+                      onChange={(e) => bookTravelStore.setUserCharacter({ name: e.target.value, identity: bookTravelStore.userCharacter?.identity || '', goal: bookTravelStore.userCharacter?.goal || '' })}
+                      style={{ flex: 1 }}
+                    />
+                    <Input
+                      placeholder="身份"
+                      value={bookTravelStore.userCharacter?.identity || ''}
+                      onChange={(e) => bookTravelStore.setUserCharacter({ name: bookTravelStore.userCharacter?.name || '', identity: e.target.value, goal: bookTravelStore.userCharacter?.goal || '' })}
+                      style={{ flex: 1 }}
+                    />
+                  </div>
+                  <Input.TextArea
+                    placeholder="目标（可选）"
+                    value={bookTravelStore.userCharacter?.goal || ''}
+                    onChange={(e) => bookTravelStore.setUserCharacter({ name: bookTravelStore.userCharacter?.name || '', identity: bookTravelStore.userCharacter?.identity || '', goal: e.target.value })}
+                    autoSize={{ minRows: 2, maxRows: 4 }}
+                    style={{ marginTop: 8 }}
+                  />
+                </div>
+              )}
+
+              {/* Start Button */}
+              <StylePresetSelector
+                target="bookTravel"
+                value={bookTravelStore.selectedStylePresetIds[0] || null}
+                onChange={(id) => bookTravelStore.setSelectedStylePresetIds(id ? [id] : [])}
+              />
+
+              {/* Start Button */}
+              <Button
+                type="primary"
+                size="large"
+                icon={<PlayCircleOutlined />}
+                onClick={startBookTravelAdventure}
+                disabled={!canStartBookTravel}
+                className={`book-travel-start-button ${canStartBookTravel ? 'is-ready' : ''}`}
+              >
+                开始穿书
+              </Button>
+            </div>
+
+            {/* Streaming progress in setup wizard */}
+            {startProgressPhase === 'writer' && (
+              <div className="book-travel-stream-card book-travel-stream-card--setup">
+                <div className="book-travel-progress-line">
+                  <Spin size="small" />
+                  ✍️ 场景写手正在书写...
+                  <span style={{ fontSize: 12, color: '#b8b3ab', fontFamily: 'monospace', marginLeft: 'auto' }}>
+                    {formatElapsed(startElapsedMs)}
+                  </span>
+                </div>
+                {(() => {
+                  const partial = extractPartialContent(writerOutput);
+                  return partial !== null ? (
+                    <div className="book-travel-writer-output">
+                      {partial}
+                      <span style={{ display: 'inline-block', width: 2, height: 14, background: '#d97757', marginLeft: 2, verticalAlign: 'middle', animation: 'blink 1s step-end infinite' }} />
+                    </div>
+                  ) : null;
+                })()}
+                <div className="book-travel-modal-footer">
+                  <Button size="small" onClick={handleCancelStart}>中断</Button>
+                </div>
+              </div>
+            )}
+            {startProgressPhase === 'error' && (
+              <div className="book-travel-error-notice book-travel-setup-notice">
+                生成失败：{startProgressError}
+              </div>
+            )}
+            {startProgressPhase === 'cancelled' && (
+              <div className="book-travel-cancel-notice book-travel-setup-notice">
+                已中断生成
+              </div>
+            )}
+
+          </div>
+        )}
+      </div>
+
+      {/* Composer Input Area */}
+      {(bookTravelStore.scenes.length > 0) && !bookTravelStore.isCompleted && (
+        <div className="agent-composer book-travel-composer">
+          {/* Formatted Text input helper overlay inside composer box */}
+          <div id="agent-composer-box" className="agent-composer__box book-travel-composer-box">
+
+            {/* Input Action Segment Controller */}
+            <div className="book-travel-mode-tabs">
+              <Radio.Group
+                value={inputMode}
+                onChange={(e) => setInputMode(e.target.value)}
+                size="small"
+                buttonStyle="solid"
+              >
+                <Radio.Button value="speech" style={{ borderRadius: '4px 0 0 4px' }}>
+                  <CommentOutlined style={{ marginRight: 4 }} />
+                  角色说话
+                </Radio.Button>
+                <Radio.Button value="behavior">
+                  <ExperimentOutlined style={{ marginRight: 4 }} />
+                  角色行为
+                </Radio.Button>
+                <Radio.Button value="plot" style={{ borderRadius: '0 4px 4px 0' }}>
+                  <BranchesOutlined style={{ marginRight: 4 }} />
+                  剧情客观推进
+                </Radio.Button>
+              </Radio.Group>
+            </div>
+
+            <Input.TextArea
+              className="agent-composer__textarea"
+              autoSize={{ minRows: 1, maxRows: 8 }}
+              disabled={bookTravelStore.isCompleted}
+              onChange={(e) => setInput(e.target.value)}
+              style={{ zIndex: 2, position: 'relative', background: 'transparent', boxShadow: 'none', border: 'none', padding: '12px 16px 40px 16px', fontSize: '15px' }}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+                  event.preventDefault();
+                  void handleSend();
+                }
+              }}
+              placeholder={
+                bookTravelStore.isCompleted
+                  ? "本局穿书已完结，无法继续发送指令"
+                  : bookTravelStore.scenes.length > 0
+                    ? inputMode === 'speech'
+                      ? "说些什么..."
+                      : inputMode === 'behavior'
+                        ? "做点什么..."
+                        : "推进剧情..."
+                    : inputMode === 'speech'
+                      ? "以你角色的口吻输入对话内容，按 Cmd/Ctrl + Enter 提交..."
+                      : inputMode === 'behavior'
+                        ? "描述你角色采取的具体动作（例如：撬门、施法、隐蔽等）..."
+                        : "以旁白口吻描述剧情推进（例如：天空突然放晴、怪物发动袭击等）..."
+              }
+              value={input}
+            />
+
+            <div className="agent-composer__actions book-travel-composer-actions">
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                {bookTravelStore.scenes.length > 0 ? (
+                  <Tooltip title="查看当前状态和剧情回顾">
+                    <Button
+                      aria-label="状态"
+                      icon={<ProfileOutlined />}
+                      onClick={showBookTravelStatusModal}
+                      size="small"
+                      type="text"
+                      style={{ color: '#d97757', fontWeight: 500, paddingInline: 8 }}
+                    >
+                      状态
+                    </Button>
+                  </Tooltip>
+                ) : (
+                  <span style={{ fontSize: '12px', color: '#8c8882' }}>
+                    当前模式：
+                    <Tag color="orange" style={{ margin: 0 }}>
+                      {inputMode === 'speech' ? '说话 (我：“内容”)' : inputMode === 'behavior' ? '动作 (（我 内容）)' : '第三方剧情推进'}
+                    </Tag>
+                  </span>
+                )}
+              </div>
+
+              <div className="agent-send-cluster" style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                <Tooltip color="#fff" placement="topRight" title={contextTooltip} overlayInnerStyle={{ width: 'max-content', maxWidth: 320, padding: '8px 12px', border: '1px solid #eae6df' }}>
+                  <button
+                    aria-label="查看上下文"
+                    className="agent-context-ring"
+                    style={{ '--context-fill': `${contextPercent}%` } as React.CSSProperties}
+                    type="button"
+                  >
+                    <span>{contextPercent}%</span>
+                  </button>
+                </Tooltip>
+
+                <Tooltip title={isStreaming ? '停止' : isBookTravelBusy ? '正在处理行动' : bookTravelStore.isCompleted ? '当前故事已结局' : '提交行动'}>
+                  <Button
+                    className="de-ai-agent-run-button"
+                    disabled={bookTravelStore.isCompleted || isBookTravelBusy || (!isStreaming && !input.trim())}
+                    icon={isStreaming ? <StopOutlined /> : <PlayCircleOutlined />}
+                    onClick={isStreaming ? handleStop : handleSend}
+                    shape="circle"
+                    type={isStreaming ? "default" : "primary"}
+                    danger={isStreaming}
+                    style={isStreaming ? undefined : {
+                      backgroundColor: '#d97757',
+                      borderColor: '#d97757',
+                      color: '#ffffff'
+                    }}
+                  />
+                </Tooltip>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+function updateMessageTool(
+  messages: Message[],
+  messageId: string,
+  tool: AgentToolEntry,
+  mode: 'start' | 'output' | 'end',
+) {
+  return messages.map((msg) => {
+    if (msg.id !== messageId) {
+      return msg;
+    }
+    const tools = [...(msg.tools ?? [])];
+    const index = tool.id
+      ? tools.findIndex((entry) => entry.id === tool.id)
+      : tools.length - 1;
+    if (mode === 'start' || index < 0) {
+      return { ...msg, tools: [...tools, tool] };
+    }
+
+    const current = tools[index];
+    const prevResult = current.result === '正在执行工具' ? '' : current.result;
+    tools[index] = {
+      ...current,
+      name: tool.name || current.name,
+      status: tool.status || current.status,
+      arguments: tool.arguments || current.arguments,
+      result: mode === 'output'
+        ? `${prevResult}${tool.result}`
+        : tool.result || current.result,
+    };
+    return { ...msg, tools };
+  });
+}
+// ---------- P2 自主叙事引擎面板（规格 §5 / §12） ----------
+// 运行模式切换 + 大纲四级约束编辑 + 托梦输入 + 回合成本预估 + 场景快照/分支/锁定。
+// 挂载即订阅运行时（roundDone / synthesisDone），卸载退订（集成缝）。
+
+const RUN_MODE_OPTIONS: Array<{ value: RunMode; label: string }> = [
+  { value: 'interactive', label: '互动模式' },
+  { value: 'observe', label: '观察模式' },
+  { value: 'chapterDraft', label: '章节草稿' },
+];
+
+const CONSTRAINT_OPTIONS: Array<{ value: ConstraintLevel; label: string }> = [
+  { value: 'hard', label: '硬节点' },
+  { value: 'soft', label: '软节点' },
+  { value: 'free', label: '自由' },
+];
+
+const CONSTRAINT_COLOR: Record<ConstraintLevel, string> = {
+  hard: '#d97757',
+  soft: '#c99a2e',
+  free: '#6b8e6b',
+};
+
+const emptyCharacterState = () => ({
+  goals: [],
+  emotions: [],
+  resources: [],
+  secrets: [],
+  misconceptions: [],
+  plans: [],
+  arcStage: '',
+});
+
+export const NarrativeRuntimePanel: React.FC = () => {
+  const settings = useSettingsStore();
+  const cardsV2 = usePartnerStore((s) => s.characterCardsV2);
+
+  const runtimeState = useCharacterRuntimeStore((s) => s.state);
+  const currentRunId = useCharacterRuntimeStore((s) => s.currentRunId);
+  const sceneIds = useCharacterRuntimeStore((s) => s.sceneIds);
+  const roundStatus = useCharacterRuntimeStore((s) => s.roundStatus);
+  const blockedReason = useCharacterRuntimeStore((s) => s.blockedReason);
+  const lastError = useCharacterRuntimeStore((s) => s.lastError);
+  const costEstimate = useCharacterRuntimeStore((s) => s.costEstimate);
+
+  const initRun = useCharacterRuntimeStore((s) => s.init);
+  const estimate = useCharacterRuntimeStore((s) => s.estimate);
+  const startRound = useCharacterRuntimeStore((s) => s.startRound);
+  const cancelRound = useCharacterRuntimeStore((s) => s.cancel);
+  const lockScenes = useCharacterRuntimeStore((s) => s.lock);
+  const takeSnapshot = useCharacterRuntimeStore((s) => s.takeSnapshot);
+  const branch = useCharacterRuntimeStore((s) => s.branch);
+
+  const [mode, setMode] = useState<RunMode>('observe');
+  const [activeCardIds, setActiveCardIds] = useState<string[]>([]);
+  const [outlineText, setOutlineText] = useState('');
+  const [predicateExpr, setPredicateExpr] = useState('');
+  const [predicateReason, setPredicateReason] = useState('');
+  const [predicates, setPredicates] = useState<Array<{ id: string; expression: string; reason: string }>>([]);
+  const [whisperTarget, setWhisperTarget] = useState<string | undefined>(undefined);
+  const [whisperText, setWhisperText] = useState('');
+  const [whispers, setWhispers] = useState<Record<string, string>>({});
+  const [maxOutputTokens, setMaxOutputTokens] = useState(4096);
+  const [scenes, setScenes] = useState(1);
+  const [maxTotalTokens, setMaxTotalTokens] = useState(120000);
+  const [lockSelection, setLockSelection] = useState<string[]>([]);
+  const [busy, setBusy] = useState(false);
+
+  // 集成缝：面板挂载即订阅运行时事件，卸载退订。
+  useEffect(() => useCharacterRuntimeStore.getState().subscribe(), []);
+
+  const activeCards = cardsV2.filter((c) => activeCardIds.includes(c.id));
+  const parsedNodes = React.useMemo(() => parseOutline(outlineText), [outlineText]);
+  // 面板可编辑的节点约束覆盖（parseOutline 缺省软，用户可改级）。
+  const [nodeOverrides, setNodeOverrides] = useState<Record<string, ConstraintLevel>>({});
+  const outlineNodes: OutlineNode[] = parsedNodes.map((n) => ({
+    ...n,
+    constraint: nodeOverrides[n.id] ?? n.constraint,
+  }));
+
+  const modelProfile = React.useMemo(() => {
+    const m = settings.models?.find((x) => x.id === settings.selectedModelId) || settings.models?.[0];
+    if (!m) return null;
+    return { interface: m.modelInterface, baseUrl: m.baseUrl, apiKey: m.apiKey, model: m.model };
+  }, [settings.models, settings.selectedModelId]);
+
+  const addPredicate = () => {
+    const check = validateForbiddenExpression(predicateExpr);
+    if (!check.valid) {
+      message.error(check.error || '禁止谓词表达式非法');
+      return;
+    }
+    setPredicates((prev) => [
+      ...prev,
+      { id: `fp-${Date.now()}`, expression: predicateExpr.trim(), reason: predicateReason.trim() },
+    ]);
+    setPredicateExpr('');
+    setPredicateReason('');
+  };
+
+  const addWhisper = () => {
+    if (!whisperTarget || !whisperText.trim()) {
+      message.warning('请选择托梦对象并输入内容');
+      return;
+    }
+    setWhispers((prev) => ({ ...prev, [whisperTarget]: whisperText.trim() }));
+    setWhisperText('');
+  };
+
+  const buildInitialState = (): NarrativeState => ({
+    schemaVersion: 1,
+    runId: `run-${Date.now()}`,
+    revision: 0,
+    world: {},
+    characters: Object.fromEntries(activeCards.map((c) => [c.id, emptyCharacterState()])),
+    relations: [],
+    narrative: {
+      outlineNodes,
+      forbiddenPredicates: predicates,
+      foreshadowing: [],
+      pacingNotes: [],
+    },
+    authoring: { lockedSceneIds: [], branchSnapshotIds: [] },
+  });
+
+  const handleInit = async () => {
+    if (activeCards.length < 2) {
+      message.warning('至少选择 2 个活跃角色（上限 5）');
+      return;
+    }
+    setBusy(true);
+    try {
+      await initRun(buildInitialState());
+      message.success('已初始化叙事运行');
+    } catch (e) {
+      message.error(`初始化失败：${String(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleEstimate = async () => {
+    try {
+      await estimate(activeCards.length || 3, maxOutputTokens, scenes);
+    } catch (e) {
+      message.error(`预估失败：${String(e)}`);
+    }
+  };
+
+  const handleRunRound = async () => {
+    if (!currentRunId) {
+      message.warning('请先初始化叙事运行');
+      return;
+    }
+    if (!modelProfile) {
+      message.error('未配置可用模型');
+      return;
+    }
+    const request: RoundRequestInput = {
+      runId: currentRunId,
+      mode,
+      routes: { default: modelProfile },
+      prompts: {
+        director: settings.narrativeDirectorPrompt,
+        decide: settings.narrativeDecidePrompt,
+        arbiter: settings.narrativeArbiterPrompt,
+        writer: settings.narrativeWriterPrompt,
+        critic: settings.narrativeCriticPrompt,
+      },
+      activeCards: Object.fromEntries(activeCards.map((c) => [c.id, c])),
+      otherCardsBrief: {},
+      whispers,
+      fragments: {},
+      maxOutputTokens,
+      budget: { maxTotalTokens, spentTokens: 0, maxScenes: scenes },
+    };
+    setBusy(true);
+    try {
+      await startRound(request);
+      message.success('已开始一回合叙事');
+    } catch (e) {
+      message.error(`启动回合失败：${String(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleLock = async () => {
+    if (!currentRunId || lockSelection.length === 0) {
+      message.warning('请选择要锁定的场景');
+      return;
+    }
+    try {
+      await lockScenes(currentRunId, lockSelection);
+      message.success('已锁定所选场景（后续生成不会改写）');
+    } catch (e) {
+      message.error(`锁定失败：${String(e)}`);
+    }
+  };
+
+  const handleSnapshot = async (sceneId: string) => {
+    if (!currentRunId) return;
+    try {
+      const snap = await takeSnapshot(currentRunId, sceneId);
+      message.success(`已在场景 ${sceneId} 创建快照 ${snap.snapshotId}`);
+    } catch (e) {
+      message.error(`快照失败：${String(e)}`);
+    }
+  };
+
+  const handleBranch = async (sceneId: string) => {
+    if (!currentRunId) return;
+    try {
+      const snap = await takeSnapshot(currentRunId, sceneId);
+      const newRunId = `run-${Date.now()}`;
+      await branch(snap.snapshotId, currentRunId, newRunId);
+      message.success(`已从场景 ${sceneId} 分支出新运行`);
+    } catch (e) {
+      message.error(`分支失败：${String(e)}`);
+    }
+  };
+
+  const lockedSceneIds = runtimeState?.authoring.lockedSceneIds ?? [];
+
+  return (
+    <div style={{ paddingBottom: 24 }}>
+      <Alert
+        type="info"
+        showIcon
+        style={{ marginBottom: 16 }}
+        message="自主叙事引擎（P2）"
+        description="投入 2–5 个角色，让他们在大纲约束下各自决策、推动剧情。互动/观察/章节草稿三种模式，随时暂停、快照、分支或锁定已确认的章节。"
+      />
+
+      {/* 运行模式 */}
+      <Divider titlePlacement="start">运行模式</Divider>
+      <Radio.Group
+        value={mode}
+        onChange={(e) => setMode(e.target.value)}
+        optionType="button"
+        buttonStyle="solid"
+        options={RUN_MODE_OPTIONS}
+      />
+
+      {/* 活跃角色 */}
+      <Divider titlePlacement="start">活跃角色（2–5）</Divider>
+      <Select
+        mode="multiple"
+        style={{ width: '100%' }}
+        placeholder="选择投入本次叙事的 V2 角色卡"
+        value={activeCardIds}
+        onChange={(ids) => setActiveCardIds(ids.slice(0, 5))}
+        options={cardsV2.map((c) => ({ value: c.id, label: c.identity.name || c.id }))}
+        aria-label="活跃角色"
+        notFoundContent={<Empty description="尚无 V2 角色卡，请先在背景页提取或升级" image={Empty.PRESENTED_IMAGE_SIMPLE} />}
+      />
+
+      {/* 大纲四级约束 */}
+      <Divider titlePlacement="start">大纲约束（硬 / 软 / 自由 + 禁止谓词）</Divider>
+      <Input.TextArea
+        value={outlineText}
+        onChange={(e) => setOutlineText(e.target.value)}
+        placeholder={'每行一个节点，前缀 [硬]/[软]/[自由]，缺省为软。例如：\n[硬] 主角揭穿骗局\n与盟友决裂\n[自由] 支线：寻找旧友'}
+        autoSize={{ minRows: 3, maxRows: 8 }}
+        aria-label="大纲文本"
+      />
+      {outlineNodes.length > 0 && (
+        <List
+          size="small"
+          style={{ marginTop: 8 }}
+          dataSource={outlineNodes}
+          renderItem={(node) => (
+            <List.Item
+              actions={[
+                <Select<ConstraintLevel>
+                  key="level"
+                  size="small"
+                  value={node.constraint}
+                  style={{ width: 100 }}
+                  options={CONSTRAINT_OPTIONS}
+                  onChange={(level) => setNodeOverrides((prev) => ({ ...prev, [node.id]: level }))}
+                  aria-label={`约束级别 ${node.id}`}
+                />,
+              ]}
+            >
+              <Tag color={CONSTRAINT_COLOR[node.constraint]}>{CONSTRAINT_OPTIONS.find((o) => o.value === node.constraint)?.label}</Tag>
+              <span>{node.summary}</span>
+            </List.Item>
+          )}
+        />
+      )}
+
+      <div style={{ marginTop: 12 }}>
+        <span style={{ fontSize: 12, color: '#8c8882' }}>禁止结果（独立状态谓词，与节点分离）</span>
+        <Space.Compact style={{ width: '100%', marginTop: 4 }}>
+          <Input
+            placeholder='如：characters.li.arcStage == "堕落"'
+            value={predicateExpr}
+            onChange={(e) => setPredicateExpr(e.target.value)}
+            aria-label="禁止谓词表达式"
+          />
+          <Input
+            placeholder="原因"
+            value={predicateReason}
+            onChange={(e) => setPredicateReason(e.target.value)}
+            style={{ maxWidth: 160 }}
+            aria-label="禁止谓词原因"
+          />
+          <Button onClick={addPredicate}>添加</Button>
+        </Space.Compact>
+        {predicates.length > 0 && (
+          <div style={{ marginTop: 8 }}>
+            {predicates.map((p) => (
+              <Tag
+                key={p.id}
+                closable
+                onClose={() => setPredicates((prev) => prev.filter((x) => x.id !== p.id))}
+                style={{ marginBottom: 4 }}
+              >
+                {p.expression}
+              </Tag>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* 托梦 */}
+      <Divider titlePlacement="start">
+        <Space size={4}>
+          <BulbOutlined />
+          托梦（给角色的私密引导）
+        </Space>
+      </Divider>
+      <Space.Compact style={{ width: '100%' }}>
+        <Select
+          placeholder="托梦对象"
+          style={{ width: 160 }}
+          value={whisperTarget}
+          onChange={setWhisperTarget}
+          options={activeCards.map((c) => ({ value: c.id, label: c.identity.name || c.id }))}
+          aria-label="托梦对象"
+        />
+        <Input
+          placeholder="悄悄告诉该角色的信息或暗示"
+          value={whisperText}
+          onChange={(e) => setWhisperText(e.target.value)}
+          aria-label="托梦内容"
+        />
+        <Button onClick={addWhisper}>加入</Button>
+      </Space.Compact>
+      {Object.keys(whispers).length > 0 && (
+        <List
+          size="small"
+          style={{ marginTop: 8 }}
+          dataSource={Object.entries(whispers)}
+          renderItem={([cid, text]) => (
+            <List.Item
+              actions={[
+                <Button
+                  key="del"
+                  size="small"
+                  type="text"
+                  danger
+                  onClick={() =>
+                    setWhispers((prev) => {
+                      const next = { ...prev };
+                      delete next[cid];
+                      return next;
+                    })
+                  }
+                >
+                  删除
+                </Button>,
+              ]}
+            >
+              <strong>{cardsV2.find((c) => c.id === cid)?.identity.name ?? cid}</strong>：{text}
+            </List.Item>
+          )}
+        />
+      )}
+
+      {/* 成本预估 */}
+      <Divider titlePlacement="start">回合成本预估</Divider>
+      <Space wrap>
+        <span>
+          最大输出 Token{' '}
+          <InputNumber min={256} step={256} value={maxOutputTokens} onChange={(v) => setMaxOutputTokens(v ?? 4096)} aria-label="最大输出Token" />
+        </span>
+        <span>
+          场景数{' '}
+          <InputNumber min={1} max={20} value={scenes} onChange={(v) => setScenes(v ?? 1)} aria-label="场景数" />
+        </span>
+        <span>
+          单章预算上限{' '}
+          <InputNumber min={1000} step={1000} value={maxTotalTokens} onChange={(v) => setMaxTotalTokens(v ?? 120000)} aria-label="单章预算上限" />
+        </span>
+        <Button icon={<ThunderboltOutlined />} onClick={handleEstimate}>
+          预估
+        </Button>
+      </Space>
+      {costEstimate && (
+        <Alert
+          type="warning"
+          style={{ marginTop: 8 }}
+          message={`每场景调用约 ${costEstimate.callsPerScene} 次 · 预计 ${costEstimate.estimatedTokensLow}~${costEstimate.estimatedTokensHigh} Token`}
+        />
+      )}
+
+      {/* 运行控制 */}
+      <Divider titlePlacement="start">运行</Divider>
+      <Space>
+        <Button onClick={handleInit} loading={busy}>
+          初始化运行
+        </Button>
+        <Button type="primary" icon={<PlayCircleOutlined />} loading={busy} onClick={handleRunRound} disabled={!currentRunId}>
+          运行一回合
+        </Button>
+        {roundStatus === 'running' && (
+          <Button danger icon={<StopOutlined />} onClick={() => cancelRound()}>
+            停止
+          </Button>
+        )}
+        <Tag>{roundStatus === 'running' ? '运行中' : roundStatus === 'done' ? '已完成' : roundStatus === 'blocked' ? '受阻' : roundStatus === 'failed' ? '失败' : '空闲'}</Tag>
+      </Space>
+      {blockedReason && (
+        <Alert type="warning" showIcon style={{ marginTop: 8 }} message={`回合受阻：${blockedReason}`} description="约束互相冲突或不可满足时进入 blocked，请调整节点或禁止谓词后重试。" />
+      )}
+      {lastError && (
+        <Alert type="error" showIcon style={{ marginTop: 8 }} message={`${lastError.code}：${lastError.message}`} />
+      )}
+
+      {/* 场景快照 / 分支 / 锁定 */}
+      <Divider titlePlacement="start">场景 · 快照 / 分支 / 锁定</Divider>
+      {sceneIds.length === 0 ? (
+        <Empty description="尚无场景，运行回合后生成" image={Empty.PRESENTED_IMAGE_SIMPLE} />
+      ) : (
+        <>
+          <Checkbox.Group
+            style={{ display: 'block' }}
+            value={lockSelection}
+            onChange={(vals) => setLockSelection(vals as string[])}
+          >
+            <List
+              size="small"
+              dataSource={sceneIds}
+              renderItem={(sceneId) => (
+                <List.Item
+                  actions={[
+                    <Button key="snap" size="small" icon={<CameraOutlined />} onClick={() => handleSnapshot(sceneId)}>
+                      快照
+                    </Button>,
+                    <Button key="branch" size="small" icon={<BranchesOutlined />} onClick={() => handleBranch(sceneId)}>
+                      分支
+                    </Button>,
+                  ]}
+                >
+                  <Checkbox value={sceneId} aria-label={`锁定 ${sceneId}`}>
+                    {sceneId}
+                    {lockedSceneIds.includes(sceneId) && (
+                      <Tag color="green" style={{ marginLeft: 8 }}>
+                        已锁定
+                      </Tag>
+                    )}
+                  </Checkbox>
+                </List.Item>
+              )}
+            />
+          </Checkbox.Group>
+          <Button icon={<LockOutlined />} onClick={handleLock} style={{ marginTop: 8 }}>
+            锁定所选场景
+          </Button>
+        </>
+      )}
+    </div>
+  );
+};
+
+const Story: React.FC = () => useStoryView();
+
+export default Story;

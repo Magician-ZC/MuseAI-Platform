@@ -1,0 +1,4 @@
+interface:
+  display_name: "番茄历史古代大纲"
+  short_description: "番茄小说历史古代选题、样本节奏拆解与长篇章节大纲生成器"
+  default_prompt: "使用 $fanqie-long-lishi-outline 生成一个番茄历史古代选题和前30章大纲。"

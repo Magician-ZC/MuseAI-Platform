@@ -1,0 +1,4 @@
+interface:
+  display_name: "番茄长篇东方仙侠大纲"
+  short_description: "番茄长篇东方仙侠选题、开篇节奏拆解与章节大纲生成器"
+  default_prompt: "使用 $fanqie-long-xianxia-outline 生成一个番茄长篇东方仙侠选题和前30章大纲。"

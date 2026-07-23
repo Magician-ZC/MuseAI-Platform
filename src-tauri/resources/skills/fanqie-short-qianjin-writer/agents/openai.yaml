@@ -1,0 +1,4 @@
+interface:
+  display_name: "番茄短篇真假千金写作"
+  short_description: "创作番茄短篇真假千金身份修罗场与反转打脸正文写作规则"
+  default_prompt: "使用 $fanqie-short-qianjin-writer 写一篇番茄短篇真假千金小说，包含强钩子、身份冲突、反转打脸和四层自检。"

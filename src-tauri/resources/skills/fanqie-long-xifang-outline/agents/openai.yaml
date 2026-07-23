@@ -1,0 +1,4 @@
+interface:
+  display_name: "番茄长篇西方奇幻大纲"
+  short_description: "番茄长篇西方奇幻选题、节奏拆解与前30章大纲生成器"
+  default_prompt: "使用 $fanqie-long-xifang-outline 生成一个番茄长篇西方奇幻选题和前30章大纲。"

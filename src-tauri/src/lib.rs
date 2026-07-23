@@ -1,0 +1,385 @@
+mod book_travel;
+mod crawler;
+mod engine_host;
+mod fs_commands;
+mod mobile_server;
+
+#[macro_use]
+mod agent;
+#[macro_use]
+mod commands;
+mod llm;
+mod models;
+#[macro_use]
+mod tools;
+mod utils;
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+
+use tokio::sync::oneshot;
+
+pub use agent::sessions::*;
+pub use book_travel::*;
+pub use commands::fs::*;
+pub use commands::skills::*;
+pub use commands::versions::*;
+pub use commands::workspace::*;
+pub use models::{DailyActivity, WritingStats};
+pub use tools::*;
+
+use tauri::AppHandle;
+#[cfg(not(all(debug_assertions, target_os = "macos")))]
+use tauri::Manager;
+
+static BASH_PERMISSION_CHANNELS: OnceLock<Mutex<HashMap<String, oneshot::Sender<bool>>>> =
+    OnceLock::new();
+
+pub fn bash_permission_channels() -> &'static Mutex<HashMap<String, oneshot::Sender<bool>>> {
+    BASH_PERMISSION_CHANNELS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub struct ActiveStreams(Mutex<HashMap<String, tauri::async_runtime::JoinHandle<()>>>);
+
+#[tauri::command]
+fn rename_item(path: String, new_name: String) -> Result<(), String> {
+    fs_commands::rename_item_cmd(path, new_name)
+}
+
+#[tauri::command]
+fn move_item(app: AppHandle, source: String, target_dir: String) -> Result<(), String> {
+    let doc_dir = utils::resolve_document_dir(&app)?;
+    let museai_dir = doc_dir.join("MuseAI");
+    let refs_dir = museai_dir.join("references");
+    let articles_dir = museai_dir.join("articles");
+    let outline_dir = museai_dir.join("outline");
+    let source_path = std::path::Path::new(&source);
+    let target_path = std::path::Path::new(&target_dir);
+    let source_canonical = source_path.canonicalize().map_err(|e| e.to_string())?;
+    let target_canonical = target_path.canonicalize().map_err(|e| e.to_string())?;
+    let roots = [refs_dir, articles_dir, outline_dir];
+    let is_allowed_move = roots.iter().any(|root| {
+        root.exists()
+            && root
+                .canonicalize()
+                .map(|canonical_root| {
+                    source_canonical.starts_with(&canonical_root)
+                        && target_canonical.starts_with(&canonical_root)
+                })
+                .unwrap_or(false)
+    });
+
+    if !is_allowed_move {
+        return Err("只能在同个工作区内部移动文件".to_string());
+    }
+
+    fs_commands::move_item_cmd(source, target_dir)
+}
+
+#[tauri::command]
+fn import_local_folder_shallow(source: String, target_dir: String) -> Result<String, String> {
+    fs_commands::import_local_folder_shallow_cmd(source, target_dir)
+}
+
+#[tauri::command]
+fn crawl_fanqie_article(
+    url: String,
+    novel_type: String,
+    target_dir: String,
+) -> Result<String, String> {
+    crawler::crawl_fanqie_article(&url, &novel_type, &target_dir)
+}
+
+#[tauri::command]
+fn build_full_system_prompt(
+    app: AppHandle,
+    system_prompt: String,
+    workspace_path: Option<String>,
+    selected_reference_files: Option<Vec<String>>,
+) -> Result<String, String> {
+    let request = models::ChatStreamRequest {
+        agent_id: None,
+        model_interface: String::new(),
+        base_url: String::new(),
+        api_key: String::new(),
+        model: String::new(),
+        temperature: None,
+        max_output_tokens: None,
+        max_context_tokens: None,
+        compaction_turn_threshold: None,
+        frequency_penalty: None,
+        presence_penalty: None,
+        top_p: None,
+        thinking_depth: None,
+        system_prompt,
+        workspace_path,
+        messages: vec![],
+        context_compaction: None,
+        selected_reference_files,
+        allowed_tools: None,
+        allowed_write_paths: None,
+        role_play_context: None,
+    };
+
+    let mut full = agent::assemble_system_prompt(Some(&app), &request)?;
+
+    let reference_ctx = agent::build_reference_context(&request);
+    if !reference_ctx.is_empty() {
+        full.push_str(&reference_ctx);
+    }
+
+    Ok(full)
+}
+
+#[tauri::command]
+fn create_untitled_item(target_dir: String, is_dir: bool) -> Result<String, String> {
+    fs_commands::create_untitled_item_cmd(target_dir, is_dir)
+}
+
+#[cfg(all(debug_assertions, target_os = "macos"))]
+fn set_development_dock_icon() {
+    use objc2::{AllocAnyThread, MainThreadMarker};
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::NSData;
+
+    let data = NSData::with_bytes(include_bytes!("../icons/icon-dev.icns"));
+    let icon = NSImage::initWithData(NSImage::alloc(), &data).expect("creating development icon");
+    let marker = unsafe { MainThreadMarker::new_unchecked() };
+    let app = NSApplication::sharedApplication(marker);
+    unsafe { app.setApplicationIconImage(Some(&icon)) };
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    let app = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            #[cfg(target_os = "windows")]
+            {
+                let icon =
+                    tauri::image::Image::from_bytes(include_bytes!("../icons/128x128@2x.png"))?;
+                if let Some(window) = app.get_webview_window("main") {
+                    window.set_icon(icon)?;
+                }
+            }
+            #[cfg(all(
+                not(target_os = "windows"),
+                not(all(debug_assertions, target_os = "macos"))
+            ))]
+            {
+                let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png"))?;
+                if let Some(window) = app.get_webview_window("main") {
+                    window.set_icon(icon)?;
+                }
+            }
+            #[cfg(all(debug_assertions, target_os = "macos"))]
+            {
+                let _ = app;
+            }
+            let _ = migrate_agent_sessions(&app.handle());
+            let app_handle = app.handle().clone();
+            // Register the concrete Wry AppHandle before starting the mobile server,
+            // so HTTP route handlers can call Tauri commands without unsafe transmute.
+            mobile_server::register_wry_handle(app_handle.clone());
+            tauri::async_runtime::spawn(async move {
+                let _ = mobile_server::start_server(app_handle).await;
+            });
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            list_dir,
+            read_file,
+            read_image_data_url,
+            write_file,
+            export_json_to_downloads,
+            export_json_files_to_downloads,
+            create_file,
+            create_dir,
+            rename_path,
+            delete_path,
+            file_modified_at,
+            tool_read,
+            tool_write,
+            tool_edit,
+            tool_bash,
+            resolve_bash_permission,
+            tool_grep,
+            tool_glob,
+            tool_skill,
+            tool_subagent,
+            tool_todo,
+            create_file_version,
+            read_file_version,
+            list_file_versions,
+            delete_file_version,
+            update_version_ai_score,
+            update_version_ai_result,
+            list_agent_sessions,
+            load_agent_session,
+            save_agent_session,
+            delete_agent_session,
+            summarize_text,
+            update_agent_session_title,
+            analyze_character_memory,
+            convert_character_card_to_silly_tavern,
+            start_chat_completion_stream,
+            import_skill,
+            delete_skill,
+            get_skills,
+            stop_chat_stream,
+            import_workspace_item,
+            delete_workspace_item,
+            get_workspace_dir,
+            get_writing_stats,
+            get_interaction_stats,
+            save_work_summary_result,
+            load_work_summary_result,
+            rename_item,
+            move_item,
+            import_local_folder_shallow,
+            crawl_fanqie_article,
+            create_untitled_item,
+            build_full_system_prompt,
+            generate_background_items,
+            generate_background_stage_one,
+            generate_background_character_card,
+            assemble_book_travel_materials,
+            generate_book_travel_entry_setup,
+            start_assemble_book_travel_materials_stream,
+            start_generate_book_travel_entry_setup_stream,
+            start_plan_book_travel_scene_stream,
+            start_write_book_travel_change_scene_stream,
+            start_write_book_travel_insert_beat_stream,
+            stop_book_travel_stream,
+            classify_book_travel_input,
+            plan_book_travel_scene,
+            summarize_book_travel_memory,
+            judge_book_travel_ending,
+            write_book_travel_insert_beat,
+            write_book_travel_change_scene,
+            cancel_background_task,
+            start_generate_background_items_stream,
+            optimize_character_memories,
+            preview_reverse_outline_chapters,
+            save_reverse_outline,
+            start_reverse_outline_analysis,
+            retry_and_finalize_reverse_outline,
+            test_llm_connection,
+            load_app_state,
+            save_app_state,
+            mobile_server::get_mobile_service_status,
+            commands::character_v2::start_character_extraction,
+            commands::character_v2::get_character_extraction_task,
+            commands::character_v2::confirm_character_roster,
+            commands::character_v2::start_character_dna_synthesis,
+            commands::character_v2::cancel_character_extraction,
+            commands::character_v2::get_extraction_coverage_report,
+            commands::character_v2::run_character_swap_test,
+            commands::character_v2::run_character_stress_test,
+            commands::knowledge::import_knowledge_source,
+            commands::knowledge::distill_knowledge_pack,
+            commands::knowledge::search_knowledge,
+            commands::knowledge::get_knowledge_usage,
+            commands::knowledge::list_knowledge_packs,
+            commands::knowledge::delete_knowledge_pack,
+            commands::knowledge::list_knowledge_bindings,
+            commands::knowledge::upsert_knowledge_binding,
+            commands::knowledge::remove_knowledge_binding,
+            commands::narrative::narrative_init_run,
+            commands::narrative::narrative_get_state,
+            commands::narrative::narrative_estimate,
+            commands::narrative::start_narrative_round,
+            commands::narrative::cancel_narrative_round,
+            commands::narrative::narrative_list_scenes,
+            commands::narrative::narrative_get_scene,
+            commands::narrative::narrative_lock_scenes,
+            commands::narrative::narrative_take_snapshot,
+            commands::narrative::narrative_branch,
+            commands::narrative::narrative_list_snapshots,
+        ])
+        .manage(ActiveStreams(Mutex::new(HashMap::new())))
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|_app_handle, event| {
+        #[cfg(all(debug_assertions, target_os = "macos"))]
+        if matches!(event, tauri::RunEvent::Ready) {
+            set_development_dock_icon();
+        }
+        #[cfg(not(all(debug_assertions, target_os = "macos")))]
+        let _ = event;
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+    use std::fs;
+    use std::time::SystemTime;
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        let millis = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time should be after epoch")
+            .as_millis();
+        env::temp_dir().join(format!("museai_tool_test_{}_{}", millis, name))
+    }
+
+    #[test]
+    fn tool_read_returns_line_numbers() {
+        let path = temp_path("read.txt");
+        fs::write(&path, "line1\nline2\nline3\n").expect("write temp file");
+
+        let result = tool_read(path.display().to_string(), Some(2), Some(1), None);
+
+        assert!(result.success);
+        assert_eq!(result.output, "2\tline2\n... (3 lines total, showing 2-2)");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn tool_grep_finds_matching_lines() {
+        let dir = temp_path("grep");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("story.md");
+        fs::write(&path, "第一行\n关键词\n").expect("write temp file");
+
+        let result = tool_grep(
+            "关键词".to_string(),
+            Some(dir.display().to_string()),
+            Some("*.md".to_string()),
+            None,
+        );
+
+        assert!(result.success);
+        assert!(result.output.contains("story.md:2: 关键词"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tool_bash_blocks_dangerous_command() {
+        assert!(dangerous_command_reason("rm -rf /").is_some());
+    }
+
+    #[test]
+    fn tool_todo_rejects_multiple_in_progress_items() {
+        let result = tool_todo(vec![
+            models::TodoItem {
+                content: "A".to_string(),
+                active_form: "Doing A".to_string(),
+                status: "in_progress".to_string(),
+            },
+            models::TodoItem {
+                content: "B".to_string(),
+                active_form: "Doing B".to_string(),
+                status: "in_progress".to_string(),
+            },
+        ]);
+
+        assert!(!result.success);
+        assert!(result.output.contains("only one todo"));
+    }
+}

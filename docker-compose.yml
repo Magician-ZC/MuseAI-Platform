@@ -1,0 +1,31 @@
+# prod-like 本地环境（平台规格 §7）：PostgreSQL + Redis。
+# dev 默认用 SQLite 内存库 + 内存队列，无需此文件；需要贴近生产时：
+#   docker compose up -d
+#   MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo run -p muse-server
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: muse
+      POSTGRES_PASSWORD: muse
+      POSTGRES_DB: muse
+    ports:
+      - "5433:5432"
+    volumes:
+      - muse-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U muse"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    volumes:
+      - muse-redis:/data
+
+volumes:
+  muse-pg:
+  muse-redis:

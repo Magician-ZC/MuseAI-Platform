@@ -1,0 +1,4 @@
+interface:
+  display_name: "番茄短篇大女主写作"
+  short_description: "创作番茄短篇大女主爽文正文、打脸反击与清醒成长规则"
+  default_prompt: "写一篇番茄短篇大女主小说，包含强钩子、清醒反击、公开打脸、事业翻盘和四层自检。"

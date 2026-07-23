@@ -1,0 +1,4 @@
+interface:
+  display_name: "番茄短篇规则怪谈写作"
+  short_description: "创作番茄短篇规则怪谈小说副本规则反转与强钩子正文规范"
+  default_prompt: "写一篇番茄短篇规则怪谈小说，包含强钩子、规则压迫、反转破局和四层自检。"

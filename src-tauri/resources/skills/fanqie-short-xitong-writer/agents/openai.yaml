@@ -1,0 +1,4 @@
+interface:
+  display_name: "番茄短篇系统穿越写作"
+  short_description: "创作番茄短篇系统穿越攻略失败、穿书改命、摆烂求死与追悔反噬正文规则"
+  default_prompt: "使用 $fanqie-short-xitong-writer 写一篇番茄短篇系统穿越小说，包含强钩子、系统规则反转、主角清醒改命和四层自检。"

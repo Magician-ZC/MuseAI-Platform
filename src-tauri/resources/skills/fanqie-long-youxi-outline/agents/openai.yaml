@@ -1,0 +1,4 @@
+interface:
+  display_name: "番茄游戏体育大纲"
+  short_description: "番茄小说游戏体育选题、节奏拆解与前30章大纲生成器"
+  default_prompt: "使用 $fanqie-long-youxi-outline 生成一个番茄游戏体育长篇选题和前30章大纲。"

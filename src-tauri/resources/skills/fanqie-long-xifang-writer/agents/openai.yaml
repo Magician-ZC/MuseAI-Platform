@@ -1,0 +1,4 @@
+interface:
+  display_name: "番茄长篇西方奇幻写作"
+  short_description: "创作强钩子、快节奏、高追读感的中文长篇西方奇幻网文正文"
+  default_prompt: "使用 $fanqie-long-xifang-writer 按番茄长篇西方奇幻节奏创作中文小说正文。"

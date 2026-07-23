@@ -1,0 +1,204 @@
+import React, { useMemo } from 'react';
+import { Modal, Typography, Button, Tooltip, message } from 'antd';
+import { CopyOutlined } from '@ant-design/icons';
+import { ScoreRadarChart } from './ScoreRadarChart';
+
+const { Title, Paragraph, Text } = Typography;
+
+const DEFAULT_SCORE_FIELDS = ['引流能力', '开局钩子', '设定新鲜感', '情绪爽点密度', '人设代入与话题性'];
+const SUGGESTION_KEYS = new Set(['综合建议', '优化建议', '建议', '改进方向', '整体评价']);
+const COPY_SUGGESTION_BUTTON_STYLE: React.CSSProperties = {
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  border: 'none',
+  background: 'transparent',
+  cursor: 'pointer',
+  opacity: 0.8,
+  transition: 'opacity 0.2s',
+};
+
+interface ScoreDetailsModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  parsedAssessment: any;
+  totalScore: number;
+  scoreFields?: Array<{ name: string; max?: number }> | string[];
+  title?: string;
+  chartTitle?: string;
+}
+
+export const ScoreDetailsModal: React.FC<ScoreDetailsModalProps> = ({
+  isOpen,
+  onClose,
+  parsedAssessment,
+  totalScore,
+  scoreFields,
+  title = '大纲综合评分',
+  chartTitle = '大纲多维评分',
+}) => {
+  const radarData = useMemo(() => {
+    if (!parsedAssessment) return null;
+    const fields = scoreFields && scoreFields.length > 0
+      ? scoreFields
+      : DEFAULT_SCORE_FIELDS;
+    const dimensions = fields.map((item) => {
+      if (typeof item === 'string') {
+        return { name: item, max: 20 };
+      }
+      return { name: item.name, max: item.max || 20 };
+    });
+    const values = dimensions.map((d) => {
+      const val = parsedAssessment[d.name];
+      return typeof val === 'number' ? val : 0;
+    });
+
+    return { dimensions, values };
+  }, [parsedAssessment, scoreFields]);
+
+  // Extract suggestions from parsedAssessment
+  // We'll look for string values in the parsed JSON that could represent suggestions
+  const suggestions = useMemo(() => {
+    if (!parsedAssessment) return [];
+    const texts: { label: string; text: string }[] = [];
+    
+    // Some common keys that might be used for suggestions
+    for (const key of Object.keys(parsedAssessment)) {
+      if (SUGGESTION_KEYS.has(key) && typeof parsedAssessment[key] === 'string') {
+        texts.push({ label: key, text: parsedAssessment[key] });
+      }
+    }
+
+    // If no explicit suggestion keys found, let's just collect any string fields
+    // that are long enough to be considered a suggestion
+    if (texts.length === 0) {
+      for (const key of Object.keys(parsedAssessment)) {
+        if (typeof parsedAssessment[key] === 'string' && parsedAssessment[key].length > 15) {
+          texts.push({ label: key, text: parsedAssessment[key] });
+        }
+      }
+    }
+
+    return texts;
+  }, [parsedAssessment]);
+
+  return (
+    <Modal
+      title={null}
+      open={isOpen}
+      onCancel={onClose}
+      footer={null}
+      width={960}
+      centered
+      destroyOnClose
+      styles={{
+        body: {
+          padding: 0,
+          backgroundColor: '#faf9f5',
+          borderRadius: 8,
+          overflow: 'hidden',
+        }
+      }}
+    >
+      <div style={{ display: 'flex', minHeight: 400 }}>
+        {/* Left Side: Radar Chart */}
+        <div style={{ 
+          flex: '0 0 400px', 
+          padding: '32px 24px', 
+          backgroundColor: '#ffffff',
+          borderRight: '1px solid rgba(0,0,0,0.06)',
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center'
+        }}>
+          <div style={{ marginBottom: 16, textAlign: 'center' }}>
+            <Title level={4} style={{ color: '#33312e', margin: 0, fontWeight: 600 }}>{title}</Title>
+            <div style={{ color: '#d97757', fontSize: 36, fontWeight: 700, lineHeight: 1.2, marginTop: 8 }}>
+              {totalScore} <span style={{ fontSize: 16, color: '#999', fontWeight: 400 }}>/ 100</span>
+            </div>
+          </div>
+          
+          <div style={{ width: '100%', flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            {radarData ? (
+              <ScoreRadarChart data={radarData} parsedAssessment={parsedAssessment} title={chartTitle} />
+            ) : (
+              <Text type="secondary">暂无数据</Text>
+            )}
+          </div>
+        </div>
+
+        {/* Right Side: Suggestions */}
+        <div style={{ 
+          flex: 1, 
+          padding: '32px 32px 32px 24px',
+          overflowY: 'auto',
+          maxHeight: '600px'
+        }}>
+          <Title level={4} style={{ color: '#33312e', margin: 0, marginBottom: 24, fontWeight: 600 }}>优化建议</Title>
+          
+          {suggestions.length > 0 ? (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+              {suggestions.map((item) => (
+                <div key={item.label} style={{
+                  backgroundColor: '#ffffff', 
+                  padding: 16, 
+                  borderRadius: 8,
+                  boxShadow: '0 2px 8px rgba(0,0,0,0.02)',
+                  border: '1px solid rgba(217, 119, 87, 0.1)'
+                }}>
+                  <div style={{ 
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                    marginBottom: 8
+                  }}>
+                    <span style={{ 
+                      color: '#d97757', 
+                      fontWeight: 600, 
+                      fontSize: 14 
+                    }}>
+                      {item.label}
+                    </span>
+                    <Tooltip title="复制建议全文">
+                      <Button
+                        type="text"
+                        size="small"
+                        icon={<CopyOutlined style={{ color: '#d97757' }} />}
+                        onClick={() => {
+                          navigator.clipboard.writeText(item.text)
+                            .then(() => {
+                              message.success('已复制优化建议全文');
+                            })
+                            .catch((err) => {
+                              console.error('复制失败:', err);
+                              message.error('复制失败，请手动选择复制');
+                            });
+                        }}
+                        style={COPY_SUGGESTION_BUTTON_STYLE}
+                        onMouseEnter={(e) => (e.currentTarget.style.opacity = '1')}
+                        onMouseLeave={(e) => (e.currentTarget.style.opacity = '0.8')}
+                      />
+                    </Tooltip>
+                  </div>
+                  <Paragraph style={{ color: '#555', margin: 0, fontSize: 14, lineHeight: 1.6, whiteSpace: 'pre-wrap' }}>
+                    {item.text}
+                  </Paragraph>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div style={{ 
+              height: '100%', 
+              display: 'flex', 
+              alignItems: 'center', 
+              justifyContent: 'center',
+              color: '#999'
+            }}>
+              暂无优化建议
+            </div>
+          )}
+        </div>
+      </div>
+    </Modal>
+  );
+};

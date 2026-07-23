@@ -1,0 +1,4 @@
+interface:
+  display_name: "番茄长篇游戏体育写作"
+  short_description: "创作高追读感的番茄长篇游戏体育小说正文、开篇与续写章节"
+  default_prompt: "使用 $fanqie-long-youxi-writer 写一章番茄风格的长篇游戏体育小说正文。"

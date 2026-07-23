@@ -1,0 +1,4 @@
+interface:
+  display_name: "番茄短篇真假千金大纲"
+  short_description: "番茄短篇真假千金身份错位、绿茶互斗与全文大纲生成器"
+  default_prompt: "使用 $fanqie-short-qianjin-outline 生成一个番茄短篇真假千金选题和全文大纲。"

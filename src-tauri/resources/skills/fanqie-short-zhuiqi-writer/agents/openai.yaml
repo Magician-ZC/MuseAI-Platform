@@ -1,0 +1,4 @@
+interface:
+  display_name: "番茄短篇追妻火葬场写作"
+  short_description: "创作番茄短篇追妻火葬场小说并进行自检的正文写作工具"
+  default_prompt: "写一篇番茄短篇追妻火葬场小说，包含强钩子、情绪递进和四层自检。"

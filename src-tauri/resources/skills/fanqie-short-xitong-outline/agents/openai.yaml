@@ -1,0 +1,4 @@
+interface:
+  display_name: "番茄短篇系统大纲"
+  short_description: "番茄短篇系统穿越选题、片段节奏与全文大纲生成器"
+  default_prompt: "使用 $fanqie-short-xitong-outline 生成一个番茄短篇系统穿越选题和全文大纲。"

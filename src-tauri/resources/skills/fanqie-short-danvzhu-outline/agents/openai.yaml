@@ -1,0 +1,4 @@
+interface:
+  display_name: "番茄短篇大女主大纲"
+  short_description: "番茄短篇大女主开篇节奏、爽点反击与全文大纲生成器"
+  default_prompt: "使用 $fanqie-short-danvzhu-outline 生成一个番茄短篇大女主选题和全文大纲。"

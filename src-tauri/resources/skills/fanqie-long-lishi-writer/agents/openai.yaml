@@ -1,0 +1,4 @@
+interface:
+  display_name: "番茄历史古代写作"
+  short_description: "创作番茄历史古代长篇开篇、章节续写与正文润色规则指南"
+  default_prompt: "使用 $fanqie-long-lishi-writer 写一章强钩子、重生存、讲制度兑现并带章末悬念的番茄历史古代小说。"

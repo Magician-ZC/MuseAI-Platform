@@ -1,0 +1,4 @@
+interface:
+  display_name: "番茄东方仙侠写作"
+  short_description: "创作番茄东方仙侠长篇开篇、章节续写与润色的完整规则"
+  default_prompt: "使用 $fanqie-long-xianxia-writer 写一章有仙侠气韵、明确机缘、人物选择和章末追读钩子的番茄东方仙侠小说。"

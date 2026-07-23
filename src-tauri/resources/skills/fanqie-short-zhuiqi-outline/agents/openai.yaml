@@ -1,0 +1,4 @@
+interface:
+  display_name: "番茄短篇追妻火葬场大纲"
+  short_description: "番茄短篇追妻火葬场选题与全文大纲生成器"
+  default_prompt: "使用 $fanqie-short-zhuiqi-outline 生成一个番茄短篇追妻火葬场选题和全文大纲。"

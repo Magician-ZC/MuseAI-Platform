@@ -216,6 +216,10 @@ pub fn parse_outline(text: &str) -> Result<Vec<OutlineNode>, EngineError> {
             summary: summary.to_string(),
             constraint: level,
             status: NodeStatus::Pending,
+            // 文本大纲不带阈值/谓词/权重配置（老式节点，走 build_patch 兼容路径）。
+            threshold: None,
+            advance_when: None,
+            weights: None,
         });
     }
     Ok(nodes)

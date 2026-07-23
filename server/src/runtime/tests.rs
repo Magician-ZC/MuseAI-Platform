@@ -482,3 +482,978 @@ async fn irreversible_action_gates_consent_then_approve_lands() {
     .await;
     assert_eq!(n_pending_after, 0, "落定后不应残留/重复新建 pending 同意");
 }
+
+// ---------- Phase 1：世界固有角色（NPC/反派）注入 ----------
+
+/// 把一组 NPC 条目钉进 worlds.assembled_json 的 worldCharacterEntries（模拟装配产物，runtime 每 tick 读回）。
+async fn pin_world_characters(db: &AnyPool, world_id: &str, npcs: &[(&str, &str)]) {
+    let entries: Vec<serde_json::Value> = npcs
+        .iter()
+        .map(|(id, name)| {
+            let card: serde_json::Value = serde_json::from_str(&sample_card_json(id, name)).unwrap();
+            json!({ "characterId": id, "card": card, "location": "", "carriedItems": [] })
+        })
+        .collect();
+    let assembled = json!({ "assembly": { "worldCharacterEntries": entries } });
+    sqlx::query("UPDATE worlds SET assembled_json=? WHERE id=?")
+        .bind(assembled.to_string())
+        .bind(world_id)
+        .execute(db)
+        .await
+        .unwrap();
+}
+
+/// NPC 从 assembled_json 注入 active_cards：参与本回合决策 → 产出 world_events（actor=npc，Public 广播），
+/// 但【不是 world_member】（不进 members_projection、无日报投影）。预算多一次 decide 调用为证。
+#[tokio::test]
+async fn world_character_injected_participates_and_is_not_a_member() {
+    let state = test_state().await;
+    let wid = running_world_with_two_members(&state).await;
+    pin_world_characters(&state.db, &wid, &[("npc1", "黑衣人")]).await;
+
+    let model: Arc<dyn ModelClient> = Arc::new(MockModel { input_tokens: 10, output_tokens: 20 });
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 0, model).await.unwrap(), TickStatus::Done);
+
+    // NPC 参与决策 → 其行动落库为 world_event（actor 含 npc1，Public 广播）。
+    let npc_events = i64_one(
+        &state.db,
+        "SELECT COUNT(*) FROM world_events WHERE world_id=? AND actors_json LIKE '%npc1%'",
+        &wid,
+    )
+    .await;
+    assert!(npc_events > 0, "NPC 应参与本回合决策并产出可广播的 world_events");
+
+    // NPC 无 owner，不是 world_member（故不进 members_projection、无日报投影）。
+    let npc_member_rows = i64_one(
+        &state.db,
+        "SELECT COUNT(*) FROM world_members WHERE world_id=? AND cloud_character_id='npc1'",
+        &wid,
+    )
+    .await;
+    assert_eq!(npc_member_rows, 0, "NPC 无 owner，不应是 world_member");
+
+    // 预算实测：3 活跃角色（chA/chB/npc1）→ director + decide×3 + writer + critic = 6 调用 ×30 = 180
+    //（对照纯 2 成员基线 150：NPC 计入活跃多一次 decide）。
+    let spent = i64_one(&state.db, "SELECT spent_tokens_today FROM world_budgets WHERE world_id=?", &wid).await;
+    assert_eq!(spent, 180, "NPC 计入活跃 → 多一次 decide 调用（6 调用 ×30）");
+}
+
+// ---------- Phase 2：地点维度（初始位置种入 + 按地点分组） ----------
+
+/// 钉地点图 + NPC 落在与玩家默认起点不同的地点：玩家默认起点 = 首个非秘境地点（id 序 hall<north → hall），
+/// NPC home=north → 玩家与 NPC 分属两组。
+async fn pin_locations_and_remote_npc(db: &AnyPool, world_id: &str) {
+    let npc_card: serde_json::Value = serde_json::from_str(&sample_card_json("npc1", "北境守将")).unwrap();
+    let assembled = json!({
+        "assembly": {
+            "worldCharacterEntries": [
+                { "characterId": "npc1", "card": npc_card, "location": "north", "carriedItems": [] }
+            ],
+            "locationGraph": [
+                { "id": "hall", "name": "前厅", "connections": ["north"] },
+                { "id": "north", "name": "北境", "connections": ["hall"] }
+            ]
+        }
+    });
+    sqlx::query("UPDATE worlds SET assembled_json=? WHERE id=?")
+        .bind(assembled.to_string())
+        .bind(world_id)
+        .execute(db)
+        .await
+        .unwrap();
+}
+
+/// build_seed_state 给角色初始 location：玩家 → 默认起点 hall，NPC → 其 home north；
+/// 两地点分两组 → 导演/写作各按组放大（成本随地点组数上升）。
+#[tokio::test]
+async fn locations_seed_initial_positions_and_split_groups() {
+    let state = test_state().await;
+    let wid = running_world_with_two_members(&state).await;
+    pin_locations_and_remote_npc(&state.db, &wid).await;
+
+    let model: Arc<dyn ModelClient> = Arc::new(MockModel { input_tokens: 10, output_tokens: 20 });
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 0, model).await.unwrap(), TickStatus::Done);
+
+    // 初始位置种入：玩家 chA/chB → 默认起点 hall；NPC npc1 → 其 home north。
+    let st: NarrativeState =
+        serde_json::from_str(&load_world(&state.db, &wid).await.unwrap().narrative_state_json).unwrap();
+    assert_eq!(st.characters["chA"].location, "hall", "玩家默认起点 = 首个非秘境地点");
+    assert_eq!(st.characters["chB"].location, "hall");
+    assert_eq!(st.characters["npc1"].location, "north", "NPC 落在其 home_location");
+
+    // 2 组（hall:{chA,chB}、north:{npc1}）→ 导演2 + 决策3 + 写作2 + 审校1 = 8 调用 ×30 = 240。
+    // （对照单组 3 活跃基线 180：多一个地点组 → 多一次导演 + 一次写作。）
+    let spent = i64_one(&state.db, "SELECT spent_tokens_today FROM world_budgets WHERE world_id=?", &wid).await;
+    assert_eq!(spent, 240, "地点分组 → 导演/写作按组放大（8 调用 ×30）");
+}
+
+// ---------- Phase 3：道具事实源单一化（backpack / NPC 携带 → resources）+ 秘境准入端到端 ----------
+
+/// 直接写 items 定义（绕过 grant_item，测试脚手架）。
+async fn seed_item(db: &AnyPool, id: &str, effect_tags: &[&str], cosmology: &[&str], tier: i64) {
+    sqlx::query(
+        "INSERT INTO items (id, narrative, effect_tags, origin_world_template_id, cosmology_json, power_tier, created_at) \
+         VALUES (?, '测试道具', ?, 'tpl-x', ?, ?, ?)",
+    )
+    .bind(id)
+    .bind(serde_json::to_string(effect_tags).unwrap())
+    .bind(serde_json::to_string(cosmology).unwrap())
+    .bind(tier)
+    .bind(now_ms())
+    .execute(db)
+    .await
+    .unwrap();
+}
+
+/// 直接写一条 carried 背包行（模拟 carry 入场：物品随角色携带进本世界）。
+async fn seed_carried(db: &AnyPool, user: &str, item_id: &str, world_id: &str) {
+    sqlx::query(
+        "INSERT INTO backpacks (id, user_id, item_id, acquired_world_id, status, carried_world_id, acquired_at) \
+         VALUES (?, ?, ?, ?, 'carried', ?, ?)",
+    )
+    .bind(new_id("bp"))
+    .bind(user)
+    .bind(item_id)
+    .bind(world_id)
+    .bind(world_id)
+    .bind(now_ms())
+    .execute(db)
+    .await
+    .unwrap();
+}
+
+/// 钉一个携带道具的 NPC（carriedItems 已是装配解引用后的 ItemDefinition 形态）。
+async fn pin_npc_with_carried(db: &AnyPool, world_id: &str, npc_id: &str, name: &str, item_id: &str, effect_tags: &[&str]) {
+    let card: serde_json::Value = serde_json::from_str(&sample_card_json(npc_id, name)).unwrap();
+    let carried = json!([{
+        "id": item_id, "narrative": "", "effectTags": effect_tags,
+        "origin": { "worldTemplateId": "tpl-x", "cosmology": ["mundane"], "powerTier": 2 }
+    }]);
+    let assembled = json!({
+        "assembly": { "worldCharacterEntries": [
+            { "characterId": npc_id, "card": card, "location": "", "carriedItems": carried }
+        ] }
+    });
+    sqlx::query("UPDATE worlds SET assembled_json=? WHERE id=?")
+        .bind(assembled.to_string())
+        .bind(world_id)
+        .execute(db)
+        .await
+        .unwrap();
+}
+
+/// 玩家 backpack + NPC 携带道具都物化进 CharacterState.resources（`item:<id>`/`tag:<t>`），单一事实源。
+/// 未携带的玩家无道具事实；跨 tick 幂等（不累积重复项）。
+#[tokio::test]
+async fn player_backpack_and_npc_items_materialize_into_resources() {
+    let state = test_state().await;
+    let wid = running_world_with_two_members(&state).await;
+
+    // 玩家 uA(chA) 携带 jade_key 入场；chB 未携带任何道具。
+    seed_item(&state.db, "jade_key", &["advantage:stealth"], &["myth"], 2).await;
+    seed_carried(&state.db, "uA", "jade_key", &wid).await;
+    // NPC npc1 携带 dark_blade（装配钉住）。
+    pin_npc_with_carried(&state.db, &wid, "npc1", "黑衣人", "dark_blade", &["advantage:combat"]).await;
+
+    let model: Arc<dyn ModelClient> = Arc::new(MockModel { input_tokens: 10, output_tokens: 20 });
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 0, model.clone()).await.unwrap(), TickStatus::Done);
+
+    let st: NarrativeState =
+        serde_json::from_str(&load_world(&state.db, &wid).await.unwrap().narrative_state_json).unwrap();
+    // 玩家 backpack 物化：chA 持有 item:jade_key + tag:advantage:stealth。
+    let cha = &st.characters["chA"].resources;
+    assert!(cha.contains(&"item:jade_key".to_string()), "玩家携带道具应物化为持有事实: {cha:?}");
+    assert!(cha.contains(&"tag:advantage:stealth".to_string()), "effectTag 应物化: {cha:?}");
+    // 未携带的 chB 无道具事实。
+    assert!(
+        !st.characters["chB"].resources.iter().any(|r| r.starts_with("item:")),
+        "未携带的玩家不应有道具事实"
+    );
+    // NPC 携带道具物化：npc1 持有 item:dark_blade + tag:advantage:combat。
+    let npc = &st.characters["npc1"].resources;
+    assert!(npc.contains(&"item:dark_blade".to_string()), "NPC 携带道具应物化: {npc:?}");
+    assert!(npc.contains(&"tag:advantage:combat".to_string()));
+
+    // 跨 tick 幂等：再跑一 tick，道具事实不重复累积（backpack 单一事实源，物化前先清派生项）。
+    insert_tick(&state.db, &wid, 1, 1).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 1, model).await.unwrap(), TickStatus::Done);
+    let st2: NarrativeState =
+        serde_json::from_str(&load_world(&state.db, &wid).await.unwrap().narrative_state_json).unwrap();
+    let jade_count = st2.characters["chA"].resources.iter().filter(|r| *r == "item:jade_key").count();
+    assert_eq!(jade_count, 1, "跨 tick 道具事实应幂等，不累积重复项");
+}
+
+/// 秘境准入端到端：MoveMockModel 让全体尝试进秘境；持钥匙者（backpack 物化 → 引擎 R6b 读持有）被准入并
+/// 移动落定，无钥匙者被拒留原地。证明 backpack → resources → 引擎 R6b 的完整链路。
+struct MoveMockModel {
+    dest: String,
+}
+
+#[async_trait]
+impl ModelClient for MoveMockModel {
+    async fn complete(&self, spec: &ModelCallSpec, cancel: &CancelFlag) -> Result<ModelOutput, EngineError> {
+        cancel.check()?;
+        let content = match spec.agent.as_str() {
+            "director" => r#"{"situation":"前厅通往秘境的石门前。"}"#.to_string(),
+            "roleDecide" => format!(
+                r#"{{"intent":"探秘","action":"前往秘境","speak":{{"willSpeak":false,"purpose":""}},"targets":["loc:{}"],"acceptableCosts":[],"predictions":[]}}"#,
+                self.dest
+            ),
+            "arbiter" => r#"{"outcomes":[]}"#.to_string(),
+            "writer" => r#"{"prose":"石门轰然而开。"}"#.to_string(),
+            "critic" => r#"{"characterConsistencyIssues":[],"causalIssues":[],"revisionSuggestions":[]}"#.to_string(),
+            _ => "{}".to_string(),
+        };
+        Ok(ModelOutput { content, input_tokens: Some(5), output_tokens: Some(5) })
+    }
+}
+
+/// 钉一个「前厅 ⇄ 秘境（gate 需 jade_key）」的地点图。
+async fn pin_secret_realm(db: &AnyPool, world_id: &str) {
+    let assembled = json!({
+        "assembly": { "locationGraph": [
+            { "id": "hall", "name": "前厅", "connections": ["secret"] },
+            { "id": "secret", "name": "秘境", "connections": ["hall"], "isSecretRealm": true,
+              "gate": { "requiredItemIds": ["jade_key"] } }
+        ] }
+    });
+    sqlx::query("UPDATE worlds SET assembled_json=? WHERE id=?")
+        .bind(assembled.to_string())
+        .bind(world_id)
+        .execute(db)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn secret_realm_admission_gates_move_by_materialized_backpack() {
+    let state = test_state().await;
+    let wid = running_world_with_two_members(&state).await;
+    pin_secret_realm(&state.db, &wid).await;
+    // chA(uA) 持秘境钥匙 jade_key 并携带入场；chB 无。
+    seed_item(&state.db, "jade_key", &[], &["myth"], 1).await;
+    seed_carried(&state.db, "uA", "jade_key", &wid).await;
+
+    let model: Arc<dyn ModelClient> = Arc::new(MoveMockModel { dest: "secret".into() });
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 0, model).await.unwrap(), TickStatus::Done);
+
+    let st: NarrativeState =
+        serde_json::from_str(&load_world(&state.db, &wid).await.unwrap().narrative_state_json).unwrap();
+    // 持钥匙者通过 R6b 准入 → 移动落定到秘境。
+    assert_eq!(st.characters["chA"].location, "secret", "持秘境钥匙者应被准入并移动到秘境");
+    // 无钥匙者被 R6b 拒绝 → 留在前厅（初始默认起点）。
+    assert_eq!(st.characters["chB"].location, "hall", "无钥匙者应被秘境准入拒绝，留在原地");
+}
+
+// ---------- 第二块 Phase 2：server event 模式接线（DES 时间线） ----------
+
+/// soft 模板（普通软节点，无 threshold 里程碑 → is_terminal 永不判 MainlineDone，世界持续可推进）。
+/// 用于 event 模式跨 tick 推进 game_time 的用例（里程碑模板首 tick 即完成主线 → 次 tick 终局短路，时钟不再前进）。
+async fn seed_template_soft(db: &AnyPool, id: &str) {
+    let skeleton = json!({
+        "mainlineNodes": [{ "id": "n1", "summary": "两位大臣寒暄", "fated": false, "constraint": "soft" }],
+        "forbiddenPredicates": []
+    });
+    sqlx::query(
+        "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, official, version, moderation, created_at) \
+         VALUES (?, '软节点模板', 'idle', ?, '{\"mode\":\"open\"}', 1, 1, 'approved', ?)",
+    )
+    .bind(id)
+    .bind(skeleton.to_string())
+    .bind(now_ms())
+    .execute(db)
+    .await
+    .unwrap();
+}
+
+/// 建一个 running、soft 模板、带 2 名成员的世界，按 `mode` 设 timeline_mode（'interval'/'event'）。
+/// 各资源 id 以 `tag` 隔离，便于单个测试内并存多个世界（内存库无跨测试共享）。
+async fn running_soft_world(state: &AppState, tag: &str, mode: &str) -> String {
+    let tpl = format!("tpl-{tag}");
+    let routes_v = format!("routes-{tag}");
+    let (ua, ub) = (format!("u{tag}A"), format!("u{tag}B"));
+    let (ca, cb) = (format!("c{tag}A"), format!("c{tag}B"));
+    seed_template_soft(&state.db, &tpl).await;
+    seed_model_routes(&state.db, &routes_v).await;
+    seed_user(&state.db, &ua).await;
+    seed_user(&state.db, &ub).await;
+    seed_char(&state.db, &ca, &ua, "李").await;
+    seed_char(&state.db, &cb, &ub, "王").await;
+
+    let mut p = CreateWorldParams::official(tpl.clone(), 1, "DES 测试世界");
+    p.status = Some("running".into());
+    p.model_route_version = Some(routes_v.clone());
+    p.prompt_set_version = Some("test-prompts".into());
+    p.member_limit = 10;
+    p.daily_token_budget = 1_000_000;
+    p.daily_cny_budget_cents = 0;
+    let wid = create_world(&state.db, p).await.unwrap();
+
+    seed_member(&state.db, &wid, &ua, &ca).await;
+    seed_member(&state.db, &wid, &ub, &cb).await;
+
+    if mode != "interval" {
+        sqlx::query("UPDATE worlds SET timeline_mode=? WHERE id=?")
+            .bind(mode)
+            .bind(&wid)
+            .execute(&state.db)
+            .await
+            .unwrap();
+    }
+    wid
+}
+
+/// commit_tick 把 NarrativeState.timeline.now 回写到 worlds.game_time；event 模式跨 tick 单调推进，
+/// interval 模式恒为 0（run_round 不触碰 timeline）。
+#[tokio::test]
+async fn game_time_written_back() {
+    let state = test_state().await;
+    let ev = running_soft_world(&state, "ev", "event").await;
+    let iv = running_soft_world(&state, "iv", "interval").await;
+    let model: Arc<dyn ModelClient> = Arc::new(MockModel { input_tokens: 10, output_tokens: 20 });
+
+    // event 世界 tick 0：首步激活时刻 T=0（全体缺席 next_time 视为 now=0）→ game_time 回写 0，与状态一致。
+    insert_tick(&state.db, &ev, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &ev, 0, model.clone()).await.unwrap(), TickStatus::Done);
+    let gt0 = i64_one(&state.db, "SELECT game_time FROM worlds WHERE id=?", &ev).await;
+    let st0: NarrativeState =
+        serde_json::from_str(&load_world(&state.db, &ev).await.unwrap().narrative_state_json).unwrap();
+    assert_eq!(gt0, st0.timeline.now, "game_time 应等于 timeline.now");
+    assert_eq!(gt0, 0, "首步 T=0");
+    // 首步推进 cohort 的 next_time = T + DEFAULT_DURATION（60）。角色 id 由 running_soft_world("ev",..) 派生为 cevA。
+    assert_eq!(st0.timeline.next_time.get("cevA").copied(), Some(60));
+
+    // event 世界 tick 1：最小 next_time = 60 → T=60 → game_time 回写 60（游戏时钟随事件步前进）。
+    insert_tick(&state.db, &ev, 1, 1).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &ev, 1, model.clone()).await.unwrap(), TickStatus::Done);
+    let gt1 = i64_one(&state.db, "SELECT game_time FROM worlds WHERE id=?", &ev).await;
+    let st1: NarrativeState =
+        serde_json::from_str(&load_world(&state.db, &ev).await.unwrap().narrative_state_json).unwrap();
+    assert_eq!(gt1, st1.timeline.now, "game_time 应持续等于 timeline.now");
+    assert_eq!(gt1, 60, "第二事件步激活时刻 T=60，game_time 应推进到 60");
+    assert!(gt1 > gt0, "event 模式 game_time 应跨 tick 单调推进");
+
+    // interval 世界：走原 run_round，timeline 不被触碰 → game_time 恒为 0。
+    insert_tick(&state.db, &iv, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &iv, 0, model.clone()).await.unwrap(), TickStatus::Done);
+    let gt_iv = i64_one(&state.db, "SELECT game_time FROM worlds WHERE id=?", &iv).await;
+    assert_eq!(gt_iv, 0, "interval 世界不推进游戏时钟，game_time 恒为 0");
+}
+
+/// event 模式调度器「背靠背」：上一 tick done 且无 outstanding → 立即排下一 tick（不看墙钟 interval）；
+/// interval 模式在同一 schedule_due_ticks 轮里未到间隔 → 不排新 tick（退化路径不受影响）。
+#[tokio::test]
+async fn timeline_mode_event_back_to_back() {
+    let state = test_state().await;
+    let ev = running_soft_world(&state, "ev", "event").await;
+    let iv = running_soft_world(&state, "iv", "interval").await;
+    let model: Arc<dyn ModelClient> = Arc::new(MockModel { input_tokens: 10, output_tokens: 20 });
+
+    // 两个世界各处理完 tick 0（done）。
+    insert_tick(&state.db, &ev, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &ev, 0, model.clone()).await.unwrap(), TickStatus::Done);
+    insert_tick(&state.db, &iv, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &iv, 0, model.clone()).await.unwrap(), TickStatus::Done);
+
+    // 调度器轮询：event 世界背靠背排出 tick 1（无 outstanding）；interval 世界未到间隔不排。
+    super::schedule_due_ticks(&state).await.unwrap();
+
+    let ev_max = i64_one(
+        &state.db,
+        "SELECT COALESCE(MAX(tick_no), -1) FROM world_ticks WHERE world_id=?",
+        &ev,
+    )
+    .await;
+    assert_eq!(ev_max, 1, "event 世界上一 tick done → 应背靠背立即排出 tick 1");
+    let ev_pending = i64_one(
+        &state.db,
+        "SELECT COUNT(*) FROM world_ticks WHERE world_id=? AND tick_no=1 AND status='pending'",
+        &ev,
+    )
+    .await;
+    assert_eq!(ev_pending, 1, "背靠背排出的 tick 1 应为 pending 待处理");
+
+    let iv_max = i64_one(
+        &state.db,
+        "SELECT COALESCE(MAX(tick_no), -1) FROM world_ticks WHERE world_id=?",
+        &iv,
+    )
+    .await;
+    assert_eq!(iv_max, 0, "interval 世界刚建 tick 0，未到墙钟间隔，不应排新 tick");
+
+    // 背靠背排出的 tick 1 可继续处理 → game_time 随之推进（证明 event 世界持续推进）。
+    assert_eq!(process_tick_with_model(&state, &ev, 1, model.clone()).await.unwrap(), TickStatus::Done);
+    let gt = i64_one(&state.db, "SELECT game_time FROM worlds WHERE id=?", &ev).await;
+    assert_eq!(gt, 60, "背靠背处理的第二 tick 应把 game_time 推进到 60");
+
+    // 再轮询一次：tick 1 已 done → 继续背靠背排出 tick 2。
+    super::schedule_due_ticks(&state).await.unwrap();
+    let ev_max2 = i64_one(
+        &state.db,
+        "SELECT COALESCE(MAX(tick_no), -1) FROM world_ticks WHERE world_id=?",
+        &ev,
+    )
+    .await;
+    assert_eq!(ev_max2, 2, "event 世界应持续背靠背排 tick（tick 2）");
+}
+
+/// 纯 NPC 无玩家成员的世界 → member_ids 空短路，跳过（防空跑）：即便 NPC 使活跃卡 ≥2 也不推进。
+#[tokio::test]
+async fn pure_npc_world_without_members_skips() {
+    let state = test_state().await;
+    seed_template(&state.db, "tpl-x").await;
+    seed_model_routes(&state.db, "test-routes").await;
+
+    let mut p = CreateWorldParams::official("tpl-x", 1, "纯 NPC 世界");
+    p.status = Some("running".into());
+    p.model_route_version = Some("test-routes".into());
+    p.prompt_set_version = Some("test-prompts".into());
+    p.member_limit = 10;
+    p.daily_token_budget = 1_000_000;
+    p.daily_cny_budget_cents = 0;
+    let wid = create_world(&state.db, p).await.unwrap();
+
+    // 无 world_members；钉两个 NPC（活跃卡将达 2，但无玩家 → 短路跳过）。
+    pin_world_characters(&state.db, &wid, &[("npcA", "甲"), ("npcB", "乙")]).await;
+
+    let model: Arc<dyn ModelClient> = Arc::new(MockModel { input_tokens: 10, output_tokens: 20 });
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(
+        process_tick_with_model(&state, &wid, 0, model).await.unwrap(),
+        TickStatus::Skipped("insufficient_members"),
+        "无玩家成员的纯 NPC 世界应短路跳过，防空跑"
+    );
+}
+
+// ==================== P1 Phase 0：放置房终局停机 + 防秒结束 ====================
+
+/// 模板：给定 mainlineNodes（可空 → 空 skeleton）+ endgame 对象（P1 Phase 0 终局配置）。
+async fn seed_template_with_endgame(
+    db: &AnyPool,
+    id: &str,
+    room_type: &str,
+    mainline: serde_json::Value,
+    endgame: serde_json::Value,
+) {
+    let skeleton = json!({
+        "mainlineNodes": mainline,
+        "forbiddenPredicates": [],
+        "endgame": endgame,
+    });
+    sqlx::query(
+        "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, official, version, moderation, created_at) \
+         VALUES (?, '终局模板', ?, ?, '{\"mode\":\"open\"}', 1, 1, 'approved', ?)",
+    )
+    .bind(id)
+    .bind(room_type)
+    .bind(skeleton.to_string())
+    .bind(now_ms())
+    .execute(db)
+    .await
+    .unwrap();
+}
+
+/// 建一个 running、指定模板 / timeline_mode / room_type、带 2 名成员的世界（终局测试专用）。
+/// 资源 id 以 `tag` 隔离；模板须由调用方先 seed。
+async fn running_world_for_endgame(
+    state: &AppState,
+    tag: &str,
+    tpl: &str,
+    mode: &str,
+    room_type: &str,
+) -> String {
+    let routes_v = format!("routes-{tag}");
+    let (ua, ub) = (format!("u{tag}A"), format!("u{tag}B"));
+    let (ca, cb) = (format!("c{tag}A"), format!("c{tag}B"));
+    seed_model_routes(&state.db, &routes_v).await;
+    seed_user(&state.db, &ua).await;
+    seed_user(&state.db, &ub).await;
+    seed_char(&state.db, &ca, &ua, "李").await;
+    seed_char(&state.db, &cb, &ub, "王").await;
+
+    let mut p = CreateWorldParams::official(tpl.to_string(), 1, "终局测试世界");
+    p.status = Some("running".into());
+    p.room_type = room_type.into();
+    p.model_route_version = Some(routes_v.clone());
+    p.prompt_set_version = Some("test-prompts".into());
+    p.member_limit = 10;
+    p.daily_token_budget = 1_000_000;
+    p.daily_cny_budget_cents = 0;
+    let wid = create_world(&state.db, p).await.unwrap();
+
+    seed_member(&state.db, &wid, &ua, &ca).await;
+    seed_member(&state.db, &wid, &ub, &cb).await;
+
+    if mode != "interval" {
+        sqlx::query("UPDATE worlds SET timeline_mode=? WHERE id=?")
+            .bind(mode)
+            .bind(&wid)
+            .execute(&state.db)
+            .await
+            .unwrap();
+    }
+    wid
+}
+
+async fn world_status(db: &AnyPool, wid: &str) -> String {
+    text_one(db, "SELECT status FROM worlds WHERE id=?", wid).await
+}
+
+/// 终局条件(2) 世界时间上限：idle event 房到 max_world_ticks → end_world（status=ended）+ Concluded。
+/// soft 模板（无硬节点）→ 引擎永不判 MainlineDone，世界持续跑到时间上限被 server 终结。
+#[tokio::test]
+async fn idle_world_concludes_at_max_world_ticks() {
+    let state = test_state().await;
+    seed_template_with_endgame(
+        &state.db,
+        "tpl-cap",
+        "idle",
+        json!([{ "id": "n1", "summary": "寒暄", "constraint": "soft" }]),
+        json!({ "minWorldTicks": 0, "maxWorldTicks": 2 }),
+    )
+    .await;
+    let wid = running_world_for_endgame(&state, "cap", "tpl-cap", "event", "idle").await;
+    let model: Arc<dyn ModelClient> = Arc::new(MockModel { input_tokens: 10, output_tokens: 20 });
+
+    // tick 0/1：未到时间上限（< max=2）→ 正常推进，世界仍 running。
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 0, model.clone()).await.unwrap(), TickStatus::Done);
+    assert_eq!(world_status(&state.db, &wid).await, "running", "tick 0 未到上限，世界仍 running");
+    insert_tick(&state.db, &wid, 1, 1).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 1, model.clone()).await.unwrap(), TickStatus::Done);
+    assert_eq!(world_status(&state.db, &wid).await, "running", "tick 1 未到上限，世界仍 running");
+
+    // tick 2：tick_no(2) >= max_world_ticks(2) → 世界时间上限终局 → ended + Concluded。
+    insert_tick(&state.db, &wid, 2, 2).await.unwrap();
+    assert_eq!(
+        process_tick_with_model(&state, &wid, 2, model.clone()).await.unwrap(),
+        TickStatus::Concluded,
+        "到 max_world_ticks 应返回 Concluded（成功终态）"
+    );
+    assert_eq!(world_status(&state.db, &wid).await, "ended", "到时间上限世界应 status=ended 停机");
+    // 终局与状态 CAS 同事务：本 tick 的状态推进（revision 2→3）与停机同时落库。
+    let rev = i64_one(&state.db, "SELECT state_revision FROM worlds WHERE id=?", &wid).await;
+    assert_eq!(rev, 3, "终局 tick 的状态 CAS 与 end_world 同事务提交（revision 仍推进到 3）");
+}
+
+/// 终局条件(1) 主线走完（P2 引擎信号 MainlineDone 被消费）+ 防秒结束地板 min_world_ticks。
+/// P1 调和后「主线」= 里程碑（threshold.is_some()）：低阈值里程碑首 tick 即被回合强度累积推过阈值完成
+/// → 引擎产 MainlineDone；但 min_world_ticks=2 地板拦住早期终局；到地板后（含终局短路路径）才停机。
+#[tokio::test]
+async fn idle_world_concludes_on_mainline_complete_after_floor() {
+    let state = test_state().await;
+    seed_template_with_endgame(
+        &state.db,
+        "tpl-main",
+        "idle",
+        // 里程碑：threshold=1.0（2 名成员一回合的强度足以推过）+ 无 advanceWhen 谓词门。
+        json!([{ "id": "n1", "summary": "摊牌", "constraint": "soft", "threshold": 1.0 }]),
+        json!({ "minWorldTicks": 2, "maxWorldTicks": 100 }),
+    )
+    .await;
+    let wid = running_world_for_endgame(&state, "main", "tpl-main", "event", "idle").await;
+    let model: Arc<dyn ModelClient> = Arc::new(MockModel { input_tokens: 10, output_tokens: 20 });
+
+    // tick 0：跑完回合把里程碑 n1 的 milestoneProgress 累积过阈值 → Done → 引擎产 MainlineDone；
+    // 但 tick 0 < 地板 2 → 不停机，保持 running。
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 0, model.clone()).await.unwrap(), TickStatus::Done);
+    assert_eq!(world_status(&state.db, &wid).await, "running", "主线已完成但未到地板 → 不秒结束");
+    let st0: NarrativeState =
+        serde_json::from_str(&load_world(&state.db, &wid).await.unwrap().narrative_state_json).unwrap();
+    assert_eq!(st0.narrative.outline_nodes[0].status, NodeStatus::Done, "里程碑 n1 首 tick 已达阈值 Done");
+
+    // tick 1：run_event_step 起始即判 MainlineDone → 终局短路（无回合）；仍未到地板 2 → 保持 running（noop）。
+    // 短路 tick 不推进 revision，故 base_revision 仍为 1。
+    insert_tick(&state.db, &wid, 1, 1).await.unwrap();
+    assert_eq!(
+        process_tick_with_model(&state, &wid, 1, model.clone()).await.unwrap(),
+        TickStatus::Skipped("terminal"),
+        "主线完成 + 未到地板 → 终局短路保持 running（沿用 P2 noop）"
+    );
+    assert_eq!(world_status(&state.db, &wid).await, "running");
+
+    // tick 2：终局短路 + tick_no(2) >= 地板 2 → 消费 MainlineDone → ended + Concluded。
+    insert_tick(&state.db, &wid, 2, 1).await.unwrap();
+    assert_eq!(
+        process_tick_with_model(&state, &wid, 2, model.clone()).await.unwrap(),
+        TickStatus::Concluded,
+        "主线完成 + 过地板 → 消费终局信号停机（含终局短路路径）"
+    );
+    assert_eq!(world_status(&state.db, &wid).await, "ended", "主线走完过地板 → status=ended");
+}
+
+/// 防秒结束守卫①：空 skeleton（mainlineNodes=[]）的 idle 房，引擎 is_terminal 因「里程碑集为空」永不判
+/// MainlineDone → 绝不因「主线完成」在空集上真空成立而秒结束；只可能在 max_world_ticks 到点被 server 终结。
+#[tokio::test]
+async fn empty_skeleton_does_not_conclude_early() {
+    let state = test_state().await;
+    seed_template_with_endgame(
+        &state.db,
+        "tpl-empty",
+        "idle",
+        json!([]), // 空 skeleton
+        json!({ "minWorldTicks": 0, "maxWorldTicks": 5 }),
+    )
+    .await;
+    let wid = running_world_for_endgame(&state, "empty", "tpl-empty", "event", "idle").await;
+    let model: Arc<dyn ModelClient> = Arc::new(MockModel { input_tokens: 10, output_tokens: 20 });
+
+    // tick 0：即便地板=0（无地板保护），空 skeleton 也不因「主线完成」秒结束（守卫①）→ Done + running。
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(
+        process_tick_with_model(&state, &wid, 0, model.clone()).await.unwrap(),
+        TickStatus::Done,
+        "空 skeleton 不得秒结束（is_terminal 因里程碑集为空永不 MainlineDone）"
+    );
+    assert_eq!(world_status(&state.db, &wid).await, "running", "空 skeleton 首 tick 世界仍 running");
+
+    // 持续推进到 max_world_ticks(5)：ticks 1..=4 保持 running，tick 5 才因世界时间上限被 server 终结。
+    for n in 1..=4i64 {
+        insert_tick(&state.db, &wid, n, n).await.unwrap();
+        assert_eq!(process_tick_with_model(&state, &wid, n, model.clone()).await.unwrap(), TickStatus::Done);
+        assert_eq!(world_status(&state.db, &wid).await, "running", "未到上限前空 skeleton 世界持续 running");
+    }
+    insert_tick(&state.db, &wid, 5, 5).await.unwrap();
+    assert_eq!(
+        process_tick_with_model(&state, &wid, 5, model.clone()).await.unwrap(),
+        TickStatus::Concluded,
+        "空 skeleton 世界最终在 max_world_ticks 被兜底终结（不无限跑）"
+    );
+    assert_eq!(world_status(&state.db, &wid).await, "ended");
+}
+
+/// ended 后：schedule_due_ticks 不再排新 tick（status='running' 门），遗留 tick 命中 world_not_running noop。
+#[tokio::test]
+async fn ended_world_is_not_rescheduled() {
+    let state = test_state().await;
+    seed_template_with_endgame(
+        &state.db,
+        "tpl-sched",
+        "idle",
+        json!([{ "id": "n1", "summary": "寒暄", "constraint": "soft" }]),
+        json!({ "minWorldTicks": 0, "maxWorldTicks": 1 }),
+    )
+    .await;
+    let wid = running_world_for_endgame(&state, "sched", "tpl-sched", "event", "idle").await;
+    let model: Arc<dyn ModelClient> = Arc::new(MockModel { input_tokens: 10, output_tokens: 20 });
+
+    // tick 0 → Done；tick 1 → Concluded（1 >= max 1）→ ended。
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 0, model.clone()).await.unwrap(), TickStatus::Done);
+    insert_tick(&state.db, &wid, 1, 1).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 1, model.clone()).await.unwrap(), TickStatus::Concluded);
+    assert_eq!(world_status(&state.db, &wid).await, "ended");
+
+    // 调度器轮询：ended 世界不在 WHERE status='running' 内 → 不排新 tick（max tick_no 仍为 1）。
+    super::schedule_due_ticks(&state).await.unwrap();
+    let max_tick = i64_one(
+        &state.db,
+        "SELECT COALESCE(MAX(tick_no), -1) FROM world_ticks WHERE world_id=?",
+        &wid,
+    )
+    .await;
+    assert_eq!(max_tick, 1, "ended 世界不应再被排新 tick");
+
+    // 遗留 tick（补投一个 pending）：process 命中 world_not_running noop，不再跑回合、不重复结算。
+    insert_tick(&state.db, &wid, 2, 2).await.unwrap();
+    assert_eq!(
+        process_tick_with_model(&state, &wid, 2, model.clone()).await.unwrap(),
+        TickStatus::Skipped("world_not_running"),
+        "ended 世界的遗留 tick 应 world_not_running noop"
+    );
+    assert_eq!(world_status(&state.db, &wid).await, "ended", "遗留 tick 不改变已 ended 的状态");
+}
+
+/// 幂等：end_world_tx 的 WHERE status='running' 保证只结算一次——首次 rows=1，再次 rows=0。
+#[tokio::test]
+async fn end_world_tx_is_idempotent() {
+    let state = test_state().await;
+    seed_template_with_endgame(
+        &state.db,
+        "tpl-idem",
+        "idle",
+        json!([{ "id": "n1", "summary": "寒暄", "constraint": "soft" }]),
+        json!({ "minWorldTicks": 0, "maxWorldTicks": 100 }),
+    )
+    .await;
+    let wid = running_world_for_endgame(&state, "idem", "tpl-idem", "event", "idle").await;
+
+    let mut tx = state.db.begin().await.unwrap();
+    let r1 = super::end_world_tx(&mut tx, &wid, "time_limit").await.unwrap();
+    let r2 = super::end_world_tx(&mut tx, &wid, "time_limit").await.unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(r1, 1, "首次 end_world 结算 running 世界 → rows=1");
+    assert_eq!(r2, 0, "再次 end_world 命中非 running → rows=0（幂等，只结算一次）");
+    assert_eq!(world_status(&state.db, &wid).await, "ended");
+}
+
+/// 非 idle 房（chapter）严格门：policy.enabled=false → 终局评估全跳过，即便配了极小 max_world_ticks 也不停机。
+/// chapter/arena 既有收敛旁路零影响。
+#[tokio::test]
+async fn non_idle_world_ignores_endgame() {
+    let state = test_state().await;
+    seed_template_with_endgame(
+        &state.db,
+        "tpl-chap",
+        "chapter",
+        json!([{ "id": "n1", "summary": "寒暄", "constraint": "soft" }]),
+        json!({ "minWorldTicks": 0, "maxWorldTicks": 1 }), // 极小上限，但 room_type=chapter → 不生效
+    )
+    .await;
+    let wid = running_world_for_endgame(&state, "chap", "tpl-chap", "event", "chapter").await;
+    let model: Arc<dyn ModelClient> = Arc::new(MockModel { input_tokens: 10, output_tokens: 20 });
+
+    // 连跑 3 tick（远超 maxWorldTicks=1）：非 idle 房终局逻辑全跳过 → 全 Done，世界始终 running。
+    for n in 0..=2i64 {
+        insert_tick(&state.db, &wid, n, n).await.unwrap();
+        assert_eq!(
+            process_tick_with_model(&state, &wid, n, model.clone()).await.unwrap(),
+            TickStatus::Done,
+            "非 idle 房不应因 endgame 停机"
+        );
+        assert_eq!(world_status(&state.db, &wid).await, "running", "非 idle 房始终 running（终局门 room_type=='idle'）");
+    }
+}
+
+// ---------- P1 Phase 3：关键角色退场 + 终局产出（select_ending / 荣誉奖励红线） ----------
+
+/// 钉住实例装配层 enabled_endings（select_ending 的读取源）。最小 assembled_json 包装（其余段缺省，
+/// runtime 读均为 guarded pointer，缺失即退化）。
+async fn set_enabled_endings(db: &AnyPool, wid: &str, endings: &[&str]) {
+    let assembled = json!({
+        "assembly": { "enabledEndings": endings },
+        "chapterState": {},
+    });
+    sqlx::query("UPDATE worlds SET assembled_json=? WHERE id=?")
+        .bind(assembled.to_string())
+        .bind(wid)
+        .execute(db)
+        .await
+        .unwrap();
+}
+
+/// 放置房软主线示例 skeleton（6 个带 threshold + advanceWhen 的里程碑）：与
+/// `docs/build/example-idle-skeleton.md` 的样例镜像同一份，作为「可加载 + 结构合法」的测试样例。
+/// 关系谓词引用固定角色 id（heroine/player），用于文档展示 advanceWhen 写法；本测试只验证其能被
+/// seed_narrative_layer 正确种入（谓词是否命中另由引擎级测试覆盖）。
+fn example_idle_skeleton() -> (serde_json::Value, serde_json::Value) {
+    let mainline = json!([
+        { "id": "firstMeeting",  "summary": "初次照面：两人第一次在同一空间独处",       "constraint": "soft", "threshold": 2.0 },
+        { "id": "smallTalk",     "summary": "日常寒暄累积成习惯",                       "constraint": "soft", "threshold": 3.0, "advanceWhen": "relations[heroine->player].affinity > 0.2" },
+        { "id": "sharedSecret",  "summary": "有人先卸下防备，交换一个秘密",             "constraint": "soft", "threshold": 4.0, "advanceWhen": "relations[heroine->player].trust > 0.4" },
+        { "id": "conflict",      "summary": "一次误会让关系出现裂痕",                   "constraint": "soft", "threshold": 4.0, "advanceWhen": "relations[player->heroine].affinity > 0.5" },
+        { "id": "reconcile",     "summary": "裂痕后的和解，关系更进一步",               "constraint": "soft", "threshold": 5.0, "advanceWhen": "relations[heroine->player].trust > 0.6" },
+        { "id": "turningPoint",  "summary": "面对去留的抉择，主线收束",                 "constraint": "soft", "threshold": 6.0, "advanceWhen": "relations[heroine->player].affinity > 0.7" },
+    ]);
+    let endgame = json!({
+        "minWorldTicks": 5,
+        "maxWorldTicks": 240,
+        "keyCharacterIds": ["heroine"],
+        "worldTimeLimit": null,
+    });
+    (mainline, endgame)
+}
+
+/// 终局条件(3) 关键角色退场：关键角色永久退场（成员表 left）→ 早于 insufficient_members 门直接终局停机。
+/// 覆盖「关键角色离场使在场成员跌破 2 也能收敛」这一必须先于门槛评估的关键路径。
+#[tokio::test]
+async fn idle_world_concludes_on_key_character_exit() {
+    let state = test_state().await;
+    // 关键角色 = 成员 A（ckeyA）。maxWorldTicks 极大（不靠时间上限）；floor=0；n1 为无阈值软节点（引擎不判 MainlineDone）。
+    seed_template_with_endgame(
+        &state.db,
+        "tpl-key",
+        "idle",
+        json!([{ "id": "n1", "summary": "相处", "constraint": "soft" }]),
+        json!({ "minWorldTicks": 0, "maxWorldTicks": 100000, "keyCharacterIds": ["ckeyA"] }),
+    )
+    .await;
+    let wid = running_world_for_endgame(&state, "key", "tpl-key", "event", "idle").await;
+    let model: Arc<dyn ModelClient> = Arc::new(MockModel { input_tokens: 10, output_tokens: 20 });
+
+    // tick 0：关键角色仍在场 → 正常推进（无里程碑、未到时间上限）→ Done + running。
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 0, model.clone()).await.unwrap(), TickStatus::Done);
+    assert_eq!(world_status(&state.db, &wid).await, "running");
+
+    // 关键角色 A 永久退场（成员表 left）——同时使在场活跃成员跌破 2。
+    sqlx::query("UPDATE world_members SET status='left' WHERE world_id=? AND cloud_character_id=?")
+        .bind(&wid)
+        .bind("ckeyA")
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    // tick 1：关键角色退场判定先于 insufficient_members 门触发 → 终局停机 → Concluded + ended。
+    insert_tick(&state.db, &wid, 1, 1).await.unwrap();
+    assert_eq!(
+        process_tick_with_model(&state, &wid, 1, model.clone()).await.unwrap(),
+        TickStatus::Concluded,
+        "关键角色退场（过地板）→ 消费终局停机（先于 insufficient_members 门）"
+    );
+    assert_eq!(world_status(&state.db, &wid).await, "ended", "关键角色退场 → status=ended");
+    // 终局审计留痕（reason=key_character_exit）。
+    let audits =
+        i64_one(&state.db, "SELECT COUNT(*) FROM audit_logs WHERE action='world.ended' AND subject=?", &wid)
+            .await;
+    assert_eq!(audits, 1, "关键角色退场终局写一条审计");
+}
+
+/// 终局条件(1) 软主线跑到全里程碑 Done → ended + 终局日报 + select_ending 选定结局落成荣誉。
+/// 多里程碑顺序推进（每 tick 至多推首个 Pending 里程碑），最后一个里程碑完成的 tick 经 commit_tick 收敛。
+#[tokio::test]
+async fn idle_world_concludes_on_full_mainline_with_ending_report() {
+    let state = test_state().await;
+    seed_template_with_endgame(
+        &state.db,
+        "tpl-full",
+        "idle",
+        // 3 个纯阈值里程碑（无 advanceWhen 谓词门，保证 mock 回合强度可推过）；阈值 0.5 一回合即达标。
+        json!([
+            { "id": "m1", "summary": "初遇", "constraint": "soft", "threshold": 0.5 },
+            { "id": "m2", "summary": "羁绊", "constraint": "soft", "threshold": 0.5 },
+            { "id": "m3", "summary": "抉择", "constraint": "soft", "threshold": 0.5 },
+        ]),
+        json!({ "minWorldTicks": 0, "maxWorldTicks": 100 }),
+    )
+    .await;
+    let wid = running_world_for_endgame(&state, "full", "tpl-full", "event", "idle").await;
+    set_enabled_endings(&state.db, &wid, &["golden_reunion", "quiet_parting"]).await;
+    let model: Arc<dyn ModelClient> = Arc::new(MockModel { input_tokens: 10, output_tokens: 20 });
+
+    // tick 0/1：逐个推进里程碑 m1、m2；未全 Done → 世界仍 running（不秒结束——多里程碑天然拦真空完成）。
+    for n in 0..=1i64 {
+        insert_tick(&state.db, &wid, n, n).await.unwrap();
+        assert_eq!(process_tick_with_model(&state, &wid, n, model.clone()).await.unwrap(), TickStatus::Done);
+        assert_eq!(world_status(&state.db, &wid).await, "running");
+    }
+
+    // tick 2：推进最后一个里程碑 m3 → 全里程碑 Done → 引擎 MainlineDone → commit_tick 内终局 → Concluded。
+    insert_tick(&state.db, &wid, 2, 2).await.unwrap();
+    assert_eq!(
+        process_tick_with_model(&state, &wid, 2, model.clone()).await.unwrap(),
+        TickStatus::Concluded,
+        "全里程碑 Done → 终局停机"
+    );
+    assert_eq!(world_status(&state.db, &wid).await, "ended");
+
+    // 全部里程碑 Done。
+    let st: NarrativeState =
+        serde_json::from_str(&load_world(&state.db, &wid).await.unwrap().narrative_state_json).unwrap();
+    assert!(
+        st.narrative.outline_nodes.iter().all(|n| n.status == NodeStatus::Done),
+        "终局时全部里程碑应 Done"
+    );
+
+    // 终局日报：commit_tick 报告循环生成（每成员一份，幂等 per world+char+day）。
+    let reports = i64_one(&state.db, "SELECT COUNT(*) FROM daily_reports WHERE world_id=?", &wid).await;
+    assert!(reports >= 1, "全里程碑 Done 的终局 tick 应产出终局日报");
+
+    // 终局产出：审计留痕 + select_ending 取 enabled_endings 首个（golden_reunion）落成每成员一枚荣誉。
+    let audits =
+        i64_one(&state.db, "SELECT COUNT(*) FROM audit_logs WHERE action='world.ended' AND subject=?", &wid)
+            .await;
+    assert_eq!(audits, 1, "终局审计一条");
+    let ending_rewards = i64_one(
+        &state.db,
+        "SELECT COUNT(*) FROM arena_rewards WHERE kind='ending' AND label='golden_reunion' AND world_id=?",
+        &wid,
+    )
+    .await;
+    assert_eq!(ending_rewards, 2, "select_ending 取首个结局 → 每成员一枚终局荣誉");
+}
+
+/// 终局奖励红线（§2.5）：终局若发奖，只入 arena_rewards 荣誉旁路——荣誉非战力、无买判定、幂等只发一次。
+#[tokio::test]
+async fn ending_reward_respects_arena_redline() {
+    let state = test_state().await;
+    seed_template_with_endgame(
+        &state.db,
+        "tpl-rw",
+        "idle",
+        json!([{ "id": "n1", "summary": "寒暄", "constraint": "soft" }]),
+        json!({ "minWorldTicks": 0, "maxWorldTicks": 1 }), // 到时间上限即终局，快速收敛
+    )
+    .await;
+    let wid = running_world_for_endgame(&state, "rw", "tpl-rw", "event", "idle").await;
+    set_enabled_endings(&state.db, &wid, &["honor_ending"]).await;
+    let model: Arc<dyn ModelClient> = Arc::new(MockModel { input_tokens: 10, output_tokens: 20 });
+
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 0, model.clone()).await.unwrap(), TickStatus::Done);
+    insert_tick(&state.db, &wid, 1, 1).await.unwrap();
+    assert_eq!(
+        process_tick_with_model(&state, &wid, 1, model.clone()).await.unwrap(),
+        TickStatus::Concluded
+    );
+    assert_eq!(world_status(&state.db, &wid).await, "ended");
+
+    // 红线①：终局奖励只入 arena_rewards（荣誉），kind='ending'、label=选定结局；arena_rewards schema 无
+    //        任何强度/属性列 → 结构性保证「荣誉非战力」。
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT kind, label FROM arena_rewards WHERE world_id=?")
+            .bind(&wid)
+            .fetch_all(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(rows.len(), 2, "两名成员各获一枚终局荣誉");
+    for (kind, label) in &rows {
+        assert_eq!(kind, "ending", "奖励为荣誉类（非强度）");
+        assert_eq!(label, "honor_ending", "荣誉 label = select_ending 选定结局");
+    }
+
+    // 红线②：无买判定——终局发奖不经任何计费/账本路径（全库无 ledger_entries）。
+    let ledger: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM ledger_entries")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(ledger.0, 0, "终局发奖不产生任何计费/账本记录（荣誉非交易）");
+
+    // 红线③（幂等）：ended 世界的遗留 tick → world_not_running noop，不重复发奖。
+    insert_tick(&state.db, &wid, 2, 2).await.unwrap();
+    assert_eq!(
+        process_tick_with_model(&state, &wid, 2, model.clone()).await.unwrap(),
+        TickStatus::Skipped("world_not_running")
+    );
+    let after = i64_one(&state.db, "SELECT COUNT(*) FROM arena_rewards WHERE world_id=?", &wid).await;
+    assert_eq!(after, 2, "遗留 tick 不重复发奖（幂等）");
+}
+
+/// 文档样例自检：放置房软主线示例 skeleton（6 里程碑 + advanceWhen + endgame keyCharacterIds）能被
+/// 正确种入——里程碑携带 threshold/advanceWhen，keyCharacterIds 被 load_endgame_policy 读出。
+/// 保证 docs/build/example-idle-skeleton.md 的样例是可加载、结构合法的（防样例腐化）。
+#[tokio::test]
+async fn example_idle_skeleton_seeds_valid_milestones() {
+    let state = test_state().await;
+    let (mainline, endgame) = example_idle_skeleton();
+    seed_template_with_endgame(&state.db, "tpl-example", "idle", mainline, endgame).await;
+    let wid = running_world_for_endgame(&state, "ex", "tpl-example", "event", "idle").await;
+    let model: Arc<dyn ModelClient> = Arc::new(MockModel { input_tokens: 10, output_tokens: 20 });
+
+    // 跑一个 tick 触发种子物化；floor=5 → 早期不终局。
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 0, model.clone()).await.unwrap(), TickStatus::Done);
+
+    // 6 个里程碑全部种入，且均带 threshold（软里程碑）。
+    let st: NarrativeState =
+        serde_json::from_str(&load_world(&state.db, &wid).await.unwrap().narrative_state_json).unwrap();
+    let milestones: Vec<_> =
+        st.narrative.outline_nodes.iter().filter(|n| n.threshold.is_some()).collect();
+    assert_eq!(milestones.len(), 6, "示例 skeleton 应种入 6 个阈值里程碑");
+    // 带 advanceWhen 谓词的里程碑（语法合法）应保留谓词。
+    let with_gate = milestones.iter().filter(|n| n.advance_when.is_some()).count();
+    assert_eq!(with_gate, 5, "示例中 5 个里程碑带合法 advanceWhen 关系谓词门");
+
+    // load_endgame_policy 读出 keyCharacterIds=["heroine"]。
+    let world = load_world(&state.db, &wid).await.unwrap();
+    let policy = super::load_endgame_policy(&state.db, &world).await.unwrap();
+    assert!(policy.enabled, "idle 房终局策略启用");
+    assert_eq!(policy.key_character_ids, vec!["heroine".to_string()], "keyCharacterIds 被读出");
+    assert_eq!(policy.min_world_ticks, 5);
+    assert_eq!(policy.max_world_ticks, 240);
+}

@@ -14,6 +14,8 @@ use crate::app::{build_router, AppState};
 use crate::config::ServerConfig;
 use crate::db::{new_id, now_ms};
 
+use muse_engine::character::types::{CardLifecycle, CharacterCardV2, Identity};
+
 static INIT: std::sync::Once = std::sync::Once::new();
 
 fn test_config() -> ServerConfig {
@@ -52,6 +54,30 @@ fn user_token(state: &AppState) -> String {
 
 fn role_token(state: &AppState, role: &str) -> String {
     crate::auth::issue_access(&state.config.jwt_secret, &format!("actor_{role}"), role, 3600).unwrap()
+}
+
+/// 完整可解析的 CharacterCardV2 JSON（全字段用 Default 填充）；用于需卡真正解析的引用完整性校验用例。
+fn full_card_json(id: &str, name: &str) -> Value {
+    let card = CharacterCardV2 {
+        schema_version: 2,
+        id: id.into(),
+        lifecycle: CardLifecycle::Ready,
+        identity: Identity { name: name.into(), ..Default::default() },
+        dramatic_core: Default::default(),
+        decision_model: Default::default(),
+        perception: Default::default(),
+        emotion_dynamics: Default::default(),
+        relation_grammar: Default::default(),
+        expression_fingerprint: Default::default(),
+        agency: Default::default(),
+        growth_arc: Default::default(),
+        world_adaptation: Default::default(),
+        evidence_index: Default::default(),
+        revision: 1,
+        created_at: 0,
+        updated_at: 0,
+    };
+    serde_json::to_value(card).unwrap()
 }
 
 async fn get(app: &axum::Router, uri: &str, token: Option<&str>) -> (StatusCode, Value) {
@@ -427,6 +453,99 @@ async fn template_create_and_review_flow() {
     let m = sqlx::query("SELECT moderation FROM world_templates WHERE id=?")
         .bind(&tpl_id).fetch_one(&state.db).await.unwrap().try_get::<String, _>("moderation").unwrap();
     assert_eq!(m, "approved");
+}
+
+// ---------------- Phase 3：建模板期引用完整性校验（reward_item_ref / connections / residentItems） ----------------
+
+#[tokio::test]
+async fn create_template_rejects_dangling_references() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+
+    let create = |body: Value| {
+        let app = app.clone();
+        let admin = admin.clone();
+        async move { post(&app, "/api/admin/world-templates", Some(&admin), body).await }
+    };
+
+    // 1) 完整引用 → 通过（worldItems 目录 + 地点连通/驻留/gate + 世界角色携带全部可解引用）。
+    let good = json!({
+        "title": "完整引用模板", "roomType": "chapter",
+        "skeletonJson": {
+            "worldItems": [
+                { "id": "wi_key", "narrative": "玉钥", "effectTags": ["access:secret"],
+                  "origin": { "worldTemplateId": "t", "cosmology": ["myth"], "powerTier": 2 } }
+            ],
+            "locations": [
+                { "id": "hall", "name": "前厅", "connections": ["secret"] },
+                { "id": "secret", "name": "秘境", "connections": ["hall"], "isSecretRealm": true,
+                  "gate": { "requiredItemIds": ["wi_key"], "requiredCosmologies": ["myth"], "maxPowerTier": 3 },
+                  "residentItemIds": ["wi_key"] }
+            ],
+            "hiddenContentPool": [ { "id": "hc1", "themes": ["秘"], "rewardItemRef": "wi_key" } ]
+        }
+    });
+    let (st, body) = create(good).await;
+    assert_eq!(st, StatusCode::OK, "完整引用应通过: {body}");
+
+    // 2) rewardItemRef 悬空（目录无此 id 且无内联 fallback）→ 400。
+    let (st, _) = create(json!({
+        "title": "悬空奖励引用", "roomType": "chapter",
+        "skeletonJson": {
+            "worldItems": [],
+            "hiddenContentPool": [ { "id": "hc1", "themes": ["秘"], "rewardItemRef": "ghost_item" } ]
+        }
+    })).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "悬空 rewardItemRef 应拒绝");
+
+    // 2b) rewardItemRef 悬空但有内联 fallback → 通过（兼容期 fallback 合法）。
+    let (st, _) = create(json!({
+        "title": "悬空引用但有内联", "roomType": "chapter",
+        "skeletonJson": {
+            "hiddenContentPool": [ { "id": "hc1", "themes": ["秘"], "rewardItemRef": "ghost_item",
+                "rewardItem": { "id": "inline", "narrative": "内联", "effectTags": [],
+                  "origin": { "worldTemplateId": "t", "cosmology": ["myth"], "powerTier": 1 } } } ]
+        }
+    })).await;
+    assert_eq!(st, StatusCode::OK, "有内联 fallback 的悬空 ref 应通过");
+
+    // 3) connections 悬空（连向不存在地点）→ 400。
+    let (st, _) = create(json!({
+        "title": "悬空连通", "roomType": "chapter",
+        "skeletonJson": { "locations": [ { "id": "hall", "connections": ["nowhere"] } ] }
+    })).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "悬空 connections 应拒绝");
+
+    // 4) residentItemIds 悬空（引用不存在的 worldItems）→ 400。
+    let (st, _) = create(json!({
+        "title": "悬空驻留道具", "roomType": "chapter",
+        "skeletonJson": {
+            "worldItems": [],
+            "locations": [ { "id": "hall", "residentItemIds": ["ghost_item"] } ]
+        }
+    })).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "悬空 residentItemIds 应拒绝");
+
+    // 5) gate.requiredCosmologies 非官方枚举 → 400。
+    let (st, _) = create(json!({
+        "title": "非法体系", "roomType": "chapter",
+        "skeletonJson": {
+            "locations": [ { "id": "secret", "gate": { "requiredCosmologies": ["warp"] } } ]
+        }
+    })).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "非法体系标签应拒绝");
+
+    // 6) 世界角色 carriedItemIds 悬空 → 400（卡须完整可解析，否则 Skeleton 解析失败会退化为不校验）。
+    let npc_card = full_card_json("npc1", "反派");
+    let (st, _) = create(json!({
+        "title": "悬空携带道具", "roomType": "chapter",
+        "skeletonJson": {
+            "worldItems": [],
+            "worldCharacters": [ { "card": npc_card, "carriedItemIds": ["ghost_item"] } ]
+        }
+    })).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "世界角色悬空 carriedItemIds 应拒绝");
 }
 
 // ---------------- Prompt 版本化 / 激活互斥 / 灰度 ----------------

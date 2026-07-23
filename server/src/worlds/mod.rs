@@ -48,6 +48,14 @@ pub struct WorldRow {
     pub narrative_state_json: String,
     /// 开局装配结果（钉住）：runtime 首 tick 从中提取硬节点/禁止谓词种子（E-1）。
     pub assembled_json: Option<String>,
+    /// 时间线模式（第二块 Phase 2）：'interval'（默认，老世界墙钟固定间隔→run_round）
+    /// 或 'event'（放置房 DES：背靠背→run_event_step 调度）。世界级渐进闸。
+    pub timeline_mode: String,
+    /// 世界游戏时钟快照（= NarrativeState.timeline.now，第二块 Phase 2）：commit_tick 每步回写。
+    /// interval 世界恒为 0（不推进时钟）。Phase 2 仅回写、暂无读取方（调度器 T 由引擎从 FS 状态自算），
+    /// 保留供后续 Phase/展示层读「当前游戏时刻」而不必反序列化整份 narrative_state_json。
+    #[allow(dead_code)]
+    pub game_time: i64,
 }
 
 fn map_world(row: &sqlx::any::AnyRow) -> Result<WorldRow, ApiError> {
@@ -68,6 +76,8 @@ fn map_world(row: &sqlx::any::AnyRow) -> Result<WorldRow, ApiError> {
         state_revision: row.try_get("state_revision")?,
         narrative_state_json: row.try_get("narrative_state_json")?,
         assembled_json: row.try_get("assembled_json")?,
+        timeline_mode: row.try_get("timeline_mode")?,
+        game_time: row.try_get("game_time")?,
     })
 }
 

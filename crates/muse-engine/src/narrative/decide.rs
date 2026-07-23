@@ -125,7 +125,8 @@ fn build_decide_user_prompt(character_id: &str, visible_context: &str) -> String
 \"speak\":{{\"willSpeak\":true,\"purpose\":\"若发言，目的是什么\"}},\
 \"targets\":[\"你行动指向的在场角色id\"],\
 \"acceptableCosts\":[\"你愿意为此付出的代价\"],\
-\"predictions\":[{{\"characterId\":\"某在场角色id\",\"expected\":\"你预测他会如何反应\",\"confidence\":0.6}}]}}"
+\"predictions\":[{{\"characterId\":\"某在场角色id\",\"expected\":\"你预测他会如何反应\",\"confidence\":0.6}}],\
+\"duration\":本行动预计耗时（正整数，游戏时间单位；越大则你越晚再次行动）}}"
     )
 }
 
@@ -139,6 +140,8 @@ pub async fn role_decide(
     temperature: f32,
     max_output_tokens: u32,
     run_id: &str,
+    // DES 调度时刻 T（P2 Phase 1）：并入 decision_id 时间段，防同角色跨步撞 id。interval 模式为 0。
+    now_hint: i64,
     character_id: &str,
     visible_context: &str,
     active_character_ids: &[String],
@@ -158,12 +161,23 @@ pub async fn role_decide(
     let mut decision: RoleDecision =
         json_call(host.model.as_ref(), host.events.as_ref(), &spec, cancel).await?;
 
-    // 代码补齐不可信字段：决策 id 确定性派生（同 run 同角色稳定，便于幂等与定序）。
-    decision.decision_id = format!("dec:{run_id}:{character_id}");
+    // 代码补齐不可信字段：决策 id 确定性派生。加入时间段 now_hint（P2 DES）——同角色异步多次行动
+    // （跨 event_step，T 不同）不再撞 id；interval 模式 now_hint=0，形如 `dec:{run}:0:{cid}` 稳定。
+    decision.decision_id = format!("dec:{run_id}:{now_hint}:{character_id}");
     decision.character_id = character_id.to_string();
 
-    // targets 白名单：只保留在场角色，越界目标丢弃（模型原始输出已由 ModelCall 日志留痕）。
-    decision.targets.retain(|t| active_character_ids.iter().any(|a| a == t));
+    // duration 补齐（P2 DES）：模型缺省/给 0 或负 → 兜底 DEFAULT_DURATION；再 clamp 到 [MIN,MAX]。
+    // 防 duration<=0 导致该角色 next_time 不前进、永远抢占最小 T 而饿死其它角色。
+    if decision.duration <= 0 {
+        decision.duration = super::DEFAULT_DURATION;
+    }
+    decision.duration = decision.duration.clamp(super::MIN_DURATION, super::MAX_DURATION);
+
+    // targets 白名单：只保留同组在场角色（active_character_ids 为同组子集，Phase 2 分组收窄），
+    // 越界角色目标丢弃；移动伪目标 `loc:<id>` 保留（合法性交仲裁 R6 判连通/准入，非角色白名单范畴）。
+    decision
+        .targets
+        .retain(|t| t.starts_with(super::arbiter::LOC_TARGET_PREFIX) || active_character_ids.iter().any(|a| a == t));
 
     Ok(decision)
 }
@@ -364,6 +378,7 @@ mod tests {
             0.0,
             512,
             "run-1",
+            0,
             "A",
             "（可见上下文）",
             &active,
@@ -372,11 +387,69 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(d.decision_id, "dec:run-1:A");
+        assert_eq!(d.decision_id, "dec:run-1:0:A");
         assert_eq!(d.character_id, "A");
         // ghost 越界被丢弃，仅保留在场的 B。
         assert_eq!(d.targets, vec!["B".to_string()]);
         assert!(d.speak.will_speak);
+        // duration 缺省（模型未给）→ 兜底 DEFAULT_DURATION。
+        assert_eq!(d.duration, crate::narrative::DEFAULT_DURATION);
+    }
+
+    #[tokio::test]
+    async fn role_decide_keeps_move_target_drops_offscene() {
+        // Phase 2：移动伪目标 loc:<id> 保留（交仲裁 R6），越界角色目标仍丢弃。
+        let resp = r#"{"intent":"转移","action":"前往密室","speak":{"willSpeak":false,"purpose":""},"targets":["loc:密室","ghost"],"acceptableCosts":[],"predictions":[]}"#;
+        let (host, _ev) = test_host(vec![Ok(resp.to_string())]);
+        let prompts = DecidePrompts { system: "s".into(), prompt_version: "v1".into() };
+        let active = vec!["A".to_string()];
+        let d = role_decide(
+            host.as_ref(),
+            &dummy_profile(),
+            &prompts,
+            0.0,
+            512,
+            "run-1",
+            0,
+            "A",
+            "ctx",
+            &active,
+            &CancelFlag::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(d.targets, vec!["loc:密室".to_string()], "loc: 目标保留，ghost 丢弃");
+    }
+
+    #[tokio::test]
+    async fn role_decide_fills_and_clamps_duration() {
+        // P2 DES：模型给 0 / 负 → 兜底 DEFAULT_DURATION；超大 → clamp 到 MAX_DURATION。
+        let zero = r#"{"intent":"i","action":"a","speak":{"willSpeak":false,"purpose":""},"targets":[],"duration":0}"#;
+        let neg = r#"{"intent":"i","action":"a","speak":{"willSpeak":false,"purpose":""},"targets":[],"duration":-5}"#;
+        let huge = r#"{"intent":"i","action":"a","speak":{"willSpeak":false,"purpose":""},"targets":[],"duration":999999999}"#;
+        let (host, _ev) = test_host(vec![Ok(zero.into()), Ok(neg.into()), Ok(huge.into())]);
+        let prompts = DecidePrompts { system: "s".into(), prompt_version: "v1".into() };
+        let d0 = role_decide(
+            host.as_ref(), &dummy_profile(), &prompts, 0.0, 512, "run-1", 0, "A", "ctx",
+            &["A".to_string()], &CancelFlag::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(d0.duration, crate::narrative::DEFAULT_DURATION, "0 应兜底 DEFAULT");
+        let dn = role_decide(
+            host.as_ref(), &dummy_profile(), &prompts, 0.0, 512, "run-1", 0, "A", "ctx",
+            &["A".to_string()], &CancelFlag::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dn.duration, crate::narrative::DEFAULT_DURATION, "负值应兜底 DEFAULT");
+        let dh = role_decide(
+            host.as_ref(), &dummy_profile(), &prompts, 0.0, 512, "run-1", 0, "A", "ctx",
+            &["A".to_string()], &CancelFlag::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dh.duration, crate::narrative::MAX_DURATION, "超大值应 clamp 到 MAX");
     }
 
     #[tokio::test]
@@ -392,6 +465,7 @@ mod tests {
             0.0,
             512,
             "run-1",
+            0,
             "A",
             "ctx",
             &["A".to_string()],

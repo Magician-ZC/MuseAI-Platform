@@ -269,6 +269,8 @@ pub(super) struct CreateWorldReq {
     daily_token_budget: Option<i64>,
     daily_cny_budget_cents: Option<i64>,
     status: Option<String>,
+    /// 平台指派主播：赛事房（arena）必须指定；idle/chapter 可选。
+    host_user_id: Option<String>,
 }
 
 fn default_template_version() -> i64 {
@@ -318,9 +320,34 @@ pub(super) async fn create_world(
         }
         p.status = Some(s);
     }
+    // 平台指派主播：写入 host_user_id。赛事房若无主播，require_host 恒 Forbidden、
+    // 主播控制台整条回路（host/tick/eliminate/settle）不可用，故 arena 必填。
+    if let Some(h) = req.host_user_id {
+        let h = h.trim().to_string();
+        if h.is_empty() {
+            return Err(ApiError::BadRequest("hostUserId 不能为空".into()));
+        }
+        let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id = ?")
+            .bind(&h)
+            .fetch_one(&state.db)
+            .await?;
+        if exists == 0 {
+            return Err(ApiError::BadRequest("hostUserId 对应用户不存在".into()));
+        }
+        p.host_user_id = Some(h);
+    }
+    if p.room_type == "arena" && p.host_user_id.is_none() {
+        return Err(ApiError::BadRequest(
+            "赛事房（arena）必须指定 hostUserId（平台指派主播）".into(),
+        ));
+    }
+    let host_note = match &p.host_user_id {
+        Some(h) => format!("official world, host={h}"),
+        None => "official world".to_string(),
+    };
 
     let world_id = create_world_inner(&state.db, p).await?;
-    audit(&state.db, &admin.0, "world.create", &world_id, "official world").await?;
+    audit(&state.db, &admin.0, "world.create", &world_id, &host_note).await?;
     Ok(Json(json!({ "worldId": world_id })))
 }
 
@@ -419,6 +446,12 @@ pub(super) async fn create_template(
     // skeleton_json 校验：必须为对象（主线硬节点/结局池/隐藏内容池/装配规则的容器）。
     if !req.skeleton_json.is_object() {
         return Err(ApiError::BadRequest("skeletonJson 必须是 JSON 对象".into()));
+    }
+    // Phase 3：引用完整性校验——reward_item_ref / connections / residentItemIds / carried_item_ids /
+    // gate.requiredItemIds 须能在 world_items / locations 目录解引用，gate.requiredCosmologies ∈ 官方枚举。
+    // 建模板期前置拦截坏引用，避免装配/运行时静默退化（防御式解析吞掉 → 数据错误难发现）。
+    if let Err(msg) = crate::assembly::validate_skeleton_refs(&req.skeleton_json) {
+        return Err(ApiError::BadRequest(msg));
     }
     let admission = req.admission_json.unwrap_or_else(|| json!({ "mode": "open" }));
     if !admission.is_object() {

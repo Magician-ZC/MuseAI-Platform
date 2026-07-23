@@ -50,7 +50,12 @@ pub fn deterministic_invariants(
         }
     }
 
-    // I3：事件引用完整性。
+    // I3：事件引用完整性。actor/target 的「在场」按**事件所属地点的同组集**判定（Phase 2）：
+    // 在场集 = active 中与事件主 actor 同 location 的角色（从 state 派生位置）。
+    // 退化：locations 空 → 全体 location 皆 "" → 同组集 = active 全集，与 Phase 1 语义等价。
+    let loc_of = |cid: &str| -> &str {
+        state.characters.get(cid).map(|c| c.location.as_str()).unwrap_or("")
+    };
     for ev in events {
         if ev.state_patch_id != patch.id {
             violations.push(format!(
@@ -58,14 +63,18 @@ pub fn deterministic_invariants(
                 ev.id, ev.state_patch_id, patch.id
             ));
         }
+        // 事件地点 = 主 actor 的 location（无 actor 时退化为 ""）。
+        let ev_loc = ev.actor_ids.first().map(|a| loc_of(a)).unwrap_or("");
+        let present: BTreeSet<&str> =
+            active.iter().copied().filter(|c| loc_of(c) == ev_loc).collect();
         for a in &ev.actor_ids {
-            if !active.contains(a.as_str()) {
+            if !present.contains(a.as_str()) {
                 violations.push(format!("I3: 事件 {} 的 actor {a} 不在场", ev.id));
             }
         }
         if let Some(targets) = &ev.target_ids {
             for t in targets {
-                if !active.contains(t.as_str()) {
+                if !present.contains(t.as_str()) {
                     violations.push(format!("I3: 事件 {} 的 target {t} 不在场", ev.id));
                 }
             }
@@ -168,6 +177,7 @@ mod tests {
             targets: vec![],
             acceptable_costs: vec![],
             predictions: vec![],
+            duration: 0,
         }
     }
 
@@ -186,6 +196,7 @@ mod tests {
             id: id.to_string(),
             run_id: "r".into(),
             sequence: 0,
+            timestamp: 0,
             event_type: DomainEventType::ActionResolved,
             actor_ids: actors.into_iter().map(String::from).collect(),
             target_ids: targets.map(|t| t.into_iter().map(String::from).collect()),
@@ -267,6 +278,30 @@ mod tests {
         let ev = event("e1", "p1", vec!["A"], Some(vec!["B"]));
         let v = deterministic_invariants(&s, &[], &p, &[ev], "clean", &active());
         assert!(v.is_empty());
+    }
+
+    #[test]
+    fn i3_flags_cross_location_target() {
+        // Phase 2 同组在场重定义：actor A 在「前厅」、target B 在「密室」→ B 不在 A 的同组集 → I3 违规。
+        let mut s = state_with_secret();
+        s.characters.get_mut("A").unwrap().location = "前厅".into();
+        s.characters.get_mut("B").unwrap().location = "密室".into();
+        let p = patch("p1", vec![], vec![]);
+        let ev = event("e1", "p1", vec!["A"], Some(vec!["B"]));
+        let v = deterministic_invariants(&s, &[], &p, &[ev], "clean", &active());
+        assert!(v.iter().any(|x| x.starts_with("I3")), "跨地点 target 应 I3 违规：{v:?}");
+    }
+
+    #[test]
+    fn i3_passes_same_location_actor_and_target() {
+        // 同地点 actor+target → 在场，不违规。
+        let mut s = state_with_secret();
+        s.characters.get_mut("A").unwrap().location = "密室".into();
+        s.characters.get_mut("B").unwrap().location = "密室".into();
+        let p = patch("p1", vec![], vec![]);
+        let ev = event("e1", "p1", vec!["A"], Some(vec!["B"]));
+        let v = deterministic_invariants(&s, &[], &p, &[ev], "clean", &active());
+        assert!(v.is_empty(), "同地点 actor+target 应通过：{v:?}");
     }
 
     // ===== I4 锁定场景保护 =====

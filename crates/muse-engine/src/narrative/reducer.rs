@@ -65,7 +65,7 @@ pub fn parse_path(path: &str) -> Result<ParsedPath, EngineError> {
         let (id, field) = (parts[0], parts[1]);
         match field {
             "goals" | "emotions" | "resources" | "secrets" | "misconceptions" | "plans"
-            | "arcStage" => {
+            | "arcStage" | "location" => {
                 return Ok(ParsedPath::Character {
                     id: id.to_string(),
                     field: field.to_string(),
@@ -280,6 +280,7 @@ fn char_field_value(c: &CharacterState, field: &str) -> Result<Value, EngineErro
         "secrets" => serde_json::to_value(&c.secrets)?,
         "misconceptions" => serde_json::to_value(&c.misconceptions)?,
         "plans" => serde_json::to_value(&c.plans)?,
+        "location" => Value::String(c.location.clone()),
         _ => Value::String(c.arc_stage.clone()), // arcStage
     })
 }
@@ -316,6 +317,8 @@ fn apply_character(c: &mut CharacterState, field: &str, op: &PatchOperation) -> 
         "misconceptions" => apply_str_list(&mut c.misconceptions, op),
         "plans" => apply_str_list(&mut c.plans, op),
         "emotions" => apply_emotions(&mut c.emotions, op),
+        // location（Phase 2）：标量 Set 单值（非 list append），与 arcStage 同款；movement 落定路径。
+        "location" => apply_scalar_string(&mut c.location, op),
         _ => apply_scalar_string(&mut c.arc_stage, op), // arcStage
     }
 }
@@ -559,6 +562,9 @@ mod tests {
             summary: "开场".into(),
             constraint: ConstraintLevel::Hard,
             status: NodeStatus::Pending,
+            threshold: None,
+            advance_when: None,
+            weights: None,
         });
         s.narrative.forbidden_predicates.push(ForbiddenPredicate {
             id: "f1".into(),
@@ -584,6 +590,10 @@ mod tests {
         assert_eq!(
             parse_path("characters.li.arcStage").unwrap(),
             ParsedPath::Character { id: "li".into(), field: "arcStage".into() }
+        );
+        assert_eq!(
+            parse_path("characters.li.location").unwrap(),
+            ParsedPath::Character { id: "li".into(), field: "location".into() }
         );
         assert_eq!(
             parse_path("relations[li->wang].trust").unwrap(),
@@ -741,6 +751,43 @@ mod tests {
         assert_eq!(next.characters["li"].goals, vec!["复仇".to_string()]);
         assert_eq!(next.narrative.outline_nodes[0].status, NodeStatus::Done);
         assert_eq!(next.revision, 1);
+    }
+
+    // ---- Phase 2：location 标量 Set（movement 落定路径） ----
+
+    #[test]
+    fn location_set_applies_as_scalar() {
+        let s = base_state(); // li/wang location 默认 ""
+        let p = patch("p1", 0, vec![op(PatchOp::Set, "characters.li.location", Some(json!("密室")))]);
+        let next = validate_and_apply(&s, &p).unwrap();
+        assert_eq!(next.characters["li"].location, "密室");
+        assert_eq!(next.revision, 1);
+    }
+
+    #[test]
+    fn location_rejects_non_set_ops() {
+        // location 是标量字符串：Append/Remove/Increment 一律非法。
+        let s = base_state();
+        for bad in [PatchOp::Append, PatchOp::Remove, PatchOp::Increment] {
+            let p = patch("p1", 0, vec![op(bad, "characters.li.location", Some(json!("密室")))]);
+            assert_eq!(validate_and_apply(&s, &p).unwrap_err().code(), "validation", "应拒绝 {bad:?}");
+        }
+    }
+
+    #[test]
+    fn location_precondition_gates_move() {
+        // 乐观前置：仅当当前 location 等于期望才落定（movement 幂等/CAS 佐证）。
+        let mut s = base_state();
+        s.characters.get_mut("li").unwrap().location = "前厅".into();
+        let mut o = op(PatchOp::Set, "characters.li.location", Some(json!("密室")));
+        o.precondition = Some(json!("前厅"));
+        let next = validate_and_apply(&s, &patch("p1", 0, vec![o])).unwrap();
+        assert_eq!(next.characters["li"].location, "密室");
+        // 前置不满足 → Conflict，输入不变。
+        let mut o2 = op(PatchOp::Set, "characters.li.location", Some(json!("密室")));
+        o2.precondition = Some(json!("别处"));
+        assert_eq!(validate_and_apply(&s, &patch("p2", 0, vec![o2])).unwrap_err().code(), "conflict");
+        assert_eq!(s.characters["li"].location, "前厅");
     }
 
     #[test]

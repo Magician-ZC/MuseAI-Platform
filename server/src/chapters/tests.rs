@@ -270,6 +270,217 @@ async fn assemble_binds_hidden_content_to_obsession_and_weights_endings() {
     assert_eq!(v["templateVersion"], json!(1));
 }
 
+/// Phase 0：reward_item_ref 从 world_items 目录解引用填 CharacterHook.reward_item（单一事实源）；
+/// ref 优先于内联 reward_item，悬空 ref 退回内联 fallback。
+#[tokio::test]
+async fn reward_item_ref_dereferences_world_items_catalog() {
+    // 骨架：world_items 目录 + 两个池物品（ref 命中目录 / 仅内联 fallback）。命中执念的排前。
+    const SKELETON_REF: &str = r#"{
+      "worldItems": [
+        { "id": "wi_relic", "narrative": "目录里的记忆残片", "effectTags": ["info:reveal"],
+          "origin": { "worldTemplateId": "tpl_ref", "cosmology": ["myth"], "powerTier": 3 } }
+      ],
+      "hiddenContentPool": [
+        { "id": "hc_ref", "themes": ["遗忘"], "template": "{name} 直面 {fear}。", "difficultyBase": 0.5,
+          "rewardItemRef": "wi_relic",
+          "rewardItem": { "id": "wi_inline_should_lose", "narrative": "内联应被覆盖", "effectTags": [],
+            "origin": { "worldTemplateId": "tpl_ref", "cosmology": ["myth"], "powerTier": 1 } } }
+      ],
+      "assemblyRules": { "hiddenPerCharacter": 1, "endingWeightThreshold": 0.5 }
+    }"#;
+
+    let state = test_state().await;
+    seed_user(&state, "usrRef").await;
+    let card = make_card("chRef", "苏未央", "害怕被遗忘", &["寻找失散的姐姐"], None, true);
+    seed_char(&state, "chRef", "usrRef", &card).await;
+    seed_template(&state, "tpl_ref", "chapter", SKELETON_REF, r#"{"mode":"open"}"#).await;
+    let wid = make_chapter_world(&state, "tpl_ref").await;
+    seed_member(&state, &wid, "usrRef", "chRef").await;
+
+    let assembled = assemble_instance(&state, &wid).await.unwrap();
+    assert_eq!(assembled.per_character_hooks.len(), 1);
+    let hook = &assembled.per_character_hooks[0];
+    assert_eq!(hook.pool_item_id, "hc_ref");
+    let reward = hook.reward_item.as_ref().expect("reward_item_ref 应解引用出目录道具");
+    // ref 命中目录：填目录里的道具，而非内联 fallback。
+    assert_eq!(reward.id, "wi_relic", "应取 world_items 目录条目而非内联");
+    assert_eq!(reward.narrative, "目录里的记忆残片");
+    assert_eq!(reward.origin.power_tier, 3);
+}
+
+/// Phase 0：无 world_items 目录 / 无 reward_item_ref 时退化为旧行为——内联 reward_item 直填。
+#[tokio::test]
+async fn inline_reward_item_survives_without_catalog() {
+    let state = test_state().await;
+    seed_user(&state, "usrInline").await;
+    let card = make_card("chInline", "苏未央", "害怕被遗忘", &["寻找失散的姐姐"], Some(("src_novel", "测试小说")), true);
+    seed_char(&state, "chInline", "usrInline", &card).await;
+    // 复用原骨架（无 worldItems、hc_abandon 仅内联 rewardItem）。
+    seed_template(&state, "tpl_inline", "chapter", CHAPTER_SKELETON, r#"{"mode":"open"}"#).await;
+    let wid = make_chapter_world(&state, "tpl_inline").await;
+    seed_member(&state, &wid, "usrInline", "chInline").await;
+
+    let assembled = assemble_instance(&state, &wid).await.unwrap();
+    let hook = &assembled.per_character_hooks[0];
+    let reward = hook.reward_item.as_ref().expect("内联 reward_item 应保留");
+    assert_eq!(reward.id, "item_relic", "无目录时退回内联道具");
+}
+
+/// Phase 1：world_characters 解引用 + 机审 → worldCharacterEntries 钉入 assembled_json；
+/// 携带道具从 world_items 目录解引用（不进 per_character_hooks，NPC 无 owner）。
+#[tokio::test]
+async fn world_characters_assemble_into_entries_and_pin() {
+    let state = test_state().await;
+    seed_user(&state, "usrW").await;
+    let card = make_card("chW", "苏未央", "害怕被遗忘", &["寻找失散的姐姐"], None, true);
+    seed_char(&state, "chW", "usrW", &card).await;
+
+    // NPC（反派）卡 + world_items 目录（NPC 携带道具引用）。
+    let npc_card: Value =
+        serde_json::from_str(&make_card("npc_villain", "厉无咎", "夺权", &["布局朝堂"], None, true)).unwrap();
+    let skeleton = json!({
+        "worldItems": [
+            { "id": "wi_seal", "narrative": "调兵虎符", "effectTags": ["advantage:combat"],
+              "origin": { "worldTemplateId": "tpl_npc", "cosmology": ["mundane"], "powerTier": 3 } }
+        ],
+        "worldCharacters": [
+            { "card": npc_card, "homeLocation": "朝堂", "carriedItemIds": ["wi_seal", "wi_missing"],
+              "agendaNodes": ["n1"] }
+        ],
+        "assemblyRules": { "hiddenPerCharacter": 1, "endingWeightThreshold": 0.5 }
+    });
+    seed_template(&state, "tpl_npc", "chapter", &skeleton.to_string(), r#"{"mode":"open"}"#).await;
+    let wid = make_chapter_world(&state, "tpl_npc").await;
+    seed_member(&state, &wid, "usrW", "chW").await;
+
+    let assembled = assemble_instance(&state, &wid).await.unwrap();
+
+    // 反派 NPC 装配为一条 worldCharacterEntry（机审通过）。
+    assert_eq!(assembled.world_character_entries.len(), 1, "反派 NPC 应装配为一条 worldCharacterEntry");
+    let e = &assembled.world_character_entries[0];
+    assert_eq!(e.character_id, "npc_villain");
+    assert_eq!(e.card.identity.name, "厉无咎");
+    assert_eq!(e.location, "朝堂");
+    // 携带道具从 world_items 目录解引用：命中 wi_seal，悬空 wi_missing 静默丢弃。
+    assert_eq!(e.carried_items.len(), 1, "仅命中目录的携带道具被解引用");
+    assert_eq!(e.carried_items[0].id, "wi_seal");
+    // NPC 不进 per_character_hooks（那是玩家个性化钩子）。
+    assert!(!assembled.per_character_hooks.iter().any(|h| h.character_id == "npc_villain"));
+
+    // 钉入 assembled_json（随实例持久化，runtime 每 tick 读回注入）。
+    let raw: String = sqlx::query("SELECT assembled_json FROM worlds WHERE id = ?")
+        .bind(&wid)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+        .try_get("assembled_json")
+        .unwrap();
+    let v: Value = serde_json::from_str(&raw).unwrap();
+    let entries = v["assembly"]["worldCharacterEntries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["characterId"], "npc_villain");
+    assert_eq!(entries[0]["location"], "朝堂");
+}
+
+/// Phase 2：skeleton.locations → AssembledInstance.location_graph 钉入 assembled_json（含秘境 gate），
+/// runtime 每 tick 读回组装引擎 RoundInput.locations。
+#[tokio::test]
+async fn locations_assemble_into_location_graph_and_pin() {
+    let state = test_state().await;
+    seed_user(&state, "usrL").await;
+    let card = make_card("chL", "苏未央", "害怕被遗忘", &["寻找失散的姐姐"], None, true);
+    seed_char(&state, "chL", "usrL", &card).await;
+
+    let skeleton = json!({
+        "locations": [
+            { "id": "hall", "name": "前厅", "connections": ["secret"] },
+            { "id": "secret", "name": "密室", "connections": ["hall"], "isSecretRealm": true,
+              "gate": { "requiredItemIds": ["jade_key"], "maxPowerTier": 3 } }
+        ],
+        "assemblyRules": { "hiddenPerCharacter": 1, "endingWeightThreshold": 0.5 }
+    });
+    seed_template(&state, "tpl_loc", "chapter", &skeleton.to_string(), r#"{"mode":"open"}"#).await;
+    let wid = make_chapter_world(&state, "tpl_loc").await;
+    seed_member(&state, &wid, "usrL", "chL").await;
+
+    let assembled = assemble_instance(&state, &wid).await.unwrap();
+    assert_eq!(assembled.location_graph.len(), 2, "两地点应钉入 location_graph");
+    let secret = assembled.location_graph.iter().find(|l| l.id == "secret").unwrap();
+    assert!(secret.is_secret_realm, "秘境标记应保留");
+    let gate = secret.gate.as_ref().expect("秘境应带 gate");
+    assert_eq!(gate.required_item_ids, vec!["jade_key".to_string()]);
+    assert_eq!(gate.max_power_tier, Some(3));
+
+    // 钉入 assembled_json（随实例持久化，runtime 每 tick 读回）。
+    let raw: String = sqlx::query("SELECT assembled_json FROM worlds WHERE id = ?")
+        .bind(&wid)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+        .try_get("assembled_json")
+        .unwrap();
+    let v: Value = serde_json::from_str(&raw).unwrap();
+    let graph = v["assembly"]["locationGraph"].as_array().unwrap();
+    assert_eq!(graph.len(), 2);
+    assert_eq!(graph[0]["id"], "hall");
+    assert_eq!(graph[0]["connections"][0], "secret");
+}
+
+/// Phase 3：地点 residentItemIds → 从 world_items 目录解引用为 resident_items 分布（秘境隐藏道具单一事实源）；
+/// 悬空 id 静默丢弃；无驻留道具的地点不产组。location_graph（引擎 LocationDef）丢弃 residentItemIds。
+#[tokio::test]
+async fn resident_items_distribute_from_world_items_catalog() {
+    let state = test_state().await;
+    seed_user(&state, "usrR").await;
+    let card = make_card("chR", "苏未央", "害怕被遗忘", &["寻找失散的姐姐"], None, true);
+    seed_char(&state, "chR", "usrR", &card).await;
+
+    let skeleton = json!({
+        "worldItems": [
+            { "id": "wi_orb", "narrative": "混沌珠", "effectTags": ["advantage:magic"],
+              "origin": { "worldTemplateId": "tpl_res", "cosmology": ["cultivation"], "powerTier": 4 } }
+        ],
+        "locations": [
+            { "id": "hall", "name": "前厅", "connections": ["secret"] },
+            { "id": "secret", "name": "秘境", "connections": ["hall"], "isSecretRealm": true,
+              "gate": { "requiredItemIds": ["wi_orb"] },
+              "residentItemIds": ["wi_orb", "wi_missing"] }
+        ],
+        "assemblyRules": { "hiddenPerCharacter": 1, "endingWeightThreshold": 0.5 }
+    });
+    seed_template(&state, "tpl_res", "chapter", &skeleton.to_string(), r#"{"mode":"open"}"#).await;
+    let wid = make_chapter_world(&state, "tpl_res").await;
+    seed_member(&state, &wid, "usrR", "chR").await;
+
+    let assembled = assemble_instance(&state, &wid).await.unwrap();
+    // 只有秘境有驻留道具组（前厅无 → 不产组）；悬空 wi_missing 丢弃，仅解出 wi_orb。
+    assert_eq!(assembled.resident_items.len(), 1, "仅秘境产驻留道具组");
+    let grp = &assembled.resident_items[0];
+    assert_eq!(grp.location_id, "secret");
+    assert!(grp.is_secret_realm, "秘境驻留道具标记为隐藏道具");
+    assert_eq!(grp.items.len(), 1, "悬空 residentItemId 应静默丢弃");
+    assert_eq!(grp.items[0].id, "wi_orb");
+    assert_eq!(grp.items[0].origin.power_tier, 4);
+    // location_graph（引擎 LocationDef）保留结构字段，丢弃 residentItemIds。
+    let secret = assembled.location_graph.iter().find(|l| l.id == "secret").unwrap();
+    assert!(secret.is_secret_realm);
+    assert_eq!(secret.gate.as_ref().unwrap().required_item_ids, vec!["wi_orb".to_string()]);
+
+    // 钉入 assembled_json（随实例持久化）。
+    let raw: String = sqlx::query("SELECT assembled_json FROM worlds WHERE id = ?")
+        .bind(&wid)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+        .try_get("assembled_json")
+        .unwrap();
+    let v: Value = serde_json::from_str(&raw).unwrap();
+    let groups = v["assembly"]["residentItems"].as_array().unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["locationId"], "secret");
+    assert_eq!(groups[0]["items"][0]["id"], "wi_orb");
+}
+
 // ---------- 服务端权威：carry 越权 → risk_event，整单拒绝 ----------
 
 #[tokio::test]

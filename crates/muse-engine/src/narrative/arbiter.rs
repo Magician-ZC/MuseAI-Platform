@@ -15,8 +15,39 @@ use crate::model::{json_call, ModelCallSpec, ModelProfile};
 use crate::EngineError;
 
 use super::types::{
-    ArbiterOutcome, ArbiterResult, ConstraintLevel, NarrativeState, NodeStatus, RoleDecision,
+    ArbiterOutcome, ArbiterResult, ConstraintLevel, LocationDef, LocationGate, NarrativeState,
+    NodeStatus, RoleDecision,
 };
+
+/// 移动伪目标前缀（Phase 2）：decision.targets 中 `loc:<id>` 表示「移动到地点 id」的意图。
+/// 与角色目标区分——R2 在场校验跳过它，R6 据它判定连通/准入。
+pub const LOC_TARGET_PREFIX: &str = "loc:";
+
+/// 解析移动目标：targets 中首个 `loc:<id>` 的 `<id>`（无则非移动决策）。
+fn move_dest(d: &RoleDecision) -> Option<String> {
+    d.targets.iter().find_map(|t| t.strip_prefix(LOC_TARGET_PREFIX).map(|s| s.to_string()))
+}
+
+fn is_loc_target(t: &str) -> bool {
+    t.starts_with(LOC_TARGET_PREFIX)
+}
+
+/// R6b 秘境准入（引擎侧纯函数）：required_item_ids ⊆ held ∧ required_effect_tags ⊆ held。
+/// held = 角色 resources（约定道具以 `item:<id>`、标签以 `tag:<t>` 或裸值承载）。
+/// 体系(cosmology)/强度(power_tier)闸门需 per-item 元数据，引擎无此上下文——留待 server 侧
+/// check_location_admission 在物化 held cosmology/tier 后强化（Phase 3）；此处只判引擎可确定性验证的持有闸。
+fn gate_admits(gate: &LocationGate, held: &[String]) -> bool {
+    let holds = |needle: &str| {
+        held.iter().any(|h| {
+            let h = h.as_str();
+            h == needle
+                || h.strip_prefix("item:").map(|x| x == needle).unwrap_or(false)
+                || h.strip_prefix("tag:").map(|x| x == needle).unwrap_or(false)
+        })
+    };
+    gate.required_item_ids.iter().all(|id| holds(id))
+        && gate.required_effect_tags.iter().all(|t| holds(t))
+}
 
 pub struct ArbiterPrompts {
     pub system: String,
@@ -76,10 +107,15 @@ fn violates_mind_control(d: &RoleDecision, coerce_re: &Regex, read_re: &Regex) -
 ///
 /// 设计：R1/R2/R3 命中即 Invalid（进 resolved）；干净且无冲突/无硬节点威胁的决策由规则层直接判 Success；
 /// 只有 R4（冲突）或 R5（硬节点威胁）的决策进入 pending（交模型层），保证仲裁调用 0–1 次。
+///
+/// Phase 2 分组语义：调用方逐地点组调用——`active_character_ids` 为**同组在场集**（R2 据此判「目标不在场」，
+/// 跨地点角色目标即越界）；`locations` 为本回合地点图（R6 移动合法性据此判连通/准入）。
+/// `locations` 空 = 无地点维度，退化为「无移动决策」——R6 不触发，行为与 Phase 1 一致。
 pub fn rule_arbitrate(
     state: &NarrativeState,
     decisions: &[RoleDecision],
     active_character_ids: &[String],
+    locations: &BTreeMap<String, LocationDef>,
 ) -> (Vec<ArbiterOutcome>, Vec<RoleDecision>) {
     let res_re = Regex::new(r"(动用|消耗|花费|拿出|掏出|支付)([^\s，。、；：！？…,.!?（）()]{1,8})").unwrap();
     let coerce_re = Regex::new(
@@ -91,10 +127,14 @@ pub fn rule_arbitrate(
 
     let active: BTreeSet<&str> = active_character_ids.iter().map(|s| s.as_str()).collect();
 
-    // R4 预计算：出现在 ≥2 个决策 targets 中的目标视为被争夺。
+    // R4 预计算：出现在 ≥2 个决策 targets 中的目标视为被争夺（移动伪目标 loc:<id> 不计——
+    // 多人同赴一地不是资源争夺）。
     let mut target_count: BTreeMap<&str, usize> = BTreeMap::new();
     for d in decisions {
         for t in &d.targets {
+            if is_loc_target(t) {
+                continue;
+            }
             *target_count.entry(t.as_str()).or_default() += 1;
         }
     }
@@ -125,8 +165,8 @@ pub fn rule_arbitrate(
             resolved.push(outcome(d, ArbiterResult::Invalid, "rule:resource", "行动动用了未持有的资源，无法执行"));
             continue;
         }
-        // R2
-        if d.targets.iter().any(|t| !active.contains(t.as_str())) {
+        // R2 目标在场：仅校验角色目标；移动伪目标 loc:<id> 交 R6，跨地点角色目标（不在同组在场集）判越界。
+        if d.targets.iter().filter(|t| !is_loc_target(t)).any(|t| !active.contains(t.as_str())) {
             resolved.push(outcome(d, ArbiterResult::Invalid, "rule:target", "行动目标不在场，无法执行"));
             continue;
         }
@@ -138,6 +178,44 @@ pub fn rule_arbitrate(
                 "rule:mind_control",
                 "不能直接读取或强取他人私密（信息边界）",
             ));
+            continue;
+        }
+
+        // R6 移动合法性（Phase 2）：移动是终态裁决（不落入 R4/R5）。
+        // R6a 连通：目标 ∈ 当前地点 connections；R6b 准入：目标 gate（秘境）须放行。
+        if let Some(dest) = move_dest(d) {
+            let cur_loc =
+                state.characters.get(&d.character_id).map(|c| c.location.as_str()).unwrap_or("");
+            let connected = locations
+                .get(cur_loc)
+                .map(|l| l.connections.iter().any(|c| c == &dest))
+                .unwrap_or(false);
+            if !connected {
+                resolved.push(outcome(
+                    d,
+                    ArbiterResult::Invalid,
+                    "rule:move_unreachable",
+                    "无法从当前位置抵达该地点",
+                ));
+                continue;
+            }
+            if let Some(gate) = locations.get(&dest).and_then(|l| l.gate.as_ref()) {
+                let held = state
+                    .characters
+                    .get(&d.character_id)
+                    .map(|c| c.resources.as_slice())
+                    .unwrap_or(&[]);
+                if !gate_admits(gate, held) {
+                    resolved.push(outcome(
+                        d,
+                        ArbiterResult::Invalid,
+                        "rule:move_admission",
+                        "未满足秘境准入条件",
+                    ));
+                    continue;
+                }
+            }
+            resolved.push(outcome(d, ArbiterResult::Success, "rule:move", &format!("移动到「{dest}」")));
             continue;
         }
 
@@ -283,6 +361,7 @@ mod tests {
             targets: targets.into_iter().map(String::from).collect(),
             acceptable_costs: vec![],
             predictions: vec![],
+            duration: 0,
         }
     }
 
@@ -297,13 +376,22 @@ mod tests {
         vec!["li".to_string(), "wang".to_string()]
     }
 
+    /// 无地点维度（退化路径）：locations 空 → R6 不触发，行为与 Phase 1 一致。
+    fn no_locations() -> BTreeMap<String, LocationDef> {
+        BTreeMap::new()
+    }
+
+    fn move_decision(id: &str, cid: &str, dest: &str) -> RoleDecision {
+        decision(id, cid, &format!("前往{dest}"), vec![&format!("loc:{dest}")])
+    }
+
     // ===== R1 资源约束 =====
 
     #[test]
     fn r1_rejects_unowned_resource() {
         let s = base_state(); // li 无任何 resources
         let d = decision("d1", "li", "动用禁军包围皇宫", vec![]);
-        let (resolved, pending) = rule_arbitrate(&s, &[d], &active());
+        let (resolved, pending) = rule_arbitrate(&s, &[d], &active(), &no_locations());
         assert!(pending.is_empty());
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].result, ArbiterResult::Invalid);
@@ -315,7 +403,7 @@ mod tests {
         let mut s = base_state();
         s.characters.get_mut("li").unwrap().resources.push("禁军".into());
         let d = decision("d1", "li", "动用禁军包围皇宫", vec![]);
-        let (resolved, _pending) = rule_arbitrate(&s, &[d], &active());
+        let (resolved, _pending) = rule_arbitrate(&s, &[d], &active(), &no_locations());
         // 持有该资源 → 不因 R1 违规；干净决策判 Success。
         assert_eq!(resolved[0].result, ArbiterResult::Success);
     }
@@ -326,7 +414,7 @@ mod tests {
     fn r2_rejects_offscene_target() {
         let s = base_state();
         let d = decision("d1", "li", "攻击对方", vec!["ghost"]);
-        let (resolved, _pending) = rule_arbitrate(&s, &[d], &active());
+        let (resolved, _pending) = rule_arbitrate(&s, &[d], &active(), &no_locations());
         assert_eq!(resolved[0].result, ArbiterResult::Invalid);
         assert_eq!(resolved[0].rule_refs, vec!["rule:target".to_string()]);
     }
@@ -337,7 +425,7 @@ mod tests {
     fn r3_rejects_coercing_secret() {
         let s = base_state();
         let d = decision("d1", "li", "命令王五说出他的秘密", vec![]);
-        let (resolved, _pending) = rule_arbitrate(&s, &[d], &active());
+        let (resolved, _pending) = rule_arbitrate(&s, &[d], &active(), &no_locations());
         assert_eq!(resolved[0].result, ArbiterResult::Invalid);
         assert_eq!(resolved[0].rule_refs, vec!["rule:mind_control".to_string()]);
     }
@@ -346,7 +434,7 @@ mod tests {
     fn r3_rejects_mind_reading() {
         let s = base_state();
         let d = decision("d1", "li", "窥探对方的内心想法", vec![]);
-        let (resolved, _pending) = rule_arbitrate(&s, &[d], &active());
+        let (resolved, _pending) = rule_arbitrate(&s, &[d], &active(), &no_locations());
         assert_eq!(resolved[0].result, ArbiterResult::Invalid);
         assert_eq!(resolved[0].rule_refs, vec!["rule:mind_control".to_string()]);
     }
@@ -360,7 +448,7 @@ mod tests {
         let d2 = decision("d2", "wang", "抢夺王座", vec!["throne_holder"]);
         // 目标须在场，加入 active 集合。
         let act = vec!["li".to_string(), "wang".to_string(), "throne_holder".to_string()];
-        let (resolved, pending) = rule_arbitrate(&s, &[d1, d2], &act);
+        let (resolved, pending) = rule_arbitrate(&s, &[d1, d2], &act, &no_locations());
         assert!(resolved.is_empty(), "冲突决策不应被规则层直接判定");
         assert_eq!(pending.len(), 2);
     }
@@ -375,9 +463,12 @@ mod tests {
             summary: "主角与对手决战".into(),
             constraint: ConstraintLevel::Hard,
             status: NodeStatus::Pending,
+            threshold: None,
+            advance_when: None,
+            weights: None,
         });
         let d = decision("d1", "li", "杀死关键人物王五", vec![]);
-        let (resolved, pending) = rule_arbitrate(&s, &[d], &active());
+        let (resolved, pending) = rule_arbitrate(&s, &[d], &active(), &no_locations());
         assert!(resolved.is_empty());
         assert_eq!(pending.len(), 1);
     }
@@ -386,7 +477,7 @@ mod tests {
     fn clean_decision_auto_success_without_model() {
         let s = base_state();
         let d = decision("d1", "li", "礼貌地上前问候", vec![]);
-        let (resolved, pending) = rule_arbitrate(&s, &[d], &active());
+        let (resolved, pending) = rule_arbitrate(&s, &[d], &active(), &no_locations());
         assert!(pending.is_empty(), "干净决策不需要模型层");
         assert_eq!(resolved[0].result, ArbiterResult::Success);
     }
@@ -397,9 +488,93 @@ mod tests {
         // 乱序输入，输出应按 character_id 定序。
         let d2 = decision("d2", "wang", "问候", vec![]);
         let d1 = decision("d1", "li", "问候", vec![]);
-        let (resolved, _p) = rule_arbitrate(&s, &[d2, d1], &active());
+        let (resolved, _p) = rule_arbitrate(&s, &[d2, d1], &active(), &no_locations());
         assert_eq!(resolved[0].character_id, "li");
         assert_eq!(resolved[1].character_id, "wang");
+    }
+
+    // ===== R6 移动合法性（Phase 2）：连通 + 秘境准入 =====
+
+    fn locmap(defs: Vec<LocationDef>) -> BTreeMap<String, LocationDef> {
+        defs.into_iter().map(|d| (d.id.clone(), d)).collect()
+    }
+
+    fn loc(id: &str, connections: &[&str]) -> LocationDef {
+        LocationDef {
+            id: id.into(),
+            name: id.into(),
+            connections: connections.iter().map(|s| s.to_string()).collect(),
+            is_secret_realm: false,
+            gate: None,
+        }
+    }
+
+    #[test]
+    fn r6_move_to_connected_location_succeeds() {
+        let mut s = base_state();
+        s.characters.get_mut("li").unwrap().location = "前厅".into();
+        let locs = locmap(vec![loc("前厅", &["密室"]), loc("密室", &["前厅"])]);
+        let d = move_decision("d1", "li", "密室");
+        let (resolved, pending) = rule_arbitrate(&s, &[d], &["li".to_string()], &locs);
+        assert!(pending.is_empty(), "移动是终态裁决，不进模型层");
+        assert_eq!(resolved[0].result, ArbiterResult::Success);
+        assert_eq!(resolved[0].rule_refs, vec!["rule:move".to_string()]);
+    }
+
+    #[test]
+    fn r6_move_to_unconnected_location_is_invalid() {
+        let mut s = base_state();
+        s.characters.get_mut("li").unwrap().location = "前厅".into();
+        // 前厅只连密室，不连塔顶。
+        let locs = locmap(vec![loc("前厅", &["密室"]), loc("塔顶", &[])]);
+        let d = move_decision("d1", "li", "塔顶");
+        let (resolved, _p) = rule_arbitrate(&s, &[d], &["li".to_string()], &locs);
+        assert_eq!(resolved[0].result, ArbiterResult::Invalid);
+        assert_eq!(resolved[0].rule_refs, vec!["rule:move_unreachable".to_string()]);
+    }
+
+    #[test]
+    fn r6_secret_realm_admission_denied_without_item() {
+        let mut s = base_state();
+        s.characters.get_mut("li").unwrap().location = "前厅".into();
+        // li 无 resources；秘境 gate 需玉钥。
+        let mut secret = loc("秘境", &[]);
+        secret.is_secret_realm = true;
+        secret.gate =
+            Some(LocationGate { required_item_ids: vec!["玉钥".into()], ..Default::default() });
+        let locs = locmap(vec![loc("前厅", &["秘境"]), secret]);
+        let d = move_decision("d1", "li", "秘境");
+        let (resolved, _p) = rule_arbitrate(&s, &[d], &["li".to_string()], &locs);
+        assert_eq!(resolved[0].result, ArbiterResult::Invalid);
+        assert_eq!(resolved[0].rule_refs, vec!["rule:move_admission".to_string()]);
+    }
+
+    #[test]
+    fn r6_secret_realm_admission_passes_with_item() {
+        let mut s = base_state();
+        {
+            let li = s.characters.get_mut("li").unwrap();
+            li.location = "前厅".into();
+            li.resources.push("item:玉钥".into()); // 持有玉钥
+        }
+        let mut secret = loc("秘境", &[]);
+        secret.is_secret_realm = true;
+        secret.gate =
+            Some(LocationGate { required_item_ids: vec!["玉钥".into()], ..Default::default() });
+        let locs = locmap(vec![loc("前厅", &["秘境"]), secret]);
+        let d = move_decision("d1", "li", "秘境");
+        let (resolved, _p) = rule_arbitrate(&s, &[d], &["li".to_string()], &locs);
+        assert_eq!(resolved[0].result, ArbiterResult::Success, "持有准入道具 → 放行");
+    }
+
+    #[test]
+    fn r6_cross_group_character_target_is_invalid() {
+        // R2 同组在场重定义：active = 同组 {li}，li 攻击不在同组的 wang（跨地点目标）→ 越界 Invalid。
+        let s = base_state();
+        let d = decision("d1", "li", "攻击王五", vec!["wang"]);
+        let (resolved, _p) = rule_arbitrate(&s, &[d], &["li".to_string()], &no_locations());
+        assert_eq!(resolved[0].result, ArbiterResult::Invalid);
+        assert_eq!(resolved[0].rule_refs, vec!["rule:target".to_string()]);
     }
 
     // ===== 模型层 =====

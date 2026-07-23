@@ -22,6 +22,7 @@ use crate::providers::ModerationVerdict;
 use crate::worlds::load_world;
 
 use muse_engine::character::types::CharacterCardV2;
+use muse_engine::narrative::types::{LocationDef, LocationGate};
 
 // ---------- 输出：装配结果（写入 worlds.assembled_json 的 `assembly` 段，随实例钉住） ----------
 
@@ -35,6 +36,43 @@ pub struct AssembledInstance {
     /// §2.5 主场优劣势：本书角色挂原作预知知识包 + 原作宿命作硬节点（引擎 P1/P2 机制，装配层只标注）。
     #[serde(default)]
     pub home_advantages: Vec<HomeAdvantage>,
+    /// 世界固有角色（NPC/反派）装配条目：随实例钉住，runtime 每 tick 注入引擎 active_cards +
+    /// world_controlled（不进 members_projection、无日报投影）。空 = 无世界固有角色。
+    #[serde(default)]
+    pub world_character_entries: Vec<WorldCharacterEntry>,
+    /// 地点图（Phase 2）：装配后钉住，runtime 每 tick 读回组装引擎 RoundInput.locations。
+    /// 空 = 无地点维度，全体角色单组，退化为单一全局场景。
+    #[serde(default)]
+    pub location_graph: Vec<LocationDef>,
+    /// 地点驻留道具分布（Phase 3）：各地点从 world_items 目录解引用的驻留道具（秘境隐藏道具的单一事实源）。
+    /// 空 = 无驻留道具。悬空 id 静默丢弃（与 reward_item_ref/carried 同款防御式），建模板期由引用完整性校验前置拦截。
+    #[serde(default)]
+    pub resident_items: Vec<ResidentItemGroup>,
+}
+
+/// 地点驻留道具组（Phase 3）：一个地点解引用后的驻留道具集。`is_secret_realm` 标记秘境隐藏道具，
+/// 供后续「秘境探索结算 → grant_item_tx 兑现」链路复用（与章节钩子奖励同一幂等发货口径）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResidentItemGroup {
+    pub location_id: String,
+    #[serde(default)]
+    pub is_secret_realm: bool,
+    pub items: Vec<ItemDefinition>,
+}
+
+/// 装配后钉住的世界固有角色条目：runtime 据此把 NPC 卡注入引擎 RoundInput。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorldCharacterEntry {
+    pub character_id: String,
+    pub card: CharacterCardV2,
+    /// 初始地点（Phase 1 无地点参与，仅透传）。
+    #[serde(default)]
+    pub location: String,
+    /// 解引用后的携带道具（来自 world_items 目录）。
+    #[serde(default)]
+    pub carried_items: Vec<ItemDefinition>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,8 +112,70 @@ struct Skeleton {
     hidden_content_pool: Vec<PoolItem>,
     #[serde(default)]
     side_hook_pool: Vec<PoolItem>,
+    /// 原著固有道具目录（单一事实源）：PoolItem.reward_item_ref 按 id 解引用于此。
+    #[serde(default)]
+    world_items: Vec<ItemDefinition>,
+    /// 世界固有角色（NPC/反派）目录：装配层解引用 + 机审后钉入 worldCharacterEntries，
+    /// runtime 每 tick 读回注入引擎（不进日报投影）。空 = 无世界固有角色，退化为纯玩家世界。
+    #[serde(default)]
+    world_characters: Vec<WorldCharacter>,
+    /// 地点图（Phase 2/3）：地点节点 {id,name,connections,isSecretRealm,gate,residentItemIds}。装配后
+    /// 拆为引擎 location_graph（LocationDef，丢弃 residentItemIds）+ resident_items 分布。空 = 无地点维度。
+    #[serde(default)]
+    locations: Vec<LocationSpec>,
     #[serde(default)]
     assembly_rules: AssemblyRules,
+}
+
+/// 地点骨架条目（Phase 3）：引擎 LocationDef 的 server 侧镜像 + residentItemIds（道具分布）。
+/// 装配时拆两路——结构字段转 LocationDef 传引擎，residentItemIds 解引用 world_items 目录成 resident_items。
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct LocationSpec {
+    id: String,
+    #[serde(default)]
+    name: String,
+    /// 可直达地点 id（连通性；建模板期引用完整性校验须指向存在的 location）。
+    #[serde(default)]
+    connections: Vec<String>,
+    /// 秘境标记（可见性隔离由引擎按 location 分组天然实现；此处仅透传 + 标注驻留道具为隐藏）。
+    #[serde(default)]
+    is_secret_realm: bool,
+    /// 准入门槛（秘境用），与引擎 LocationGate 同形。
+    #[serde(default)]
+    gate: Option<LocationGate>,
+    /// 驻留道具对 world_items 目录的引用（装配时解引用为 ItemDefinition）。
+    #[serde(default)]
+    resident_item_ids: Vec<String>,
+}
+
+/// LocationSpec → 引擎 LocationDef：丢弃 residentItemIds（道具分布走 resident_items，不进引擎地点图）。
+fn to_location_def(spec: &LocationSpec) -> LocationDef {
+    LocationDef {
+        id: spec.id.clone(),
+        name: spec.name.clone(),
+        connections: spec.connections.clone(),
+        is_secret_realm: spec.is_secret_realm,
+        gate: spec.gate.clone(),
+    }
+}
+
+/// 世界固有角色（NPC/反派）骨架条目：复用引擎角色卡 + 初始位置 + 携带道具引用 + 议程节点绑定。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorldCharacter {
+    /// 复用引擎 DNA 卡（NPC 与玩家角色同构，参与决策/碰撞）。
+    card: CharacterCardV2,
+    /// 初始地点（Phase 1 无地点参与时仅钉住透传，运行时不据此分组）。
+    #[serde(default)]
+    home_location: String,
+    /// 携带道具对 world_items 目录的引用（装配时解引用为 ItemDefinition）。
+    #[serde(default)]
+    carried_item_ids: Vec<String>,
+    /// 反派主动议程绑定的 mainline 节点 id（透传标注；引擎不特判，靠卡内容驱动决策）。
+    #[serde(default)]
+    #[allow(dead_code)]
+    agenda_nodes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -118,7 +218,10 @@ struct PoolItem {
     template: String,
     #[serde(default = "half")]
     difficulty_base: f32,
-    /// 通关兑现的隐藏道具（预审核池内定义）。
+    /// 通关兑现的隐藏道具对 world_items 目录的引用（单一事实源，优先解引用）。
+    #[serde(default)]
+    reward_item_ref: Option<String>,
+    /// 通关兑现的隐藏道具（内联定义，reward_item_ref 缺失/悬空时的兼容 fallback）。
     #[serde(default)]
     reward_item: Option<ItemDefinition>,
 }
@@ -240,7 +343,7 @@ pub async fn assemble_instance(state: &AppState, world_id: &str) -> Result<Assem
                 pool_item_id: pool_item.id.clone(),
                 parameterized_text: text,
                 difficulty_score: difficulty,
-                reward_item: pool_item.reward_item.clone(),
+                reward_item: resolve_reward_item(pool_item, &skeleton.world_items),
             });
             embedded += 1;
         }
@@ -275,12 +378,28 @@ pub async fn assemble_instance(state: &AppState, world_id: &str) -> Result<Assem
         "rosterSize": roster_size,
     });
 
+    // 5) 世界固有角色（NPC/反派）装配：解引用 world_characters → 过机审门（与钩子同一 S-3 规则）→
+    //    仅 Approved 钉入 worldCharacterEntries。NPC 无 owner、不投影日报；携带道具从 world_items 目录解引用。
+    let world_character_entries =
+        assemble_world_characters(state, world_id, &skeleton.world_characters, &skeleton.world_items).await?;
+
+    // 6) 地点图（Phase 2）：LocationSpec → 引擎 LocationDef（结构数据，无叙事文本机审需求）。
+    //    runtime 每 tick 读回组装引擎 RoundInput.locations。空 = 无地点维度，退化为单一全局场景。
+    let location_graph: Vec<LocationDef> = skeleton.locations.iter().map(to_location_def).collect();
+
+    // 6b) 道具分布（Phase 3）：各地点 residentItemIds 解引用 world_items 目录（悬空 id 静默丢弃）。
+    //     秘境（is_secret_realm）驻留道具即隐藏道具，单一事实源锁定在 world_items 目录。
+    let resident_items = distribute_resident_items(&skeleton.locations, &skeleton.world_items);
+
     let assembled = AssembledInstance {
         per_character_hooks: hooks,
         enabled_endings,
         lineup_params,
         difficulty_notes,
         home_advantages,
+        world_character_entries,
+        location_graph,
+        resident_items,
     };
 
     // 持久化：assembly 段钉住（含派生的 templateVersion），chapterState 段留给章节会话推进。
@@ -353,6 +472,174 @@ async fn load_active_cards(db: &AnyPool, world_id: &str) -> Result<Vec<(String, 
 }
 
 // ---------- 装配规则（纯函数，可单测） ----------
+
+/// 解析池物品的奖励道具：优先按 reward_item_ref 从 world_items 目录解引用（单一事实源），
+/// ref 缺失或悬空（目录无此 id）时退回内联 reward_item（兼容期 fallback）。
+/// 下游 chapter_finish/grant_item_tx 仍只认解出的 ItemDefinition，链路不变。
+fn resolve_reward_item(pool_item: &PoolItem, world_items: &[ItemDefinition]) -> Option<ItemDefinition> {
+    if let Some(ref_id) = pool_item.reward_item_ref.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(def) = world_items.iter().find(|it| it.id == ref_id) {
+            return Some(def.clone());
+        }
+    }
+    pool_item.reward_item.clone()
+}
+
+/// 地点驻留道具分布（Phase 3）：逐地点把 residentItemIds 从 world_items 目录解引用为 ItemDefinition。
+/// 悬空 id 静默丢弃（与 reward_item_ref/carried_item_ids 同款防御式）；无解出道具的地点不产组。
+fn distribute_resident_items(
+    locations: &[LocationSpec],
+    world_items: &[ItemDefinition],
+) -> Vec<ResidentItemGroup> {
+    locations
+        .iter()
+        .filter_map(|spec| {
+            let items: Vec<ItemDefinition> = spec
+                .resident_item_ids
+                .iter()
+                .filter_map(|iid| world_items.iter().find(|it| &it.id == iid).cloned())
+                .collect();
+            if items.is_empty() {
+                None
+            } else {
+                Some(ResidentItemGroup {
+                    location_id: spec.id.clone(),
+                    is_secret_realm: spec.is_secret_realm,
+                    items,
+                })
+            }
+        })
+        .collect()
+}
+
+/// 建模板期引用完整性校验（Phase 3，`worlds_ops::create_template` 调用）：把 skeleton_json 试解析为
+/// `Skeleton`，校验目录引用无悬空——`reward_item_ref`（无内联 fallback 时）/`connections`/`residentItemIds`/
+/// `carried_item_ids`/`gate.requiredItemIds` 须能在对应目录（world_items / locations）解引用，
+/// `gate.requiredCosmologies` 须 ∈ KNOWN_COSMOLOGIES。返回首个悬空引用的中文说明（Err）或通过（Ok）。
+///
+/// 宽松边界：解析失败（类型不符）→ Ok（沿用 load_skeleton 的防御式 unwrap_or_default 语义，不因无关字段拦截合法模板）；
+/// 只在结构成立时对「明确写了引用」的字段判悬空，避免误伤退化路径（空目录 / 无地点的老模板全部放行）。
+pub(crate) fn validate_skeleton_refs(skeleton: &Value) -> Result<(), String> {
+    let Ok(sk) = serde_json::from_value::<Skeleton>(skeleton.clone()) else {
+        return Ok(()); // 解析不出结构化骨架 → 不做引用校验（防御式，与运行时装配一致）。
+    };
+    let item_ids: std::collections::BTreeSet<&str> =
+        sk.world_items.iter().map(|it| it.id.as_str()).collect();
+    let loc_ids: std::collections::BTreeSet<&str> =
+        sk.locations.iter().map(|l| l.id.as_str()).collect();
+
+    // 1) 池物品 reward_item_ref：写了 ref 且目录无此 id 且无内联 fallback → 悬空。
+    for pool in [&sk.hidden_content_pool, &sk.side_hook_pool] {
+        for it in pool {
+            if let Some(ref_id) = it.reward_item_ref.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                if !item_ids.contains(ref_id) && it.reward_item.is_none() {
+                    return Err(format!("rewardItemRef 悬空：池物品 `{}` 引用了不存在的 worldItems.id `{ref_id}`", it.id));
+                }
+            }
+        }
+    }
+
+    // 2) 地点：connections 指向存在的 location；residentItemIds / gate.requiredItemIds 指向 world_items；
+    //    gate.requiredCosmologies ∈ KNOWN_COSMOLOGIES。
+    for loc in &sk.locations {
+        for c in &loc.connections {
+            if !loc_ids.contains(c.as_str()) {
+                return Err(format!("connections 悬空：地点 `{}` 连向不存在的地点 `{c}`", loc.id));
+            }
+        }
+        for iid in &loc.resident_item_ids {
+            if !item_ids.contains(iid.as_str()) {
+                return Err(format!("residentItemIds 悬空：地点 `{}` 引用了不存在的 worldItems.id `{iid}`", loc.id));
+            }
+        }
+        if let Some(gate) = &loc.gate {
+            for iid in &gate.required_item_ids {
+                if !item_ids.contains(iid.as_str()) {
+                    return Err(format!("gate.requiredItemIds 悬空：地点 `{}` 准入需不存在的 worldItems.id `{iid}`", loc.id));
+                }
+            }
+            for cos in &gate.required_cosmologies {
+                if !crate::admission::KNOWN_COSMOLOGIES.contains(&cos.as_str()) {
+                    return Err(format!("gate.requiredCosmologies 非法：地点 `{}` 的体系 `{cos}` 不在官方枚举内", loc.id));
+                }
+            }
+        }
+    }
+
+    // 3) 世界固有角色 carried_item_ids 指向 world_items；home_location（非空）指向存在的地点。
+    for wc in &sk.world_characters {
+        for iid in &wc.carried_item_ids {
+            if !item_ids.contains(iid.as_str()) {
+                return Err(format!("carriedItemIds 悬空：世界角色 `{}` 携带不存在的 worldItems.id `{iid}`", wc.card.id));
+            }
+        }
+        let home = wc.home_location.trim();
+        if !home.is_empty() && !loc_ids.contains(home) {
+            return Err(format!("homeLocation 悬空：世界角色 `{}` 落在不存在的地点 `{home}`", wc.card.id));
+        }
+    }
+
+    Ok(())
+}
+
+/// 世界固有角色（NPC/反派）装配：逐个过机审门（复用钩子的 S-3 规则——仅 Approved 钉入，
+/// Pending/Rejected 跳过不钉），携带道具从 world_items 目录解引用。返回可钉入 assembled_json 的条目集。
+async fn assemble_world_characters(
+    state: &AppState,
+    world_id: &str,
+    world_characters: &[WorldCharacter],
+    world_items: &[ItemDefinition],
+) -> Result<Vec<WorldCharacterEntry>, ApiError> {
+    let mut entries: Vec<WorldCharacterEntry> = Vec::new();
+    for wc in world_characters {
+        let npc_id = wc.card.id.trim().to_string();
+        if npc_id.is_empty() {
+            continue; // 无 id 的 NPC 无法被 runtime 注入/区分，跳过。
+        }
+        // S-3：NPC 卡可叙述文本过机审门，仅 Approved 钉入（未复核内容不进实例）。
+        let verdict = crate::safety::moderate_and_queue(
+            state,
+            "assembly_npc",
+            &format!("{world_id}:{npc_id}"),
+            &npc_scan_text(&wc.card),
+        )
+        .await?;
+        if verdict != ModerationVerdict::Approved {
+            continue;
+        }
+        // 携带道具解引用（悬空 id 静默丢弃，与 reward_item_ref 同款防御式）。
+        let carried_items: Vec<ItemDefinition> = wc
+            .carried_item_ids
+            .iter()
+            .filter_map(|iid| world_items.iter().find(|it| &it.id == iid).cloned())
+            .collect();
+        entries.push(WorldCharacterEntry {
+            character_id: npc_id,
+            card: wc.card.clone(),
+            location: wc.home_location.clone(),
+            carried_items,
+        });
+    }
+    Ok(entries)
+}
+
+/// NPC 卡的机审文本：拼接可叙述字段（名字 / 核心矛盾 / 表层目标 / 长期议程），供预审核门判定。
+fn npc_scan_text(card: &CharacterCardV2) -> String {
+    let dc = &card.dramatic_core;
+    let mut parts: Vec<String> = Vec::new();
+    for s in [
+        card.identity.name.as_str(),
+        dc.core_contradiction.as_str(),
+        dc.surface_goal.as_str(),
+        card.agency.long_term_agenda.as_str(),
+    ] {
+        let t = s.trim();
+        if !t.is_empty() {
+            parts.push(t.to_string());
+        }
+    }
+    parts.join(" / ")
+}
 
 /// 角色执念词条：恐惧 / 被否认的欲望 / 核心矛盾 / 隐藏需求 / 剧情种子 / 拒绝规则。
 fn obsession_terms(card: &CharacterCardV2) -> Vec<String> {

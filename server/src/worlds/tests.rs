@@ -360,6 +360,7 @@ fn domain_event(id: &str, vis: EventVisibility) -> DomainEvent {
         id: id.into(),
         run_id: "r".into(),
         sequence: 0,
+        timestamp: 0,
         event_type: DomainEventType::DialogueSpoken,
         actor_ids: vec!["chA".into()],
         target_ids: None,

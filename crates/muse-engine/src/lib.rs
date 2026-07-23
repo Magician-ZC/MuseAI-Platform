@@ -11,6 +11,7 @@ pub mod knowledge;
 pub mod model;
 pub mod narrative;
 pub mod store;
+pub mod world;
 
 pub use error::EngineError;
 

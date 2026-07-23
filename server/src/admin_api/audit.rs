@@ -219,7 +219,8 @@ async fn review(
                 .execute(&state.db)
                 .await?;
         }
-        "template" => {
+        // "template"（admin 官方模板）与 "world_template"（创作者 /assets/worlds 资产）同落 world_templates。
+        "template" | "world_template" => {
             sqlx::query("UPDATE world_templates SET moderation = ? WHERE id = ?")
                 .bind(moderation)
                 .bind(&subject_id)

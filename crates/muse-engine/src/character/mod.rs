@@ -518,7 +518,9 @@ fn build_context_samples(discoveries: &[ChapterDiscovery]) -> BTreeMap<String, V
 
 /// 单任务内并发驱动一批 future，并发上限 limit，每个完成即回调（保持宿主无关，不依赖 tokio rt / futures-util）。
 /// 用 poll_fn 手动轮询：Pending 时透传真实 waker，同步完成时在同一 poll 内继续补位，避免丢唤醒。
-async fn run_bounded_each<F, C>(futures: Vec<F>, limit: usize, mut on_complete: C)
+///
+/// `pub(crate)`：world 提取管线（`crate::world`）逐章扫描并发复用同一驱动，避免复制一份。
+pub(crate) async fn run_bounded_each<F, C>(futures: Vec<F>, limit: usize, mut on_complete: C)
 where
     F: std::future::Future,
     C: FnMut(F::Output),

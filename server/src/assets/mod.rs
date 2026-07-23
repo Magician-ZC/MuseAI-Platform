@@ -26,6 +26,9 @@ use crate::idempotency;
 use crate::providers::ModerationVerdict;
 use crate::safety;
 
+/// 世界超集资产上云端点（`/assets/worlds`，与本模块 `/assets/characters` 同款资产生命周期）。
+pub mod worlds;
+
 /// card_json 上限（防滥用）；最小发布清单只需角色版本 + 权利元数据（§2.3）。
 const MAX_CARD_BYTES: usize = 256 * 1024;
 
@@ -37,6 +40,7 @@ pub fn router() -> Router<AppState> {
         .route("/assets/characters/{id}/manifest", get(manifest))
         .route("/assets/characters/{id}/withdraw", post(withdraw))
         .route("/assets/characters/{id}", delete(delete_character))
+        .merge(worlds::router())
 }
 
 // ---------------- 请求 / 响应类型 ----------------

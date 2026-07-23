@@ -912,3 +912,160 @@ async fn pending_moderation_hook_is_skipped_for_next_candidate() {
         "Pending 装配钩子应入人审队列"
     );
 }
+
+// ---------- 装配采样（防刷第二环）：DB 集成 ----------
+
+/// 超集章节骨架：2 storylines / mainline 含 fated + 变体组 + 非 fated（模板全量 5，采样后 2）/ 3 NPC（采样 1）。
+/// isSuperset + storylines + sampling 三判据满足 → 走种子采样。
+fn superset_chapter_skeleton() -> String {
+    let npc1: Value = serde_json::from_str(&make_card("npc-1", "厉无咎", "夺权", &["布局朝堂"], None, true)).unwrap();
+    let npc2: Value = serde_json::from_str(&make_card("npc-2", "沈孤鸿", "背叛", &["归隐"], None, false)).unwrap();
+    let npc3: Value = serde_json::from_str(&make_card("npc-3", "白清欢", "孤独", &["寻医"], None, false)).unwrap();
+    json!({
+        "sourceWork": { "sourceId": "src_novel", "title": "测试小说" },
+        "isSuperset": true,
+        "storylines": [
+            { "id": "arc-1", "affinity": "strategist", "mainlineNodeIds": ["mn-fate","mn-x1","mn-x2","mn-y"], "hiddenPoolIds": ["hc-1","hc-2"], "endingIds": ["end-1"] },
+            { "id": "arc-2", "affinity": "social",     "mainlineNodeIds": ["mn-z"],                            "hiddenPoolIds": ["hc-3"],       "endingIds": ["end-2"] }
+        ],
+        "mainlineNodes": [
+            { "id": "mn-fate", "fated": true, "arcTags": ["arc-1","arc-2"] },
+            { "id": "mn-x1", "variantGroup": "vgx", "arcTags": ["arc-1"] },
+            { "id": "mn-x2", "variantGroup": "vgx", "arcTags": ["arc-1"] },
+            { "id": "mn-y", "arcTags": ["arc-1"] },
+            { "id": "mn-z", "arcTags": ["arc-2"] }
+        ],
+        "hiddenContentPool": [
+            { "id": "hc-1", "themes": ["遗忘"], "template": "{name} 直面 {fear}", "arcTags": ["arc-1"] },
+            { "id": "hc-2", "themes": ["权谋"], "template": "静室布局", "arcTags": ["arc-1"] },
+            { "id": "hc-3", "themes": ["情谊"], "template": "月下结盟", "arcTags": ["arc-2"] }
+        ],
+        "endingPool": [
+            { "id": "end-1", "affinity": "strategist", "baseWeight": 1.0, "arcTags": ["arc-1"] },
+            { "id": "end-2", "affinity": "social",     "baseWeight": 1.0, "arcTags": ["arc-2"] }
+        ],
+        "worldCharacters": [
+            { "card": npc1, "agendaNodes": ["mn-fate"] },
+            { "card": npc2, "agendaNodes": [] },
+            { "card": npc3, "agendaNodes": [] }
+        ],
+        "sampling": { "instanceStorylineCount": 1, "instanceMainlineCount": 1, "instanceHiddenCount": 1, "instanceNpcCount": 1 }
+    })
+    .to_string()
+}
+
+/// 采样钉住：超集实例产出采样审计段（seed + 被选子集），主线收窄到 2（fated + 1 非 fated），NPC 收窄到 1。
+#[tokio::test]
+async fn superset_instance_pins_sampling_and_narrows_pools() {
+    let state = test_state().await;
+    seed_user(&state, "usrS").await;
+    let card = make_card("chS", "苏未央", "害怕被遗忘", &["寻找失散的姐姐"], Some(("src_novel", "测试小说")), true);
+    seed_char(&state, "chS", "usrS", &card).await;
+    seed_template(&state, "tpl_superset", "chapter", &superset_chapter_skeleton(), r#"{"mode":"open"}"#).await;
+    let wid = make_chapter_world(&state, "tpl_superset").await;
+    seed_member(&state, &wid, "usrS", "chS").await;
+
+    let assembled = assemble_instance(&state, &wid).await.unwrap();
+    let s = assembled.sampling.as_ref().expect("超集实例必须产出采样审计段");
+
+    // 种子：16 位十六进制，非零。
+    assert_eq!(s.seed.len(), 16, "seed 应为 u64 十六进制");
+    assert_ne!(s.seed, "0000000000000000");
+    assert!(!s.roster_fingerprint.is_empty());
+
+    // 主线：fated 必留 + 计数收窄。模板全量 5 → 采样后 2（mn-fate + 1 非 fated）。
+    assert!(s.selected_mainline.contains(&"mn-fate".to_string()), "fated 硬节点必留");
+    assert_eq!(s.selected_mainline.len(), 2, "采样后主线 = fated + 1 非 fated（模板全量 5）: {:?}", s.selected_mainline);
+
+    // NPC：3 → 采样 1；仅被选 NPC 装配为 worldCharacterEntries。
+    assert_eq!(s.selected_npcs.len(), 1, "NPC 采样收窄到 1: {:?}", s.selected_npcs);
+    assert_eq!(assembled.world_character_entries.len(), 1, "仅被选 NPC 钉入 entries");
+    assert_eq!(assembled.world_character_entries[0].character_id, s.selected_npcs[0]);
+
+    // 隐藏内容：收窄到 1，且 ⊆ 所选 storyline。
+    assert!(s.selected_hidden.len() <= 1, "隐藏内容采样 ≤ 1: {:?}", s.selected_hidden);
+
+    // 钉入 assembled_json /assembly/sampling（服务端审计，随实例钉住）。
+    let raw: String = sqlx::query("SELECT assembled_json FROM worlds WHERE id = ?")
+        .bind(&wid).fetch_one(&state.db).await.unwrap().try_get("assembled_json").unwrap();
+    let v: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(v["assembly"]["sampling"]["seed"], json!(s.seed));
+    assert!(v["assembly"]["sampling"]["selectedMainline"].as_array().unwrap().len() == 2);
+}
+
+/// 退出重进不重掷：CAS 输家读回既有实例，seed 与被选子集不变（replay 一致）。
+#[tokio::test]
+async fn superset_reassembly_replays_same_seed() {
+    let state = test_state().await;
+    seed_user(&state, "usrRe").await;
+    let card = make_card("chRe", "苏未央", "害怕被遗忘", &["寻找失散的姐姐"], Some(("src_novel", "测试小说")), true);
+    seed_char(&state, "chRe", "usrRe", &card).await;
+    seed_template(&state, "tpl_replay", "chapter", &superset_chapter_skeleton(), r#"{"mode":"open"}"#).await;
+    let wid = make_chapter_world(&state, "tpl_replay").await;
+    seed_member(&state, &wid, "usrRe", "chRe").await;
+
+    let a1 = assemble_instance(&state, &wid).await.unwrap();
+    let a2 = assemble_instance(&state, &wid).await.unwrap(); // CAS 输家：读回既有实例，不重掷。
+    let (s1, s2) = (a1.sampling.unwrap(), a2.sampling.unwrap());
+    assert_eq!(s1.seed, s2.seed, "退出重进 seed 不变");
+    assert_eq!(s1.selected_mainline, s2.selected_mainline, "replay 主线一致");
+    assert_eq!(s1.selected_hidden, s2.selected_hidden, "replay 隐藏一致");
+    assert_eq!(s1.selected_npcs, s2.selected_npcs, "replay NPC 一致");
+    assert_eq!(s1.selected_locations, s2.selected_locations, "replay 地点一致");
+}
+
+/// 副本间不同：两个不同 world_id、同阵容同模板 → 服务端算出的种子不同（world_id 唯一 → 不可换卡/重进复现）。
+#[tokio::test]
+async fn superset_distinct_worlds_get_distinct_seeds() {
+    let state = test_state().await;
+    seed_user(&state, "usrD").await;
+    let card = make_card("chD", "苏未央", "害怕被遗忘", &["寻找失散的姐姐"], Some(("src_novel", "测试小说")), true);
+    seed_char(&state, "chD", "usrD", &card).await;
+    seed_template(&state, "tpl_distinct", "chapter", &superset_chapter_skeleton(), r#"{"mode":"open"}"#).await;
+
+    let w1 = make_chapter_world(&state, "tpl_distinct").await;
+    seed_member(&state, &w1, "usrD", "chD").await;
+    let w2 = make_chapter_world(&state, "tpl_distinct").await;
+    seed_member(&state, &w2, "usrD", "chD").await;
+
+    let s1 = assemble_instance(&state, &w1).await.unwrap().sampling.unwrap();
+    let s2 = assemble_instance(&state, &w2).await.unwrap().sampling.unwrap();
+    assert_ne!(s1.seed, s2.seed, "不同实例（world_id 唯一）→ 种子不同");
+    // 阵容指纹相同（同一 roster），证明种子差异来自 world_id 而非阵容 → 不可换卡复现。
+    assert_eq!(s1.roster_fingerprint, s2.roster_fingerprint, "同阵容指纹一致");
+}
+
+/// 下游生效：通关判定按被选主线数（2），而非模板全量（5）——否则采样后永不通关。
+#[tokio::test]
+async fn superset_clearance_uses_selected_mainline_count() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    seed_user(&state, "usrC").await;
+    let card = make_card("chC", "苏未央", "害怕被遗忘", &["寻找失散的姐姐"], Some(("src_novel", "测试小说")), true);
+    seed_char(&state, "chC", "usrC", &card).await;
+    seed_template(&state, "tpl_clear", "chapter", &superset_chapter_skeleton(), r#"{"mode":"open"}"#).await;
+    let wid = make_chapter_world(&state, "tpl_clear").await;
+    seed_member(&state, &wid, "usrC", "chC").await;
+    let tc = token(&state, "usrC");
+
+    // start（触发装配）。
+    let (st, sbody) = post(&app, &format!("/api/worlds/{wid}/chapters/start"), &tc, None, json!({})).await;
+    assert_eq!(st, StatusCode::OK, "{sbody}");
+    // 种子不外泄：start 响应不含 seed / sampling。
+    let sbody_str = sbody.to_string();
+    assert!(!sbody_str.contains("\"seed\""), "start 响应不得暴露 seed");
+    assert!(!sbody_str.contains("sampling"), "start 响应不得暴露 sampling 段");
+
+    // 第 1 次 finish：totalNodes = 被选主线数 2（非模板全量 5）；currentNode 0→1，未通关。
+    let (st, f1) = post(&app, &format!("/api/worlds/{wid}/chapters/finish"), &tc, None, json!({})).await;
+    assert_eq!(st, StatusCode::OK, "{f1}");
+    assert_eq!(f1["totalNodes"], json!(2), "通关判定应按被选主线数（2），而非模板全量（5）");
+    assert_eq!(f1["advancedTo"], json!(1));
+    assert_eq!(f1["cleared"], json!(false));
+
+    // 第 2 次 finish：advancedTo 2 ≥ 2 → 通关。
+    let (st, f2) = post(&app, &format!("/api/worlds/{wid}/chapters/finish"), &tc, None, json!({})).await;
+    assert_eq!(st, StatusCode::OK, "{f2}");
+    assert_eq!(f2["advancedTo"], json!(2));
+    assert_eq!(f2["cleared"], json!(true), "推进到被选主线数即通关");
+}

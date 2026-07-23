@@ -402,8 +402,10 @@ async fn seed_narrative_layer(
     world: &WorldRow,
     s: &mut NarrativeState,
 ) -> Result<(), ApiError> {
-    // assembled_json 标注的宿命(硬)节点 id（装配层 home_advantages.fatedNodes）。
+    // assembled_json 标注的宿命(硬)节点 id（装配层 home_advantages.fatedNodes）+ 采样钉住的被选主线子集。
     let mut fated: std::collections::BTreeSet<String> = Default::default();
+    // 采样子集（防刷第二环）：仅对被选主线节点建 outline；缺失（退化/旧实例）→ None → 全量。
+    let mut selected_mainline: Option<std::collections::BTreeSet<String>> = None;
     if let Some(raw) = &world.assembled_json {
         if let Ok(v) = serde_json::from_str::<Value>(raw) {
             if let Some(arr) = v.pointer("/assembly/homeAdvantages").and_then(Value::as_array) {
@@ -415,6 +417,13 @@ async fn seed_narrative_layer(
                             }
                         }
                     }
+                }
+            }
+            if let Some(arr) = v.pointer("/assembly/sampling/selectedMainline").and_then(Value::as_array) {
+                let set: std::collections::BTreeSet<String> =
+                    arr.iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
+                if !set.is_empty() {
+                    selected_mainline = Some(set);
                 }
             }
         }
@@ -438,6 +447,12 @@ async fn seed_narrative_layer(
             let Some(id) = node.get("id").and_then(Value::as_str) else {
                 continue;
             };
+            // 采样钉住时仅对被选主线节点建 outline（通关判定与大纲节点数须按被选主线，见装配采样第二环）。
+            if let Some(sel) = &selected_mainline {
+                if !sel.contains(id) {
+                    continue;
+                }
+            }
             let summary = node.get("summary").and_then(Value::as_str).unwrap_or("").to_string();
             let is_fated = node.get("fated").and_then(Value::as_bool).unwrap_or(false) || fated.contains(id);
             let constraint = match node.get("constraint").and_then(Value::as_str) {

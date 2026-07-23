@@ -1457,3 +1457,61 @@ async fn example_idle_skeleton_seeds_valid_milestones() {
     assert_eq!(policy.min_world_ticks, 5);
     assert_eq!(policy.max_world_ticks, 240);
 }
+
+/// 装配采样第二环下游生效（outline 侧）：seed_narrative_layer 仅对实例钉住的 selectedMainline 建 outline，
+/// 未被选主线节点（n3）不进大纲——否则大纲节点数按模板全量，与通关判定口径不一致。
+#[tokio::test]
+async fn seed_narrative_layer_filters_outline_to_selected_mainline() {
+    let state = test_state().await;
+    // 模板：3 主线节点（n1 fated + n2 + n3）。
+    let skeleton = json!({
+        "mainlineNodes": [
+            { "id": "n1", "summary": "开场", "fated": true },
+            { "id": "n2", "summary": "中段", "constraint": "soft" },
+            { "id": "n3", "summary": "被采样裁掉的支线", "constraint": "soft" }
+        ]
+    });
+    sqlx::query(
+        "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, official, version, moderation, created_at) \
+         VALUES ('tpl-sample', '采样模板', 'idle', ?, '{\"mode\":\"open\"}', 1, 1, 'approved', ?)",
+    )
+    .bind(skeleton.to_string())
+    .bind(now_ms())
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    seed_model_routes(&state.db, "test-routes").await;
+    seed_user(&state.db, "uA").await;
+    seed_user(&state.db, "uB").await;
+    seed_char(&state.db, "chA", "uA", "李").await;
+    seed_char(&state.db, "chB", "uB", "王").await;
+
+    // 实例采样钉住：仅选 n1,n2（n3 被裁）。最小 assembled_json 包装（其余段缺省）。
+    let assembled = json!({
+        "assembly": { "sampling": { "seed": "deadbeefdeadbeef", "selectedMainline": ["n1", "n2"] } },
+        "chapterState": {},
+        "templateVersion": 1
+    });
+
+    let mut p = CreateWorldParams::official("tpl-sample", 1, "采样世界");
+    p.status = Some("running".into());
+    p.model_route_version = Some("test-routes".into());
+    p.prompt_set_version = Some("test-prompts".into());
+    p.member_limit = 10;
+    p.daily_token_budget = 1_000_000;
+    p.daily_cny_budget_cents = 0;
+    p.assembled_json = Some(assembled.to_string());
+    let wid = create_world(&state.db, p).await.unwrap();
+    seed_member(&state.db, &wid, "uA", "chA").await;
+    seed_member(&state.db, &wid, "uB", "chB").await;
+
+    let model: Arc<dyn ModelClient> = Arc::new(MockModel { input_tokens: 10, output_tokens: 20 });
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    process_tick_with_model(&state, &wid, 0, model).await.unwrap();
+
+    let w = load_world(&state.db, &wid).await.unwrap();
+    let st: NarrativeState = serde_json::from_str(&w.narrative_state_json).unwrap();
+    let ids: Vec<&str> = st.narrative.outline_nodes.iter().map(|n| n.id.as_str()).collect();
+    assert_eq!(ids, vec!["n1", "n2"], "outline 应仅含被选主线（模板序），n3 被采样裁掉");
+}

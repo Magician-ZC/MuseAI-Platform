@@ -49,7 +49,8 @@ async fn user_active_character(
     })
 }
 
-/// 主线硬节点数（通关判定用）：读模板骨架 mainlineNodes 长度。
+/// 主线硬节点数（通关判定的退化回退）：读模板骨架 mainlineNodes 长度。
+/// 超集实例优先读 `/assembly/sampling/selectedMainline` 长度（见 chapter_finish），仅无采样时回退此处。
 async fn mainline_node_count(db: &AnyPool, template_id: &str) -> Result<usize, ApiError> {
     let row = sqlx::query("SELECT skeleton_json FROM world_templates WHERE id = ?")
         .bind(template_id)
@@ -233,8 +234,12 @@ async fn chapter_finish(
             granted_ids.push(key);
         }
 
-        // 主线推进 + 通关判定。
-        let total_nodes = mainline_node_count(&state.db, &world.template_id).await?;
+        // 主线推进 + 通关判定：优先按本实例采样钉住的被选主线数（防刷第二环），缺失（退化/旧实例）回退模板全量。
+        // 否则通关判定按模板全量硬节点，采样后永不通关（被选主线 < 模板全量）。
+        let total_nodes = match assembled.sampling.as_ref().filter(|s| !s.selected_mainline.is_empty()) {
+            Some(s) => s.selected_mainline.len(),
+            None => mainline_node_count(&state.db, &world.template_id).await?,
+        };
         let next_node = cs["currentNode"].as_i64().unwrap_or(0) + 1;
         let cleared = total_nodes > 0 && next_node as usize >= total_nodes;
 

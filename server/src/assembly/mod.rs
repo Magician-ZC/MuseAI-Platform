@@ -48,6 +48,30 @@ pub struct AssembledInstance {
     /// 空 = 无驻留道具。悬空 id 静默丢弃（与 reward_item_ref/carried 同款防御式），建模板期由引用完整性校验前置拦截。
     #[serde(default)]
     pub resident_items: Vec<ResidentItemGroup>,
+    /// 装配采样审计段（防刷第二环）：由固定实例种子驱动的子集采样结果，随实例钉住写入
+    /// `worlds.assembled_json` 的 `/assembly/sampling`。**仅服务端 / 审计可见——绝不进 members_projection
+    /// 或日报投影**。`None` = 退化路径（非超集旧模板：全量装配、不采样，与改造前行为完全一致）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling: Option<InstanceSampling>,
+}
+
+/// 装配采样钉住结果（防刷第二环审计段）：种子 + 阵容指纹哈希 + 各维度被选子集 id。
+/// 副本内确定（种子由已钉住输入算出，采样纯函数）、副本间不同（world_id 唯一 → 种子唯一）、
+/// 可 replay（CAS 写入后读回不重掷）。`seed`/`rosterFingerprint` 仅供服务端审计复算，不外泄。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstanceSampling {
+    /// 实例种子（u64 十六进制）：`H(world_id ‖ 阵容指纹 ‖ template_version)`。仅审计，不进任何客户端投影。
+    pub seed: String,
+    /// 阵容指纹哈希（排序去重 cids 的哈希）：审计用，不回填明文卡。
+    pub roster_fingerprint: String,
+    pub selected_storylines: Vec<String>,
+    /// 被选主线 id（已含全部 fated 硬节点，顺序 = 模板序）。
+    pub selected_mainline: Vec<String>,
+    pub selected_hidden: Vec<String>,
+    pub selected_endings: Vec<String>,
+    pub selected_npcs: Vec<String>,
+    pub selected_locations: Vec<String>,
 }
 
 /// 地点驻留道具组（Phase 3）：一个地点解引用后的驻留道具集。`is_secret_realm` 标记秘境隐藏道具，
@@ -125,6 +149,62 @@ struct Skeleton {
     locations: Vec<LocationSpec>,
     #[serde(default)]
     assembly_rules: AssemblyRules,
+    /// 剧情线分组（超集互斥采样单元，防刷第二环）：每条 storyline 引用一组 mainline/hidden/ending id，
+    /// 采样时按阵容加权 + 种子扰动选取脊柱子集。空 = 无 storyline 维度（走退化路径）。
+    #[serde(default)]
+    storylines: Vec<StorylineSpec>,
+    /// 副本采样计数提示（每维度每副本抽样量）。全空 = 走退化路径（不采样）。
+    #[serde(default)]
+    sampling: SamplingSpec,
+    /// 超集标记：`true` 且 storylines 非空 且 sampling 非全空 → 走种子采样；否则退化为全量装配。
+    #[serde(default)]
+    is_superset: bool,
+}
+
+/// 剧情线采样单元（对齐 `assets/worlds.rs` StorylineView + affinity）：一条剧情线引用一组
+/// mainline/hidden/ending id，并声明阵容倾向（strategist/combat/social）用于加权选取。
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct StorylineSpec {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    mainline_node_ids: Vec<String>,
+    #[serde(default)]
+    hidden_pool_ids: Vec<String>,
+    #[serde(default)]
+    ending_ids: Vec<String>,
+    /// 阵容倾向：strategist / combat / social / None（无倾向）。
+    #[serde(default)]
+    affinity: Option<String>,
+}
+
+/// 副本采样计数提示（防刷第二环）：每维度每副本抽样量。字段全 `Option` + `#[serde(default)]`，
+/// 旧模板缺省 → 全 `None` → 退化路径。
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct SamplingSpec {
+    #[serde(default)]
+    instance_storyline_count: Option<usize>,
+    #[serde(default)]
+    instance_mainline_count: Option<usize>,
+    #[serde(default)]
+    instance_hidden_count: Option<usize>,
+    #[serde(default)]
+    instance_npc_count: Option<usize>,
+    #[serde(default)]
+    instance_location_count: Option<usize>,
+}
+
+impl SamplingSpec {
+    /// 是否全空（五个计数字段全 `None`）：判退化路径用。
+    fn is_empty(&self) -> bool {
+        self.instance_storyline_count.is_none()
+            && self.instance_mainline_count.is_none()
+            && self.instance_hidden_count.is_none()
+            && self.instance_npc_count.is_none()
+            && self.instance_location_count.is_none()
+    }
 }
 
 /// 地点骨架条目（Phase 3）：引擎 LocationDef 的 server 侧镜像 + residentItemIds（道具分布）。
@@ -173,8 +253,8 @@ struct WorldCharacter {
     #[serde(default)]
     carried_item_ids: Vec<String>,
     /// 反派主动议程绑定的 mainline 节点 id（透传标注；引擎不特判，靠卡内容驱动决策）。
+    /// 采样时用于 NPC 权重：议程命中被选主线的反派更贴合本副本 → 加权入选。
     #[serde(default)]
-    #[allow(dead_code)]
     agenda_nodes: Vec<String>,
 }
 
@@ -193,6 +273,12 @@ struct MainlineNode {
     id: String,
     #[serde(default)]
     fated: bool,
+    /// 变体组：同组成员互斥，采样只保留一个（fated 成员优先）。None = 无组，直通。
+    #[serde(default)]
+    variant_group: Option<String>,
+    /// 归属的 storyline id 集（arcTags）：命中被选 storyline 即入采样候选。
+    #[serde(default)]
+    arc_tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -204,6 +290,12 @@ struct EndingCandidate {
     affinity: Option<String>,
     #[serde(default = "one")]
     base_weight: f32,
+    /// 变体组：同组结局互斥，采样只保留一个。None = 无组，直通。
+    #[serde(default)]
+    variant_group: Option<String>,
+    /// 归属的 storyline id 集（arcTags）：命中被选 storyline 即入采样候选。
+    #[serde(default)]
+    arc_tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -224,6 +316,12 @@ struct PoolItem {
     /// 通关兑现的隐藏道具（内联定义，reward_item_ref 缺失/悬空时的兼容 fallback）。
     #[serde(default)]
     reward_item: Option<ItemDefinition>,
+    /// 变体组：同组隐藏内容互斥，采样只保留一个。None = 无组，直通。
+    #[serde(default)]
+    variant_group: Option<String>,
+    /// 归属的 storyline id 集（arcTags）：命中被选 storyline 即入采样候选。
+    #[serde(default)]
+    arc_tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -249,6 +347,460 @@ fn half() -> f32 {
 }
 fn one_usize() -> usize {
     1
+}
+
+// ---------- 装配采样（防刷第二环）：固定实例种子 + 确定性整数 PRNG ----------
+//
+// 种子 = H(world_id ‖ 阵容指纹 ‖ template_version)，全部输入在首次 start 已钉住。采样为纯函数
+// （种子 → SplitMix64 整数流 → 按模板 Vec 序消费），结果经 CAS 写入 assembled_json，退出重进读回同一
+// 实例不重掷。**禁三样**：系统随机（thread_rng）、浮点 RNG、HashMap/BTreeMap 迭代序驱动 RNG——
+// 变体分桶用「首见序 = 模板序」而非 map 序；跨版本一致性由 FNV/SplitMix 测试向量兜底。
+
+/// FNV-1a 64：种子 / 阵容指纹派生（显式常量，跨 Rust 版本稳定，不用 std SipHash/DefaultHasher）。
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// SplitMix64：确定性整数流（每维度独立子流从含 world_id 的全局 seed 派生，杜绝纯阵容维度可被观测反推）。
+struct Rng(u64);
+impl Rng {
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    /// [0, n) 均匀整数（n=0 → 0）。
+    fn below(&mut self, n: usize) -> usize {
+        if n == 0 {
+            0
+        } else {
+            (self.next_u64() % n as u64) as usize
+        }
+    }
+}
+
+// 各维度子流域常量（seed ^ DOMAIN 派生，避免维度间串扰）。
+const DOMAIN_STORYLINE: u64 = 0x51;
+const DOMAIN_MAINLINE: u64 = 0x52;
+const DOMAIN_HIDDEN: u64 = 0x53;
+const DOMAIN_ENDING: u64 = 0x54;
+const DOMAIN_NPC: u64 = 0x55;
+const DOMAIN_LOC: u64 = 0x56;
+
+/// 权重整数化缩放（避免浮点 RNG / NaN 比较；每项 +1 保底 → 零权项仍最小概率可被选中）。
+fn scale_weight(w: f32) -> u64 {
+    ((w.max(0.0) as f64) * 1_000_000.0) as u64 + 1
+}
+
+/// 按权重选一个（整数化权重，纯整数取模 → 无浮点 RNG / 无 NaN）。空 → None。
+fn weighted_pick_one<'a, T>(rng: &mut Rng, items: &[(&'a T, f32)]) -> Option<&'a T> {
+    if items.is_empty() {
+        return None;
+    }
+    let scaled: Vec<u64> = items.iter().map(|(_, w)| scale_weight(*w)).collect();
+    let total: u64 = scaled.iter().copied().sum();
+    if total == 0 {
+        return items.first().map(|(t, _)| *t);
+    }
+    let mut r = rng.next_u64() % total;
+    for (i, s) in scaled.iter().enumerate() {
+        if r < *s {
+            return Some(items[i].0);
+        }
+        r -= *s;
+    }
+    items.last().map(|(t, _)| *t)
+}
+
+/// 无放回按权重选 k 个，输出保留模板序（逐次整数化加权抽取；全程整数 RNG，权重高者更早入选）。
+fn choose_k<'a, T>(rng: &mut Rng, items: &[(&'a T, f32)], k: usize) -> Vec<&'a T> {
+    let n = items.len();
+    let take = k.min(n);
+    if take == 0 {
+        return Vec::new();
+    }
+    if take == n {
+        return items.iter().map(|(t, _)| *t).collect(); // 全取，模板序
+    }
+    let weights: Vec<u64> = items.iter().map(|(_, w)| scale_weight(*w)).collect();
+    let mut picked = vec![false; n];
+    let mut chosen: Vec<usize> = Vec::with_capacity(take);
+    for _ in 0..take {
+        let total: u64 = (0..n).filter(|&i| !picked[i]).map(|i| weights[i]).sum();
+        if total == 0 {
+            break;
+        }
+        let mut r = rng.next_u64() % total;
+        let mut sel: Option<usize> = None;
+        for i in 0..n {
+            if picked[i] {
+                continue;
+            }
+            if r < weights[i] {
+                sel = Some(i);
+                break;
+            }
+            r -= weights[i];
+        }
+        let idx = match sel.or_else(|| (0..n).find(|&i| !picked[i])) {
+            Some(i) => i,
+            None => break,
+        };
+        picked[idx] = true;
+        chosen.push(idx);
+    }
+    chosen.sort_unstable(); // 还原模板序
+    chosen.into_iter().map(|idx| items[idx].0).collect()
+}
+
+/// 变体组归约：按 variant_group 分桶（**首见序 = 模板序**，非 map 序），每桶 weighted_pick_one 取一个
+/// （等权 → 均匀），无组者直通；输出保留模板序。组内候选为空则跳过该组（风险 §9）。
+fn resolve_variant_groups<'a, T>(
+    rng: &mut Rng,
+    items: &[&'a T],
+    group_of: impl Fn(&T) -> Option<&str>,
+) -> Vec<&'a T> {
+    // 分桶：Vec<(组名, Vec<模板下标>)>，按首见序（模板序）append —— 不用 HashMap 驱动 RNG。
+    let mut buckets: Vec<(String, Vec<usize>)> = Vec::new();
+    for (idx, it) in items.iter().enumerate() {
+        if let Some(g) = group_of(*it).map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(b) = buckets.iter_mut().find(|(name, _)| name == g) {
+                b.1.push(idx);
+            } else {
+                buckets.push((g.to_string(), vec![idx]));
+            }
+        }
+    }
+    // 每桶按首见序 weighted_pick_one 选一个 winner（等权）。
+    let mut winners: std::collections::BTreeSet<usize> = Default::default();
+    for (_, members) in &buckets {
+        let choices: Vec<(&usize, f32)> = members.iter().map(|i| (i, 1.0)).collect();
+        if let Some(w) = weighted_pick_one(rng, &choices) {
+            winners.insert(*w);
+        }
+    }
+    // 输出：模板序；无组者直通，有组者仅 winner。
+    items
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, it)| {
+            let grouped = group_of(*it).map(str::trim).map(|s| !s.is_empty()).unwrap_or(false);
+            if !grouped || winners.contains(&idx) {
+                Some(*it)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// 阵容指纹：排序去重 cid（cloud_character_id）后 `\n` 连接（排序消 joined_at 顺序敏感）。
+fn roster_fingerprint(cards: &[(String, CharacterCardV2)]) -> String {
+    let mut cids: Vec<&str> = cards.iter().map(|(c, _)| c.as_str()).collect();
+    cids.sort_unstable();
+    cids.dedup();
+    cids.join("\n")
+}
+
+/// 全阵容执念词条汇总（隐藏内容采样加权用：贴合阵容执念的隐藏内容更可能入选）。
+fn aggregate_obsession_terms(cards: &[(String, CharacterCardV2)]) -> Vec<String> {
+    let mut all = Vec::new();
+    for (_, c) in cards {
+        all.extend(obsession_terms(c));
+    }
+    all
+}
+
+/// 实例种子：`fnv1a_64(world_id ‖ 0x01 ‖ 阵容指纹 ‖ 0x01 ‖ template_version)`。
+fn instance_seed(world_id: &str, fingerprint: &str, template_version: i64) -> u64 {
+    fnv1a_64(format!("{world_id}\u{1}{fingerprint}\u{1}{template_version}").as_bytes())
+}
+
+/// storyline 阵容加权 boost（复用 weight_endings 的阵容画像口径）。
+fn affinity_boost(affinity: &Option<String>, profile: &(u32, u32, u32)) -> f32 {
+    let total = (profile.0 + profile.1 + profile.2).max(1) as f32;
+    match affinity.as_deref() {
+        Some("strategist") => profile.0 as f32 / total,
+        Some("combat") => profile.1 as f32 / total,
+        Some("social") => profile.2 as f32 / total,
+        _ => 0.0,
+    }
+}
+
+/// 一次装配的被选子集（+ 钉住审计段）。`audit == None` → 退化路径（全量，不采样）。
+struct Selection {
+    audit: Option<InstanceSampling>,
+    /// per-character 钩子可用的隐藏内容 id 子集（退化 = 全体，模板序）。
+    hidden_ids: Vec<String>,
+    /// 最终阵容加权启用的结局 id（对被选候选跑 weight_endings 的结果；退化 = 全体池加权）。
+    enabled_endings: Vec<String>,
+    /// 被选世界固有角色 id 子集（退化 = 全体）。
+    npc_ids: Vec<String>,
+    /// 被选地点 id 子集（退化 = 全体）。
+    loc_ids: Vec<String>,
+}
+
+/// 地点采样（保连通 + 计数上限）：从「含驻留道具的地点 + 被选 NPC 主场」作必选种子，沿 connections
+/// 用 rng_loc BFS 扩张到 count（严格 ≤ count 上限），保持连通（只加与已选集相邻的地点）。
+/// count 未设 / ≥ 地点数 → 全体（退化）。
+fn sample_location_ids(
+    rng: &mut Rng,
+    locations: &[LocationSpec],
+    seed_ids: &[String],
+    count: Option<usize>,
+) -> Vec<String> {
+    let all_ids = || -> Vec<String> { locations.iter().map(|l| l.id.clone()).collect() };
+    let Some(count) = count else {
+        return all_ids();
+    };
+    if count == 0 || count >= locations.len() {
+        return all_ids();
+    }
+    let exists: std::collections::BTreeSet<&str> = locations.iter().map(|l| l.id.as_str()).collect();
+    let conns = |id: &str| -> Vec<String> {
+        locations
+            .iter()
+            .find(|l| l.id == id)
+            .map(|l| l.connections.iter().filter(|c| exists.contains(c.as_str())).cloned().collect())
+            .unwrap_or_default()
+    };
+    // 必选种子（模板序、去重、须存在）。
+    let mut selected: Vec<String> = Vec::new();
+    for l in locations {
+        if seed_ids.iter().any(|s| s == &l.id) && !selected.contains(&l.id) {
+            selected.push(l.id.clone());
+        }
+    }
+    if selected.is_empty() {
+        if let Some(first) = locations.first() {
+            selected.push(first.id.clone()); // 无种子 → 以模板首个地点起步（连通根）。
+        }
+    }
+    // 前沿 = 已选集的相邻未选地点。
+    let mut frontier: Vec<String> = Vec::new();
+    let extend_frontier = |frontier: &mut Vec<String>, selected: &[String], id: &str| {
+        for nb in conns(id) {
+            if !selected.contains(&nb) && !frontier.contains(&nb) {
+                frontier.push(nb);
+            }
+        }
+    };
+    for s in selected.clone() {
+        extend_frontier(&mut frontier, &selected, &s);
+    }
+    // BFS 扩张至 count（保持连通：只加相邻地点）。
+    while selected.len() < count && !frontier.is_empty() {
+        let pos = rng.below(frontier.len());
+        let node = frontier.remove(pos);
+        if selected.contains(&node) {
+            continue;
+        }
+        selected.push(node.clone());
+        extend_frontier(&mut frontier, &selected, &node);
+    }
+    // 输出模板序；种子多于 count 的边角（模板配置失当）时保种子、补至 count。
+    let sel_set: std::collections::BTreeSet<&str> = selected.iter().map(String::as_str).collect();
+    let mut out: Vec<String> =
+        locations.iter().filter(|l| sel_set.contains(l.id.as_str())).map(|l| l.id.clone()).collect();
+    if out.len() > count {
+        let seed_set: std::collections::BTreeSet<&str> = seed_ids.iter().map(String::as_str).collect();
+        let mut kept: Vec<String> = out.iter().filter(|id| seed_set.contains(id.as_str())).cloned().collect();
+        for id in &out {
+            if kept.len() >= count {
+                break;
+            }
+            if !kept.contains(id) {
+                kept.push(id.clone());
+            }
+        }
+        let kset: std::collections::BTreeSet<&str> = kept.iter().map(String::as_str).collect();
+        out = locations.iter().filter(|l| kset.contains(l.id.as_str())).map(|l| l.id.clone()).collect();
+    }
+    out
+}
+
+/// 纯采样规划（防刷第二环，无 DB / 无系统随机）：由固定实例种子驱动，从超集各池采子集。
+/// 退化路径（`is_superset != true` 或 storylines 空 或 sampling 全空）→ `audit=None` + 全量 id（不采样）。
+fn plan_sampling(
+    skeleton: &Skeleton,
+    fingerprint: &str,
+    world_id: &str,
+    template_version: i64,
+    profile: &(u32, u32, u32),
+    roster_terms: &[String],
+    ending_threshold: f32,
+) -> Selection {
+    let superset_mode =
+        skeleton.is_superset && !skeleton.storylines.is_empty() && !skeleton.sampling.is_empty();
+    if !superset_mode {
+        // 退化：全量，行为与改造前完全一致，sampling=None。
+        return Selection {
+            audit: None,
+            hidden_ids: skeleton.hidden_content_pool.iter().map(|p| p.id.clone()).collect(),
+            enabled_endings: weight_endings(&skeleton.ending_pool, profile, ending_threshold),
+            npc_ids: skeleton.world_characters.iter().map(|w| w.card.id.clone()).collect(),
+            loc_ids: skeleton.locations.iter().map(|l| l.id.clone()).collect(),
+        };
+    }
+
+    let seed = instance_seed(world_id, fingerprint, template_version);
+
+    // 1) Storyline 脊柱（阵容依赖 + 种子扰动）。
+    let weighted_sl: Vec<(&StorylineSpec, f32)> =
+        skeleton.storylines.iter().map(|s| (s, 1.0 + affinity_boost(&s.affinity, profile))).collect();
+    let sl_k = skeleton
+        .sampling
+        .instance_storyline_count
+        .unwrap_or(((skeleton.storylines.len() + 1) / 2).max(1));
+    let mut rng_sl = Rng(seed ^ DOMAIN_STORYLINE);
+    let mut selected_storylines: Vec<&StorylineSpec> = choose_k(&mut rng_sl, &weighted_sl, sl_k);
+    if selected_storylines.is_empty() {
+        selected_storylines = skeleton.storylines.iter().collect(); // 空 → 全 storylines（兼容无分组超集）。
+    }
+    let sl_ids: std::collections::BTreeSet<&str> =
+        selected_storylines.iter().map(|s| s.id.as_str()).collect();
+    let sl_mainline: std::collections::BTreeSet<&str> =
+        selected_storylines.iter().flat_map(|s| s.mainline_node_ids.iter().map(String::as_str)).collect();
+    let sl_hidden: std::collections::BTreeSet<&str> =
+        selected_storylines.iter().flat_map(|s| s.hidden_pool_ids.iter().map(String::as_str)).collect();
+    let sl_ending: std::collections::BTreeSet<&str> =
+        selected_storylines.iter().flat_map(|s| s.ending_ids.iter().map(String::as_str)).collect();
+    let in_arc = |tags: &[String]| tags.iter().any(|t| sl_ids.contains(t.as_str()));
+
+    // 2) Mainline（fated 必留 + 变体组互斥 + 计数上限）。
+    let ml_candidates: Vec<&MainlineNode> = skeleton
+        .mainline_nodes
+        .iter()
+        .filter(|n| sl_mainline.contains(n.id.as_str()) || in_arc(&n.arc_tags))
+        .collect();
+    // fated 组（全池）：这些 variant_group 由 fated 成员占据，非 fated 同组成员排除（避免互斥冲突）。
+    let fated_groups: std::collections::BTreeSet<&str> = skeleton
+        .mainline_nodes
+        .iter()
+        .filter(|n| n.fated)
+        .filter_map(|n| n.variant_group.as_deref())
+        .collect();
+    let nonfated_cand: Vec<&MainlineNode> = ml_candidates
+        .iter()
+        .copied()
+        .filter(|n| !n.fated)
+        .filter(|n| n.variant_group.as_deref().map(|g| !fated_groups.contains(g)).unwrap_or(true))
+        .collect();
+    let mut rng_ml = Rng(seed ^ DOMAIN_MAINLINE);
+    let resolved_nonfated = resolve_variant_groups(&mut rng_ml, &nonfated_cand, |n| n.variant_group.as_deref());
+    let nonfated_final: Vec<&MainlineNode> =
+        if let Some(c) = skeleton.sampling.instance_mainline_count {
+            let weighted: Vec<(&MainlineNode, f32)> = resolved_nonfated.iter().map(|&n| (n, 1.0)).collect();
+            choose_k(&mut rng_ml, &weighted, c)
+        } else {
+            resolved_nonfated
+        };
+    // 强制并入全部 fated（宿命硬节点，采样不得裁）→ selected_mainline 按模板原序。
+    let sel_ml: std::collections::BTreeSet<&str> = skeleton
+        .mainline_nodes
+        .iter()
+        .filter(|n| n.fated)
+        .map(|n| n.id.as_str())
+        .chain(nonfated_final.iter().map(|n| n.id.as_str()))
+        .collect();
+    let mut selected_mainline: Vec<String> = skeleton
+        .mainline_nodes
+        .iter()
+        .filter(|n| sel_ml.contains(n.id.as_str()))
+        .map(|n| n.id.clone())
+        .collect();
+    if selected_mainline.is_empty() {
+        if let Some(first) = skeleton.mainline_nodes.first() {
+            selected_mainline.push(first.id.clone()); // 保底 ≥1（副本必须可推进）。
+        }
+    }
+
+    // 3) Hidden content（约束到脊柱 + 变体组归约 + 阵容执念加权 + 计数上限）。
+    let hidden_candidates: Vec<&PoolItem> = skeleton
+        .hidden_content_pool
+        .iter()
+        .filter(|p| sl_hidden.contains(p.id.as_str()) || in_arc(&p.arc_tags))
+        .collect();
+    let mut rng_hidden = Rng(seed ^ DOMAIN_HIDDEN);
+    let resolved_hidden = resolve_variant_groups(&mut rng_hidden, &hidden_candidates, |p| p.variant_group.as_deref());
+    let weighted_hidden: Vec<(&PoolItem, f32)> = resolved_hidden
+        .iter()
+        .map(|&p| {
+            let (m, _) = score_pool_item(p, roster_terms);
+            (p, 1.0 + m as f32)
+        })
+        .collect();
+    let hk = skeleton.sampling.instance_hidden_count.unwrap_or(resolved_hidden.len());
+    let selected_hidden_items = choose_k(&mut rng_hidden, &weighted_hidden, hk);
+    let hidden_ids: Vec<String> = selected_hidden_items.iter().map(|p| p.id.clone()).collect();
+
+    // 4) Endings（storyline 约束 + 变体组互斥 → 现有 weight_endings 阵容加权）。
+    let mut ending_candidates: Vec<&EndingCandidate> = skeleton
+        .ending_pool
+        .iter()
+        .filter(|e| sl_ending.contains(e.id.as_str()) || in_arc(&e.arc_tags))
+        .collect();
+    if ending_candidates.is_empty() {
+        ending_candidates = skeleton.ending_pool.iter().collect(); // 无则全体（副本必须可结束）。
+    }
+    let mut rng_end = Rng(seed ^ DOMAIN_ENDING);
+    let resolved_endings = resolve_variant_groups(&mut rng_end, &ending_candidates, |e| e.variant_group.as_deref());
+    let resolved_owned: Vec<EndingCandidate> = resolved_endings.iter().map(|&e| e.clone()).collect();
+    let enabled_endings = weight_endings(&resolved_owned, profile, ending_threshold);
+
+    // 5) World characters（NPC）：议程命中被选主线者加权。
+    let sel_ml_set: std::collections::BTreeSet<&str> = selected_mainline.iter().map(String::as_str).collect();
+    let weighted_npc: Vec<(&WorldCharacter, f32)> = skeleton
+        .world_characters
+        .iter()
+        .map(|wc| {
+            let boost = if wc.agenda_nodes.iter().any(|n| sel_ml_set.contains(n.as_str())) { 1.0 } else { 0.0 };
+            (wc, 1.0 + boost)
+        })
+        .collect();
+    let nk = skeleton.sampling.instance_npc_count.unwrap_or(skeleton.world_characters.len());
+    let mut rng_npc = Rng(seed ^ DOMAIN_NPC);
+    let selected_npc_refs = choose_k(&mut rng_npc, &weighted_npc, nk);
+    let npc_ids: Vec<String> = selected_npc_refs.iter().map(|wc| wc.card.id.clone()).collect();
+
+    // 6) Locations + resident items（保连通 + 计数）。
+    let npc_set: std::collections::BTreeSet<&str> = npc_ids.iter().map(String::as_str).collect();
+    let mut loc_seeds: Vec<String> = Vec::new();
+    for l in &skeleton.locations {
+        if !l.resident_item_ids.is_empty() {
+            loc_seeds.push(l.id.clone()); // 含驻留道具（秘境门槛道具单一事实源）→ 必选。
+        }
+    }
+    for wc in &skeleton.world_characters {
+        if npc_set.contains(wc.card.id.as_str()) {
+            let h = wc.home_location.trim();
+            if !h.is_empty() {
+                loc_seeds.push(h.to_string()); // 被选 NPC 主场 → 必选。
+            }
+        }
+    }
+    let mut rng_loc = Rng(seed ^ DOMAIN_LOC);
+    let loc_ids =
+        sample_location_ids(&mut rng_loc, &skeleton.locations, &loc_seeds, skeleton.sampling.instance_location_count);
+
+    let audit = InstanceSampling {
+        seed: format!("{seed:016x}"),
+        roster_fingerprint: format!("{:016x}", fnv1a_64(fingerprint.as_bytes())),
+        selected_storylines: selected_storylines.iter().map(|s| s.id.clone()).collect(),
+        selected_mainline: selected_mainline.clone(),
+        selected_hidden: hidden_ids.clone(),
+        selected_endings: enabled_endings.clone(),
+        selected_npcs: npc_ids.clone(),
+        selected_locations: loc_ids.clone(),
+    };
+    Selection { audit: Some(audit), hidden_ids, enabled_endings, npc_ids, loc_ids }
 }
 
 // ---------- assembled_json 包装（assembly 段钉住 + chapterState 段可变） ----------
@@ -306,14 +858,37 @@ pub async fn assemble_instance(state: &AppState, world_id: &str) -> Result<Assem
     let rules = &skeleton.assembly_rules;
     let profile = roster_profile(&cards);
 
+    // 装配采样（防刷第二环）：固定实例种子 → 从超集各池采子集（退化路径 audit=None，全量装配）。
+    // 种子由已钉住输入（world_id + 阵容指纹 + template_version）算出，纯函数、可 replay。
+    let fingerprint = roster_fingerprint(&cards);
+    let agg_terms = aggregate_obsession_terms(&cards);
+    let selection = plan_sampling(
+        &skeleton,
+        &fingerprint,
+        world_id,
+        world.template_version,
+        &profile,
+        &agg_terms,
+        rules.ending_weight_threshold,
+    );
+    let sampled = selection.audit.is_some();
+
+    // per-character 钩子只在被选隐藏内容子集上跑（退化路径 = 全池，行为不变）。
+    let hidden_pool: Vec<PoolItem> = if sampled {
+        let set: std::collections::BTreeSet<&str> = selection.hidden_ids.iter().map(String::as_str).collect();
+        skeleton.hidden_content_pool.iter().filter(|p| set.contains(p.id.as_str())).cloned().collect()
+    } else {
+        skeleton.hidden_content_pool.clone()
+    };
+
     let mut hooks: Vec<CharacterHook> = Vec::new();
     let mut difficulty_notes: Vec<String> = Vec::new();
     let mut home_advantages: Vec<HomeAdvantage> = Vec::new();
 
     for (cid, card) in &cards {
-        // 1) per-character 钩子：从隐藏内容池按执念/恐惧重叠度排序，逐个过机审，只嵌入通过者直到配额。
+        // 1) per-character 钩子：从（被选）隐藏内容池按执念/恐惧重叠度排序，逐个过机审，只嵌入通过者直到配额。
         let terms = obsession_terms(card);
-        let candidates = rank_pool_items(&skeleton.hidden_content_pool, &terms);
+        let candidates = rank_pool_items(&hidden_pool, &terms);
         let quota = rules.hidden_per_character.max(1);
         let mut embedded = 0usize;
         for (pool_item, matches, matched_term) in candidates {
@@ -365,8 +940,8 @@ pub async fn assemble_instance(state: &AppState, world_id: &str) -> Result<Assem
         }
     }
 
-    // 3) 结局池按阵容加权启用。
-    let enabled_endings = weight_endings(&skeleton.ending_pool, &profile, rules.ending_weight_threshold);
+    // 3) 结局：采样已按 storyline 约束 + 变体组互斥 + 阵容加权算出 enabled_endings（退化 = 全池加权）。
+    let enabled_endings = selection.enabled_endings.clone();
 
     // 4) 阵容级参数：支线权重 / 冲突密度 / 资源稀缺度。
     let roster_size = cards.len();
@@ -378,18 +953,30 @@ pub async fn assemble_instance(state: &AppState, world_id: &str) -> Result<Assem
         "rosterSize": roster_size,
     });
 
-    // 5) 世界固有角色（NPC/反派）装配：解引用 world_characters → 过机审门（与钩子同一 S-3 规则）→
+    // 5) 世界固有角色（NPC/反派）装配：仅处理被选 NPC 子集（退化 = 全体）→ 过机审门（与钩子同一 S-3 规则）→
     //    仅 Approved 钉入 worldCharacterEntries。NPC 无 owner、不投影日报；携带道具从 world_items 目录解引用。
+    let world_characters_sel: Vec<WorldCharacter> = if sampled {
+        let set: std::collections::BTreeSet<&str> = selection.npc_ids.iter().map(String::as_str).collect();
+        skeleton.world_characters.iter().filter(|w| set.contains(w.card.id.as_str())).cloned().collect()
+    } else {
+        skeleton.world_characters.clone()
+    };
     let world_character_entries =
-        assemble_world_characters(state, world_id, &skeleton.world_characters, &skeleton.world_items).await?;
+        assemble_world_characters(state, world_id, &world_characters_sel, &skeleton.world_items).await?;
 
-    // 6) 地点图（Phase 2）：LocationSpec → 引擎 LocationDef（结构数据，无叙事文本机审需求）。
+    // 6) 地点图（Phase 2）：仅被选地点（退化 = 全体）LocationSpec → 引擎 LocationDef（结构数据，无叙事文本机审需求）。
     //    runtime 每 tick 读回组装引擎 RoundInput.locations。空 = 无地点维度，退化为单一全局场景。
-    let location_graph: Vec<LocationDef> = skeleton.locations.iter().map(to_location_def).collect();
+    let locations_sel: Vec<LocationSpec> = if sampled {
+        let set: std::collections::BTreeSet<&str> = selection.loc_ids.iter().map(String::as_str).collect();
+        skeleton.locations.iter().filter(|l| set.contains(l.id.as_str())).cloned().collect()
+    } else {
+        skeleton.locations.clone()
+    };
+    let location_graph: Vec<LocationDef> = locations_sel.iter().map(to_location_def).collect();
 
-    // 6b) 道具分布（Phase 3）：各地点 residentItemIds 解引用 world_items 目录（悬空 id 静默丢弃）。
+    // 6b) 道具分布（Phase 3）：各（被选）地点 residentItemIds 解引用 world_items 目录（悬空 id 静默丢弃）。
     //     秘境（is_secret_realm）驻留道具即隐藏道具，单一事实源锁定在 world_items 目录。
-    let resident_items = distribute_resident_items(&skeleton.locations, &skeleton.world_items);
+    let resident_items = distribute_resident_items(&locations_sel, &skeleton.world_items);
 
     let assembled = AssembledInstance {
         per_character_hooks: hooks,
@@ -400,6 +987,7 @@ pub async fn assemble_instance(state: &AppState, world_id: &str) -> Result<Assem
         world_character_entries,
         location_graph,
         resident_items,
+        sampling: selection.audit,
     };
 
     // 持久化：assembly 段钉住（含派生的 templateVersion），chapterState 段留给章节会话推进。
@@ -852,4 +1440,210 @@ pub(crate) fn build_offline_gain(character_id: &str, kind: &str, summary: &str) 
         "createdAt": now_ms(),
         "claimed": false,
     })
+}
+
+// ---------- 装配采样纯函数单测（防刷第二环；无 DB / 无系统随机） ----------
+
+#[cfg(test)]
+mod sampling_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    const PROFILE: (u32, u32, u32) = (1, 1, 1);
+
+    /// 超集骨架：3 storylines（默认采 2）；mainline 含 fated + 两个变体组；hidden/ending 各含变体组；
+    /// 4 地点（含一个秘境，驻留道具）。计数上限压到子集。
+    fn superset() -> Skeleton {
+        serde_json::from_value(serde_json::json!({
+            "isSuperset": true,
+            "storylines": [
+                { "id": "arc-A", "affinity": "combat",     "mainlineNodeIds": ["mn-a1","mn-a2"], "hiddenPoolIds": ["hc-a1","hc-a2"], "endingIds": ["end-a1","end-a2"] },
+                { "id": "arc-B", "affinity": "social",     "mainlineNodeIds": ["mn-b1","mn-b2"], "hiddenPoolIds": ["hc-b1"],         "endingIds": ["end-b1"] },
+                { "id": "arc-C", "affinity": "strategist", "mainlineNodeIds": ["mn-c1"],         "hiddenPoolIds": ["hc-c1"],         "endingIds": ["end-c1"] }
+            ],
+            "mainlineNodes": [
+                { "id": "mn-fate", "fated": true, "arcTags": ["arc-A","arc-B","arc-C"] },
+                { "id": "mn-a1", "variantGroup": "vg1", "arcTags": ["arc-A"] },
+                { "id": "mn-a2", "variantGroup": "vg1", "arcTags": ["arc-A"] },
+                { "id": "mn-b1", "variantGroup": "vg2", "arcTags": ["arc-B"] },
+                { "id": "mn-b2", "variantGroup": "vg2", "arcTags": ["arc-B"] },
+                { "id": "mn-c1", "arcTags": ["arc-C"] }
+            ],
+            "hiddenContentPool": [
+                { "id": "hc-a1", "variantGroup": "vh", "arcTags": ["arc-A"], "themes": ["a"] },
+                { "id": "hc-a2", "variantGroup": "vh", "arcTags": ["arc-A"], "themes": ["a"] },
+                { "id": "hc-b1", "arcTags": ["arc-B"], "themes": ["b"] },
+                { "id": "hc-c1", "arcTags": ["arc-C"], "themes": ["c"] }
+            ],
+            "endingPool": [
+                { "id": "end-a1", "variantGroup": "ve", "arcTags": ["arc-A"], "affinity": "combat" },
+                { "id": "end-a2", "variantGroup": "ve", "arcTags": ["arc-A"], "affinity": "combat" },
+                { "id": "end-b1", "arcTags": ["arc-B"], "affinity": "social" },
+                { "id": "end-c1", "arcTags": ["arc-C"], "affinity": "strategist" }
+            ],
+            "worldItems": [
+                { "id": "wi", "narrative": "秘境道具", "effectTags": [], "origin": { "worldTemplateId": "t", "cosmology": ["myth"], "powerTier": 1 } }
+            ],
+            "locations": [
+                { "id": "loc-hub", "connections": ["loc-a","loc-b"] },
+                { "id": "loc-a", "connections": ["loc-hub","loc-secret"] },
+                { "id": "loc-secret", "isSecretRealm": true, "connections": ["loc-a"], "residentItemIds": ["wi"] },
+                { "id": "loc-b", "connections": ["loc-hub"] }
+            ],
+            "sampling": { "instanceMainlineCount": 2, "instanceHiddenCount": 1, "instanceLocationCount": 2 }
+        }))
+        .unwrap()
+    }
+
+    fn plan(sk: &Skeleton, world_id: &str, fp: &str) -> Selection {
+        plan_sampling(sk, fp, world_id, 1, &PROFILE, &[], 0.5)
+    }
+
+    // #10 PRNG 测试向量：锁死跨版本一致性（FNV-1a / SplitMix64 均为规范实现）。
+    #[test]
+    fn prng_test_vectors() {
+        assert_eq!(fnv1a_64(b"museai"), 0xd2b6_e20e_3fd2_d255);
+        let mut r = Rng(fnv1a_64(b"museai"));
+        assert_eq!(r.next_u64(), 0x0f17_9d52_19b9_fab1);
+        assert_eq!(r.next_u64(), 0xc458_c510_8aff_a280);
+        assert_eq!(r.next_u64(), 0x25e6_26b7_137b_99c7);
+        // 规范 SplitMix64 seed=0 首输出（实现自证）。
+        assert_eq!(Rng(0).next_u64(), 0xe220_a839_7b1d_cdaf);
+    }
+
+    // #1 副本内确定：同 (world_id, roster, template) 连调两次 → 逐字段一致。
+    #[test]
+    fn same_seed_same_sampling() {
+        let sk = superset();
+        let a = plan(&sk, "world_fixed_1", "cidA\ncidB");
+        let b = plan(&sk, "world_fixed_1", "cidA\ncidB");
+        let (sa, sb) = (a.audit.unwrap(), b.audit.unwrap());
+        assert_eq!(sa.seed, sb.seed);
+        assert_eq!(sa.selected_storylines, sb.selected_storylines);
+        assert_eq!(sa.selected_mainline, sb.selected_mainline);
+        assert_eq!(sa.selected_hidden, sb.selected_hidden);
+        assert_eq!(sa.selected_endings, sb.selected_endings);
+        assert_eq!(sa.selected_locations, sb.selected_locations);
+    }
+
+    // #2 副本间不同：不同 world_id、同阵容同模板 → 采样有差异（多实例统计覆盖）。
+    #[test]
+    fn different_instance_different_sampling() {
+        let sk = superset();
+        let sigs: BTreeSet<String> = (0..12)
+            .map(|i| {
+                let s = plan(&sk, &format!("world_inst_{i}"), "cidA\ncidB").audit.unwrap();
+                format!("{}|{}|{}", s.selected_storylines.join(","), s.selected_mainline.join(","), s.selected_hidden.join(","))
+            })
+            .collect();
+        assert!(sigs.len() >= 2, "不同实例应采出内容不同的副本，实得 {} 种", sigs.len());
+    }
+
+    // #4 阵容敏感：换一张卡 → 指纹变 → 种子变 → 采样（大概率）不同。
+    #[test]
+    fn roster_fingerprint_changes_seed() {
+        let sk = superset();
+        let a = plan(&sk, "world_fixed_2", "cidA\ncidB").audit.unwrap();
+        let b = plan(&sk, "world_fixed_2", "cidA\ncidB\ncidC").audit.unwrap();
+        assert_ne!(a.seed, b.seed, "阵容指纹变 → 种子必变");
+        assert_ne!(a.roster_fingerprint, b.roster_fingerprint);
+    }
+
+    // #5 fated 必留：任意种子下 selected_mainline ⊇ {fated 节点}。
+    #[test]
+    fn fated_always_retained() {
+        let sk = superset();
+        for i in 0..16 {
+            let s = plan(&sk, &format!("world_fate_{i}"), "cidA").audit.unwrap();
+            assert!(s.selected_mainline.contains(&"mn-fate".to_string()), "seed {i} 漏了 fated 硬节点");
+        }
+    }
+
+    // #6 变体组互斥：各 variantGroup 在选中集内 ≤1 成员（mainline/hidden/ending 三处）。
+    #[test]
+    fn variant_groups_exclusive() {
+        let sk = superset();
+        for i in 0..16 {
+            let s = plan(&sk, &format!("world_vg_{i}"), "cidA").audit.unwrap();
+            let count = |ids: &[String], group: &[&str]| group.iter().filter(|g| ids.iter().any(|x| x == *g)).count();
+            assert!(count(&s.selected_mainline, &["mn-a1", "mn-a2"]) <= 1, "vg1 互斥破坏: {:?}", s.selected_mainline);
+            assert!(count(&s.selected_mainline, &["mn-b1", "mn-b2"]) <= 1, "vg2 互斥破坏: {:?}", s.selected_mainline);
+            assert!(count(&s.selected_hidden, &["hc-a1", "hc-a2"]) <= 1, "vh 互斥破坏: {:?}", s.selected_hidden);
+            assert!(count(&s.selected_endings, &["end-a1", "end-a2"]) <= 1, "ve 互斥破坏: {:?}", s.selected_endings);
+        }
+    }
+
+    // #7 脊柱自洽：selected_hidden ⊆ 所选 storyline 的 hiddenPoolIds。
+    #[test]
+    fn hidden_subset_of_selected_storylines() {
+        let sk = superset();
+        for i in 0..16 {
+            let s = plan(&sk, &format!("world_spine_{i}"), "cidA").audit.unwrap();
+            let allowed: BTreeSet<String> = sk
+                .storylines
+                .iter()
+                .filter(|sl| s.selected_storylines.contains(&sl.id))
+                .flat_map(|sl| sl.hidden_pool_ids.clone())
+                .collect();
+            for h in &s.selected_hidden {
+                assert!(allowed.contains(h), "seed {i} 选了脊柱外的隐藏内容 {h}（allowed={allowed:?}）");
+            }
+        }
+    }
+
+    // #8 计数上限：hidden ≤ count；location ≤ count；mainline 非 fated 部分 ≤ count。
+    #[test]
+    fn count_caps_respected() {
+        let sk = superset();
+        for i in 0..16 {
+            let s = plan(&sk, &format!("world_cap_{i}"), "cidA").audit.unwrap();
+            assert!(s.selected_hidden.len() <= 1, "hidden 超上限: {:?}", s.selected_hidden);
+            assert!(s.selected_locations.len() <= 2, "location 超上限: {:?}", s.selected_locations);
+            let nonfated = s.selected_mainline.iter().filter(|id| *id != "mn-fate").count();
+            assert!(nonfated <= 2, "mainline 非 fated 超上限: {:?}", s.selected_mainline);
+        }
+    }
+
+    // 秘境保连通：被选秘境 loc-secret 必伴随其通路 loc-a（避免孤立秘境，风险 §3）。
+    #[test]
+    fn secret_realm_stays_connected() {
+        let sk = superset();
+        for i in 0..16 {
+            let s = plan(&sk, &format!("world_loc_{i}"), "cidA").audit.unwrap();
+            if s.selected_locations.contains(&"loc-secret".to_string()) {
+                assert!(
+                    s.selected_locations.contains(&"loc-a".to_string()),
+                    "秘境 loc-secret 入选但通路 loc-a 未入选（孤立秘境）: {:?}",
+                    s.selected_locations
+                );
+            }
+        }
+    }
+
+    // #9 退化：非超集模板 → 全量 + sampling=None（与改造前一致）。
+    #[test]
+    fn non_superset_degrades_to_full() {
+        // 无 isSuperset / storylines / sampling 的旧骨架。
+        let sk: Skeleton = serde_json::from_value(serde_json::json!({
+            "mainlineNodes": [ { "id": "n1", "fated": true }, { "id": "n2" } ],
+            "hiddenContentPool": [ { "id": "h1", "themes": ["x"] }, { "id": "h2", "themes": ["y"] } ],
+            "endingPool": [ { "id": "e1", "baseWeight": 1.0 } ],
+            "locations": [ { "id": "l1" }, { "id": "l2" } ]
+        }))
+        .unwrap();
+        let s = plan(&sk, "world_degrade", "cidA");
+        assert!(s.audit.is_none(), "退化路径不产采样审计段");
+        assert_eq!(s.hidden_ids, vec!["h1".to_string(), "h2".to_string()], "退化 = 全量隐藏池");
+        assert_eq!(s.loc_ids, vec!["l1".to_string(), "l2".to_string()], "退化 = 全量地点");
+        assert_eq!(s.enabled_endings, vec!["e1".to_string()], "退化 = 全池阵容加权");
+    }
+
+    // is_superset=true 但 sampling 全空 → 仍退化（三判据之一不满足）。
+    #[test]
+    fn superset_flag_without_sampling_degrades() {
+        let mut sk = superset();
+        sk.sampling = SamplingSpec::default();
+        let s = plan(&sk, "world_nosampling", "cidA");
+        assert!(s.audit.is_none(), "sampling 全空 → 退化");
+    }
 }

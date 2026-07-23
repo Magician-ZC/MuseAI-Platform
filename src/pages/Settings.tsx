@@ -52,6 +52,16 @@ import {
   defaultCharacterSynthesisPrompt,
   defaultCharacterSwapTestPrompt,
   defaultCharacterStressTestPrompt,
+  defaultWorldScanPrompt,
+  defaultWorldCharMergePrompt,
+  defaultWorldLocMergePrompt,
+  defaultWorldItemMergePrompt,
+  defaultWorldCharTieringPrompt,
+  defaultWorldCharSynthesisPrompt,
+  defaultWorldLocationSynthesisPrompt,
+  defaultWorldItemSynthesisPrompt,
+  defaultWorldPlotSynthesisPrompt,
+  defaultWorldEndingSynthesisPrompt,
   defaultKnowledgeDistillMindPrompt,
   defaultKnowledgeDistillValuePrompt,
   defaultKnowledgeDistillExpressionPrompt,
@@ -622,6 +632,7 @@ const useSettingsView = () => {
           onClick={(e) => e.preventDefault()}
           items={[
             { key: 'character-extraction-config', href: '#character-extraction-config', title: '角色提取设置' },
+            { key: 'world-extraction-config', href: '#world-extraction-config', title: '世界提取设置' },
             { key: 'knowledge-config', href: '#knowledge-config', title: '知识包设置' },
             { key: 'narrative-config', href: '#narrative-config', title: '叙事引擎设置' },
           ]}
@@ -1332,6 +1343,123 @@ const useSettingsView = () => {
               onSavePrompt={store.setCharacterStressTestPrompt}
               onResetPrompt={store.resetCharacterStressTestPrompt}
               helpText="压力测试：在不同压力场景下检验角色的决策一致性。"
+              showModelId
+            />
+            </LazyConfigGroup>
+          </section>
+
+          <Divider style={{ borderColor: '#eae6df', margin: '48px 0' }} />
+
+          {/* 世界提取设置区域（P3 世界内容超集提取，10 段 system prompt） */}
+          <section id="world-extraction-config" style={{ marginBottom: 48 }}>
+            <LazyConfigGroup title="世界提取设置" count={10} icon={<GlobalOutlined style={{ fontSize: '20px', color: '#d97757' }} />}>
+            <AgentSettingCard
+              title="逐章世界实体扫描器"
+              agentId="worldScan"
+              defaultPrompt={defaultWorldScanPrompt}
+              currentPrompt={store.worldScanPrompt}
+              onSavePrompt={store.setWorldScanPrompt}
+              onResetPrompt={store.resetWorldScanPrompt}
+              helpText="世界提取第一阶段：逐章并发扫描 NPC/反派、地点/秘境、道具、剧情节拍、结局线索（严格 JSON、温度 0）。"
+              showModelId
+            />
+
+            <AgentSettingCard
+              title="人物别名归并器"
+              agentId="worldCharMerge"
+              defaultPrompt={defaultWorldCharMergePrompt}
+              currentPrompt={store.worldCharMergePrompt}
+              onSavePrompt={store.setWorldCharMergePrompt}
+              onResetPrompt={store.resetWorldCharMergePrompt}
+              helpText="归并指向同一 NPC/反派的不同称呼，宁可漏并不可错并，结果进用户确认页。"
+              showModelId
+            />
+
+            <AgentSettingCard
+              title="地点归并器"
+              agentId="worldLocMerge"
+              defaultPrompt={defaultWorldLocMergePrompt}
+              currentPrompt={store.worldLocMergePrompt}
+              onSavePrompt={store.setWorldLocMergePrompt}
+              onResetPrompt={store.resetWorldLocMergePrompt}
+              helpText="归并指向同一地点/秘境的不同称呼，保留秘境（封闭异境）标注。"
+              showModelId
+            />
+
+            <AgentSettingCard
+              title="道具归并器"
+              agentId="worldItemMerge"
+              defaultPrompt={defaultWorldItemMergePrompt}
+              currentPrompt={store.worldItemMergePrompt}
+              onSavePrompt={store.setWorldItemMergePrompt}
+              onResetPrompt={store.resetWorldItemMergePrompt}
+              helpText="归并指向同一法宝/道具/功法的不同称呼，同类不同件不得归并。"
+              showModelId
+            />
+
+            <AgentSettingCard
+              title="人物重要度分层器"
+              agentId="worldCharTiering"
+              defaultPrompt={defaultWorldCharTieringPrompt}
+              currentPrompt={store.worldCharTieringPrompt}
+              onSavePrompt={store.setWorldCharTieringPrompt}
+              onResetPrompt={store.resetWorldCharTieringPrompt}
+              helpText="复核边界人物的核心/重要/功能/过场分层；主要反派应给到较高层级。"
+              showModelId
+            />
+
+            <AgentSettingCard
+              title="世界角色 DNA 合成师"
+              agentId="worldCharSynthesis"
+              defaultPrompt={defaultWorldCharSynthesisPrompt}
+              currentPrompt={store.worldCharSynthesisPrompt}
+              onSavePrompt={store.setWorldCharSynthesisPrompt}
+              onResetPrompt={store.resetWorldCharSynthesisPrompt}
+              helpText="为每个 NPC/反派合成十层 Character DNA V2，反派刻画主动议程（agency.longTermAgenda）。"
+              showModelId
+            />
+
+            <AgentSettingCard
+              title="地点合成师"
+              agentId="worldLocationSynthesis"
+              defaultPrompt={defaultWorldLocationSynthesisPrompt}
+              currentPrompt={store.worldLocationSynthesisPrompt}
+              onSavePrompt={store.setWorldLocationSynthesisPrompt}
+              onResetPrompt={store.resetWorldLocationSynthesisPrompt}
+              helpText="合成地点/秘境的连通结构、驻留道具与（秘境）进入门槛，引用须自洽无悬空。"
+              showModelId
+            />
+
+            <AgentSettingCard
+              title="道具合成师"
+              agentId="worldItemSynthesis"
+              defaultPrompt={defaultWorldItemSynthesisPrompt}
+              currentPrompt={store.worldItemSynthesisPrompt}
+              onSavePrompt={store.setWorldItemSynthesisPrompt}
+              onResetPrompt={store.resetWorldItemSynthesisPrompt}
+              helpText="合成道具目录条目，cosmology 只用官方六体系白名单，powerTier 1–5。"
+              showModelId
+            />
+
+            <AgentSettingCard
+              title="剧情线合成师"
+              agentId="worldPlotSynthesis"
+              defaultPrompt={defaultWorldPlotSynthesisPrompt}
+              currentPrompt={store.worldPlotSynthesisPrompt}
+              onSavePrompt={store.setWorldPlotSynthesisPrompt}
+              onResetPrompt={store.resetWorldPlotSynthesisPrompt}
+              helpText="合成主线段/隐藏内容池/剧情线分组，命名变体组≥2 成员以保证内容超集冗余。"
+              showModelId
+            />
+
+            <AgentSettingCard
+              title="结局池合成师"
+              agentId="worldEndingSynthesis"
+              defaultPrompt={defaultWorldEndingSynthesisPrompt}
+              currentPrompt={store.worldEndingSynthesisPrompt}
+              onSavePrompt={store.setWorldEndingSynthesisPrompt}
+              onResetPrompt={store.resetWorldEndingSynthesisPrompt}
+              helpText="合成结局候选池，同一倾向（strategist/combat/social）保留多个候选形成冗余。"
               showModelId
             />
             </LazyConfigGroup>

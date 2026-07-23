@@ -24,6 +24,7 @@ const { Text } = Typography;
 const NAV_ITEMS = [
   { key: '/platform', icon: <GlobalOutlined />, label: '世界大厅' },
   { key: '/platform/publish', icon: <CloudUploadOutlined />, label: '发布角色' },
+  { key: '/platform/worlds/publish', icon: <GlobalOutlined />, label: '发布世界' },
   { key: '/platform/my', icon: <AppstoreOutlined />, label: '我的世界' },
   { key: '/platform/reports', icon: <ReadOutlined />, label: '日报' },
   { key: '/platform/wallet', icon: <WalletOutlined />, label: '钱包' },

@@ -9,3 +9,4 @@ pub mod skills;
 pub mod character_v2;
 pub mod knowledge;
 pub mod narrative;
+pub mod world_v2;

@@ -18,6 +18,7 @@ import PlatformShell, { RequireAuth } from './pages/platform/PlatformShell';
 import PlatformLogin from './pages/platform/PlatformLogin';
 import PlatformHall from './pages/platform/PlatformHall';
 import CharacterPublish from './pages/platform/CharacterPublish';
+import WorldPublish from './pages/platform/WorldPublish';
 import MyWorlds from './pages/platform/MyWorlds';
 import WorldRoom from './pages/platform/WorldRoom';
 import WorldSpectate from './pages/platform/WorldSpectate';
@@ -106,6 +107,7 @@ function App() {
               <Route index element={<RequireAuth><PlatformHall /></RequireAuth>} />
               <Route path="login" element={<PlatformLogin />} />
               <Route path="publish" element={<RequireAuth><CharacterPublish /></RequireAuth>} />
+              <Route path="worlds/publish" element={<RequireAuth><WorldPublish /></RequireAuth>} />
               <Route path="my" element={<RequireAuth><MyWorlds /></RequireAuth>} />
               <Route path="worlds/:id" element={<RequireAuth><WorldRoom /></RequireAuth>} />
               <Route path="worlds/:id/spectate" element={<RequireAuth><WorldSpectate /></RequireAuth>} />

@@ -3,7 +3,7 @@
 //! 未知世界 404、签名校验（纯单元）、GET /arena/{worldId}/clips 列表。
 
 use super::*;
-use crate::safety::testkit::{count, seed_user, seed_world, test_state, token};
+use crate::safety::testkit::{count, seed_member, seed_user, seed_world, test_state, token};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
@@ -201,4 +201,122 @@ async fn list_clips_route_returns_generated() {
     let v: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["clips"].as_array().unwrap().len(), 1, "列表应含一条切片");
     assert_eq!(v["clips"][0]["eventId"], "e1");
+}
+
+// ---------- POST /arena/{worldId}/gift：站内观众打赏（AuthUser + 观战资格 + via=in_app + 进流） ----------
+
+/// 带鉴权（可选 Idempotency-Key）的站内打赏请求。
+async fn post_gift(
+    state: &AppState,
+    world: &str,
+    user: &str,
+    body: Value,
+    idem: Option<&str>,
+) -> (StatusCode, Value) {
+    let tk = token(state, user);
+    let app = crate::app::build_router(state.clone());
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(format!("/api/arena/{world}/gift"))
+        .header("authorization", format!("Bearer {tk}"))
+        .header("content-type", "application/json");
+    if let Some(k) = idem {
+        builder = builder.header("idempotency-key", k);
+    }
+    let resp = app.oneshot(builder.body(Body::from(body.to_string())).unwrap()).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap_or(json!(null)))
+}
+
+#[tokio::test]
+async fn spectator_gift_maps_to_env_and_stream() {
+    let state = arena_state().await;
+    seed_user(&state.db, "viewer").await;
+    seed_world(&state.db, "w1", 0, "running").await; // official → 可观战
+
+    let (s, v) = post_gift(&state, "w1", "viewer", json!({ "sku": "rose", "count": 1 }), None).await;
+    assert_eq!(s, StatusCode::OK, "body={v}");
+    assert_eq!(v["mapped"], true);
+    assert_eq!(v["boundary"]["notImmunity"], true);
+    assert_eq!(v["boundary"]["notFinalVerdict"], true);
+
+    // 与 webhook 同一系统频道：arena_env_events(gift_boon)。
+    assert_eq!(
+        count(&state.db, "SELECT COUNT(*) FROM arena_env_events WHERE world_id='w1' AND kind='gift_boon'").await,
+        1
+    );
+    // gift_events 记账且 via='in_app'（区分站内来源，供分成）。
+    assert_eq!(
+        count(&state.db, "SELECT COUNT(*) FROM gift_events WHERE world_id='w1' AND via='in_app'").await,
+        1
+    );
+    // 打赏进 public 流：arena_gift（audience NULL → 双硬隔离天然满足）。
+    assert_eq!(
+        count(&state.db, "SELECT COUNT(*) FROM world_events WHERE world_id='w1' AND event_type='arena_gift' AND visibility='public' AND audience_json IS NULL").await,
+        1
+    );
+    // 红线：不写玩家 interventions。
+    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM interventions").await, 0);
+}
+
+#[tokio::test]
+async fn spectator_gift_unmapped_sku_no_boon() {
+    let state = arena_state().await;
+    seed_user(&state.db, "viewer").await;
+    seed_world(&state.db, "w1", 0, "running").await;
+
+    let (s, v) = post_gift(&state, "w1", "viewer", json!({ "sku": "nonesuch", "count": 1 }), None).await;
+    assert_eq!(s, StatusCode::OK, "未映射 SKU 不应报错");
+    assert_eq!(v["mapped"], false);
+    assert_eq!(v["boon"], Value::Null);
+
+    // 未映射：不写 env、不进流；仍逐笔记 gift_events(via=in_app)（对账用，对齐 webhook 语义）。
+    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM arena_env_events").await, 0, "未映射不写环境事件");
+    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM world_events WHERE event_type='arena_gift'").await, 0, "未映射不进流");
+    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM gift_events WHERE mapped=0 AND via='in_app'").await, 1);
+}
+
+#[tokio::test]
+async fn spectator_gift_requires_view_permission() {
+    let state = arena_state().await;
+    seed_user(&state.db, "u1").await;
+    seed_user(&state.db, "stranger").await;
+    seed_world(&state.db, "w1", 0, "running").await;
+    // 收敛为 private：仅成员/房主可观战 → 可打赏。
+    sqlx::query("UPDATE worlds SET visibility='private' WHERE id='w1'").execute(&state.db).await.unwrap();
+    seed_member(&state.db, "m1", "w1", "u1", "c1", "active").await;
+
+    // 非成员 → 403（守卫挡在 apply_gift 之前，绝不记账）。
+    let (s1, _) = post_gift(&state, "w1", "stranger", json!({ "sku": "rose", "count": 1 }), None).await;
+    assert_eq!(s1, StatusCode::FORBIDDEN);
+    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM gift_events").await, 0, "被拒绝的打赏不得记账");
+
+    // 成员 → 200。
+    let (s2, v2) = post_gift(&state, "w1", "u1", json!({ "sku": "rose", "count": 1 }), None).await;
+    assert_eq!(s2, StatusCode::OK, "body={v2}");
+    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM gift_events WHERE via='in_app'").await, 1);
+}
+
+#[tokio::test]
+async fn spectator_gift_idempotent() {
+    let state = arena_state().await;
+    seed_user(&state.db, "viewer").await;
+    seed_world(&state.db, "w1", 0, "running").await;
+
+    // 同 Idempotency-Key 重投两次 → 第二次返回缓存，计数不翻倍。
+    let (s1, v1) = post_gift(&state, "w1", "viewer", json!({ "sku": "rose", "count": 3 }), Some("k-1")).await;
+    assert_eq!(s1, StatusCode::OK, "body={v1}");
+    let (s2, v2) = post_gift(&state, "w1", "viewer", json!({ "sku": "rose", "count": 3 }), Some("k-1")).await;
+    assert_eq!(s2, StatusCode::OK, "body={v2}");
+
+    // gift_events 只一笔（幂等），聚合计数 = 3（非 6）。
+    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM gift_events WHERE world_id='w1'").await, 1, "幂等重投不得重复记账");
+    assert_eq!(
+        count(&state.db, "SELECT aggregated_count FROM arena_env_events WHERE world_id='w1' AND kind='gift_boon'").await,
+        3,
+        "幂等重投聚合计数不得翻倍"
+    );
+    // 进流也只一条 arena_gift。
+    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM world_events WHERE world_id='w1' AND event_type='arena_gift'").await, 1);
 }

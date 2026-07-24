@@ -80,19 +80,21 @@ export function cloudStream(
   const auth = useAuthStore.getState();
   let closed = false;
   let ws: WebSocket | null = null;
-  let lastEventId = '';
+  // 重连补偿游标：服务端 StreamQuery.last_event_id: Option<i64> 收 sequence（i64），非事件 id（string）。
+  // 用 sequence 且参数名对齐 last_event_id，否则断线补偿完全失效。-1 表示尚无已收事件。
+  let lastEventSeq = -1;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
   const connect = () => {
     if (closed) return;
     const base = getPlatformBase().replace(/^http/, 'ws');
     const params = new URLSearchParams({ token: auth.accessToken || '' });
-    if (lastEventId) params.set('lastEventId', lastEventId);
+    if (lastEventSeq >= 0) params.set('last_event_id', String(lastEventSeq));
     ws = new WebSocket(`${base}/api/worlds/${worldId}/stream?${params.toString()}`);
     ws.onmessage = (e) => {
       try {
         const payload = JSON.parse(e.data);
-        if (payload?.id) lastEventId = payload.id;
+        if (typeof payload?.sequence === 'number') lastEventSeq = payload.sequence;
         onEvent(payload);
       } catch (err) {
         onError?.(err);

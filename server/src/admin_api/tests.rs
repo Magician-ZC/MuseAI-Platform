@@ -726,15 +726,34 @@ async fn world_create_timeline_mode() {
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
 
-    // 跨字段约束：event + 非 idle 房型 → 400。
-    let (st, _) = post(
+    // P2 Stage3 建房闸放宽：event × chapter 现允许（引擎走 DES 地点碰撞，调度节奏由 chapter start 端点驱动）。
+    let (st, body) = post(
         &app,
         "/api/admin/worlds",
         Some(&admin),
         json!({ "templateId": "tpl1", "templateVersion": 1, "title": "event章节房", "roomType": "chapter", "timelineMode": "event" }),
     )
     .await;
-    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert_eq!(st, StatusCode::OK, "event × chapter 应允许建房（Stage3 放宽）");
+    let wid_chap = body["worldId"].as_str().unwrap().to_string();
+    let tm_chap = sqlx::query("SELECT timeline_mode FROM worlds WHERE id=?")
+        .bind(&wid_chap).fetch_one(&state.db).await.unwrap().try_get::<String, _>("timeline_mode").unwrap();
+    assert_eq!(tm_chap, "event");
+
+    // P2 Stage3：event × arena 亦允许（arena 需平台指派主播 hostUserId）。
+    seed_user(&state, "host-arena", None, "user", "active").await;
+    let (st, body) = post(
+        &app,
+        "/api/admin/worlds",
+        Some(&admin),
+        json!({ "templateId": "tpl1", "templateVersion": 1, "title": "event赛事房", "roomType": "arena", "timelineMode": "event", "hostUserId": "host-arena" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "event × arena 应允许建房（Stage3 放宽）");
+    let wid_arena = body["worldId"].as_str().unwrap().to_string();
+    let tm_arena = sqlx::query("SELECT timeline_mode FROM worlds WHERE id=?")
+        .bind(&wid_arena).fetch_one(&state.db).await.unwrap().try_get::<String, _>("timeline_mode").unwrap();
+    assert_eq!(tm_arena, "event");
 }
 
 // ---------------- 数据看板聚合 ----------------

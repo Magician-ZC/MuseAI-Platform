@@ -343,3 +343,140 @@ async fn red_line_no_immunity_or_buy_verdict_endpoints() {
         assert_eq!(s, StatusCode::NOT_FOUND, "不得存在免死/买最终判定端点：{path}");
     }
 }
+
+// ---------- 赛制事件进流：淘汰/胜者作为 public world_event（双硬隔离不泄私密） ----------
+
+#[tokio::test]
+async fn settle_emits_elim_and_winner_public_events() {
+    let state = test_state().await;
+    seed_user(&state.db, "host").await;
+    seed_user(&state.db, "u1").await;
+    seed_user(&state.db, "u2").await;
+    seed_arena_world(&state.db, "w", "host", "official").await;
+    seed_member(&state.db, "m1", "w", "u1", "c1", "active").await;
+    seed_member(&state.db, "m2", "w", "u2", "c2", "active").await;
+
+    // 淘汰 c1 → 当事人 u1 同意 → 结算落定 → 收敛胜者 c2。
+    let (_, v) = post(&state, "/api/arena/w/eliminate", "host", json!({ "cloudCharacterId": "c1" })).await;
+    let cid = v["consentId"].as_str().unwrap().to_string();
+    respond_consent(&state, "u1", "w", &cid, true).await;
+    let (_, settled) = post(&state, "/api/arena/w/settle", "host", json!({})).await;
+    assert_eq!(settled["winnerCharId"], "c2");
+
+    // 淘汰/胜者各落一行 public world_event，audience_json IS NULL（双硬隔离天然满足）。
+    let elim = count(&state.db, "SELECT COUNT(*) FROM world_events WHERE world_id='w' AND event_type='arena_elim' AND visibility='public' AND audience_json IS NULL").await;
+    assert_eq!(elim, 1, "淘汰应作为 public 系统事件进流");
+    let win = count(&state.db, "SELECT COUNT(*) FROM world_events WHERE world_id='w' AND event_type='arena_winner' AND visibility='public' AND audience_json IS NULL").await;
+    assert_eq!(win, 1, "胜者应作为 public 系统事件进流");
+    // 红线：系统事件不携带任何私有投影。
+    let leaked = count(&state.db, "SELECT COUNT(*) FROM world_events WHERE world_id='w' AND event_type IN ('arena_elim','arena_winner') AND private_projections_json IS NOT NULL").await;
+    assert_eq!(leaked, 0, "赛制系统事件不得含私有投影");
+
+    // 观众经回放能看到淘汰/胜者（public 放行），且携带 characterId。
+    let (s, rep) = get(&state, "/api/arena/w/replay", "host").await;
+    assert_eq!(s, StatusCode::OK, "body={rep}");
+    let evs = rep["events"].as_array().unwrap();
+    let elim_ev = evs.iter().find(|e| e["type"] == "arena_elim").expect("回放含淘汰事件");
+    assert_eq!(elim_ev["characterId"], "c1");
+    assert_eq!(elim_ev["arenaKind"], "elim");
+    let win_ev = evs.iter().find(|e| e["type"] == "arena_winner").expect("回放含胜者事件");
+    assert_eq!(win_ev["characterId"], "c2");
+}
+
+// ---------- 回放端点：从 world_events 重建 public 时间线（seekable，private 不泄） ----------
+
+#[tokio::test]
+async fn replay_returns_public_timeline_seekable() {
+    let state = test_state().await;
+    seed_user(&state.db, "spectator").await;
+    seed_arena_world(&state.db, "w", "host", "public").await;
+
+    // 3 条 public（seq 0/1/2）+ 1 条 private（seq 3，含机密摘要）。
+    seed_public_event(&state.db, "w", 0, 0, "action", "李上前行礼", None).await;
+    seed_public_event(&state.db, "w", 0, 1, "dialogue", "寒暄致意", None).await;
+    seed_public_event(&state.db, "w", 1, 2, "action", "王拂袖而去", None).await;
+    seed_private_event(&state.db, "w", 3, "机密：王暗藏毒计").await;
+
+    // 首页 limit=2 → 前两条 public，按 sequence 升序，nextCursor=1。
+    let (s, p1) = get(&state, "/api/arena/w/replay?limit=2", "spectator").await;
+    assert_eq!(s, StatusCode::OK, "body={p1}");
+    let evs = p1["events"].as_array().unwrap();
+    assert_eq!(evs.len(), 2);
+    assert_eq!(evs[0]["sequence"], 0);
+    assert_eq!(evs[1]["sequence"], 1);
+    assert_eq!(evs[0]["summary"], "李上前行礼");
+    assert_eq!(p1["nextCursor"], 1);
+
+    // seek：cursor=1 → 只回 public seq 2（private seq 3 被 visibility 过滤，不进回放）。
+    let (_, p2) = get(&state, "/api/arena/w/replay?cursor=1&limit=2", "spectator").await;
+    let evs2 = p2["events"].as_array().unwrap();
+    assert_eq!(evs2.len(), 1, "剩余仅一条 public；私有事件不进回放");
+    assert_eq!(evs2[0]["sequence"], 2);
+
+    // 私有摘要绝不泄露到任一页。
+    assert!(!p1.to_string().contains("机密"), "回放不得含私有投影");
+    assert!(!p2.to_string().contains("机密"), "回放不得含私有投影");
+}
+
+#[tokio::test]
+async fn replay_forbidden_for_private_world_non_member() {
+    let state = test_state().await;
+    seed_user(&state.db, "host").await;
+    seed_user(&state.db, "u1").await;
+    seed_user(&state.db, "stranger").await;
+    // private 世界：观战不开放，仅成员/房主可回放（复用 can_view_world 语义）。
+    seed_arena_world(&state.db, "w", "host", "private").await;
+    seed_member(&state.db, "m1", "w", "u1", "c1", "active").await;
+
+    let (s1, _) = get(&state, "/api/arena/w/replay", "u1").await;
+    assert_eq!(s1, StatusCode::OK, "成员可回放");
+    let (s2, _) = get(&state, "/api/arena/w/replay", "stranger").await;
+    assert_eq!(s2, StatusCode::FORBIDDEN, "private 世界非成员不得回放");
+    let (s3, _) = get(&state, "/api/arena/w/replay", "host").await;
+    assert_eq!(s3, StatusCode::OK, "房主可回放");
+}
+
+// ---------- 红线：站内打赏只写系统频道，永不触碰 eliminations/winner/interventions ----------
+
+#[tokio::test]
+async fn gift_does_not_touch_eliminations_or_winner() {
+    let state = test_state().await;
+    seed_user(&state.db, "host").await;
+    seed_user(&state.db, "u1").await;
+    seed_user(&state.db, "u2").await;
+    seed_user(&state.db, "viewer").await;
+    seed_arena_world(&state.db, "w", "host", "public").await;
+    seed_member(&state.db, "m1", "w", "u1", "c1", "active").await;
+    seed_member(&state.db, "m2", "w", "u2", "c2", "active").await;
+
+    // 建 match（host/tick → running，eliminations '[]'，winner NULL）。
+    post(&state, "/api/arena/w/host/tick", "host", json!({})).await;
+    let elim_before =
+        sqlx::query_scalar::<_, String>("SELECT eliminations_json FROM arena_matches WHERE world_id='w'").fetch_one(&state.db).await.unwrap();
+    let winner_before: Option<String> =
+        sqlx::query_scalar::<_, Option<String>>("SELECT winner_char_id FROM arena_matches WHERE world_id='w'").fetch_one(&state.db).await.unwrap();
+
+    // 观众打赏 rose ×2（命中映射）。
+    let (s, g) = post(&state, "/api/arena/w/gift", "viewer", json!({ "sku": "rose", "count": 2 })).await;
+    assert_eq!(s, StatusCode::OK, "body={g}");
+    assert_eq!(g["mapped"], true);
+    assert_eq!(g["boundary"]["buys"], "process_boon");
+    assert_eq!(g["boundary"]["notImmunity"], true);
+    assert_eq!(g["boundary"]["notFinalVerdict"], true);
+
+    // 红线：eliminations / winner 一字不改。
+    let elim_after =
+        sqlx::query_scalar::<_, String>("SELECT eliminations_json FROM arena_matches WHERE world_id='w'").fetch_one(&state.db).await.unwrap();
+    let winner_after: Option<String> =
+        sqlx::query_scalar::<_, Option<String>>("SELECT winner_char_id FROM arena_matches WHERE world_id='w'").fetch_one(&state.db).await.unwrap();
+    assert_eq!(elim_before, elim_after, "打赏不得改动淘汰");
+    assert_eq!(winner_before, winner_after, "打赏不得改动胜者");
+    assert!(winner_after.is_none(), "无淘汰仍无胜者");
+
+    // 系统频道确实写入：arena_env_events(gift_boon) + gift_events(via=in_app) + arena_gift 进 public 流。
+    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM arena_env_events WHERE world_id='w' AND kind='gift_boon'").await, 1);
+    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM gift_events WHERE world_id='w' AND via='in_app'").await, 1);
+    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM world_events WHERE world_id='w' AND event_type='arena_gift' AND visibility='public'").await, 1);
+    // 红线：打赏绝不进玩家 interventions 通道。
+    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM interventions WHERE world_id='w'").await, 0);
+}

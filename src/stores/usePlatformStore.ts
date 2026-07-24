@@ -172,6 +172,47 @@ export interface MyWorldEntry {
   latestReportDay?: string;
 }
 
+/** 「我的角色 × 世界」权威成员关系（GET /me/memberships）：补日报反推的盲区（刚投放没日报也在场）。 */
+export interface Membership {
+  worldId: string;
+  worldTitle: string;
+  roomType: string;
+  worldStatus: string;
+  stateRevision: number;
+  cloudCharacterId: string;
+  characterName: string;
+  membershipStatus: string; // active | left
+  joinedAt: number;
+}
+
+/** 跨世界背包物品（GET /me/backpack；镜像 backpack/mod.rs::my_backpack）。 */
+export interface BackpackItem {
+  backpackId: string;
+  status: string; // owned | carried | sealed | consumed
+  acquiredWorldId: string;
+  carriedWorldId: string | null;
+  item: {
+    id: string;
+    narrative: string;
+    effectTags: string[];
+    origin: { worldTemplateId: string; cosmology: string[]; powerTier: number };
+  };
+}
+
+/** 羁绊边（前端派生，非端点）：跨世界聚合各世界 state-summary.relations 中含我角色的有向边。 */
+export interface BondEdge {
+  worldId: string;
+  worldTitle: string;
+  myCharacterId: string;
+  otherCharacterId: string;
+  otherName: string;
+  trust: number;
+  affinity: number;
+  fear: number;
+  debt: number;
+  direction: 'out' | 'in'; // 我的角色是 from(out) 还是被 known_to(in)
+}
+
 // ---------- 赛事房契约镜像（P6，FE1 追加；GET /arena/{id}/report 形态） ----------
 
 export type ArenaPhase = 'lobby' | 'running' | 'concluded' | string;
@@ -212,6 +253,48 @@ export interface ArenaReport {
   rounds: ArenaRound[];
   environment: ArenaEnvEvent[];
   compliance?: { arbitrationPublic: boolean; aiGenerated: boolean };
+}
+
+// ---------- 回放 / 直播统一事件（GET /arena/{id}/replay + WS 实时流 arena_* 事件） ----------
+
+/** 回放/直播统一事件：public 时间线的一条（含引擎回合事件 + arena_* 系统事件）。 */
+export interface ArenaReplayEvent {
+  id: string;
+  sequence: number;
+  tick: number;
+  occurredAt: number;
+  type: string; // action|dialogue|status|arena_elim|arena_winner|arena_gift|...
+  actors: string[];
+  summary: string;
+  ruleRefs: string[];
+  arenaKind?: 'elim' | 'winner' | 'gift' | null;
+  characterId?: string | null;
+  sku?: string | null;
+  aggregatedCount?: number | null;
+}
+
+/** GET /arena/{id}/replay 返回：可 seek 的 public 时间线 + 赛制快照 + 时长。 */
+export interface ArenaReplay {
+  worldId: string;
+  match: ArenaMatchState;
+  events: ArenaReplayEvent[];
+  nextCursor: number | null;
+  durationMs: number;
+  startedAt: number;
+  endedAt: number;
+  compliance?: { arbitrationPublic: boolean; aiGenerated: boolean };
+}
+
+/** POST /arena/{id}/gift 返回：站内打赏结果 + 付费边界（买过程不买结果）。 */
+export interface ArenaGiftResult {
+  worldId: string;
+  sku: string;
+  count: number;
+  mapped: boolean;
+  boon: unknown;
+  envEventId?: string;
+  aggregatedCount?: number;
+  boundary: { buys: string; notImmunity: boolean; notFinalVerdict: boolean };
 }
 
 // ---------- 错误友好化（所有平台页面复用；键在稳定 error code + Conflict 子原因） ----------
@@ -308,8 +391,28 @@ export function eventTypeMeta(type: string): { label: string; color: string } {
       return { label: '世界', color: 'magenta' };
     case 'consent_request':
       return { label: '同意请求', color: 'orange' };
+    case 'arena_elim':
+      return { label: '淘汰', color: 'red' };
+    case 'arena_winner':
+      return { label: '胜者', color: 'gold' };
+    case 'arena_gift':
+      return { label: '打赏', color: 'magenta' };
     default:
       return { label: type, color: 'default' };
+  }
+}
+
+/** 赛事系统事件 type（arena_elim/winner/gift）→ 展示标签与色彩（观战/回放时间线高亮）。 */
+export function arenaEventKindMeta(type: string): { label: string; color: string } {
+  switch (type) {
+    case 'arena_elim':
+      return { label: '淘汰', color: 'red' };
+    case 'arena_winner':
+      return { label: '胜者', color: 'gold' };
+    case 'arena_gift':
+      return { label: '打赏', color: 'magenta' };
+    default:
+      return eventTypeMeta(type);
   }
 }
 
@@ -345,7 +448,7 @@ export function provenanceMeta(kind: ProvenanceKind): { label: string; color: st
 
 // ---------- store ----------
 
-export type RoomView = 'stream' | 'cards' | 'graph' | 'map' | 'status';
+export type RoomView = 'stream' | 'cards' | 'graph' | 'map' | 'status' | 'worldline';
 
 interface PlatformState {
   // 世界大厅
@@ -363,12 +466,24 @@ interface PlatformState {
   reportsLoading: boolean;
   reportsError: string | null;
 
+  // 我的角色 × 世界（权威 memberships；补日报反推盲区）
+  memberships: Membership[];
+  membershipsLoading: boolean;
+  membershipsError: string | null;
+
+  // 跨世界背包
+  backpack: BackpackItem[];
+  backpackLoading: boolean;
+  backpackError: string | null;
+
   // 房间 L1 视图切换（偏好，持久化）
   roomView: RoomView;
 
   setRoomTypeFilter: (filter: RoomTypeFilter) => Promise<void>;
   loadWorlds: (reset?: boolean) => Promise<void>;
   loadReports: () => Promise<void>;
+  loadMemberships: () => Promise<Membership[]>;
+  loadBackpack: () => Promise<void>;
   enrichWorldTitles: (ids: string[]) => Promise<void>;
   setRoomView: (view: RoomView) => void;
   unreadTotal: () => number;
@@ -386,6 +501,12 @@ const initialListState = {
   worldTitles: {} as Record<string, string>,
   reportsLoading: false,
   reportsError: null as string | null,
+  memberships: [] as Membership[],
+  membershipsLoading: false,
+  membershipsError: null as string | null,
+  backpack: [] as BackpackItem[],
+  backpackLoading: false,
+  backpackError: null as string | null,
 };
 
 export const usePlatformStore = create<PlatformState>()(
@@ -451,6 +572,38 @@ export const usePlatformStore = create<PlatformState>()(
           void get().enrichWorldTitles(myWorlds.map((w) => w.worldId));
         } catch (e) {
           set({ reportsLoading: false, reportsError: describeCloudError(e) });
+        }
+      },
+
+      // 权威「我的角色 × 世界」：直接读 world_members（补日报反推盲区）。返回列表供页面链式聚合（羁绊/档案）。
+      loadMemberships: async () => {
+        set({ membershipsLoading: true, membershipsError: null });
+        try {
+          const data = await cloudFetch<{ memberships: Membership[] }>('/api/me/memberships');
+          const memberships = data.memberships ?? [];
+          // 顺带补世界标题缓存（memberships 自带 worldTitle，避免各页再请求 /worlds/{id}）。
+          const titles: Record<string, string> = {};
+          for (const m of memberships) if (m.worldTitle) titles[m.worldId] = m.worldTitle;
+          set((s) => ({
+            memberships,
+            worldTitles: { ...titles, ...s.worldTitles },
+            membershipsLoading: false,
+          }));
+          return memberships;
+        } catch (e) {
+          set({ membershipsLoading: false, membershipsError: describeCloudError(e) });
+          return [];
+        }
+      },
+
+      // 跨世界背包（纯读 /me/backpack；服务端已按 user_id 归属且排除 consumed）。
+      loadBackpack: async () => {
+        set({ backpackLoading: true, backpackError: null });
+        try {
+          const data = await cloudFetch<{ items: BackpackItem[] }>('/api/me/backpack');
+          set({ backpack: data.items ?? [], backpackLoading: false });
+        } catch (e) {
+          set({ backpackLoading: false, backpackError: describeCloudError(e) });
         }
       },
 

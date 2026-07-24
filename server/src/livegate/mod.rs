@@ -29,6 +29,7 @@ use crate::idempotency;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/livegate/webhook", post(webhook))
+        .route("/arena/{worldId}/gift", post(spectator_gift))
         .route("/arena/{worldId}/clips", get(list_clips))
 }
 
@@ -80,46 +81,133 @@ async fn webhook(
         return Err(ApiError::NotFound);
     }
 
-    // SKU → boon 映射查表（未命中或停用 = 未映射）。
-    let mapping: Option<String> =
-        sqlx::query_scalar::<_, String>("SELECT boon_json FROM gift_sku_map WHERE sku = ? AND enabled = 1")
-            .bind(&req.gift_sku)
-            .fetch_optional(&state.db)
-            .await?;
-
     // seam：未成年人礼物限额——真实身份接入后在此对 from_user 做限额判定。
+    let resp = apply_gift(
+        &state,
+        &req.world_id,
+        &req.gift_sku,
+        req.count,
+        req.from_user.as_deref(),
+        "livegate",
+    )
+    .await?;
+
+    guard.store_response(&state.db, &resp.to_string()).await?;
+    Ok(Json(resp))
+}
+
+/// 礼物落地核心（外部 livegate webhook 与站内观众打赏共用）：
+/// SKU→boon 映射查表 → 命中则写/聚合 `arena_env_events(kind='gift_boon')` + 进流 `arena_gift` public 事件；
+/// 无论是否命中都逐笔记 `gift_events`（`via` 区分来源，供分成/对账）。
+///
+/// 红线（§2.5）：本函数**只**写 `arena_env_events` + `gift_events` 两张系统频道表 + 一行 public world_event，
+/// **绝不** touch `arena_matches.eliminations_json/winner_char_id` 或 `interventions`（HC 已禁玩家 item 干预）。
+/// SKU 映射表（0008）已约束 boon 仅 advantage/reroll/info 过程增益，无免死/最终判定。
+pub async fn apply_gift(
+    state: &AppState,
+    world_id: &str,
+    sku: &str,
+    count: i64,
+    from_user: Option<&str>,
+    via: &str,
+) -> Result<Value, ApiError> {
+    // SKU → boon 映射查表（未命中或停用 = 未映射）。label 供进流展示文案。
+    let mapping: Option<(String, String)> = sqlx::query_as::<_, (String, String)>(
+        "SELECT boon_json, label FROM gift_sku_map WHERE sku = ? AND enabled = 1",
+    )
+    .bind(sku)
+    .fetch_optional(&state.db)
+    .await?;
 
     let resp = match mapping {
-        Some(boon_json) => {
+        Some((boon_json, label)) => {
             let boon: Value = serde_json::from_str(&boon_json).unwrap_or_else(|_| json!({}));
             // 写入/聚合 gift_boon 到 arena_env_events（专用系统环境通道，不走玩家 interventions）。
             let (env_event_id, aggregated) =
-                upsert_gift_boon(&state.db, &req.world_id, &req.gift_sku, &boon, req.count).await?;
-            record_gift(&state.db, &req, true, Some(&env_event_id)).await?;
+                upsert_gift_boon(&state.db, world_id, sku, &boon, count).await?;
+            record_gift(&state.db, world_id, sku, count, from_user, true, Some(&env_event_id), via).await?;
+
+            // 打赏进流：public 系统事件（观众实时看到环境被注入）。仅广播，红线内不碰赛制结果字段。
+            let label_text = if label.is_empty() { sku.to_string() } else { label };
+            crate::arena::emit_arena_event(
+                state,
+                world_id,
+                "arena_gift",
+                &format!("观众打赏「{label_text}」×{count} 已注入场内环境（系统代投）"),
+                &[],
+                json!({ "arenaKind": "gift", "sku": sku, "aggregatedCount": aggregated }),
+            )
+            .await;
+
             json!({
-                "worldId": req.world_id,
-                "sku": req.gift_sku,
-                "count": req.count,
+                "worldId": world_id,
+                "sku": sku,
+                "count": count,
                 "mapped": true,
                 "boon": boon,
                 "envEventId": env_event_id,
                 "aggregatedCount": aggregated,
+                // 付费边界（诚实标注）：买过程增益，不是免死、不改最终判定。
+                "boundary": { "buys": "process_boon", "notImmunity": true, "notFinalVerdict": true },
             })
         }
         None => {
-            // 未映射：无 boon 可代投（无法凭空生成过程增益）——不写 arena_env_events，
+            // 未映射：无 boon 可代投（无法凭空生成过程增益）——不写 arena_env_events、不进流，
             // 仍记 gift_events 账用于对账/结算（礼物已在直播端发生）。
-            record_gift(&state.db, &req, false, None).await?;
+            record_gift(&state.db, world_id, sku, count, from_user, false, None, via).await?;
             json!({
-                "worldId": req.world_id,
-                "sku": req.gift_sku,
-                "count": req.count,
+                "worldId": world_id,
+                "sku": sku,
+                "count": count,
                 "mapped": false,
                 "boon": Value::Null,
+                "boundary": { "buys": "process_boon", "notImmunity": true, "notFinalVerdict": true },
             })
         }
     };
+    Ok(resp)
+}
 
+// ---------- POST /arena/{worldId}/gift（站内观众打赏，AuthUser + 观战资格守卫） ----------
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SpectatorGiftReq {
+    sku: String,
+    #[serde(default = "default_count")]
+    count: i64,
+}
+
+/// 站内观众打赏：走与外部 webhook 同一 `apply_gift`（同 upsert 聚合 + 同 arena_env_events 系统频道 +
+/// 同 arena_gift 进流），`via='in_app'` 区分来源。守卫 = AuthUser + `can_view_world`（与观战/回放同口径）。
+///
+/// 红线：只写系统频道，绝不触碰 eliminations/winner/interventions。
+/// seam（诚实标注）：实际扣费 `billing::charge(user, sku)` 跨 feature，本期 TODO——端点先记账（gift_events）不扣费。
+async fn spectator_gift(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(world_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<SpectatorGiftReq>,
+) -> Result<Json<Value>, ApiError> {
+    if body.count <= 0 {
+        return Err(ApiError::BadRequest("count 必须为正".into()));
+    }
+    // 观战资格（复用 events::can_view_world）：official/public 任何登录用户；private 需成员/房主；
+    // 世界不存在 → load_world 内返回 404。
+    if !crate::events::can_view_world(&state.db, &world_id, &user.user_id).await? {
+        return Err(ApiError::Forbidden);
+    }
+
+    // 幂等：同 Idempotency-Key 重投 → 返回缓存，计数不翻倍（与其它副作用端点同模式）。
+    let payload_hash = idempotency::hash_payload(format!("{world_id}:{}:{}", body.sku, body.count).as_bytes());
+    let idem = headers.get("idempotency-key").and_then(|v| v.to_str().ok());
+    let guard = idempotency::guard(&state.db, &user.user_id, "arena.gift", idem, &payload_hash).await?;
+    if let Some(cached) = &guard.cached_response {
+        return Ok(Json(serde_json::from_str(cached).unwrap_or_else(|_| json!({}))));
+    }
+
+    let resp = apply_gift(&state, &world_id, &body.sku, body.count, Some(&user.user_id), "in_app").await?;
     guard.store_response(&state.db, &resp.to_string()).await?;
     Ok(Json(resp))
 }
@@ -181,24 +269,30 @@ async fn upsert_gift_boon(
     Ok((id, add_count))
 }
 
-/// 记 gift_events 账（战报 + 结算 seam）。
+/// 记 gift_events 账（战报 + 结算 seam）。`via` 区分来源（'livegate' 外部 / 'in_app' 站内）供分成/审计。
+#[allow(clippy::too_many_arguments)]
 async fn record_gift(
     db: &AnyPool,
-    req: &GiftWebhook,
+    world_id: &str,
+    sku: &str,
+    count: i64,
+    from_user: Option<&str>,
     mapped: bool,
     env_event_id: Option<&str>,
+    via: &str,
 ) -> Result<(), ApiError> {
     sqlx::query(
-        "INSERT INTO gift_events (id, world_id, sku, gift_count, from_user, mapped, env_event_id, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO gift_events (id, world_id, sku, gift_count, from_user, mapped, env_event_id, via, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(new_id("gift"))
-    .bind(&req.world_id)
-    .bind(&req.gift_sku)
-    .bind(req.count)
-    .bind(req.from_user.as_deref())
+    .bind(world_id)
+    .bind(sku)
+    .bind(count)
+    .bind(from_user)
     .bind(if mapped { 1_i64 } else { 0 })
     .bind(env_event_id)
+    .bind(via)
     .bind(now_ms())
     .execute(db)
     .await?;

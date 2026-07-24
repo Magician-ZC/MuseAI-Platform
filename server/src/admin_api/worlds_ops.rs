@@ -327,12 +327,13 @@ pub(super) async fn create_world(
         if !matches!(tm.as_str(), "interval" | "event") {
             return Err(ApiError::BadRequest("timelineMode 非法（仅 interval/event）".into()));
         }
-        // 跨字段约束：event（DES/run_event_step）是放置房终局管线的一部分，load_endgame_policy
-        // 亦 idle-gated。event 与 arena/chapter 组合未经引擎验证 → 拒绝，避免建出不可自终局的 event 房。
-        // 顺序：本块须在 room_type 已落 p（上方 roomType 块）之后，才能读到 p.room_type 做跨字段校验。
-        if tm == "event" && p.room_type != "idle" {
-            return Err(ApiError::BadRequest("timelineMode=event 仅支持 idle 放置房".into()));
-        }
+        // event × {idle, chapter, arena} 全允许（P2 Stage3 建房闸放宽）：event 对 chapter/arena 表示
+        // **引擎走 DES 地点碰撞**（run_event_step → select_cohort 同 location + 时间窗碰撞，房型无关）；
+        // 调度节奏仍由端点驱动（arena host/tick、chapter start），schedule_due_ticks 的背靠背自治仅 idle
+        //（runtime/mod.rs），故 chapter/arena event 房「手动排 tick 才推进」，保 arena 节目节奏 / chapter 会话驱动；
+        // 终局仍 idle-gated（load_endgame_policy 门 room_type=='idle'），chapter/arena 的引擎终局天然不触发
+        //（skeleton 硬节点 threshold=None → 里程碑集空 → 恒不发 MainlineDone），结算走各自 finish/settle 端点。
+        // interval 仍为默认，老世界零影响。
         p.timeline_mode = tm;
     }
     // 平台指派主播：写入 host_user_id。赛事房若无主播，require_host 恒 Forbidden、

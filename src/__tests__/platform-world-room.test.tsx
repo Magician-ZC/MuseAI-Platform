@@ -219,3 +219,49 @@ describe('WorldRoom', () => {
     ).toBe(true);
   });
 });
+
+describe('WorldRoom — 世界线视图（按角色过滤 + 深链）', () => {
+  const renderRoomAt = (path: string) =>
+    render(
+      <MemoryRouter initialEntries={[path]}>
+        <Routes>
+          <Route path="/platform/worlds/:id" element={<WorldRoom />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+  it('有我方角色时出现「世界线」视图：过滤到我角色参与的事件并叙事化', async () => {
+    fetchMock.mockImplementation(happyPath);
+    renderRoomAt('/platform/worlds/w1');
+    await screen.findByText('云州世界');
+
+    // 我方角色 cMine 在阵容 → 「世界线」视图可用
+    fireEvent.click(screen.getByText('世界线'));
+    // cMine 参与了 ev1 → 叙事化呈现该事件，并标「我的角色」
+    expect(await screen.findByText('我的角色')).toBeInTheDocument();
+    expect(screen.getByText('沈霜与游侠交谈')).toBeInTheDocument();
+    // 同场其他角色以名解析（cOther → 游侠）
+    expect(screen.getByText(/同场：游侠/)).toBeInTheDocument();
+  });
+
+  it('?character= 深链：预选角色并自动切到世界线视图', async () => {
+    fetchMock.mockImplementation(happyPath);
+    renderRoomAt('/platform/worlds/w1?character=cMine');
+
+    // 无需手动点击，深链直接进入世界线（出现「我的角色」标注 + 事件）
+    expect(await screen.findByText('我的角色')).toBeInTheDocument();
+    expect(screen.getByText('沈霜与游侠交谈')).toBeInTheDocument();
+  });
+
+  it('我角色在本世界尚无事件：世界线空态', async () => {
+    fetchMock.mockImplementation(async (path: string, opts?: { method?: string }) => {
+      if (path === '/api/worlds/w1/events') return { events: [], nextCursor: null };
+      return happyPath(path, opts);
+    });
+    renderRoomAt('/platform/worlds/w1');
+    await screen.findByText('云州世界');
+
+    fireEvent.click(screen.getByText('世界线'));
+    expect(await screen.findByText(/TA 还没在这个世界留下故事/)).toBeInTheDocument();
+  });
+});

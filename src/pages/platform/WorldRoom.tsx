@@ -28,7 +28,7 @@ import {
   TeamOutlined,
   ThunderboltOutlined,
 } from '@ant-design/icons';
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
 import ReactECharts from 'echarts-for-react';
 import { cloudFetch, cloudStream } from '../../utils/cloudApi';
 import { usePartnerStore } from '../../stores/usePartnerStore';
@@ -685,6 +685,75 @@ export const FactionMap: React.FC<{
   );
 };
 
+// ---------- L1 世界线（只看我这个角色的故事线；情感留存核心） ----------
+
+/**
+ * 单角色世界线：把已取的全量投影事件（useWorldEvents）过滤到「该角色作为 actor 参与」的事件，
+ * 按 sequence 升序（一生按发生顺序读）叙事化渲染。纯前端过滤，无新请求。
+ * private 事件标「仅你可见」；同场其他角色以名解析显示。
+ */
+export const CharacterWorldline: React.FC<{
+  events: WorldEventItem[];
+  characterId: string | undefined;
+  roster?: WorldRosterEntry[];
+}> = ({ events, characterId, roster }) => {
+  const nameOf = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const r of roster ?? []) m.set(r.cloudCharacterId, r.name || r.cloudCharacterId);
+    return m;
+  }, [roster]);
+  const mine = useMemo(
+    () =>
+      characterId
+        ? events
+            .filter((ev) => ev.actors.includes(characterId))
+            .slice()
+            .sort((a, b) => a.sequence - b.sequence)
+        : [],
+    [events, characterId],
+  );
+
+  if (!characterId) {
+    return <Empty description="先选择一个你的角色，查看 TA 的世界线" image={Empty.PRESENTED_IMAGE_SIMPLE} />;
+  }
+  if (mine.length === 0) {
+    return (
+      <Empty description="TA 还没在这个世界留下故事，等待下一个节拍" image={Empty.PRESENTED_IMAGE_SIMPLE} />
+    );
+  }
+  return (
+    <Timeline
+      items={mine.map((ev) => {
+        const meta = eventTypeMeta(ev.type);
+        const others = ev.actors.filter((a) => a !== characterId).map((a) => nameOf.get(a) || a);
+        return {
+          color: meta.color === 'default' ? 'gray' : meta.color,
+          children: (
+            <div>
+              <Space size={6} wrap>
+                <Tag color="orange">我的角色</Tag>
+                <Tag color={meta.color}>{meta.label}</Tag>
+                <Text type="secondary" style={{ fontSize: 12 }}>
+                  第 {ev.tick} 拍
+                </Text>
+                {ev.visibility !== 'public' && <Tag color="purple">仅你可见</Tag>}
+              </Space>
+              <Paragraph style={{ margin: '6px 0 0', color: '#33312e' }}>
+                {ev.projection?.narrative || ev.projection?.summary || '（无摘要）'}
+              </Paragraph>
+              {others.length > 0 && (
+                <Text type="secondary" style={{ fontSize: 12 }}>
+                  同场：{others.join('、')}
+                </Text>
+              )}
+            </div>
+          ),
+        };
+      })}
+    />
+  );
+};
+
 // ---------- L1 视图容器（房间与观战席共用） ----------
 
 const L1_OPTIONS = [
@@ -694,6 +763,8 @@ const L1_OPTIONS = [
   { label: '势力地图', value: 'map' as RoomView },
   { label: '状态面板', value: 'status' as RoomView },
 ];
+
+const WORLDLINE_OPTION = { label: '世界线', value: 'worldline' as RoomView };
 
 export const WorldViewPanel: React.FC<{
   view: RoomView;
@@ -705,13 +776,22 @@ export const WorldViewPanel: React.FC<{
   summary?: WorldStateSummary | null;
   loading?: boolean;
   error?: string | null;
-}> = ({ view, onViewChange, events, roster, myIds, summary, loading, error }) => {
+  /** 我在本世界的角色（提供且非空时解锁「世界线」视图 + 角色选择器）。观战席不传 → 无此视图。 */
+  myChars?: WorldRosterEntry[];
+  selectedCharId?: string;
+  onSelectChar?: (id: string) => void;
+}> = ({ view, onViewChange, events, roster, myIds, summary, loading, error, myChars, selectedCharId, onSelectChar }) => {
+  const hasWorldline = (myChars?.length ?? 0) > 0;
+  const options = hasWorldline ? [...L1_OPTIONS, WORLDLINE_OPTION] : L1_OPTIONS;
+  // roomView 持久化且与观战席共享：无我方角色（观战/无角色世界）时回退 stream，避免 Segmented 值越界。
+  const effectiveView: RoomView = view === 'worldline' && !hasWorldline ? 'stream' : view;
+  const currentChar = selectedCharId ?? myChars?.[0]?.cloudCharacterId;
   return (
     <Card
       style={{ borderRadius: 12, border: 'none', boxShadow: '0 1px 3px rgba(0,0,0,0.05)' }}
       styles={{ body: { padding: 20 } }}
       title={
-        <Segmented options={L1_OPTIONS} value={view} onChange={(v) => onViewChange(v as RoomView)} />
+        <Segmented options={options} value={effectiveView} onChange={(v) => onViewChange(v as RoomView)} />
       }
     >
       {error ? (
@@ -720,14 +800,30 @@ export const WorldViewPanel: React.FC<{
         <div style={{ textAlign: 'center', padding: 40 }}>
           <Spin />
         </div>
-      ) : view === 'stream' ? (
+      ) : effectiveView === 'stream' ? (
         <EventStream events={events} />
-      ) : view === 'cards' ? (
+      ) : effectiveView === 'cards' ? (
         <EventCards events={events} />
-      ) : view === 'graph' ? (
+      ) : effectiveView === 'graph' ? (
         <RelationGraph roster={roster} events={events} relations={summary?.relations} myIds={myIds} />
-      ) : view === 'map' ? (
+      ) : effectiveView === 'map' ? (
         <FactionMap roster={roster} events={events} relations={summary?.relations} myIds={myIds} />
+      ) : effectiveView === 'worldline' ? (
+        <Space direction="vertical" size={12} style={{ width: '100%' }}>
+          {(myChars?.length ?? 0) > 1 && (
+            <Select
+              style={{ width: '100%', maxWidth: 320 }}
+              value={currentChar}
+              onChange={onSelectChar}
+              options={(myChars ?? []).map((c) => ({ label: c.name || c.cloudCharacterId, value: c.cloudCharacterId }))}
+              aria-label="选择要查看世界线的角色"
+            />
+          )}
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            只看这个角色的故事线，按发生顺序叙事化排列（仅你可见的私密事件也在其中）。
+          </Text>
+          <CharacterWorldline events={events} characterId={currentChar} roster={roster} />
+        </Space>
       ) : (
         <StatusPanel roster={roster} events={events} characters={summary?.characters} myIds={myIds} />
       )}
@@ -1137,10 +1233,14 @@ const ConsentPanel: React.FC<{ worldId: string }> = ({ worldId }) => {
 const WorldRoom: React.FC = () => {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const characterParam = searchParams.get('character') ?? undefined;
   const roomView = usePlatformStore((s) => s.roomView);
   const setRoomView = usePlatformStore((s) => s.setRoomView);
 
   const localCards = usePartnerStore((s) => s.characterCardsV2);
+  const [selectedCharId, setSelectedCharId] = useState<string | undefined>(characterParam);
+  const deepLinkAppliedRef = useRef(false);
 
   const [world, setWorld] = useState<WorldDetail | null>(null);
   const [worldError, setWorldError] = useState<string | null>(null);
@@ -1181,11 +1281,25 @@ const WorldRoom: React.FC = () => {
 
   const myIds = useMemo(() => new Set(myCloudChars.map((c) => c.id)), [myCloudChars]);
 
-  // 我在本世界的角色 = 我的云端角色 ∩ 当前阵容（干预对象）。
+  // 我在本世界的角色 = 我的云端角色 ∩ 当前阵容（干预对象 + 世界线主角）。
   const myChars = useMemo(
     () => (world ? world.roster.filter((r) => myIds.has(r.cloudCharacterId)) : []),
     [world, myIds],
   );
+
+  // 我方角色就绪后校正世界线选中角色：?character= 深链优先，否则首个；深链时一次性切到「世界线」视图。
+  useEffect(() => {
+    if (myChars.length === 0) return;
+    const ids = myChars.map((c) => c.cloudCharacterId);
+    setSelectedCharId((cur) =>
+      cur && ids.includes(cur) ? cur : characterParam && ids.includes(characterParam) ? characterParam : ids[0],
+    );
+    if (!deepLinkAppliedRef.current && characterParam && ids.includes(characterParam)) {
+      deepLinkAppliedRef.current = true;
+      setRoomView('worldline');
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [myChars, characterParam]);
 
   // 可投放候选 = 已过审、未撤回、且尚未在本世界的我的角色（本地卡名解析友好显示）。
   const joinCandidates = useMemo(() => {
@@ -1244,6 +1358,9 @@ const WorldRoom: React.FC = () => {
             summary={summary}
             loading={eventsLoading}
             error={eventsError}
+            myChars={myChars}
+            selectedCharId={selectedCharId}
+            onSelectChar={setSelectedCharId}
           />
         </div>
         <div style={{ flex: '0 1 340px', minWidth: 280, display: 'flex', flexDirection: 'column', gap: 16 }}>

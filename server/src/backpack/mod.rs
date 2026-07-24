@@ -182,6 +182,51 @@ async fn my_backpack(State(state): State<AppState>, user: AuthUser) -> Result<Js
     Ok(Json(json!({ "items": items })))
 }
 
+// ---------- GET /me/memberships ----------
+
+/// 权威「我的角色 × 世界」清单：直接读 world_members（WHERE user_id=本人 AND status='active'），
+/// 补齐日报反推的盲区（刚投放尚无日报的角色/世界也在场）。无 owner 泄漏——只出本人成员行。
+/// 角色名解析复用 worlds::world_detail 的 `card_json → identity.name`（缺失兜底为 cloud_character_id）。
+async fn my_memberships(State(state): State<AppState>, user: AuthUser) -> Result<Json<Value>, ApiError> {
+    let rows = sqlx::query(
+        "SELECT wm.cloud_character_id AS cid, wm.status AS mstatus, wm.joined_at AS joined_at, \
+         w.id AS world_id, w.title AS title, w.room_type AS room_type, w.status AS wstatus, \
+         w.state_revision AS state_revision, cc.card_json AS card \
+         FROM world_members wm \
+         JOIN worlds w ON w.id = wm.world_id \
+         JOIN cloud_characters cc ON cc.id = wm.cloud_character_id \
+         WHERE wm.user_id = ? AND wm.status = 'active' \
+         ORDER BY wm.joined_at DESC",
+    )
+    .bind(&user.user_id)
+    .fetch_all(&state.db)
+    .await?;
+
+    let mut memberships = Vec::new();
+    for r in &rows {
+        let cid: String = r.try_get("cid")?;
+        let card: String = r.try_get("card")?;
+        // identity.name 缺失时兜底为角色 id（非空，供列表展示），同 world_detail 的解析法。
+        let name = serde_json::from_str::<Value>(&card)
+            .ok()
+            .and_then(|v| v["identity"]["name"].as_str().map(str::to_string))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| cid.clone());
+        memberships.push(json!({
+            "worldId": r.try_get::<String, _>("world_id")?,
+            "worldTitle": r.try_get::<String, _>("title")?,
+            "roomType": r.try_get::<String, _>("room_type")?,
+            "worldStatus": r.try_get::<String, _>("wstatus")?,
+            "stateRevision": r.try_get::<i64, _>("state_revision")?,
+            "cloudCharacterId": cid,
+            "characterName": name,
+            "membershipStatus": r.try_get::<String, _>("mstatus")?,
+            "joinedAt": r.try_get::<i64, _>("joined_at")?,
+        }));
+    }
+    Ok(Json(json!({ "memberships": memberships })))
+}
+
 // ---------- POST /worlds/{id}/carry ----------
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -328,5 +373,105 @@ async fn carry(
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/me/backpack", get(my_backpack))
+        .route("/me/memberships", get(my_memberships))
         .route("/worlds/{id}/carry", post(carry))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::safety::testkit::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    /// 播种一枚云端角色（memberships 端点 JOIN cloud_characters，需其存在以解析名字）。
+    async fn seed_cloud_char(db: &AnyPool, id: &str, owner: &str, card_json: &str) {
+        sqlx::query(
+            "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, \
+             rights_declaration, moderation, withdrawn, created_at) \
+             VALUES (?, ?, 'local', 1, ?, 'original', 'approved', 0, ?)",
+        )
+        .bind(id)
+        .bind(owner)
+        .bind(card_json)
+        .bind(now_ms())
+        .execute(db)
+        .await
+        .expect("seed cloud_character");
+    }
+
+    async fn get_memberships(state: &AppState, bearer: Option<&str>) -> (StatusCode, Value) {
+        let app = crate::app::build_router(state.clone());
+        let mut builder = Request::builder().method("GET").uri("/api/me/memberships");
+        if let Some(tk) = bearer {
+            builder = builder.header("authorization", format!("Bearer {tk}"));
+        }
+        let resp = app.oneshot(builder.body(Body::empty()).unwrap()).await.unwrap();
+        let s = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (s, serde_json::from_slice(&bytes).unwrap_or(json!(null)))
+    }
+
+    #[tokio::test]
+    async fn memberships_lists_active_and_isolates_owner() {
+        let state = test_state().await;
+        seed_user(&state.db, "u1").await;
+        seed_user(&state.db, "u2").await;
+        seed_world(&state.db, "w1", 7, "running").await;
+        seed_world(&state.db, "w2", 0, "running").await;
+        // u1：c1 active in w1（有名字）、c2 已离场 in w2（不应出现）。
+        seed_cloud_char(&state.db, "c1", "u1", &json!({ "identity": { "name": "沈霜" } }).to_string()).await;
+        seed_cloud_char(&state.db, "c2", "u1", &json!({ "identity": { "name": "游侠" } }).to_string()).await;
+        // u2：c3 active in w1（他人角色，绝不能出现在 u1 的清单——owner 隔离）。
+        seed_cloud_char(&state.db, "c3", "u2", &json!({ "identity": { "name": "他人" } }).to_string()).await;
+        seed_member(&state.db, "m1", "w1", "u1", "c1", "active").await;
+        seed_member(&state.db, "m2", "w2", "u1", "c2", "left").await;
+        seed_member(&state.db, "m3", "w1", "u2", "c3", "active").await;
+
+        let (s, v) = get_memberships(&state, Some(&token(&state, "u1"))).await;
+        assert_eq!(s, StatusCode::OK, "body={v}");
+        let ms = v["memberships"].as_array().unwrap();
+        assert_eq!(ms.len(), 1, "仅 active 且属本人：只余 c1（c2 已离场、c3 属他人）");
+        assert_eq!(ms[0]["cloudCharacterId"], "c1");
+        assert_eq!(ms[0]["characterName"], "沈霜");
+        assert_eq!(ms[0]["worldId"], "w1");
+        assert_eq!(ms[0]["worldTitle"], "测试世界");
+        assert_eq!(ms[0]["roomType"], "idle");
+        assert_eq!(ms[0]["worldStatus"], "running");
+        assert_eq!(ms[0]["stateRevision"].as_i64().unwrap(), 7, "stateRevision 供直达世界预填干预 CAS");
+        assert_eq!(ms[0]["membershipStatus"], "active");
+    }
+
+    #[tokio::test]
+    async fn memberships_name_falls_back_to_char_id() {
+        let state = test_state().await;
+        seed_user(&state.db, "u1").await;
+        seed_world(&state.db, "w1", 0, "running").await;
+        // card_json 无 identity.name → 名字兜底为 cloud_character_id（非空，供列表展示）。
+        seed_cloud_char(&state.db, "cNoName", "u1", "{}").await;
+        seed_member(&state.db, "m1", "w1", "u1", "cNoName", "active").await;
+        let (s, v) = get_memberships(&state, Some(&token(&state, "u1"))).await;
+        assert_eq!(s, StatusCode::OK);
+        let ms = v["memberships"].as_array().unwrap();
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0]["characterName"], "cNoName", "identity.name 缺失兜底为角色 id");
+    }
+
+    #[tokio::test]
+    async fn memberships_empty_when_none() {
+        let state = test_state().await;
+        seed_user(&state.db, "u1").await;
+        let (s, v) = get_memberships(&state, Some(&token(&state, "u1"))).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(v["memberships"].as_array().unwrap().is_empty(), "无成员关系 → 空清单，不报错");
+    }
+
+    #[tokio::test]
+    async fn memberships_requires_auth() {
+        let state = test_state().await;
+        let (s, _) = get_memberships(&state, None).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "AuthUser 守卫：缺凭证应 401");
+    }
 }

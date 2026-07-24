@@ -20,12 +20,17 @@ import PlatformHall from './pages/platform/PlatformHall';
 import CharacterPublish from './pages/platform/CharacterPublish';
 import WorldPublish from './pages/platform/WorldPublish';
 import MyWorlds from './pages/platform/MyWorlds';
+import MyCharacters from './pages/platform/MyCharacters';
+import CharacterArchive from './pages/platform/CharacterArchive';
+import Backpack from './pages/platform/Backpack';
+import Bonds from './pages/platform/Bonds';
 import WorldRoom from './pages/platform/WorldRoom';
 import WorldSpectate from './pages/platform/WorldSpectate';
 import DailyReport from './pages/platform/DailyReport';
 import Wallet from './pages/platform/Wallet';
 import ArenaHost from './pages/platform/ArenaHost';
 import ArenaSpectate from './pages/platform/ArenaSpectate';
+import ArenaReplay from './pages/platform/ArenaReplay';
 
 // Mobile components
 import MobileShell from './components/MobileShell';
@@ -109,6 +114,11 @@ function App() {
               <Route path="publish" element={<RequireAuth><CharacterPublish /></RequireAuth>} />
               <Route path="worlds/publish" element={<RequireAuth><WorldPublish /></RequireAuth>} />
               <Route path="my" element={<RequireAuth><MyWorlds /></RequireAuth>} />
+              {/* 留存核心：以角色为轴（我的角色 / 一生档案）+ 跨世界背包 / 羁绊 */}
+              <Route path="characters" element={<RequireAuth><MyCharacters /></RequireAuth>} />
+              <Route path="characters/:cid" element={<RequireAuth><CharacterArchive /></RequireAuth>} />
+              <Route path="backpack" element={<RequireAuth><Backpack /></RequireAuth>} />
+              <Route path="bonds" element={<RequireAuth><Bonds /></RequireAuth>} />
               <Route path="worlds/:id" element={<RequireAuth><WorldRoom /></RequireAuth>} />
               <Route path="worlds/:id/spectate" element={<RequireAuth><WorldSpectate /></RequireAuth>} />
               <Route path="reports" element={<RequireAuth><DailyReport /></RequireAuth>} />
@@ -117,6 +127,7 @@ function App() {
               <Route path="wallet" element={<RequireAuth><Wallet /></RequireAuth>} />
               <Route path="arena/:worldId/host" element={<RequireAuth><ArenaHost /></RequireAuth>} />
               <Route path="arena/:worldId/spectate" element={<RequireAuth><ArenaSpectate /></RequireAuth>} />
+              <Route path="arena/:worldId/replay" element={<RequireAuth><ArenaReplay /></RequireAuth>} />
             </Route>
           </>
         )}

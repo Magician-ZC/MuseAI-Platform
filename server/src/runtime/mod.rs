@@ -210,16 +210,20 @@ async fn schedule_due_ticks(state: &AppState) -> Result<(), ApiError> {
     .execute(&state.db)
     .await?;
 
-    let worlds = sqlx::query("SELECT id, tick_per_day, timeline_mode FROM worlds WHERE status = 'running'")
-        .fetch_all(&state.db)
-        .await?;
+    let worlds =
+        sqlx::query("SELECT id, tick_per_day, timeline_mode, room_type FROM worlds WHERE status = 'running'")
+            .fetch_all(&state.db)
+            .await?;
     for w in &worlds {
         let world_id: String = w.try_get("id")?;
         let tick_per_day: i64 = w.try_get("tick_per_day")?;
         let timeline_mode: String = w.try_get("timeline_mode")?;
+        // P2 Stage3：调度节奏由 room_type 驱动（与引擎 dispatch 的 timeline_mode 解耦）。
+        let room_type: String = w.try_get("room_type")?;
 
-        // event 模式（放置房 DES，第二块 Phase 2）：**去掉墙钟 interval 依赖**，改「背靠背立即推进」——
-        // 只要世界 running 且无 outstanding（pending/running）tick（即上一 tick 已 done/无 tick），就立即排新 tick。
+        // event 模式（DES，第二块 Phase 2 + P2 Stage3 全房型）：**去掉墙钟 interval 依赖**。调度节奏按 room_type：
+        // idle 放置房「背靠背立即推进」——只要 running 且无 outstanding（pending/running）tick 就立即排新 tick；
+        // chapter/arena event 房**不自动排新 tick**（手动端点驱动，见下方 room_type 分支）。
         // 游戏时间由引擎在 run_event_step 内按最小 next_time 自算推进，不依赖墙钟到点。
         // 补偿 re-enqueue 改用绝对阈值 RECLAIM_PENDING_MIN_MS（无 interval 可依）。
         // 说明：P1 Phase 0 起，终局（主线走完 / 世界时间上限）由 commit_tick/终局短路置 status='ended' 停机；
@@ -244,16 +248,24 @@ async fn schedule_due_ticks(state: &AppState) -> Result<(), ApiError> {
                 )
                 .await;
             }
-            // 无 outstanding（pending/running）tick → 上一 tick done（或无 tick）→ 背靠背立即排下一 tick。
-            let outstanding: i64 = sqlx::query(
-                "SELECT COUNT(*) AS c FROM world_ticks WHERE world_id = ? AND status IN ('pending','running')",
-            )
-            .bind(&world_id)
-            .fetch_one(&state.db)
-            .await?
-            .try_get("c")?;
-            if outstanding == 0 {
-                let _ = schedule_tick(state, &world_id).await?;
+            // ★P2 Stage3：背靠背自治仅 idle 放置房。event 现过载了两个正交语义——(a) 引擎 dispatch
+            // （run_event_step 的地点碰撞 + 游戏时钟，由 timeline_mode 驱动，房型无关）与 (b) 调度节奏
+            // （背靠背自治，由 room_type 驱动）。解耦二者：
+            //   - idle：自治放置房，无 outstanding（上一 tick done 或无 tick）→ 立即排下一 tick，引擎自算时钟推进。
+            //   - chapter/arena：event 房只走引擎 DES 碰撞，但**不自动排新 tick**——新 tick 全部来自手动端点
+            //     （arena host_tick、chapter start / advance），保 arena「节目节奏优先于定时器」与 chapter「会话驱动」。
+            //     上方 straggler 补偿 re-enqueue 仍保留（房型无关），只是不新增 tick。
+            if room_type == "idle" {
+                let outstanding: i64 = sqlx::query(
+                    "SELECT COUNT(*) AS c FROM world_ticks WHERE world_id = ? AND status IN ('pending','running')",
+                )
+                .bind(&world_id)
+                .fetch_one(&state.db)
+                .await?
+                .try_get("c")?;
+                if outstanding == 0 {
+                    let _ = schedule_tick(state, &world_id).await?;
+                }
             }
             continue;
         }
@@ -1181,7 +1193,13 @@ async fn process_tick_inner(
     //   置于 running/superseded/budget/model 各门之后：不为将被 skip 的世界白装配；且必须在下方
     //   active_cards.len() < 2 门之前——NPC 来自装配的 worldCharacterEntries，装配前注入不了 NPC，否则单人 idle
     //   + NPC 模板会永远卡在 insufficient_members（本缺口的死锁）。
-    let world = if world.room_type == "idle" && world.assembled_json.is_none() {
+    //   P2 Stage3 扩容：装配兜底也覆盖 **event 房**（room_type=="idle" || timeline_mode=="event"），使
+    //   event×arena 房在首个 host/tick 排下的 tick 里一次性装配（产 locationGraph/worldCharacterEntries——
+    //   select_cohort 地点碰撞的前提，否则退化为单一全局 cohort）。chapter 已在 start 装配 → 命中
+    //   assembled_json.is_some() 短路，逐字节不变；interval 世界 timeline_mode!="event" 且非 idle → 不触发，零影响。
+    let world = if world.assembled_json.is_none()
+        && (world.room_type == "idle" || world.timeline_mode == "event")
+    {
         crate::assembly::assemble_instance(state, world_id).await?;
         // 重载：使下方 6b 的 worldCharacterEntries/locationGraph 注入、seed_narrative_layer 的
         // fatedNodes/selectedMainline 种入、select_ending 的 enabledEndings 读取均命中新装配。

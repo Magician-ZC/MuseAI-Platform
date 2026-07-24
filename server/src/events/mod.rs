@@ -266,6 +266,84 @@ pub async fn persist_events(
     Ok(out)
 }
 
+/// 落一行 **public** world_event 并广播（供 arena 等系统频道复用）。
+///
+/// 双硬隔离天然满足：`visibility='public'` + `audience_json=NULL` + 无私有投影 → 推送层 `ws_visible`
+/// 与查询层 `row_to_event` 对 public 一律放行，任何观战者可见、且不携带任一 principal 的私密投影。
+/// `extra` 合并进 public 投影（如 arenaKind/characterId/sku/aggregatedCount，纯展示层）。
+/// 单事务分配 per-world 单调 sequence（复用 `insert_events_tx` 的 `MAX(sequence)+1` 口径）。
+#[allow(dead_code)]
+pub async fn persist_and_broadcast_public_event(
+    state: &AppState,
+    world_id: &str,
+    tick_no: i64,
+    event_type: &str,
+    summary: &str,
+    actors: &[String],
+    extra: Value,
+) -> Result<StoredEvent, ApiError> {
+    let mut tx = state.db.begin().await?;
+    let base: i64 = sqlx::query("SELECT COALESCE(MAX(sequence), -1) AS m FROM world_events WHERE world_id = ?")
+        .bind(world_id)
+        .fetch_one(&mut *tx)
+        .await?
+        .try_get("m")?;
+    let sequence = base + 1;
+    let id = new_id("we");
+    let domain_event_id = new_id("sys"); // 合成来源标识（非引擎 DomainEvent）
+    let now = now_ms();
+
+    // public 投影 = { summary } 合并 extra（仅展示字段；不含任何私密）。
+    let mut proj = json!({ "summary": summary });
+    if let (Some(obj), Some(extra_obj)) = (proj.as_object_mut(), extra.as_object()) {
+        for (k, v) in extra_obj {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
+    let actors_json = serde_json::to_string(actors).unwrap_or_else(|_| "[]".into());
+
+    sqlx::query(
+        "INSERT INTO world_events (id, world_id, tick_no, sequence, domain_event_id, event_type, \
+         actors_json, visibility, audience_json, public_projection_json, private_projections_json, \
+         arbiter_note, moderation, ai_label, occurred_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'public', NULL, ?, NULL, NULL, 'approved', 1, ?)",
+    )
+    .bind(&id)
+    .bind(world_id)
+    .bind(tick_no)
+    .bind(sequence)
+    .bind(&domain_event_id)
+    .bind(event_type)
+    .bind(&actors_json)
+    .bind(proj.to_string())
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    let payload = json!({
+        "id": id,
+        "worldId": world_id,
+        "tick": tick_no,
+        "sequence": sequence,
+        "domainEventId": domain_event_id,
+        "type": event_type,
+        "actors": actors,
+        "visibility": "public",
+        "projection": proj,
+        "aiLabel": { "visible": true },
+        "occurredAt": now,
+    });
+    let stored = StoredEvent { audience_user_ids: None, payload_json: payload.to_string() };
+    // 提交后广播（推送层对 public 广播给全部连接；audience=None）。
+    state.ws_hub.publish(WsMessage {
+        world_id: world_id.to_string(),
+        audience_user_ids: None,
+        payload_json: stored.payload_json.clone(),
+    });
+    Ok(stored)
+}
+
 // ---------- 访问资格 ----------
 
 /// 成员/观战资格：world public/official → 允许观战；private → 必须是成员或房主。

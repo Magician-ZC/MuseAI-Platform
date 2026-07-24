@@ -2,8 +2,8 @@
 // GET /arena/{id}/report —— 事件时间轴 + 判定依据 ruleRefs（对抗「是不是剧本」质疑）+ 礼物/环境日志。
 // echarts 阵容/淘汰图；胜者奖励荣誉性展示；观众买过程不买结果。
 // Local-first：仅平台路由；云端故障显示错误卡不崩；角色名 best-effort（取不到回退角色 ID）。
-import React, { useEffect, useMemo, useState } from 'react';
-import { Typography, Card, Tag, Space, Alert, Spin, Empty, Button, Timeline, Divider } from 'antd';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { Typography, Card, Tag, Space, Alert, Spin, Empty, Button, Timeline, Divider, message } from 'antd';
 import {
   TrophyOutlined,
   SafetyCertificateOutlined,
@@ -12,17 +12,22 @@ import {
   EyeOutlined,
   LeftOutlined,
   ReloadOutlined,
+  PlayCircleOutlined,
+  ThunderboltOutlined,
 } from '@ant-design/icons';
 import { useParams, useNavigate } from 'react-router-dom';
 import ReactECharts from 'echarts-for-react';
-import { cloudFetch } from '../../utils/cloudApi';
+import { cloudFetch, cloudStream } from '../../utils/cloudApi';
 import {
   describeCloudError,
   arenaPhaseMeta,
+  arenaEventKindMeta,
   eventTypeMeta,
   type WorldDetail,
   type ArenaReport,
   type ArenaEnvEvent,
+  type ArenaReplayEvent,
+  type ArenaGiftResult,
 } from '../../stores/usePlatformStore';
 
 const { Title, Text, Paragraph } = Typography;
@@ -56,6 +61,95 @@ const EnvEventRow: React.FC<{ env: ArenaEnvEvent }> = ({ env }) => {
   );
 };
 
+/** 站内打赏快捷 SKU（映射见 server 0008 gift_sku_map；均为「买过程」的环境/道具增益，无免死/最终判定）。 */
+const GIFT_SKUS: Array<{ sku: string; label: string; icon: React.ReactNode }> = [
+  { sku: 'rose', label: '玫瑰·助战', icon: <GiftOutlined /> },
+  { sku: 'rocket', label: '火箭·重掷', icon: <ThunderboltOutlined /> },
+  { sku: 'crown', label: '皇冠·情报', icon: <TrophyOutlined /> },
+  { sku: 'shield', label: '护盾·掩体', icon: <SafetyCertificateOutlined /> },
+];
+
+/** 打赏入口：SKU 快捷键 → POST /arena/{id}/gift（幂等）。买过程不买结果——经系统频道注入场内环境。 */
+const GiftBar: React.FC<{ worldId: string; onGifted: () => void }> = ({ worldId, onGifted }) => {
+  const [busy, setBusy] = useState<string | null>(null);
+
+  const send = async (sku: string, label: string) => {
+    setBusy(sku);
+    try {
+      const res = await cloudFetch<ArenaGiftResult>(`/api/arena/${worldId}/gift`, {
+        method: 'POST',
+        idempotent: true,
+        body: { sku, count: 1 },
+      });
+      if (res.mapped) {
+        message.success(`已打赏「${label}」，注入场内环境（系统代投）`);
+      } else {
+        message.info(`「${label}」已记账；该 SKU 暂无对应场内增益`);
+      }
+      onGifted();
+    } catch (e) {
+      message.error(describeCloudError(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <Card
+      title="打赏入口"
+      size="small"
+      style={{ borderRadius: 12, border: 'none', boxShadow: '0 1px 3px rgba(0,0,0,0.05)' }}
+      styles={{ body: { padding: 12 } }}
+    >
+      <Space size={8} wrap>
+        {GIFT_SKUS.map((g) => (
+          <Button
+            key={g.sku}
+            icon={g.icon}
+            loading={busy === g.sku}
+            disabled={busy !== null && busy !== g.sku}
+            onClick={() => void send(g.sku, g.label)}
+          >
+            {g.label}
+          </Button>
+        ))}
+      </Space>
+      <Divider style={{ margin: '10px 0' }} />
+      <Text type="secondary" style={{ fontSize: 12 }}>
+        观众买的是过程（环境/道具增益），不买结果——无免死、最终判定不可购买；礼物经系统频道代投，不走玩家道具干预。
+      </Text>
+    </Card>
+  );
+};
+
+/** 实时动态条：把流里的赛制系统事件（淘汰/胜者/打赏）按到达顺序倒序展示。 */
+const LiveTicker: React.FC<{ events: ArenaReplayEvent[]; nameOf: (id: string) => string }> = ({ events, nameOf }) => {
+  if (events.length === 0) {
+    return <Empty description="等待实时赛况…" image={Empty.PRESENTED_IMAGE_SIMPLE} />;
+  }
+  return (
+    <Space direction="vertical" size={8} style={{ width: '100%' }}>
+      {events
+        .slice()
+        .reverse()
+        .slice(0, 20)
+        .map((ev) => {
+          const meta = arenaEventKindMeta(ev.type);
+          const who = ev.characterId ? nameOf(ev.characterId) : '';
+          return (
+            <Space key={`${ev.sequence}-${ev.id}`} size={6} wrap>
+              <Tag color={meta.color}>{meta.label}</Tag>
+              {who && <Text style={{ color: '#33312e' }}>{who}</Text>}
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                {ev.summary}
+              </Text>
+            </Space>
+          );
+        })}
+    </Space>
+  );
+};
+
 const ArenaSpectate: React.FC = () => {
   const { worldId } = useParams<{ worldId: string }>();
   const navigate = useNavigate();
@@ -64,6 +158,8 @@ const ArenaSpectate: React.FC = () => {
   const [world, setWorld] = useState<WorldDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  // 实时赛制事件（arena_elim/winner/gift）：由 cloudStream 合并，去重按 sequence。
+  const [liveEvents, setLiveEvents] = useState<ArenaReplayEvent[]>([]);
 
   const loadReport = async () => {
     if (!worldId) return;
@@ -101,6 +197,44 @@ const ArenaSpectate: React.FC = () => {
     for (const r of world?.roster ?? []) m.set(r.cloudCharacterId, r.name || r.cloudCharacterId);
     return (id: string) => m.get(id) || id;
   }, [world]);
+
+  // 让流处理闭包始终读到最新 nameOf（world 异步加载后才有名字映射）。
+  const nameOfRef = useRef(nameOf);
+  nameOfRef.current = nameOf;
+
+  // 实时观战：订阅世界流，只合并赛制系统事件（arena_*）。淘汰/胜者弹 toast；打赏/胜者补拉权威快照。
+  useEffect(() => {
+    if (!worldId) return;
+    let unsub: (() => void) | null = null;
+    try {
+      unsub = cloudStream(
+        worldId,
+        (raw) => {
+          const ev = raw as ArenaReplayEvent;
+          if (!ev || typeof ev.sequence !== 'number') return;
+          if (ev.type !== 'arena_elim' && ev.type !== 'arena_winner' && ev.type !== 'arena_gift') return;
+          setLiveEvents((prev) => {
+            if (prev.some((e) => e.sequence === ev.sequence)) return prev; // 按 sequence 去重
+            return [...prev, ev].sort((a, b) => a.sequence - b.sequence);
+          });
+          const who = ev.characterId ? nameOfRef.current(ev.characterId) : '';
+          if (ev.type === 'arena_elim') message.warning(`${who || '有角色'} 被淘汰`);
+          if (ev.type === 'arena_winner') message.success(`唯一胜者：${who || '已产生'}`);
+          // 打赏/胜者落定后补拉权威快照（环境日志 / eliminations / winner）。
+          if (ev.type === 'arena_gift' || ev.type === 'arena_winner') void loadReport();
+        },
+        () => {
+          // 实时流异常不致命：保留已加载战报，等待 cloudStream 自动重连补偿。
+        },
+      );
+    } catch {
+      // WebSocket 不可用（离线等）：降级为手动刷新，页面不崩。
+    }
+    return () => {
+      if (unsub) unsub();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [worldId]);
 
   const eliminations = report?.match.eliminations ?? [];
   const rosterCount = world?.roster.length ?? 0;
@@ -206,9 +340,21 @@ const ArenaSpectate: React.FC = () => {
                 仲裁公开
               </Tag>
             )}
-            <Button size="small" type="text" icon={<ReloadOutlined />} onClick={() => void loadReport()}>
-              刷新
-            </Button>
+            <Space size={4}>
+              <Button size="small" type="text" icon={<ReloadOutlined />} onClick={() => void loadReport()}>
+                刷新
+              </Button>
+              {phase === 'concluded' && (
+                <Button
+                  size="small"
+                  type="text"
+                  icon={<PlayCircleOutlined />}
+                  onClick={() => navigate(`/platform/arena/${worldId}/replay`)}
+                >
+                  回放
+                </Button>
+              )}
+            </Space>
           </Space>
         </Space>
       </Card>
@@ -312,8 +458,26 @@ const ArenaSpectate: React.FC = () => {
           </Card>
         </div>
 
-        {/* 侧栏：阵容/淘汰图 + 礼物/环境日志 */}
+        {/* 侧栏：实时动态 + 打赏入口 + 阵容/淘汰图 + 礼物/环境日志 */}
         <div style={{ flex: '0 1 320px', minWidth: 280, display: 'flex', flexDirection: 'column', gap: 16 }}>
+          <Card
+            title={
+              <Space size={6}>
+                <span>实时动态</span>
+                <Tag color="processing" style={{ marginInlineEnd: 0 }}>
+                  LIVE
+                </Tag>
+              </Space>
+            }
+            size="small"
+            style={{ borderRadius: 12, border: 'none', boxShadow: '0 1px 3px rgba(0,0,0,0.05)' }}
+            styles={{ body: { padding: 12 } }}
+          >
+            <LiveTicker events={liveEvents} nameOf={nameOf} />
+          </Card>
+
+          {worldId && <GiftBar worldId={worldId} onGifted={() => void loadReport()} />}
+
           <Card
             title="阵容 / 淘汰"
             size="small"

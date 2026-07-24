@@ -12,6 +12,9 @@ import {
   UserOutlined,
   LogoutOutlined,
   RollbackOutlined,
+  TeamOutlined,
+  ShoppingOutlined,
+  HeartOutlined,
 } from '@ant-design/icons';
 import { Outlet, useNavigate, useLocation, Navigate } from 'react-router-dom';
 import { warmMinimalistTheme } from '../../theme';
@@ -26,6 +29,9 @@ const NAV_ITEMS = [
   { key: '/platform/publish', icon: <CloudUploadOutlined />, label: '发布角色' },
   { key: '/platform/worlds/publish', icon: <GlobalOutlined />, label: '发布世界' },
   { key: '/platform/my', icon: <AppstoreOutlined />, label: '我的世界' },
+  { key: '/platform/characters', icon: <TeamOutlined />, label: '我的角色' },
+  { key: '/platform/backpack', icon: <ShoppingOutlined />, label: '背包' },
+  { key: '/platform/bonds', icon: <HeartOutlined />, label: '羁绊' },
   { key: '/platform/reports', icon: <ReadOutlined />, label: '日报' },
   { key: '/platform/wallet', icon: <WalletOutlined />, label: '钱包' },
 ];

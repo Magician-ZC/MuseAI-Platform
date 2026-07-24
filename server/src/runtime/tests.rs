@@ -1771,3 +1771,133 @@ async fn resolve_model_routes_reads_max_output_tokens_from_config() {
         super::resolve_model_routes(&state.db, "v-zero").await.unwrap().expect("应解析出路由");
     assert_eq!(max_zero, super::DEFAULT_MAX_OUTPUT_TOKENS, "maxOutputTokens=0 应回退默认");
 }
+
+// ---------- P2 Stage3：异步时间线全房型（调度节奏 room_type 解耦 + event 地点碰撞） ----------
+
+/// 调度节奏解耦（本 Stage 核心）：event 房的「背靠背自动排 tick」**仅 idle 放置房**生效；
+/// chapter/arena 的 event 房**不被调度器自动推进**——新 tick 只来自手动端点（arena host_tick /
+/// chapter start），保 arena「节目节奏优先于定时器」与 chapter「会话驱动」语义。
+#[tokio::test]
+async fn event_non_idle_manual_only_idle_back_to_back() {
+    let state = test_state().await;
+    seed_template_soft(&state.db, "tpl-mr").await;
+    // 三个 event 房，房型各异（room_type 由 helper 显式落 p.room_type）。
+    let idle = running_world_for_endgame(&state, "mri", "tpl-mr", "event", "idle").await;
+    let chap = running_world_for_endgame(&state, "mrc", "tpl-mr", "event", "chapter").await;
+    let arena = running_world_for_endgame(&state, "mra", "tpl-mr", "event", "arena").await;
+
+    // 首轮调度：idle 无 outstanding → 背靠背排出 tick 0；chapter/arena 不自动排（房型闸）。
+    super::schedule_due_ticks(&state).await.unwrap();
+    assert_eq!(
+        i64_one(&state.db, "SELECT COUNT(*) FROM world_ticks WHERE world_id=?", &idle).await,
+        1,
+        "event×idle 应背靠背自动排出首 tick"
+    );
+    assert_eq!(
+        i64_one(&state.db, "SELECT COUNT(*) FROM world_ticks WHERE world_id=?", &chap).await,
+        0,
+        "event×chapter 不应被调度器自动排 tick（手动端点驱动）"
+    );
+    assert_eq!(
+        i64_one(&state.db, "SELECT COUNT(*) FROM world_ticks WHERE world_id=?", &arena).await,
+        0,
+        "event×arena 不应被调度器自动排 tick（手动端点驱动）"
+    );
+
+    // 手动端点排 tick（镜像 chapter start / arena host_tick 内的 schedule_tick）→ 各恰一个 tick。
+    assert_eq!(super::schedule_tick(&state, &chap).await.unwrap(), Some(0), "手动端点排下 chapter 首 tick");
+    assert_eq!(super::schedule_tick(&state, &arena).await.unwrap(), Some(0), "手动端点排下 arena 首 tick");
+    assert_eq!(
+        i64_one(&state.db, "SELECT COUNT(*) FROM world_ticks WHERE world_id=?", &chap).await,
+        1
+    );
+    assert_eq!(
+        i64_one(&state.db, "SELECT COUNT(*) FROM world_ticks WHERE world_id=?", &arena).await,
+        1
+    );
+
+    // 再轮调度：chapter/arena 仍不追加自动 tick（保持手动排的 1 个）；idle 首 tick 仍 pending → 不背靠背再排。
+    super::schedule_due_ticks(&state).await.unwrap();
+    assert_eq!(
+        i64_one(&state.db, "SELECT COUNT(*) FROM world_ticks WHERE world_id=?", &chap).await,
+        1,
+        "调度器不应给 event×chapter 追加自动 tick"
+    );
+    assert_eq!(
+        i64_one(&state.db, "SELECT COUNT(*) FROM world_ticks WHERE world_id=?", &arena).await,
+        1,
+        "调度器不应给 event×arena 追加自动 tick"
+    );
+    assert_eq!(
+        i64_one(&state.db, "SELECT COUNT(*) FROM world_ticks WHERE world_id=?", &idle).await,
+        1,
+        "idle 首 tick 未 done（pending），本轮 outstanding≠0 → 不背靠背再排"
+    );
+}
+
+/// 钉 2 地点图 + 2 NPC 落在 north；玩家默认起点 = 首个非秘境地点（id 序 hall<north → hall）。
+async fn pin_two_locations_with_npcs(db: &AnyPool, world_id: &str) {
+    let n1: serde_json::Value = serde_json::from_str(&sample_card_json("npcN1", "北境甲")).unwrap();
+    let n2: serde_json::Value = serde_json::from_str(&sample_card_json("npcN2", "北境乙")).unwrap();
+    let assembled = json!({
+        "assembly": {
+            "worldCharacterEntries": [
+                { "characterId": "npcN1", "card": n1, "location": "north", "carriedItems": [] },
+                { "characterId": "npcN2", "card": n2, "location": "north", "carriedItems": [] }
+            ],
+            "locationGraph": [
+                { "id": "hall", "name": "前厅", "connections": ["north"] },
+                { "id": "north", "name": "北境", "connections": ["hall"] }
+            ]
+        }
+    });
+    sqlx::query("UPDATE worlds SET assembled_json=? WHERE id=?")
+        .bind(assembled.to_string())
+        .bind(world_id)
+        .execute(db)
+        .await
+        .unwrap();
+}
+
+/// event×arena 地点碰撞：同一 event 步的 cohort 恒同一 location（逐地点串行），跨步各自独立 revision。
+/// 首步锚地点 = 字典序最小空闲角色 location = hall（ccolA<npcN1）→ cohort 仅 hall 玩家；NPC 留待次步在 north 成组。
+#[tokio::test]
+async fn event_arena_collision_by_location() {
+    let state = test_state().await;
+    seed_template_soft(&state.db, "tpl-col").await;
+    let wid = running_world_for_endgame(&state, "col", "tpl-col", "event", "arena").await;
+    pin_two_locations_with_npcs(&state.db, &wid).await;
+
+    let model: Arc<dyn ModelClient> = Arc::new(MockModel { input_tokens: 10, output_tokens: 20 });
+
+    // event 步 0：min next_time=0（全体首步入场），锚 = hall → cohort 仅 hall 的两玩家（NPC 未激活）。
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 0, model.clone()).await.unwrap(), TickStatus::Done);
+    let w0 = load_world(&state.db, &wid).await.unwrap();
+    let rev0 = w0.state_revision;
+    let st0: NarrativeState = serde_json::from_str(&w0.narrative_state_json).unwrap();
+    let mut act0: Vec<String> = st0.timeline.next_time.keys().cloned().collect();
+    act0.sort();
+    assert_eq!(
+        act0,
+        vec!["ccolA".to_string(), "ccolB".to_string()],
+        "首步 cohort 仅 hall 的两玩家推进 next_time；north 的 NPC 未在同步激活"
+    );
+    for c in &act0 {
+        assert_eq!(st0.characters[c].location, "hall", "首步 cohort 恒同一 location=hall");
+    }
+
+    // event 步 1：min next_time=0（NPC 缺席 next_time→now=0），锚 = north → cohort 仅 north 的 2 NPC。
+    insert_tick(&state.db, &wid, 1, rev0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 1, model.clone()).await.unwrap(), TickStatus::Done);
+    let w1 = load_world(&state.db, &wid).await.unwrap();
+    let rev1 = w1.state_revision;
+    let st1: NarrativeState = serde_json::from_str(&w1.narrative_state_json).unwrap();
+    assert!(
+        st1.timeline.next_time.contains_key("npcN1") && st1.timeline.next_time.contains_key("npcN2"),
+        "第二步激活 north 的 2 NPC（新入 next_time）"
+    );
+    assert_eq!(st1.characters["npcN1"].location, "north", "第二步 cohort 恒同一 location=north");
+    assert_eq!(st1.characters["npcN2"].location, "north");
+    assert!(rev1 > rev0, "逐地点串行 → 两步各自独立 revision（rev1 > rev0）");
+}

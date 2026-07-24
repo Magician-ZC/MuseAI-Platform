@@ -112,6 +112,66 @@ describe('usePlatformStore — 我的世界 / 日报聚合', () => {
   });
 });
 
+describe('usePlatformStore — memberships（我的角色 × 世界）', () => {
+  it('loadMemberships 成功：写入列表、回灌 worldTitles、返回数组', async () => {
+    fetchMock.mockResolvedValueOnce({
+      memberships: [
+        {
+          worldId: 'w1',
+          worldTitle: '云州世界',
+          roomType: 'idle',
+          worldStatus: 'running',
+          stateRevision: 7,
+          cloudCharacterId: 'cc1',
+          characterName: '沈霜',
+          membershipStatus: 'active',
+          joinedAt: 100,
+        },
+      ],
+    });
+    const ret = await usePlatformStore.getState().loadMemberships();
+    const s = usePlatformStore.getState();
+    expect(s.memberships).toHaveLength(1);
+    expect(s.memberships[0].characterName).toBe('沈霜');
+    expect(s.membershipsError).toBeNull();
+    // worldTitle 顺带回灌 worldTitles 缓存（免各页再请求 /worlds/{id}）
+    expect(s.worldTitles.w1).toBe('云州世界');
+    // 返回值供页面链式聚合（羁绊 / 档案）
+    expect(ret).toHaveLength(1);
+    expect(ret[0].worldId).toBe('w1');
+  });
+
+  it('loadMemberships 失败：优雅降级为 membershipsError，返回空数组', async () => {
+    fetchMock.mockRejectedValueOnce(new TypeError('offline'));
+    const ret = await usePlatformStore.getState().loadMemberships();
+    const s = usePlatformStore.getState();
+    expect(s.membershipsLoading).toBe(false);
+    expect(s.membershipsError).toContain('连接平台失败');
+    expect(ret).toEqual([]);
+  });
+
+  it('loadBackpack 成功 / 失败：写入 backpack 或 backpackError', async () => {
+    fetchMock.mockResolvedValueOnce({
+      items: [
+        {
+          backpackId: 'bp1',
+          status: 'carried',
+          acquiredWorldId: 'w0',
+          carriedWorldId: 'w1',
+          item: { id: 'itm', narrative: '一枚铜钥', effectTags: ['unlock'], origin: { worldTemplateId: 't', cosmology: ['xuanhuan'], powerTier: 2 } },
+        },
+      ],
+    });
+    await usePlatformStore.getState().loadBackpack();
+    expect(usePlatformStore.getState().backpack).toHaveLength(1);
+    expect(usePlatformStore.getState().backpack[0].status).toBe('carried');
+
+    fetchMock.mockRejectedValueOnce(new CloudError('unauthorized', 'x', 401));
+    await usePlatformStore.getState().loadBackpack();
+    expect(usePlatformStore.getState().backpackError).toContain('重新登录');
+  });
+});
+
 describe('describeCloudError — 稳定错误码 → 友好中文', () => {
   it('鉴权失效', () => {
     expect(describeCloudError(new CloudError('unauthorized', 'x', 401))).toContain('重新登录');

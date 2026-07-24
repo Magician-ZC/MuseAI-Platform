@@ -16,6 +16,8 @@ mod events;
 mod idempotency;
 mod interventions;
 mod notifications;
+// 波次 2：历练值 + 卡位制（成长值只作准入与解锁，绝不进引擎决策）。
+mod progression;
 mod providers;
 mod queue;
 mod reports;

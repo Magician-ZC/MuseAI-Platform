@@ -253,11 +253,16 @@ async fn join_enforces_server_authority() {
     assert_eq!(st2, StatusCode::OK);
     assert_eq!(body2["membershipId"].as_str().unwrap(), mid);
 
-    // 人数上限（member_limit=1，已满）。
-    seed_char(&state, "chA2", "usrA", "approved", 0).await;
-    let (st_full, _) =
-        post_json(&app, &uri, &ta, None, json!({ "cloudCharacterId": "chA2" })).await;
+    // 人数上限（member_limit=1，已满）：另一 user 的首卡也进不来 → world_full。
+    // （同 user 第二张卡在到达人数守卫前就被防自刷规则拦截，见下方专项测试。）
+    let tb = token(&state, "usrB");
+    let (st_full, body_full) =
+        post_json(&app, &uri, &tb, None, json!({ "cloudCharacterId": "chB" })).await;
     assert_eq!(st_full, StatusCode::CONFLICT, "满员应 409");
+    assert!(
+        body_full["error"]["message"].as_str().unwrap_or("").contains("world_full"),
+        "满员应命中 world_full 而非其他冲突: {body_full}"
+    );
 
     // 非本人角色 → 403。
     let (st_forbidden, _) =
@@ -323,6 +328,274 @@ async fn leave_marks_member_left() {
         .try_get("status")
         .unwrap();
     assert_eq!(status, "left");
+}
+
+// ---------- 防自刷：同一世界每位用户仅可投放一张角色卡 ----------
+
+/// 同 user 第二张卡 join 同世界 → 409 固定文案；不同 user 一人一卡互不影响。
+#[tokio::test]
+async fn join_rejects_second_active_card_from_same_user() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    seed_user(&state, "usrA").await;
+    seed_user(&state, "usrB").await;
+    seed_char(&state, "chA1", "usrA", "approved", 0).await;
+    seed_char(&state, "chA2", "usrA", "approved", 0).await;
+    seed_char(&state, "chB", "usrB", "approved", 0).await;
+    let wid = create_world(&state.db, CreateWorldParams::official("tpl", 1, "世界")).await.unwrap();
+    let uri = format!("/api/worlds/{wid}/join");
+    let ta = token(&state, "usrA");
+    let tb = token(&state, "usrB");
+
+    let (st, body) = post_json(&app, &uri, &ta, None, json!({ "cloudCharacterId": "chA1" })).await;
+    assert_eq!(st, StatusCode::OK, "首卡应成功: {body}");
+
+    // 第二张卡（防自刷抢隐藏任务钩子）→ 409 + 固定中文文案。
+    let (st2, body2) = post_json(&app, &uri, &ta, None, json!({ "cloudCharacterId": "chA2" })).await;
+    assert_eq!(st2, StatusCode::CONFLICT, "同 user 第二张卡应 409: {body2}");
+    assert!(
+        body2["error"]["message"].as_str().unwrap_or("").contains("同一世界每位用户仅可投放一张角色卡"),
+        "文案应为「同一世界每位用户仅可投放一张角色卡」: {body2}"
+    );
+
+    // 不同 user 各投一张不受影响。
+    let (st3, body3) = post_json(&app, &uri, &tb, None, json!({ "cloudCharacterId": "chB" })).await;
+    assert_eq!(st3, StatusCode::OK, "不同 user 一人一卡不受影响: {body3}");
+
+    // usrA 在库中仍只有一条 active 成员（chA2 未落行）。
+    let n: i64 = sqlx::query(
+        "SELECT COUNT(*) AS n FROM world_members WHERE world_id=? AND user_id='usrA' AND status='active'",
+    )
+    .bind(&wid)
+    .fetch_one(&state.db)
+    .await
+    .unwrap()
+    .try_get("n")
+    .unwrap();
+    assert_eq!(n, 1, "被拒的第二张卡不得落行");
+}
+
+/// 退出（left 不占名额）后换卡再进 → 成功；持有 active 卡期间复活旧卡 → 复活分支同样被拦。
+#[tokio::test]
+async fn join_allows_card_swap_after_leave() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    seed_user(&state, "usrA").await;
+    seed_char(&state, "chA1", "usrA", "approved", 0).await;
+    seed_char(&state, "chA2", "usrA", "approved", 0).await;
+    let wid = create_world(&state.db, CreateWorldParams::official("tpl", 1, "世界")).await.unwrap();
+    let ta = token(&state, "usrA");
+    let join_uri = format!("/api/worlds/{wid}/join");
+    let leave_uri = format!("/api/worlds/{wid}/leave");
+
+    let (st, _) = post_json(&app, &join_uri, &ta, None, json!({ "cloudCharacterId": "chA1" })).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st_leave, _) =
+        post_json(&app, &leave_uri, &ta, None, json!({ "cloudCharacterId": "chA1" })).await;
+    assert_eq!(st_leave, StatusCode::OK);
+
+    // 已退出（非 active）不算占用 → 换卡再进成功。
+    let (st2, body2) = post_json(&app, &join_uri, &ta, None, json!({ "cloudCharacterId": "chA2" })).await;
+    assert_eq!(st2, StatusCode::OK, "退出后换卡应成功: {body2}");
+    assert_eq!(body2["status"], "active");
+
+    // chA2 active 期间复活 chA1（已有 left 行）→ 复活分支也被防自刷拦住。
+    let (st3, body3) = post_json(&app, &join_uri, &ta, None, json!({ "cloudCharacterId": "chA1" })).await;
+    assert_eq!(st3, StatusCode::CONFLICT, "持有 active 卡时复活旧卡应 409: {body3}");
+
+    // 全程 usrA 至多一条 active，且是换入的 chA2。
+    let active_char: String = sqlx::query(
+        "SELECT cloud_character_id FROM world_members WHERE world_id=? AND user_id='usrA' AND status='active'",
+    )
+    .bind(&wid)
+    .fetch_one(&state.db)
+    .await
+    .unwrap()
+    .try_get("cloud_character_id")
+    .unwrap();
+    assert_eq!(active_char, "chA2");
+}
+
+/// 回归：同卡重复 join（无幂等键 → 直接走成员行幂等分支）不被防自刷拦截，返回同一 membership。
+#[tokio::test]
+async fn join_same_card_repeat_stays_idempotent() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    seed_user(&state, "usrA").await;
+    seed_char(&state, "chA1", "usrA", "approved", 0).await;
+    let wid = create_world(&state.db, CreateWorldParams::official("tpl", 1, "世界")).await.unwrap();
+    let ta = token(&state, "usrA");
+    let uri = format!("/api/worlds/{wid}/join");
+
+    let (st, body) = post_json(&app, &uri, &ta, None, json!({ "cloudCharacterId": "chA1" })).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let mid = body["membershipId"].as_str().unwrap().to_string();
+
+    let (st2, body2) = post_json(&app, &uri, &ta, None, json!({ "cloudCharacterId": "chA1" })).await;
+    assert_eq!(st2, StatusCode::OK, "同卡重复 join 应保持幂等成功: {body2}");
+    assert_eq!(body2["membershipId"].as_str().unwrap(), mid, "应返回同一 membership");
+
+    let n: i64 = sqlx::query("SELECT COUNT(*) AS n FROM world_members WHERE world_id=?")
+        .bind(&wid)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+        .try_get("n")
+        .unwrap();
+    assert_eq!(n, 1, "重复 join 不得多落行");
+}
+
+// ---------- 波次 3：模板星级——join 历练准入 + 列表/详情 starRating 投影 ----------
+
+/// 造一个指定星级的已过审模板（skeleton 为空对象：星级功能与骨架内容正交）。
+async fn seed_star_template(state: &AppState, id: &str, star: i64) {
+    sqlx::query(
+        "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, official, version, moderation, star_rating, created_at) \
+         VALUES (?, '星级模板', 'chapter', '{}', '{\"mode\":\"open\"}', 1, 1, 'approved', ?, ?)",
+    )
+    .bind(id)
+    .bind(star)
+    .bind(now_ms())
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+async fn set_mileage(state: &AppState, char_id: &str, mileage: i64) {
+    sqlx::query("UPDATE cloud_characters SET mileage = ? WHERE id = ?")
+        .bind(mileage)
+        .bind(char_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+}
+
+/// 1-2★ 免检：零历练卡可进 2★ 世界；模板行缺失（历史/测试世界）按 1★ 兜底同样免检。
+#[tokio::test]
+async fn join_low_star_worlds_skip_mileage_gate() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    seed_user(&state, "usrS").await;
+    seed_char(&state, "chS", "usrS", "approved", 0).await; // mileage 默认 0
+    let ts = token(&state, "usrS");
+
+    seed_star_template(&state, "tpl_s2", 2).await;
+    let w2 = create_world(&state.db, CreateWorldParams::official("tpl_s2", 1, "二星世界")).await.unwrap();
+    let (st, body) =
+        post_json(&app, &format!("/api/worlds/{w2}/join"), &ts, None, json!({ "cloudCharacterId": "chS" })).await;
+    assert_eq!(st, StatusCode::OK, "2★ 应免历练检: {body}");
+
+    // 模板行缺失 → 1★ 兜底免检（老世界零回归）。
+    let w_ghost =
+        create_world(&state.db, CreateWorldParams::official("tpl_ghost", 1, "无模板世界")).await.unwrap();
+    let (st, body) =
+        post_json(&app, &format!("/api/worlds/{w_ghost}/join"), &ts, None, json!({ "cloudCharacterId": "chS" })).await;
+    assert_eq!(st, StatusCode::OK, "模板缺失应按 1★ 免检: {body}");
+}
+
+/// 3★ 门槛 300：投放卡 mileage 299 → 409 且文案含星级/门槛/当前值；300 → 过。
+#[tokio::test]
+async fn join_three_star_gates_on_card_mileage() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    seed_user(&state, "usrS3").await;
+    seed_char(&state, "chS3", "usrS3", "approved", 0).await;
+    let ts = token(&state, "usrS3");
+    seed_star_template(&state, "tpl_s3", 3).await;
+    let wid = create_world(&state.db, CreateWorldParams::official("tpl_s3", 1, "三星世界")).await.unwrap();
+    let uri = format!("/api/worlds/{wid}/join");
+
+    set_mileage(&state, "chS3", 299).await;
+    let (st, body) = post_json(&app, &uri, &ts, None, json!({ "cloudCharacterId": "chS3" })).await;
+    assert_eq!(st, StatusCode::CONFLICT, "历练不足应 409: {body}");
+    let msg = body["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("3 星副本"), "文案应含星级: {msg}");
+    assert!(msg.contains("300"), "文案应含门槛数字: {msg}");
+    assert!(msg.contains("299"), "文案应含当前历练: {msg}");
+
+    // 被拒不落成员行。
+    let n: i64 = sqlx::query("SELECT COUNT(*) AS n FROM world_members WHERE world_id=?")
+        .bind(&wid)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+        .try_get("n")
+        .unwrap();
+    assert_eq!(n, 0, "历练不足不得落成员行");
+
+    set_mileage(&state, "chS3", 300).await;
+    let (st, body) = post_json(&app, &uri, &ts, None, json!({ "cloudCharacterId": "chS3" })).await;
+    assert_eq!(st, StatusCode::OK, "达标应放行: {body}");
+    assert_eq!(body["status"], "active");
+}
+
+/// 4★/5★ 阶梯：4★ 需 1000、5★ 需 3000（文案含对应门槛），达标即过。
+#[tokio::test]
+async fn join_high_star_thresholds_scale() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    seed_user(&state, "usrS5").await;
+    seed_char(&state, "chS5", "usrS5", "approved", 0).await;
+    let ts = token(&state, "usrS5");
+    seed_star_template(&state, "tpl_s4", 4).await;
+    seed_star_template(&state, "tpl_s5", 5).await;
+    let w4 = create_world(&state.db, CreateWorldParams::official("tpl_s4", 1, "四星世界")).await.unwrap();
+    let w5 = create_world(&state.db, CreateWorldParams::official("tpl_s5", 1, "五星世界")).await.unwrap();
+
+    set_mileage(&state, "chS5", 999).await;
+    let (st, body) =
+        post_json(&app, &format!("/api/worlds/{w4}/join"), &ts, None, json!({ "cloudCharacterId": "chS5" })).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{body}");
+    assert!(body["error"]["message"].as_str().unwrap_or("").contains("1000"), "4★ 文案应含 1000: {body}");
+
+    set_mileage(&state, "chS5", 2999).await;
+    let (st, body) =
+        post_json(&app, &format!("/api/worlds/{w5}/join"), &ts, None, json!({ "cloudCharacterId": "chS5" })).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{body}");
+    assert!(body["error"]["message"].as_str().unwrap_or("").contains("3000"), "5★ 文案应含 3000: {body}");
+
+    set_mileage(&state, "chS5", 3000).await;
+    let (st, body) =
+        post_json(&app, &format!("/api/worlds/{w5}/join"), &ts, None, json!({ "cloudCharacterId": "chS5" })).await;
+    assert_eq!(st, StatusCode::OK, "3000 历练应进 5★: {body}");
+}
+
+/// 列表（new/hot）与详情投影 starRating；模板缺失兜底 1。
+#[tokio::test]
+async fn world_list_and_detail_project_star_rating() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    seed_user(&state, "usrP").await;
+    let tp = token(&state, "usrP");
+
+    seed_star_template(&state, "tpl_s4p", 4).await;
+    let w4 = create_world(&state.db, CreateWorldParams::official("tpl_s4p", 1, "四星投影世界")).await.unwrap();
+    create_world(&state.db, CreateWorldParams::official("tpl_none", 1, "无模板投影世界")).await.unwrap();
+
+    // 列表（sort=new 默认）：每项带 starRating；模板缺失 → 1。
+    let (st, body) = get_json(&app, "/api/worlds", &tp).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let stars: std::collections::BTreeMap<String, i64> = body["worlds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| (w["title"].as_str().unwrap().to_string(), w["starRating"].as_i64().unwrap()))
+        .collect();
+    assert_eq!(stars["四星投影世界"], 4, "列表应投影模板星级");
+    assert_eq!(stars["无模板投影世界"], 1, "模板缺失应兜底 1★");
+
+    // sort=hot 同样带 starRating。
+    let (st, hot) = get_json(&app, "/api/worlds?sort=hot", &tp).await;
+    assert_eq!(st, StatusCode::OK, "{hot}");
+    assert!(
+        hot["worlds"].as_array().unwrap().iter().all(|w| w["starRating"].is_i64()),
+        "hot 榜每项应带 starRating: {hot}"
+    );
+
+    // 详情：starRating=4。
+    let (st, detail) = get_json(&app, &format!("/api/worlds/{w4}"), &tp).await;
+    assert_eq!(st, StatusCode::OK, "{detail}");
+    assert_eq!(detail["starRating"], 4, "详情应投影模板星级");
 }
 
 // ---------- 阵容头像按机审裁决过滤（Phase A 红线：未过审绝不下发） ----------

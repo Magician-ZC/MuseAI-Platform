@@ -386,7 +386,7 @@ pub(super) async fn list_templates(
     let page = clamp_limit(q.limit);
     let mut sql = String::from(
         "SELECT id, title, room_type, skeleton_json, admission_json, official, version, \
-         moderation, created_at FROM world_templates WHERE 1=1",
+         moderation, star_rating, star_source, created_at FROM world_templates WHERE 1=1",
     );
     if q.moderation.is_some() {
         sql.push_str(" AND moderation = ?");
@@ -428,6 +428,8 @@ pub(super) async fn list_templates(
             "official": row.try_get::<i64, _>("official")? != 0,
             "version": row.try_get::<i64, _>("version")?,
             "moderation": row.try_get::<String, _>("moderation")?,
+            "starRating": row.try_get::<i64, _>("star_rating")?,
+            "starSource": row.try_get::<String, _>("star_source")?,
             "createdAt": created_at,
         }));
     }
@@ -435,6 +437,54 @@ pub(super) async fn list_templates(
         next_cursor = None;
     }
     Ok(Json(json!({ "templates": items, "nextCursor": next_cursor })))
+}
+
+// ---------------- 模板星级 curation（波次 3：运营定档） ----------------
+
+/// 运营定档星级范围（1..=5）；自动定档只能给到 2★，3-5★ 唯此端点可授予（数据晋升）。
+const CURATED_STAR_MIN: i64 = 1;
+const CURATED_STAR_MAX: i64 = 5;
+/// 定档理由长度上限（字符数）；理由必填（audit_logs 留痕的最小信息量）。
+const STAR_REASON_MAX_CHARS: usize = 500;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct SetStarReq {
+    star: i64,
+    reason: String,
+}
+
+/// POST /admin/world-templates/{id}/star：运营定档（operator，admin 直通）。
+/// body {star: 1..=5, reason: 1..=500 字符} → star_rating=star + star_source='curated'，
+/// audit_logs 留痕（action 'template_star'，reason 原样入档）。范围/理由非法 400、模板不存在 404。
+pub(super) async fn set_template_star(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path(id): Path<String>,
+    Json(req): Json<SetStarReq>,
+) -> Result<Json<Value>, ApiError> {
+    require_role(&admin, &["operator"])?;
+    if !(CURATED_STAR_MIN..=CURATED_STAR_MAX).contains(&req.star) {
+        return Err(ApiError::BadRequest(format!(
+            "star 非法：星级须在 {CURATED_STAR_MIN}-{CURATED_STAR_MAX} 之间"
+        )));
+    }
+    let reason = req.reason.trim();
+    if reason.is_empty() || reason.chars().count() > STAR_REASON_MAX_CHARS {
+        return Err(ApiError::BadRequest(format!(
+            "reason 非法：定档理由须为 1-{STAR_REASON_MAX_CHARS} 字符"
+        )));
+    }
+    let res = sqlx::query("UPDATE world_templates SET star_rating = ?, star_source = 'curated' WHERE id = ?")
+        .bind(req.star)
+        .bind(&id)
+        .execute(&state.db)
+        .await?;
+    if res.rows_affected() == 0 {
+        return Err(ApiError::NotFound);
+    }
+    audit(&state.db, &admin.0, "template_star", &id, reason).await?;
+    Ok(Json(json!({ "templateId": id, "starRating": req.star, "starSource": "curated" })))
 }
 
 #[derive(Debug, Deserialize)]

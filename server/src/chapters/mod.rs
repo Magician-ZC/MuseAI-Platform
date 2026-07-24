@@ -241,6 +241,9 @@ async fn chapter_finish(
             None => mainline_node_count(&state.db, &world.template_id).await?,
         };
         let next_node = cs["currentNode"].as_i64().unwrap_or(0) + 1;
+        // 通关转变沿（波次 2 历练）：仅「未通关 → 通关」那一次结算发通关历练；
+        // 之后重复 finish（cleared 保持 true）不再发。CAS 重试会重读最新 cleared，并发结算不双发。
+        let was_cleared = cs["cleared"].as_bool().unwrap_or(false);
         let cleared = total_nodes > 0 && next_node as usize >= total_nodes;
 
         // 离线夹层启动：为本人角色追加一条离线收益（自动训练摘要，回来领取）。
@@ -287,6 +290,35 @@ async fn chapter_finish(
                 grant_item_tx(&mut tx, &user.user_id, reward, &world_id, Some(hook_key)).await?;
             if inserted.is_some() {
                 granted_items.push(json!({ "itemId": reward.id, "narrative": reward.narrative }));
+                // 隐藏任务历练（波次 2）：与隐藏道具带出**同一事务、同一幂等口径**——
+                // 仅真正发货那次 +50（DB 唯一键判已发货则道具与历练都不双发；事务回滚则同滚）。
+                crate::progression::grant_mileage_tx(
+                    &mut tx,
+                    &cid,
+                    crate::progression::MILEAGE_HIDDEN_TASK,
+                    "chapter_hidden_task",
+                )
+                .await?;
+            }
+        }
+
+        // 通关历练（波次 2）：仅「未通关 → 通关」转变沿那一次，给**每张参与卡**（结算时该世界
+        // active 成员的云端角色）+100，与通关结算（CAS 写 chapterState + 道具发货）同一事务。
+        if cleared && !was_cleared {
+            let participants: Vec<(String,)> = sqlx::query_as(
+                "SELECT cloud_character_id FROM world_members WHERE world_id = ? AND status = 'active'",
+            )
+            .bind(&world_id)
+            .fetch_all(&mut *tx)
+            .await?;
+            for (member_cid,) in &participants {
+                crate::progression::grant_mileage_tx(
+                    &mut tx,
+                    member_cid,
+                    crate::progression::MILEAGE_CHAPTER_CLEAR,
+                    "chapter_clear",
+                )
+                .await?;
             }
         }
         tx.commit().await?;

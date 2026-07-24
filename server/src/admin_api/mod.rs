@@ -7,7 +7,8 @@
 //!   内容审核：GET /admin/audit-queue?status=、POST /admin/audit-queue/{id}/approve|reject（回写主体 moderation）
 //!   申诉复审：GET /admin/appeals?status=、POST /admin/appeals/{id}/resolve（overturn/uphold，唯一改判路径）
 //!   世界运营：GET /admin/worlds?status=、GET /admin/worlds/{id}/diagnostics（脱敏诊断）、
-//!            POST /admin/worlds/{id}/pause|resume、POST /admin/worlds（官方建房）、GET/POST /admin/world-templates
+//!            POST /admin/worlds/{id}/pause|resume、POST /admin/worlds（官方建房）、GET/POST /admin/world-templates、
+//!            POST /admin/world-templates/{id}/star（星级 curation：3-5★ 唯一晋升路径）
 //!   经济运营：GET /admin/economy/overview（真实只读聚合：充值/退款/余额/礼物/订单状态，不建结算）
 //!            GET /admin/ledger/reconcile（P4：全账复式恒等 SUM=0 + 账户物化余额对账，finance 只读，无提现）
 //!   数据看板：GET /admin/metrics/overview（SQL 聚合）、GET /admin/metrics/trends?days=（按天趋势，UTC 日界）
@@ -71,6 +72,8 @@ pub fn router() -> Router<AppState> {
             "/admin/world-templates",
             get(worlds_ops::list_templates).post(worlds_ops::create_template),
         )
+        // 模板星级 curation（波次 3）：运营定档 3-5★ 的唯一路径（自动定档封顶 2★）。
+        .route("/admin/world-templates/{id}/star", post(worlds_ops::set_template_star))
         // 经济运营（真实只读聚合）
         .route("/admin/economy/overview", get(dashboards::economy_overview))
         // 财务对账（P4 合规增强）：全账复式恒等 + 账户物化余额对账（finance/admin 只读，无提现）

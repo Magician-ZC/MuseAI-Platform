@@ -896,6 +896,11 @@ async fn finalize_ending_tx(
     .execute(&mut **tx)
     .await?;
 
+    // 终局历练（波次 2）：每张在场卡发放 idle 终局历练，与终局停机同事务（只在真正结算那一次；
+    // member_char_ids 仅含玩家成员卡，NPC 不在列）。发放逻辑收在 progression 模块——本文件
+    // （RoundInput 组装处）不引用任何历练字段，红线「历练不进引擎决策」grep 级可验。
+    crate::progression::settle_idle_world_ending_tx(tx, member_char_ids).await?;
+
     // 终局荣誉奖励：每位在场成员角色获一枚「结局」荣誉（label=选定结局 id）。无强度、无购买。
     if let Some(ending_id) = ending {
         for cid in member_char_ids {

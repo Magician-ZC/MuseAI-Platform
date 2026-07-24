@@ -72,6 +72,14 @@ pub struct InstanceSampling {
     pub selected_endings: Vec<String>,
     pub selected_npcs: Vec<String>,
     pub selected_locations: Vec<String>,
+    /// 星级封顶剔除清单（波次 3 产出封顶）：奖励道具档位 > 模板星级的隐藏钩子 id（模板序），
+    /// 采样前剔除。仅审计（不外泄），`#[serde(default)]` 兼容改造前已钉住的实例回读。
+    #[serde(default)]
+    pub culled_over_tier: Vec<String>,
+    /// 稀有预算剔除清单（波次 3 产出封顶）：入选钩子中奖励档位 ≥ RARE_TIER 超出 RARE_BUDGET
+    /// 的部分（确定性序 = 入选模板序，保 replay 一致）。仅审计（不外泄）。
+    #[serde(default)]
+    pub culled_rare_budget: Vec<String>,
 }
 
 /// 地点驻留道具组（Phase 3）：一个地点解引用后的驻留道具集。`is_secret_realm` 标记秘境隐藏道具，
@@ -386,6 +394,24 @@ impl Rng {
     }
 }
 
+// ---------- 产出封顶（波次 3）：星级封顶 + 稀有预算（常量集中区，可调） ----------
+
+/// 稀有奖励档位下限：奖励道具 powerTier ≥ 此值视为「稀有」，受单实例预算约束。
+const RARE_TIER: u8 = 3;
+/// 单实例稀有预算：入选钩子中稀有奖励至多 RARE_BUDGET 个，超出的按确定性顺序剔除。
+const RARE_BUDGET: usize = 2;
+
+/// 池物品的奖励道具档位（封顶判定口径 = `resolve_reward_item`：reward_item_ref 优先解引用
+/// world_items 目录，缺失/悬空回退内联 reward_item——同口径杜绝内联绕过封顶）。无奖励 → None。
+fn reward_tier(pool_item: &PoolItem, world_items: &[ItemDefinition]) -> Option<u8> {
+    if let Some(ref_id) = pool_item.reward_item_ref.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(def) = world_items.iter().find(|it| it.id == ref_id) {
+            return Some(def.origin.power_tier);
+        }
+    }
+    pool_item.reward_item.as_ref().map(|it| it.origin.power_tier)
+}
+
 // 各维度子流域常量（seed ^ DOMAIN 派生，避免维度间串扰）。
 const DOMAIN_STORYLINE: u64 = 0x51;
 const DOMAIN_MAINLINE: u64 = 0x52;
@@ -628,6 +654,8 @@ fn sample_location_ids(
 
 /// 纯采样规划（防刷第二环，无 DB / 无系统随机）：由固定实例种子驱动，从超集各池采子集。
 /// 退化路径（`is_superset != true` 或 storylines 空 或 sampling 全空）→ `audit=None` + 全量 id（不采样）。
+/// `star_rating`（波次 3 产出封顶）：仅超集采样路径生效——奖励档位 > 星级的钩子在采样前剔除 +
+/// 入选稀有奖励受 RARE_BUDGET 约束；退化路径不读星级（与改造前行为完全一致）。
 fn plan_sampling(
     skeleton: &Skeleton,
     fingerprint: &str,
@@ -636,6 +664,7 @@ fn plan_sampling(
     profile: &(u32, u32, u32),
     roster_terms: &[String],
     ending_threshold: f32,
+    star_rating: i64,
 ) -> Selection {
     let superset_mode =
         skeleton.is_superset && !skeleton.storylines.is_empty() && !skeleton.sampling.is_empty();
@@ -722,12 +751,21 @@ fn plan_sampling(
         }
     }
 
-    // 3) Hidden content（约束到脊柱 + 变体组归约 + 阵容执念加权 + 计数上限）。
-    let hidden_candidates: Vec<&PoolItem> = skeleton
+    // 3) Hidden content（约束到脊柱 + 星级封顶 + 变体组归约 + 阵容执念加权 + 计数上限 + 稀有预算）。
+    // 3a) 星级封顶（产出封顶第一道）：奖励道具档位 > 模板星级的钩子在采样前剔除。
+    //     纯候选集过滤（模板序），不动 RNG 消费协议——同种子下剔除结果确定、可 replay。
+    let mut culled_over_tier: Vec<String> = Vec::new();
+    let mut hidden_candidates: Vec<&PoolItem> = Vec::new();
+    for p in skeleton
         .hidden_content_pool
         .iter()
         .filter(|p| sl_hidden.contains(p.id.as_str()) || in_arc(&p.arc_tags))
-        .collect();
+    {
+        match reward_tier(p, &skeleton.world_items) {
+            Some(t) if (t as i64) > star_rating => culled_over_tier.push(p.id.clone()),
+            _ => hidden_candidates.push(p),
+        }
+    }
     let mut rng_hidden = Rng(seed ^ DOMAIN_HIDDEN);
     let resolved_hidden = resolve_variant_groups(&mut rng_hidden, &hidden_candidates, |p| p.variant_group.as_deref());
     let weighted_hidden: Vec<(&PoolItem, f32)> = resolved_hidden
@@ -739,7 +777,22 @@ fn plan_sampling(
         .collect();
     let hk = skeleton.sampling.instance_hidden_count.unwrap_or(resolved_hidden.len());
     let selected_hidden_items = choose_k(&mut rng_hidden, &weighted_hidden, hk);
-    let hidden_ids: Vec<String> = selected_hidden_items.iter().map(|p| p.id.clone()).collect();
+    // 3b) 稀有预算（产出封顶第二道）：入选钩子中奖励档位 ≥ RARE_TIER 的至多 RARE_BUDGET 个，
+    //     超出的按入选序（choose_k 已还原模板序）从前往后保留、之后剔除——纯序规则无 RNG，replay 一致。
+    let mut culled_rare_budget: Vec<String> = Vec::new();
+    let mut rare_kept = 0usize;
+    let mut hidden_ids: Vec<String> = Vec::new();
+    for p in &selected_hidden_items {
+        let rare = reward_tier(p, &skeleton.world_items).map(|t| t >= RARE_TIER).unwrap_or(false);
+        if rare {
+            if rare_kept >= RARE_BUDGET {
+                culled_rare_budget.push(p.id.clone());
+                continue;
+            }
+            rare_kept += 1;
+        }
+        hidden_ids.push(p.id.clone());
+    }
 
     // 4) Endings（storyline 约束 + 变体组互斥 → 现有 weight_endings 阵容加权）。
     let mut ending_candidates: Vec<&EndingCandidate> = skeleton
@@ -799,6 +852,8 @@ fn plan_sampling(
         selected_endings: enabled_endings.clone(),
         selected_npcs: npc_ids.clone(),
         selected_locations: loc_ids.clone(),
+        culled_over_tier,
+        culled_rare_budget,
     };
     Selection { audit: Some(audit), hidden_ids, enabled_endings, npc_ids, loc_ids }
 }
@@ -850,7 +905,8 @@ pub async fn assemble_instance(state: &AppState, world_id: &str) -> Result<Assem
     let world = load_world(&state.db, world_id).await?;
 
     // 骨架（预审核池）：缺失/解析失败 → 空池（装配退化为无个性化，但不 panic）。
-    let skeleton = load_skeleton(&state.db, &world.template_id).await?;
+    // star_rating 同查读出：产出封顶输入 + 快照进 assembled_json（服务端留档）。
+    let (skeleton, star_rating) = load_skeleton(&state.db, &world.template_id).await?;
 
     // 全体在场成员卡。
     let cards = load_active_cards(&state.db, world_id).await?;
@@ -870,6 +926,7 @@ pub async fn assemble_instance(state: &AppState, world_id: &str) -> Result<Assem
         &profile,
         &agg_terms,
         rules.ending_weight_threshold,
+        star_rating,
     );
     let sampled = selection.audit.is_some();
 
@@ -990,11 +1047,12 @@ pub async fn assemble_instance(state: &AppState, world_id: &str) -> Result<Assem
         sampling: selection.audit,
     };
 
-    // 持久化：assembly 段钉住（含派生的 templateVersion），chapterState 段留给章节会话推进。
+    // 持久化：assembly 段钉住（含派生的 templateVersion + 装配时模板星级快照），chapterState 段留给章节会话推进。
     let wrapper = json!({
         "assembly": &assembled,
         "chapterState": empty_chapter_state(),
         "templateVersion": world.template_version,
+        "starRating": star_rating,
         "assembledAt": now_ms(),
     });
 
@@ -1027,16 +1085,19 @@ pub async fn assemble_instance(state: &AppState, world_id: &str) -> Result<Assem
 
 // ---------- 读取辅助 ----------
 
-async fn load_skeleton(db: &AnyPool, template_id: &str) -> Result<Skeleton, ApiError> {
-    let row = sqlx::query("SELECT skeleton_json FROM world_templates WHERE id = ?")
+/// 读骨架 + 星级（波次 3：star_rating 装配时从 world_templates 读出，供产出封顶并快照进
+/// assembled_json）。模板行缺失（测试/历史数据）→ (空骨架, 1★)：退化装配且封顶按最保守档。
+async fn load_skeleton(db: &AnyPool, template_id: &str) -> Result<(Skeleton, i64), ApiError> {
+    let row = sqlx::query("SELECT skeleton_json, star_rating FROM world_templates WHERE id = ?")
         .bind(template_id)
         .fetch_optional(db)
         .await?;
     let Some(row) = row else {
-        return Ok(Skeleton::default());
+        return Ok((Skeleton::default(), 1));
     };
     let raw: String = row.try_get("skeleton_json")?;
-    Ok(serde_json::from_str(&raw).unwrap_or_default())
+    let star_rating: i64 = row.try_get("star_rating")?;
+    Ok((serde_json::from_str(&raw).unwrap_or_default(), star_rating))
 }
 
 async fn load_active_cards(db: &AnyPool, world_id: &str) -> Result<Vec<(String, CharacterCardV2)>, ApiError> {
@@ -1495,8 +1556,13 @@ mod sampling_tests {
         .unwrap()
     }
 
+    /// 默认按 5★ 规划（不触发星级封顶）：既有采样测试聚焦随机性协议，封顶另有专项（star_cap_tests）。
     fn plan(sk: &Skeleton, world_id: &str, fp: &str) -> Selection {
-        plan_sampling(sk, fp, world_id, 1, &PROFILE, &[], 0.5)
+        plan_star(sk, world_id, fp, 5)
+    }
+
+    fn plan_star(sk: &Skeleton, world_id: &str, fp: &str, star: i64) -> Selection {
+        plan_sampling(sk, fp, world_id, 1, &PROFILE, &[], 0.5, star)
     }
 
     // #10 PRNG 测试向量：锁死跨版本一致性（FNV-1a / SplitMix64 均为规范实现）。
@@ -1645,5 +1711,116 @@ mod sampling_tests {
         sk.sampling = SamplingSpec::default();
         let s = plan(&sk, "world_nosampling", "cidA");
         assert!(s.audit.is_none(), "sampling 全空 → 退化");
+    }
+
+    // ---------- 波次 3 产出封顶：星级封顶 + 稀有预算（确定性可重放） ----------
+
+    /// 封顶专用超集：单 storyline 全含；隐藏池 5 项——hr-1(ref t1)、hr-3a(ref t3)、
+    /// hr-3b(**内联** t3，验证内联不绕过封顶口径)、hr-4(ref t4)、hr-5(ref t5)；
+    /// instanceHiddenCount=9（全取）隔离封顶效果——被剔除的只可能是封顶所为。
+    fn reward_superset() -> Skeleton {
+        let item = |id: &str, tier: u8| {
+            serde_json::json!({
+                "id": id, "narrative": format!("道具{id}"), "effectTags": [],
+                "origin": { "worldTemplateId": "t", "cosmology": ["myth"], "powerTier": tier }
+            })
+        };
+        serde_json::from_value(serde_json::json!({
+            "isSuperset": true,
+            "storylines": [
+                { "id": "arc-R", "mainlineNodeIds": ["mn-1"],
+                  "hiddenPoolIds": ["hr-1","hr-3a","hr-3b","hr-4","hr-5"], "endingIds": ["end-1"] }
+            ],
+            "mainlineNodes": [ { "id": "mn-1", "fated": true, "arcTags": ["arc-R"] } ],
+            "hiddenContentPool": [
+                { "id": "hr-1",  "arcTags": ["arc-R"], "rewardItemRef": "wi-t1" },
+                { "id": "hr-3a", "arcTags": ["arc-R"], "rewardItemRef": "wi-t3" },
+                { "id": "hr-3b", "arcTags": ["arc-R"],
+                  "rewardItem": { "id": "inline-t3", "narrative": "内联稀有", "effectTags": [],
+                    "origin": { "worldTemplateId": "t", "cosmology": ["myth"], "powerTier": 3 } } },
+                { "id": "hr-4",  "arcTags": ["arc-R"], "rewardItemRef": "wi-t4" },
+                { "id": "hr-5",  "arcTags": ["arc-R"], "rewardItemRef": "wi-t5" }
+            ],
+            "endingPool": [ { "id": "end-1", "arcTags": ["arc-R"] } ],
+            "worldItems": [ item("wi-t1", 1), item("wi-t3", 3), item("wi-t4", 4), item("wi-t5", 5) ],
+            "sampling": { "instanceStorylineCount": 1, "instanceHiddenCount": 9 }
+        }))
+        .unwrap()
+    }
+
+    // 星级封顶：2★ 模板 → 奖励档位 >2 的钩子（ref 与内联同口径）采样前剔除，仅留 tier1。
+    #[test]
+    fn star_cap_culls_over_tier_rewards_on_two_star() {
+        let sk = reward_superset();
+        let s = plan_star(&sk, "world_star2", "cidA", 2).audit.unwrap();
+        assert_eq!(s.selected_hidden, vec!["hr-1".to_string()], "2★ 只可留 tier≤2 奖励钩子");
+        assert_eq!(
+            s.culled_over_tier,
+            vec!["hr-3a".to_string(), "hr-3b".to_string(), "hr-4".to_string(), "hr-5".to_string()],
+            "tier3/4/5（含内联）应全数进星级剔除清单（模板序）"
+        );
+        assert!(s.culled_rare_budget.is_empty(), "星级已剔净，稀有预算无事可做");
+    }
+
+    // 5★ 模板：星级封顶全放行（tier≤5），稀有预算兜底——tier≥3 至多 RARE_BUDGET=2，超出按确定性序剔除。
+    #[test]
+    fn five_star_keeps_tiers_within_rare_budget() {
+        let sk = reward_superset();
+        let s = plan_star(&sk, "world_star5", "cidA", 5).audit.unwrap();
+        assert!(s.culled_over_tier.is_empty(), "5★ 无档位越界");
+        assert_eq!(
+            s.selected_hidden,
+            vec!["hr-1".to_string(), "hr-3a".to_string(), "hr-3b".to_string()],
+            "tier≥3 只保留前 2 个（模板序），tier1 不占预算"
+        );
+        assert_eq!(
+            s.culled_rare_budget,
+            vec!["hr-4".to_string(), "hr-5".to_string()],
+            "超预算稀有按确定性序剔除"
+        );
+    }
+
+    // 确定性可重放：同种子两次规划 → 选中集与两份剔除清单逐字段一致；
+    // 计数上限压到 3（choose_k 真吃 RNG）跨多实例仍恒守稀有预算。
+    #[test]
+    fn cap_culling_is_deterministic_and_replayable() {
+        let mut sk = reward_superset();
+        sk.sampling.instance_hidden_count = Some(3);
+        for i in 0..12 {
+            let wid = format!("world_replay_{i}");
+            let a = plan_star(&sk, &wid, "cidA\ncidB", 5).audit.unwrap();
+            let b = plan_star(&sk, &wid, "cidA\ncidB", 5).audit.unwrap();
+            assert_eq!(a.selected_hidden, b.selected_hidden, "同种子两次装配选中集必须一致");
+            assert_eq!(a.culled_over_tier, b.culled_over_tier, "星级剔除清单必须可重放");
+            assert_eq!(a.culled_rare_budget, b.culled_rare_budget, "稀有预算剔除清单必须可重放");
+            let rare_count = a
+                .selected_hidden
+                .iter()
+                .filter(|id| id.as_str() != "hr-1") // 除 tier1 外全为 tier≥3
+                .count();
+            assert!(rare_count <= RARE_BUDGET, "实例 {i} 稀有奖励超预算: {:?}", a.selected_hidden);
+        }
+    }
+
+    // 退化路径不读星级：非超集模板带高档奖励 + 1★ → 全量装配无剔除（与改造前行为完全一致）。
+    #[test]
+    fn degraded_path_ignores_star_cap() {
+        let sk: Skeleton = serde_json::from_value(serde_json::json!({
+            "worldItems": [ { "id": "wi-t5", "narrative": "神器", "effectTags": [],
+                "origin": { "worldTemplateId": "t", "cosmology": ["myth"], "powerTier": 5 } } ],
+            "hiddenContentPool": [
+                { "id": "h1", "themes": ["x"], "rewardItemRef": "wi-t5" },
+                { "id": "h2", "themes": ["y"] }
+            ],
+            "endingPool": [ { "id": "e1", "baseWeight": 1.0 } ]
+        }))
+        .unwrap();
+        let s = plan_star(&sk, "world_degrade_star", "cidA", 1);
+        assert!(s.audit.is_none(), "退化路径不产采样审计段");
+        assert_eq!(
+            s.hidden_ids,
+            vec!["h1".to_string(), "h2".to_string()],
+            "退化路径不读星级：tier5 奖励钩子照旧全量装配"
+        );
     }
 }

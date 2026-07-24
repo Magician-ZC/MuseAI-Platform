@@ -502,6 +502,8 @@ export const WorldHeader: React.FC<{ world: WorldDetail; spectate?: boolean }> =
           </Space>
           <Space size={16} style={{ color: '#8c857b', fontSize: 13 }}>
             <Tag color="orange">{roomTypeLabel(world.roomType)}</Tag>
+            {/* 星级（1-5）：≥3 的世界要求投放角色历练达标（join 由服务端权威校验并返回文案）。 */}
+            {typeof world.starRating === 'number' && <Tag color="gold">{world.starRating}★</Tag>}
             <span>
               <TeamOutlined /> {world.memberCount}/{world.memberLimit}
             </span>

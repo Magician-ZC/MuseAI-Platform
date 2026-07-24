@@ -7,9 +7,11 @@
 //!   - sort=new（默认）：created_at DESC + cursor 分页（现行为）
 //!   - sort=hot：热度榜快照（近 48h 事件×1 + 近 7 天打赏×5 + active 成员×2），
 //!     每项附 hotScore，LIMIT ≤50，不支持 cursor（nextCursor 恒为 null）
-//! GET  /worlds/{id}                      详情（世界书简介/规则/公开阵容/AI 标识展示）
+//! GET  /worlds/{id}                      详情（世界书简介/规则/公开阵容/AI 标识展示；含模板 starRating）
 //! POST /worlds/{id}/join                 投放角色：AuthUser + Idempotency-Key + cloudCharacterId + boundary
-//!   服务端权威校验（§9.6）：角色 approved 且未 withdrawn 且属于本人；人数上限；写 world_members
+//!   服务端权威校验（§9.6）：角色 approved 且未 withdrawn 且属于本人；人数上限；写 world_members；
+//!   防自刷：同一世界每位用户仅可投放一张 active 角色卡（退出后可换卡再进）；
+//!   历练准入（波次 3）：模板 star≥3 时投放卡 mileage 须达门槛（3★=300/4★=1000/5★=3000），1-2★ 免检
 //! POST /worlds/{id}/leave                离场：置成员 left（离场事件交由下个 tick 叙事化）
 //!
 //! 官方建房走 admin(S6)，此处提供内部 create_world 供其调用；创建时钉住
@@ -133,6 +135,10 @@ fn escape_like(s: &str) -> String {
 const HOT_EVENTS_WINDOW_MS: i64 = 48 * 3600 * 1000;
 const HOT_GIFTS_WINDOW_MS: i64 = 7 * 24 * 3600 * 1000;
 
+/// 星级投影子查询（列表 new/hot 共用）：模板行缺失（历史数据）COALESCE 兜底 1★。
+const STAR_RATING_SUBQUERY: &str =
+    "COALESCE((SELECT t.star_rating FROM world_templates t WHERE t.id = worlds.template_id), 1) AS star_rating";
+
 /// 列表项投影（new/hot 共用；hot 分支再追加 hotScore）。
 fn world_list_item(row: &sqlx::any::AnyRow, id: &str) -> Result<Value, ApiError> {
     Ok(json!({
@@ -144,6 +150,7 @@ fn world_list_item(row: &sqlx::any::AnyRow, id: &str) -> Result<Value, ApiError>
         "memberLimit": row.try_get::<i64, _>("member_limit")?,
         "memberCount": row.try_get::<i64, _>("member_count")?,
         "tickPerDay": row.try_get::<i64, _>("tick_per_day")?,
+        "starRating": row.try_get::<i64, _>("star_rating")?,
         "aiLabel": { "visible": true },
     }))
 }
@@ -177,9 +184,10 @@ async fn list_worlds_new(
 ) -> Result<Json<Value>, ApiError> {
     let page = params.limit.unwrap_or(20).clamp(1, 100);
     // 仅可见世界：open/running 且 official/public。
-    let mut sql = String::from(
+    let mut sql = format!(
         "SELECT id, room_type, title, status, visibility, member_limit, tick_per_day, created_at, \
-         (SELECT COUNT(*) FROM world_members m WHERE m.world_id = worlds.id AND m.status='active') AS member_count \
+         (SELECT COUNT(*) FROM world_members m WHERE m.world_id = worlds.id AND m.status='active') AS member_count, \
+         {STAR_RATING_SUBQUERY} \
          FROM worlds \
          WHERE status IN ('open','running') AND visibility IN ('official','public')",
     );
@@ -241,9 +249,10 @@ async fn list_worlds_hot(
 
     // SUM 可移植性：CAST(COALESCE(SUM(x),0) AS BIGINT)（先例 admin_api/reconcile.rs）；
     // 整体分再 CAST 一次，保证双库返回 BIGINT。gift_events 表恒存在（迁移不随 feature 门控）。
-    let mut sql = String::from(
+    let mut sql = format!(
         "SELECT id, room_type, title, status, visibility, member_limit, tick_per_day, created_at, \
          (SELECT COUNT(*) FROM world_members m WHERE m.world_id = worlds.id AND m.status='active') AS member_count, \
+         {STAR_RATING_SUBQUERY}, \
          CAST( \
            (SELECT COUNT(*) FROM world_events e WHERE e.world_id = worlds.id AND e.occurred_at >= ?) \
            + (SELECT CAST(COALESCE(SUM(g.gift_count),0) AS BIGINT) FROM gift_events g WHERE g.world_id = worlds.id AND g.created_at >= ?) * 5 \
@@ -334,6 +343,13 @@ async fn world_detail(
         roster.push(item);
     }
 
+    // 星级投影（波次 3）：从模板读当前 star_rating；模板行缺失（历史数据）兜底 1★。
+    let star_rating: i64 = sqlx::query_scalar("SELECT star_rating FROM world_templates WHERE id = ?")
+        .bind(&world.template_id)
+        .fetch_optional(&state.db)
+        .await?
+        .unwrap_or(1);
+
     Ok(Json(json!({
         "id": world.id,
         "title": world.title,
@@ -343,6 +359,7 @@ async fn world_detail(
         "memberLimit": world.member_limit,
         "memberCount": roster.len(),
         "tickPerDay": world.tick_per_day,
+        "starRating": star_rating,
         // 客户端干预用 expectedWorldRevision 做乐观并发校验（C1 集成缝）。
         "stateRevision": world.state_revision,
         "templateId": world.template_id,
@@ -358,6 +375,27 @@ async fn world_detail(
 }
 
 // ---------- 投放（join） ----------
+
+// ---------- 历练准入门槛（波次 3 星级第三环）：常量集中区（可调，数值即产品策划口径） ----------
+
+/// 3★ 副本投放卡历练门槛。
+const STAR3_MILEAGE_REQUIRED: i64 = 300;
+/// 4★ 副本投放卡历练门槛。
+const STAR4_MILEAGE_REQUIRED: i64 = 1000;
+/// 5★ 副本投放卡历练门槛。
+const STAR5_MILEAGE_REQUIRED: i64 = 3000;
+
+/// 模板星级 → 投放卡历练门槛：1-2★ 无门槛；3★=300、4★=1000、5★（及以上防御归并）=3000。
+/// 只挡「本次投放的卡」（历练挂卡不挂人，卡是养成容器）；历练仅用于准入，
+/// 绝不进引擎决策（progression 模块红线，本函数只在 join 消费）。
+fn star_mileage_gate(star: i64) -> Option<i64> {
+    match star {
+        ..=2 => None,
+        3 => Some(STAR3_MILEAGE_REQUIRED),
+        4 => Some(STAR4_MILEAGE_REQUIRED),
+        _ => Some(STAR5_MILEAGE_REQUIRED),
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -389,9 +427,9 @@ async fn join_world(
         return Err(ApiError::Conflict("world_not_joinable".into()));
     }
 
-    // 角色服务端权威校验：属本人 + approved + 未撤回。
+    // 角色服务端权威校验：属本人 + approved + 未撤回（mileage 同查读出，供下方星级历练准入）。
     let ch = sqlx::query(
-        "SELECT owner_id, moderation, withdrawn FROM cloud_characters WHERE id = ?",
+        "SELECT owner_id, moderation, withdrawn, mileage FROM cloud_characters WHERE id = ?",
     )
     .bind(&body.cloud_character_id)
     .fetch_optional(&state.db)
@@ -400,6 +438,7 @@ async fn join_world(
     let owner_id: String = ch.try_get("owner_id")?;
     let moderation: String = ch.try_get("moderation")?;
     let withdrawn: i64 = ch.try_get("withdrawn")?;
+    let mileage: i64 = ch.try_get("mileage")?;
     if owner_id != user.user_id {
         return Err(ApiError::Forbidden);
     }
@@ -408,6 +447,45 @@ async fn join_world(
     }
     if withdrawn != 0 {
         return Err(ApiError::Conflict("character_withdrawn".into()));
+    }
+
+    // 历练准入（波次 3 星级门槛，与防自刷同为投放资格校验）：模板 star≥3 时要求**本次投放的卡**
+    // 历练达标（1-2★ 无门槛）。模板行缺失（测试/历史数据）按 1★ 兜底 → 无门槛，与老行为一致。
+    // 409（Conflict）对齐本端点既有资格类拒绝（character_not_approved / 防自刷）的错误风格。
+    let star: i64 = sqlx::query_scalar("SELECT star_rating FROM world_templates WHERE id = ?")
+        .bind(&world.template_id)
+        .fetch_optional(&state.db)
+        .await?
+        .unwrap_or(1);
+    if let Some(required) = star_mileage_gate(star) {
+        if mileage < required {
+            return Err(ApiError::Conflict(format!(
+                "该世界为 {star} 星副本，需角色历练 ≥{required}（当前 {mileage}）"
+            )));
+        }
+    }
+
+    // 防自刷：同一世界每位用户同时仅可投放一张 active 角色卡（多卡进场可抢隐藏任务钩子）。
+    // 排除本卡自身 → 同卡重复 join / 同卡复活仍走下方幂等与复活分支，现有行为不回退；
+    // 只数 status='active' → 已退出（left/retired）不占名额，退出后可换卡再进。
+    //
+    // 取舍说明（为何不加迁移）：world_members 唯一索引是卡级 (world_id, cloud_character_id)
+    // （0001_init.sql:132），user_id 仅普通索引（:133）。这里不补 (world_id, user_id) 按
+    // status='active' 的条件唯一索引——应用层校验已覆盖正常路径；并发窗口下同 user 两卡
+    // 同时 join 理论上可各落一行 active，但真撞进两行也无资损：后续结算按任务钩子绑定计，
+    // 不按成员行数计，多出的行不影响结算、可事后治理，收益不抵迁移与回填成本。
+    let other_active: i64 = sqlx::query(
+        "SELECT COUNT(*) AS n FROM world_members \
+         WHERE world_id = ? AND user_id = ? AND status = 'active' AND cloud_character_id != ?",
+    )
+    .bind(&id)
+    .bind(&user.user_id)
+    .bind(&body.cloud_character_id)
+    .fetch_one(&state.db)
+    .await?
+    .try_get("n")?;
+    if other_active > 0 {
+        return Err(ApiError::Conflict("同一世界每位用户仅可投放一张角色卡".into()));
     }
 
     // 已有成员记录（唯一键 world+character）：active 直接幂等返回；left/retired 复活。

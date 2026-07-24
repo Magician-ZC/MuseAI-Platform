@@ -481,6 +481,75 @@ async fn resident_items_distribute_from_world_items_catalog() {
     assert_eq!(groups[0]["items"][0]["id"], "wi_orb");
 }
 
+/// 波次 3 产出封顶集成：2★ 超集模板——tier3 奖励钩子采样前剔除（绝不进 per-character 钩子），
+/// star_rating 装配时快照进 assembled_json，剔除清单钉进 sampling 审计段（服务端留档）。
+#[tokio::test]
+async fn assembly_snapshots_star_and_culls_over_tier_hooks() {
+    let state = test_state().await;
+    seed_user(&state, "usrCap").await;
+    let card = make_card("chCap", "苏未央", "害怕被遗忘", &["寻找失散的姐姐"], None, true);
+    seed_char(&state, "chCap", "usrCap", &card).await;
+
+    // 超集骨架：两条隐藏钩子同绑「遗忘」，仅奖励档位不同（t1 vs t3）。
+    let skeleton = json!({
+        "isSuperset": true,
+        "worldItems": [
+            { "id": "wi_low", "narrative": "粗玉佩", "effectTags": ["info:reveal"],
+              "origin": { "worldTemplateId": "tpl_cap", "cosmology": ["myth"], "powerTier": 1 } },
+            { "id": "wi_high", "narrative": "上古神器", "effectTags": ["advantage:combat"],
+              "origin": { "worldTemplateId": "tpl_cap", "cosmology": ["myth"], "powerTier": 3 } }
+        ],
+        "storylines": [
+            { "id": "arc-M", "summary": "主线", "mainlineNodeIds": ["mn-1"],
+              "hiddenPoolIds": ["hc_low", "hc_high"], "endingIds": ["end-1"] }
+        ],
+        "mainlineNodes": [ { "id": "mn-1", "fated": true, "arcTags": ["arc-M"] } ],
+        "hiddenContentPool": [
+            { "id": "hc_low", "themes": ["遗忘"], "template": "{name} 的低档试炼", "rewardItemRef": "wi_low", "arcTags": ["arc-M"] },
+            { "id": "hc_high", "themes": ["遗忘"], "template": "{name} 的高档试炼", "rewardItemRef": "wi_high", "arcTags": ["arc-M"] }
+        ],
+        "endingPool": [ { "id": "end-1", "baseWeight": 1.0, "arcTags": ["arc-M"] } ],
+        "sampling": { "instanceHiddenCount": 5 },
+        "assemblyRules": { "hiddenPerCharacter": 2, "endingWeightThreshold": 0.5 }
+    });
+    seed_template(&state, "tpl_cap", "chapter", &skeleton.to_string(), r#"{"mode":"open"}"#).await;
+    sqlx::query("UPDATE world_templates SET star_rating = 2 WHERE id = 'tpl_cap'")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let wid = make_chapter_world(&state, "tpl_cap").await;
+    seed_member(&state, &wid, "usrCap", "chCap").await;
+
+    let assembled = assemble_instance(&state, &wid).await.unwrap();
+
+    // 采样审计段：tier3 钩子进星级剔除清单，选中集只剩 tier1。
+    let sampling = assembled.sampling.as_ref().expect("超集模板应产采样审计段");
+    assert_eq!(sampling.culled_over_tier, vec!["hc_high".to_string()], "tier3 奖励钩子应被 2★ 封顶剔除");
+    assert_eq!(sampling.selected_hidden, vec!["hc_low".to_string()]);
+    assert!(sampling.culled_rare_budget.is_empty());
+
+    // 钩子层面：即使配额为 2，也只可能嵌入 hc_low（hc_high 已在采样前剔除）。
+    assert!(!assembled.per_character_hooks.is_empty(), "应仍有低档钩子可嵌入");
+    for h in &assembled.per_character_hooks {
+        assert_eq!(h.pool_item_id, "hc_low", "被封顶剔除的钩子绝不进实例");
+        let tier = h.reward_item.as_ref().unwrap().origin.power_tier;
+        assert!(tier <= 2, "钉住奖励档位不得超过模板星级: {tier}");
+    }
+
+    // assembled_json：starRating 快照 + 剔除清单钉进 sampling 审计段。
+    let raw: String = sqlx::query("SELECT assembled_json FROM worlds WHERE id = ?")
+        .bind(&wid)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+        .try_get("assembled_json")
+        .unwrap();
+    let v: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(v["starRating"], 2, "装配时模板星级应快照进 assembled_json");
+    assert_eq!(v["assembly"]["sampling"]["culledOverTier"][0], "hc_high");
+    assert!(v["assembly"]["sampling"]["culledRareBudget"].as_array().unwrap().is_empty());
+}
+
 // ---------- 服务端权威：carry 越权 → risk_event，整单拒绝 ----------
 
 #[tokio::test]
@@ -744,6 +813,14 @@ async fn concurrent_finish_grants_reward_exactly_once() {
     assert_eq!(
         count(&state.db, "SELECT COUNT(*) FROM backpacks WHERE user_id='usrA' AND item_id='item_relic'").await,
         1
+    );
+
+    // 波次 2：并发/重放下历练同样只发一次——隐藏任务 50（随道具那笔事务）+ 通关 100（并发两笔中
+    // 推进到第 2 节点的那笔转变沿）= 150；CAS 重试/幂等重放不得双发。
+    assert_eq!(
+        count(&state.db, "SELECT mileage FROM cloud_characters WHERE id='chA'").await,
+        150,
+        "并发 finish 历练只应发一次（50 隐藏 + 100 通关）"
     );
 }
 
@@ -1068,4 +1145,62 @@ async fn superset_clearance_uses_selected_mainline_count() {
     assert_eq!(st, StatusCode::OK, "{f2}");
     assert_eq!(f2["advancedTo"], json!(2));
     assert_eq!(f2["cleared"], json!(true), "推进到被选主线数即通关");
+}
+
+// ---------- 波次 2：历练结算（隐藏任务 +50 与道具带出同事务同幂等；通关 +100 每参与卡，转变沿只发一次） ----------
+
+/// 章节房历练：finish#1 兑现隐藏道具 → 发起人卡 +50（与道具同事务）；finish#2 通关 →
+/// **每张参与卡**（含从未 finish 的同房成员）各 +100；finish#3 已通关 → 不再发（转变沿幂等）。
+#[tokio::test]
+async fn chapter_settlement_grants_mileage_with_items_and_only_once() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    seed_user(&state, "usrA").await;
+    seed_user(&state, "usrB").await;
+    let card_a = make_card("chA", "苏未央", "害怕被遗忘", &["寻找失散的姐姐"], Some(("src_novel", "测试小说")), true);
+    seed_char(&state, "chA", "usrA", &card_a).await;
+    // 参与者 B：恐惧与隐藏池不匹配（不抢 reward 钩子的断言前提），全程不 finish，只作为参与卡收通关历练。
+    seed_char(&state, "chB", "usrB", &make_card("chB", "陆无咎", "害怕高处", &[], None, false)).await;
+    seed_template(&state, "tpl_chapter", "chapter", CHAPTER_SKELETON, r#"{"mode":"open"}"#).await;
+    let wid = make_chapter_world(&state, "tpl_chapter").await;
+    seed_member(&state, &wid, "usrA", "chA").await;
+    seed_member(&state, &wid, "usrB", "chB").await;
+    let ta = token(&state, "usrA");
+
+    let mileage = |cid: &'static str| {
+        let db = state.db.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>("SELECT mileage FROM cloud_characters WHERE id = ?")
+                .bind(cid)
+                .fetch_one(&db)
+                .await
+                .unwrap()
+        }
+    };
+
+    let (st, _) = post(&app, &format!("/api/worlds/{wid}/chapters/start"), &ta, None, json!({})).await;
+    assert_eq!(st, StatusCode::OK);
+
+    // finish#1：chA 兑现隐藏道具（+50，与 grant_item 同一事务）；未通关 → 无通关历练。
+    let (st, f1) = post(&app, &format!("/api/worlds/{wid}/chapters/finish"), &ta, None, json!({})).await;
+    assert_eq!(st, StatusCode::OK, "{f1}");
+    assert_eq!(f1["cleared"], json!(false));
+    let granted = f1["grantedItems"].as_array().unwrap().len() as i64;
+    assert_eq!(granted, 1, "chA 应兑现 1 个隐藏钩子: {f1}");
+    assert_eq!(mileage("chA").await, 50, "隐藏任务每个 +50，与道具带出同事务发放");
+    assert_eq!(mileage("chB").await, 0, "未通关不发通关历练");
+
+    // finish#2：通关转变沿 → 每张参与卡 +100（chB 从未 finish 也在场，同样计入）。
+    let (st, f2) = post(&app, &format!("/api/worlds/{wid}/chapters/finish"), &ta, None, json!({})).await;
+    assert_eq!(st, StatusCode::OK, "{f2}");
+    assert_eq!(f2["cleared"], json!(true));
+    assert_eq!(mileage("chA").await, 150, "50（隐藏任务）+ 100（通关）");
+    assert_eq!(mileage("chB").await, 100, "参与卡即使从未 finish 也应得通关历练");
+
+    // finish#3：已通关（was_cleared=true）→ 通关历练不双发；无新钩子 → 无隐藏任务历练。
+    let (st, f3) = post(&app, &format!("/api/worlds/{wid}/chapters/finish"), &ta, None, json!({})).await;
+    assert_eq!(st, StatusCode::OK, "{f3}");
+    assert_eq!(f3["grantedItems"].as_array().unwrap().len(), 0);
+    assert_eq!(mileage("chA").await, 150, "重复 finish 不得重复发通关/隐藏历练");
+    assert_eq!(mileage("chB").await, 100, "重复 finish 不得重复发通关历练");
 }

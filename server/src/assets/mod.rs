@@ -77,6 +77,8 @@ struct CharacterView {
     created_at: i64,
     /// 头像回读 URL；红线：仅头像机审 approved 才回传，否则 null（未过审绝不外泄）。
     avatar_url: Option<String>,
+    /// 历练值（波次 2）：挂卡的成长值，只作准入与解锁展示，绝不进入引擎决策。
+    mileage: i64,
 }
 
 /// 头像上传请求（base64 JSON，复用现有 JSON 栈，不碰 multipart）。
@@ -248,6 +250,16 @@ async fn publish(
         return Ok(json_response(cached));
     }
 
+    // 卡位检查（波次 2）：owner 现有未撤回云端角色数已占满 users.card_slots → 409。
+    // 撤回/删除会释放卡位；解锁更多卡位走历练（POST /me/card-slots/unlock）。
+    let active_cards = crate::progression::count_active_cards(&state.db, &user.user_id).await?;
+    let slots = crate::progression::card_slots_of(&state.db, &user.user_id).await?;
+    if active_cards >= slots {
+        return Err(ApiError::Conflict(format!(
+            "卡位已满（{active_cards}/{slots}）。通过历练可解锁更多卡位"
+        )));
+    }
+
     // 服务端权威版本号：按 owner + localCardId 递增，忽略客户端任何 version 声明。
     let max_version: Option<i64> =
         sqlx::query_scalar("SELECT MAX(version) FROM cloud_characters WHERE owner_id = ? AND local_card_id = ?")
@@ -296,16 +308,18 @@ async fn publish(
         created_at: now,
         // 发布即快照时尚无头像；头像走独立 POST /assets/characters/{id}/avatar 端点。
         avatar_url: None,
+        // 新卡历练从 0 起（唯一写入路径为各结算点的 grant_mileage_tx）。
+        mileage: 0,
     };
     let body = serde_json::to_string(&resp).map_err(ApiError::internal)?;
     guard.store_response(&state.db, &body).await?;
     Ok(json_response(body))
 }
 
-/// GET /assets/characters/mine：我的云端版本列表（owner 隔离，含审核态）。
+/// GET /assets/characters/mine：我的云端版本列表（owner 隔离，含审核态与历练值）。
 async fn list_mine(State(state): State<AppState>, user: AuthUser) -> Result<Response, ApiError> {
-    let rows: Vec<(String, String, i64, String, String, i64, i64, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT id, local_card_id, version, rights_declaration, moderation, withdrawn, created_at, avatar_url, avatar_moderation FROM cloud_characters WHERE owner_id = ? ORDER BY created_at DESC, version DESC",
+    let rows: Vec<(String, String, i64, String, String, i64, i64, Option<String>, Option<String>, i64)> = sqlx::query_as(
+        "SELECT id, local_card_id, version, rights_declaration, moderation, withdrawn, created_at, avatar_url, avatar_moderation, mileage FROM cloud_characters WHERE owner_id = ? ORDER BY created_at DESC, version DESC",
     )
     .bind(&user.user_id)
     .fetch_all(&state.db)
@@ -313,7 +327,7 @@ async fn list_mine(State(state): State<AppState>, user: AuthUser) -> Result<Resp
     let items: Vec<CharacterView> = rows
         .into_iter()
         .map(
-            |(id, local_card_id, version, rights, moderation, withdrawn, created_at, avatar_url, avatar_moderation)| {
+            |(id, local_card_id, version, rights, moderation, withdrawn, created_at, avatar_url, avatar_moderation, mileage)| {
                 CharacterView {
                     id,
                     local_card_id,
@@ -324,6 +338,7 @@ async fn list_mine(State(state): State<AppState>, user: AuthUser) -> Result<Resp
                     created_at,
                     // 红线：仅头像 approved 才回传 URL，否则 null（未过审绝不外泄）。
                     avatar_url: if avatar_moderation.as_deref() == Some("approved") { avatar_url } else { None },
+                    mileage,
                 }
             },
         )

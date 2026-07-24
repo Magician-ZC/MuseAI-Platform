@@ -691,3 +691,70 @@ async fn revive_free_when_price_zero_no_charge() {
     assert_eq!(billing_balance(&state.db, "viewer").await, 0);
     assert_eq!(count(&state.db, "SELECT COUNT(*) FROM arena_revive_grants WHERE world_id='w' AND status='eligible'").await, 1);
 }
+
+// ---------- 波次 2：arena 历练——参与 +40 / 冠军另 +120，收敛落定同事务、重复 settle 不双发 ----------
+
+/// 播种真实云端角色行（历练挂卡：mileage 落在 cloud_characters 上，须有卡才收得到）。
+async fn seed_cloud_char_row(db: &AnyPool, id: &str, owner: &str) {
+    sqlx::query(
+        "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, \
+         rights_declaration, moderation, withdrawn, created_at) \
+         VALUES (?, ?, 'local', 1, '{}', 'original', 'approved', 0, ?)",
+    )
+    .bind(id)
+    .bind(owner)
+    .bind(now_ms())
+    .execute(db)
+    .await
+    .expect("seed cloud char");
+}
+
+async fn mileage_of(db: &AnyPool, cid: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>("SELECT mileage FROM cloud_characters WHERE id=?")
+        .bind(cid)
+        .fetch_one(db)
+        .await
+        .expect("mileage query")
+}
+
+/// 结算收敛落定那一次：参赛卡（含被淘汰者）各 +40，冠军另 +120（c2=160）；
+/// 与胜者落定同一事务；重复 settle 命中 phase CAS 0 行 → 历练/荣誉都不双发。
+#[tokio::test]
+async fn settle_grants_participation_and_champion_mileage_exactly_once() {
+    let state = test_state().await;
+    seed_user(&state.db, "host").await;
+    seed_user(&state.db, "u1").await;
+    seed_user(&state.db, "u2").await;
+    seed_arena_world(&state.db, "w", "host", "official").await;
+    seed_cloud_char_row(&state.db, "c1", "u1").await;
+    seed_cloud_char_row(&state.db, "c2", "u2").await;
+    seed_member(&state.db, "m1", "w", "u1", "c1", "active").await;
+    seed_member(&state.db, "m2", "w", "u2", "c2", "active").await;
+
+    // 淘汰 c1 → 当事人同意 → settle 收敛：c2 唯一胜者，phase=concluded。
+    let (_, v) = post(&state, "/api/arena/w/eliminate", "host", json!({ "cloudCharacterId": "c1" })).await;
+    let cid = v["consentId"].as_str().unwrap().to_string();
+    // 未落定前不发任何历练（结算未发生）。
+    assert_eq!(mileage_of(&state.db, "c1").await, 0);
+    assert_eq!(mileage_of(&state.db, "c2").await, 0);
+    let (_, r) = respond_consent(&state, "u1", "w", &cid, true).await;
+    assert_eq!(r["status"], "approved");
+    let (_, v) = post(&state, "/api/arena/w/settle", "host", json!({})).await;
+    assert_eq!(v["winnerCharId"], "c2");
+    assert_eq!(v["phase"], "concluded");
+
+    // 参与 +40（c1 被淘汰仍是参赛卡）；冠军 40+120=160。
+    assert_eq!(mileage_of(&state.db, "c1").await, 40, "参赛卡（含被淘汰者）+40");
+    assert_eq!(mileage_of(&state.db, "c2").await, 160, "冠军 = 参与 40 + 冠军 120");
+
+    // 重复 settle：phase 已 concluded → CAS 0 行，历练与荣誉都不双发。
+    let (_, v) = post(&state, "/api/arena/w/settle", "host", json!({})).await;
+    assert_eq!(v["winnerCharId"], "c2", "重复 settle 结果视图不变");
+    assert_eq!(mileage_of(&state.db, "c1").await, 40, "重复 settle 不双发参与历练");
+    assert_eq!(mileage_of(&state.db, "c2").await, 160, "重复 settle 不双发冠军历练");
+    assert_eq!(
+        count(&state.db, "SELECT COUNT(*) FROM arena_rewards WHERE world_id='w' AND character_id='c2'").await,
+        1,
+        "荣誉奖励仍只一枚"
+    );
+}

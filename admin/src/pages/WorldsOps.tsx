@@ -1,4 +1,4 @@
-// 世界运营：活跃世界监控 + 脱敏诊断 + 暂停/恢复 + 官方建房 + 世界模板库。
+// 世界运营：活跃世界监控 + 脱敏诊断 + 暂停/恢复 + 官方建房 + 世界模板库（含星级 curation 定档）。
 import { useEffect, useState } from 'react';
 import {
   Alert,
@@ -18,7 +18,7 @@ import {
   Typography,
 } from 'antd';
 import type { TableColumnsType } from 'antd';
-import { adminFetch } from '../api';
+import { adminFetch, AdminApiError } from '../api';
 import { ErrorAlert, formatNumber, formatTime, friendlyError, ReasonModal, usePagedList } from '../components/shared';
 
 // ---------------- 类型 ----------------
@@ -76,6 +76,10 @@ interface TemplateRow {
   version: number;
   moderation: string;
   createdAt: number;
+  /** 星级 1-5（列表投影新增字段；后端未投影时缺省显示占位）。 */
+  starRating?: number;
+  /** 星级来源：auto 自动评估 / curated 人工定档。 */
+  starSource?: 'auto' | 'curated';
 }
 
 const ROOM_TYPE_TEXT: Record<string, string> = { idle: '放置世界', chapter: '章节房', arena: '赛事房' };
@@ -90,6 +94,31 @@ const MOD_TAG: Record<string, { color: string; text: string }> = {
   approved: { color: 'green', text: '已通过' },
   rejected: { color: 'red', text: '已驳回' },
 };
+const STAR_SOURCE_TAG: Record<string, { color: string; text: string }> = {
+  auto: { color: 'default', text: '自动评估' },
+  curated: { color: 'gold', text: '人工定档' },
+};
+
+/** 金色星级徽标 + 来源 Tag；后端尚未投影星级字段时显示占位符。 */
+function StarBadge({ rating, source }: { rating?: number | null; source?: string | null }) {
+  if (rating == null) return <>—</>;
+  const s = source ? (STAR_SOURCE_TAG[source] ?? { color: 'default', text: source }) : null;
+  return (
+    <Space size={4}>
+      <span style={{ color: '#faad14', fontWeight: 600 }}>{rating}★</span>
+      {s && <Tag color={s.color}>{s.text}</Tag>}
+    </Space>
+  );
+}
+
+/**
+ * 定档接口错误 → 提示文案：400（星级/理由非法）、403（无权限）、404（模板不存在）
+ * 按契约优先透出服务端文案；无结构化文案（如断网、空响应体）时回退通用友好提示。
+ */
+function starActionError(e: unknown): string {
+  if (e instanceof AdminApiError && e.message && !/^HTTP \d+$/.test(e.message)) return e.message;
+  return friendlyError(e);
+}
 
 // ================= 世界监控 =================
 
@@ -443,7 +472,10 @@ function Templates() {
   const [createOpen, setCreateOpen] = useState(false);
   const [creating, setCreating] = useState(false);
   const [view, setView] = useState<TemplateRow | null>(null);
+  const [starTarget, setStarTarget] = useState<TemplateRow | null>(null);
+  const [starring, setStarring] = useState(false);
   const [form] = Form.useForm();
+  const [starForm] = Form.useForm();
 
   const list = usePagedList<TemplateRow>(async (cursor) => {
     const qs = new URLSearchParams();
@@ -503,10 +535,47 @@ function Templates() {
     }
   };
 
+  /** 打开定档 Modal：星级预填当前值（无则 3★），理由每次清空。 */
+  const openStar = (row: TemplateRow) => {
+    setStarTarget(row);
+    starForm.setFieldsValue({ star: row.starRating ?? 3, reason: '' });
+  };
+
+  const submitStar = async () => {
+    if (!starTarget) return;
+    let values: { star: number; reason: string };
+    try {
+      values = await starForm.validateFields();
+    } catch {
+      return;
+    }
+    setStarring(true);
+    try {
+      // POST /api/admin/world-templates/{id}/star，body { star: 1..5, reason: 1..500 必填 }。
+      await adminFetch(`/admin/world-templates/${starTarget.id}/star`, 'POST', {
+        star: values.star,
+        reason: values.reason.trim(),
+      });
+      message.success(`模板已定档为 ${values.star}★`);
+      setStarTarget(null);
+      reload();
+    } catch (e) {
+      message.error(starActionError(e));
+    } finally {
+      setStarring(false);
+    }
+  };
+
   const columns: TableColumnsType<TemplateRow> = [
     { title: '标题', dataIndex: 'title', key: 'title' },
     { title: '房型', dataIndex: 'roomType', key: 'roomType', width: 100, render: (v: string) => ROOM_TYPE_TEXT[v] ?? v },
     { title: '官方', dataIndex: 'official', key: 'official', width: 70, render: (v: boolean) => (v ? <Tag color="gold">官方</Tag> : '—') },
+    {
+      title: '星级',
+      key: 'star',
+      width: 150,
+      render: (_, r) => <StarBadge rating={r.starRating} source={r.starSource} />,
+    },
     { title: '版本', dataIndex: 'version', key: 'version', width: 70 },
     {
       title: '审核态',
@@ -519,7 +588,17 @@ function Templates() {
       },
     },
     { title: '创建时间', dataIndex: 'createdAt', key: 'createdAt', render: formatTime },
-    { title: '操作', key: 'op', width: 90, render: (_, r) => <Button size="small" onClick={() => setView(r)}>查看</Button> },
+    {
+      title: '操作',
+      key: 'op',
+      width: 140,
+      render: (_, r) => (
+        <Space size="small">
+          <Button size="small" onClick={() => setView(r)}>查看</Button>
+          <Button size="small" onClick={() => openStar(r)}>定档</Button>
+        </Space>
+      ),
+    },
   ];
 
   return (
@@ -551,7 +630,7 @@ function Templates() {
         dataSource={list.items}
         loading={list.loading}
         pagination={false}
-        scroll={{ x: 800 }}
+        scroll={{ x: 1000 }}
       />
 
       {list.hasMore && (
@@ -595,6 +674,45 @@ function Templates() {
         </Form>
       </Modal>
 
+      {/* 模板星级定档 */}
+      <Modal
+        title={`模板定档：${starTarget?.title ?? ''}`}
+        open={!!starTarget}
+        onOk={submitStar}
+        confirmLoading={starring}
+        onCancel={() => setStarTarget(null)}
+        okText="确认定档"
+        cancelText="取消"
+        width={480}
+      >
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 12 }}
+          message="人工定档后来源标记为「人工定档」，覆盖自动评估结果；理由将写入审计日志。"
+        />
+        <Form form={starForm} layout="vertical">
+          <Form.Item name="star" label="目标星级" rules={[{ required: true, message: '请选择星级' }]}>
+            <Select
+              options={[5, 4, 3, 2, 1].map((n) => ({
+                value: n,
+                label: <span style={{ color: '#faad14', fontWeight: 600 }}>{'★'.repeat(n)}（{n} 星）</span>,
+              }))}
+            />
+          </Form.Item>
+          <Form.Item
+            name="reason"
+            label="定档理由（必填）"
+            rules={[
+              { required: true, whitespace: true, message: '请填写定档理由' },
+              { max: 500, message: '理由不能超过 500 字' },
+            ]}
+          >
+            <Input.TextArea rows={4} maxLength={500} showCount placeholder="说明定档依据（如内容质量、玩家反馈、运营策略），将写入审计日志" />
+          </Form.Item>
+        </Form>
+      </Modal>
+
       <Drawer title="模板详情" width={640} open={!!view} onClose={() => setView(null)}>
         {view && (
           <>
@@ -607,6 +725,7 @@ function Templates() {
                 { key: 'title', label: '标题', children: view.title },
                 { key: 'roomType', label: '房型', children: ROOM_TYPE_TEXT[view.roomType] ?? view.roomType },
                 { key: 'official', label: '官方', children: view.official ? '是' : '否' },
+                { key: 'star', label: '星级', children: <StarBadge rating={view.starRating} source={view.starSource} /> },
                 { key: 'version', label: '版本', children: view.version },
                 { key: 'moderation', label: '审核态', children: (MOD_TAG[view.moderation]?.text) ?? view.moderation },
                 { key: 'createdAt', label: '创建时间', children: formatTime(view.createdAt) },

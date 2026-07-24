@@ -27,6 +27,8 @@ export interface WorldSummary {
   aiLabel?: AiLabel;
   /** 热度分：仅 sort=hot 快照榜下发（近 48h 事件 + 近 7 天打赏 + active 成员加权），最新模式缺席。 */
   hotScore?: number;
+  /** 星级（1-5）：世界准入门槛展示；星级≥3 的世界要求投放角色历练达标（老服务端缺席则不展示徽标）。 */
+  starRating?: number;
 }
 
 /** 大厅排序：new=最新（cursor 分页）| hot=热度快照榜（不分页）。 */
@@ -57,6 +59,8 @@ export interface WorldDetail {
   modelRouteVersion: string;
   roster: WorldRosterEntry[];
   aiLabel?: AiLabel;
+  /** 星级（1-5）：与列表项同源；星级≥3 时 join 要求角色历练达标（服务端权威校验）。 */
+  starRating?: number;
   compliance?: { aiGenerated: boolean; arbitrationPublic: boolean };
   /** 服务端当前未在详情返回；留字段以便前向兼容 revision CAS（见 WorldRoom 干预面板）。 */
   stateRevision?: number;
@@ -140,6 +144,20 @@ export interface CloudCharacter {
   rejectReason?: string | null;
   /** 申诉状态：仅 status 端点下发；无申诉 → null。 */
   appeal?: CharacterAppeal | null;
+  /** 历练值：挂卡的成长值，只作准入与解锁展示，绝不进入引擎决策（老服务端缺席按 0 处理）。 */
+  mileage?: number;
+}
+
+/** 我的历练进度与卡位（GET /me/progression；POST /me/card-slots/unlock 成功返回同构）。 */
+export interface Progression {
+  /** 总历练：全部未撤回云端角色的 mileage 之和。 */
+  totalMileage: number;
+  /** 已解锁卡位数（默认 3）。 */
+  cardSlots: number;
+  /** 卡位硬上限（当前 6）。 */
+  maxSlots: number;
+  /** 解锁下一卡位所需总历练阈值；已达上限 → null。 */
+  nextSlotAt: number | null;
 }
 
 /** GET /assets/characters/{id}/status 返回体（含驳回理由与申诉状态回显）。 */

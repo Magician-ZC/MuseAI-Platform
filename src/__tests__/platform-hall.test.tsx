@@ -42,7 +42,7 @@ describe('PlatformHall', () => {
       if (path.startsWith('/api/worlds?')) {
         return {
           worlds: [
-            { id: 'w1', roomType: 'idle', title: '云州放置世界', status: 'open', visibility: 'official', memberLimit: 10, memberCount: 4, tickPerDay: 3 },
+            { id: 'w1', roomType: 'idle', title: '云州放置世界', status: 'open', visibility: 'official', memberLimit: 10, memberCount: 4, tickPerDay: 3, starRating: 3 },
           ],
           nextCursor: null,
         };
@@ -55,6 +55,8 @@ describe('PlatformHall', () => {
     expect(await screen.findByText('云州放置世界')).toBeInTheDocument();
     // 「放置房」同时出现在房型筛选与世界卡标签，故用 getAllByText。
     expect(screen.getAllByText('放置房').length).toBeGreaterThan(0);
+    // 星级徽标：starRating=3 → 金色「3★」
+    expect(screen.getByText('3★')).toBeInTheDocument();
   });
 
   it('云端不可用：优雅降级为「连接平台失败」而非崩溃', async () => {

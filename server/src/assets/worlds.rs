@@ -40,6 +40,18 @@ const MAX_SKELETON_BYTES: usize = 2 * 1024 * 1024;
 /// 冗余倍率下限：超集量 ÷ 单副本抽样量 ≥ 3.0，才够采出内容不同的多副本（§防刷 ①）。
 const MIN_REDUNDANCY_RATIO: f32 = 3.0;
 
+// ---------------- 星级自动定档（波次 3）：结构厚度阈值集中区（可调，数值即产品策划口径） ----------------
+
+/// 自动定档封顶：发布自动档至多 2★（保守起步）；3-5★ 只能运营 curation 晋升（数据晋升，
+/// 见 admin `POST /admin/world-templates/{id}/star`）。
+const AUTO_STAR_CAP: i64 = 2;
+/// 2★ 结构厚度门槛：剧情线 ≥ 2（互斥采样单元成型）。
+const STAR2_MIN_STORYLINES: usize = 2;
+/// 2★ 结构厚度门槛：世界固有角色 ≥ 2（NPC/反派生态成型）。
+const STAR2_MIN_WORLD_CHARACTERS: usize = 2;
+/// 2★ 结构厚度门槛：地点 ≥ 3（地点图/秘境维度成型）。
+const STAR2_MIN_LOCATIONS: usize = 3;
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/assets/worlds", post(publish))
@@ -72,6 +84,8 @@ struct WorldTemplateView {
     rights_declaration: String,
     moderation: String,
     withdrawn: bool,
+    /// 星级（1-5）：发布自动定档（封顶 2★），更高星级由运营 curation 授予。
+    star_rating: i64,
     created_at: i64,
 }
 
@@ -208,6 +222,29 @@ fn validate_superset(skeleton: &Value) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// 发布自动定档（波次 3 第一环）：基础 1★；结构厚度全达标 →「isSuperset && redundancyRatio ≥ 3.0
+/// && storylines ≥ 2 && worldCharacters ≥ 2 && locations ≥ 3」→ 2★。
+/// **自动档封顶 `AUTO_STAR_CAP`（2★）**——3-5★ 只能运营 curation 晋升（保守起步、数据晋升）。
+/// worldCharacters/locations 按原始数组计数（SupersetView 刻意不解析重型 NPC 卡，与超集校验同哲学）；
+/// 解析失败防御式回落 1★（publish 已由 validate_superset 前置拦截非法超集，此处只兜底不拦截）。
+fn auto_star_rating(skeleton: &Value) -> i64 {
+    let Ok(sv) = serde_json::from_value::<SupersetView>(skeleton.clone()) else {
+        return 1;
+    };
+    let arr_len =
+        |key: &str| skeleton.get(key).and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+    let thick = sv.is_superset
+        && sv.sampling.redundancy_ratio >= MIN_REDUNDANCY_RATIO
+        && sv.storylines.len() >= STAR2_MIN_STORYLINES
+        && arr_len("worldCharacters") >= STAR2_MIN_WORLD_CHARACTERS
+        && arr_len("locations") >= STAR2_MIN_LOCATIONS;
+    if thick {
+        AUTO_STAR_CAP
+    } else {
+        1
+    }
 }
 
 /// 机审文本：拼接可叙述内容（源作品标题 + 各 NPC 卡语义字段 + 地点名 + 道具叙事 + 隐藏/支线模板 + 剧情线摘要）。
@@ -378,11 +415,15 @@ async fn publish(
     let manifest_text = manifest.to_string();
     let admission_text = serde_json::json!({ "mode": "open" }).to_string();
 
-    // official=0（创作者资产）；withdrawn=0；moderation=机审裁决（Approved 后可建房，Pending 进人审）。
+    // 发布自动定档（服务端权威，忽略客户端任何星级声明）：1★ 起步，结构厚度达标 → 2★（自动档封顶）。
+    let star_rating = auto_star_rating(&req.skeleton_json);
+
+    // official=0（创作者资产）；withdrawn=0；moderation=机审裁决（Approved 后可建房，Pending 进人审）；
+    // star_source='auto'（发布自动定档，运营 curation 后翻转为 'curated'）。
     sqlx::query(
         "INSERT INTO world_templates \
-         (id, title, room_type, skeleton_json, admission_json, official, version, moderation, withdrawn, owner_id, rights_declaration, manifest_json, created_at) \
-         VALUES (?, ?, ?, ?, ?, 0, ?, ?, 0, ?, ?, ?, ?)",
+         (id, title, room_type, skeleton_json, admission_json, official, version, moderation, withdrawn, owner_id, rights_declaration, manifest_json, star_rating, star_source, created_at) \
+         VALUES (?, ?, ?, ?, ?, 0, ?, ?, 0, ?, ?, ?, ?, 'auto', ?)",
     )
     .bind(&id)
     .bind(&title)
@@ -394,6 +435,7 @@ async fn publish(
     .bind(&user.user_id)
     .bind(&req.rights_declaration)
     .bind(&manifest_text)
+    .bind(star_rating)
     .bind(now)
     .execute(&state.db)
     .await?;
@@ -405,6 +447,7 @@ async fn publish(
         rights_declaration: req.rights_declaration,
         moderation: moderation.to_string(),
         withdrawn: false,
+        star_rating,
         created_at: now,
     };
     let body = serde_json::to_string(&resp).map_err(ApiError::internal)?;
@@ -414,8 +457,8 @@ async fn publish(
 
 /// GET /assets/worlds/mine：我发布的世界模板列表（owner 隔离；官方模板 owner_id NULL 不入列）。
 async fn list_mine(State(state): State<AppState>, user: AuthUser) -> Result<Response, ApiError> {
-    let rows: Vec<(String, String, i64, Option<String>, String, i64, i64)> = sqlx::query_as(
-        "SELECT id, title, version, rights_declaration, moderation, withdrawn, created_at \
+    let rows: Vec<(String, String, i64, Option<String>, String, i64, i64, i64)> = sqlx::query_as(
+        "SELECT id, title, version, rights_declaration, moderation, withdrawn, star_rating, created_at \
          FROM world_templates WHERE owner_id = ? ORDER BY created_at DESC, version DESC",
     )
     .bind(&user.user_id)
@@ -423,13 +466,14 @@ async fn list_mine(State(state): State<AppState>, user: AuthUser) -> Result<Resp
     .await?;
     let items: Vec<WorldTemplateView> = rows
         .into_iter()
-        .map(|(id, title, version, rights, moderation, withdrawn, created_at)| WorldTemplateView {
+        .map(|(id, title, version, rights, moderation, withdrawn, star_rating, created_at)| WorldTemplateView {
             id,
             title,
             version,
             rights_declaration: rights.unwrap_or_default(),
             moderation,
             withdrawn: withdrawn != 0,
+            star_rating,
             created_at,
         })
         .collect();
@@ -515,6 +559,33 @@ mod tests {
     use serde_json::{json, Value};
 
     use crate::auth::tests::{build_app, login_new_user, send};
+
+    use muse_engine::character::types::{CardLifecycle, CharacterCardV2, Identity};
+
+    /// 完整可解析的 CharacterCardV2 JSON（与 admin tests 同款）：让含 worldCharacters 的超集
+    /// 真正走 `validate_skeleton_refs` 的结构化解析路径，而非防御式放行。
+    fn full_card_json(id: &str, name: &str) -> Value {
+        let card = CharacterCardV2 {
+            schema_version: 2,
+            id: id.into(),
+            lifecycle: CardLifecycle::Ready,
+            identity: Identity { name: name.into(), ..Default::default() },
+            dramatic_core: Default::default(),
+            decision_model: Default::default(),
+            perception: Default::default(),
+            emotion_dynamics: Default::default(),
+            relation_grammar: Default::default(),
+            expression_fingerprint: Default::default(),
+            agency: Default::default(),
+            growth_arc: Default::default(),
+            world_adaptation: Default::default(),
+            evidence_index: Default::default(),
+            revision: 1,
+            created_at: 0,
+            updated_at: 0,
+        };
+        serde_json::to_value(card).unwrap()
+    }
 
     /// 完整道具目录条目（对齐 server `admission::ItemDefinition`，全字段无 default，须显式给全）。
     fn full_item(id: &str, narrative: &str) -> Value {
@@ -657,6 +728,69 @@ mod tests {
         bad_room["roomType"] = json!("dungeon");
         let (st, _) = send(&app, "POST", "/api/assets/worlds", Some(&access), None, Some(bad_room)).await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
+    }
+
+    // ---------------- 波次 3：发布自动定档（1★ 基础 / 2★ 结构厚度 / 自动档封顶 2★） ----------------
+
+    /// 结构厚度达标的超集：valid_superset + 世界固有角色 ×2（完整卡）+ 第三地点
+    /// （storylines=2、redundancyRatio=3.5 已达标）→ 自动 2★。
+    fn thick_superset() -> Value {
+        let mut sk = valid_superset();
+        sk["worldCharacters"] = json!([
+            { "card": full_card_json("npc-jian", "剑冢守灵人"), "homeLocation": "loc-entrance" },
+            { "card": full_card_json("npc-mo", "墨衣客"), "homeLocation": "loc-tomb" }
+        ]);
+        sk["locations"].as_array_mut().unwrap().push(json!({
+            "id": "loc-market", "name": "山下坊市", "connections": ["loc-entrance"]
+        }));
+        sk
+    }
+
+    #[tokio::test]
+    async fn publish_auto_stars_thin_superset_at_one() {
+        let (app, state) = build_app().await;
+        let (access, _r, _u) = login_new_user(&app, "13910000021").await;
+        // valid_superset：无 worldCharacters、地点仅 2 → 结构厚度不达标 → 基础 1★。
+        let (st, v) =
+            send(&app, "POST", "/api/assets/worlds", Some(&access), Some("s1"), Some(publish_body(valid_superset()))).await;
+        assert_eq!(st, StatusCode::OK, "{v:?}");
+        assert_eq!(v["starRating"], 1, "结构厚度不达标应定 1★");
+
+        let id = v["id"].as_str().unwrap().to_string();
+        let row: (i64, String) =
+            sqlx::query_as("SELECT star_rating, star_source FROM world_templates WHERE id = ?")
+                .bind(&id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(row.0, 1);
+        assert_eq!(row.1, "auto", "发布定档 star_source 恒为 auto");
+    }
+
+    #[tokio::test]
+    async fn publish_auto_stars_thick_superset_at_two() {
+        let (app, state) = build_app().await;
+        let (access, _r, _u) = login_new_user(&app, "13910000022").await;
+        // 客户端伪造星级 → 服务端忽略（§9.6：星级为服务端权威定档）。
+        let mut body = publish_body(thick_superset());
+        body["starRating"] = json!(5);
+        let (st, v) = send(&app, "POST", "/api/assets/worlds", Some(&access), Some("s2"), Some(body)).await;
+        assert_eq!(st, StatusCode::OK, "{v:?}");
+        assert_eq!(v["starRating"], 2, "结构厚度全达标应定 2★（自动档封顶，客户端 5 被忽略）");
+
+        let id = v["id"].as_str().unwrap().to_string();
+        let row: (i64, String) =
+            sqlx::query_as("SELECT star_rating, star_source FROM world_templates WHERE id = ?")
+                .bind(&id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(row.0, 2, "自动档至多 2★（3-5★ 只能运营 curation 晋升）");
+        assert_eq!(row.1, "auto");
+
+        // mine 列表回读 starRating。
+        let (_st, mine) = send(&app, "GET", "/api/assets/worlds/mine", Some(&access), None, None).await;
+        assert_eq!(mine[0]["starRating"], 2, "mine 列表应带 starRating");
     }
 
     // ---------------- #12 预审核门：注入命中 → Pending + 单条入队/记险 ----------------

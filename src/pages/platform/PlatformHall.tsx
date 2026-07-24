@@ -82,6 +82,8 @@ const WorldCard: React.FC<{ world: WorldSummary; onEnter: () => void; onSpectate
         </Space>
         <Space size={6} wrap>
           <Tag color="orange">{roomTypeLabel(world.roomType)}</Tag>
+          {/* 星级（1-5）：星级≥3 的世界对投放角色有历练门槛，与热度徽标并列。 */}
+          {typeof world.starRating === 'number' && <Tag color="gold">{world.starRating}★</Tag>}
           {world.aiLabel?.visible !== false && <Tag>AI 生成</Tag>}
           {typeof world.hotScore === 'number' && (
             <Tag color="volcano">

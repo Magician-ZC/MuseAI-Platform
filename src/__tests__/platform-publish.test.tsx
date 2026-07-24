@@ -47,10 +47,14 @@ const renderPublish = () =>
     </MemoryRouter>,
   );
 
+// 历练与卡位默认进度（CharacterPublish 挂载即拉取 /api/me/progression；各用例可覆写）。
+const defaultProgression = { totalMileage: 0, cardSlots: 3, maxSlots: 6, nextSlotAt: 200 };
+
 describe('CharacterPublish', () => {
   it('选卡 → 权利声明 → 发布，展示审核态', async () => {
     fetchMock.mockImplementation(async (path: string, opts?: { method?: string }) => {
       if (path === '/api/assets/characters/mine') return [];
+      if (path === '/api/me/progression') return defaultProgression;
       if (path === '/api/assets/characters' && opts?.method === 'POST') {
         return {
           id: 'cc1',
@@ -86,6 +90,7 @@ describe('CharacterPublish', () => {
   it('我的云端版本加载失败：优雅降级', async () => {
     fetchMock.mockImplementation(async (path: string) => {
       if (path === '/api/assets/characters/mine') throw new TypeError('offline');
+      if (path === '/api/me/progression') throw new TypeError('offline');
       throw new Error(`unexpected ${path}`);
     });
 
@@ -108,6 +113,7 @@ describe('CharacterPublish', () => {
           },
         ];
       }
+      if (path === '/api/me/progression') return defaultProgression;
       throw new Error(`unexpected ${path}`);
     });
     uploadAvatarMock.mockResolvedValue({
@@ -148,6 +154,7 @@ describe('CharacterPublish', () => {
           },
         ];
       }
+      if (path === '/api/me/progression') return defaultProgression;
       // 驳回理由与申诉状态仅 status 端点下发（列表端点缺席）。
       if (path === '/api/assets/characters/cc9/status') {
         return {
@@ -197,5 +204,70 @@ describe('CharacterPublish', () => {
     expect(await screen.findByText('申诉中')).toBeInTheDocument();
     // 已有申诉：不再显示申诉按钮
     expect(screen.queryByRole('button', { name: '申诉' })).toBeNull();
+  });
+
+  it('历练与卡位面板：渲染总历练/卡位，达标时解锁按钮可点，点击 POST unlock 并按返回体刷新', async () => {
+    fetchMock.mockImplementation(async (path: string, opts?: { method?: string }) => {
+      if (path === '/api/assets/characters/mine') return [];
+      if (path === '/api/me/progression') {
+        return { totalMileage: 260, cardSlots: 3, maxSlots: 6, nextSlotAt: 200 };
+      }
+      if (path === '/api/me/card-slots/unlock' && opts?.method === 'POST') {
+        return { totalMileage: 260, cardSlots: 4, maxSlots: 6, nextSlotAt: 400 };
+      }
+      throw new Error(`unexpected ${path}`);
+    });
+
+    renderPublish();
+
+    // 面板渲染总历练与卡位 N/6
+    expect(await screen.findByText('260')).toBeInTheDocument();
+    expect(screen.getByText('3/6')).toBeInTheDocument();
+
+    // 达标（260 ≥ 200）→ 解锁按钮可点
+    const unlockBtn = screen.getByRole('button', { name: '解锁卡位' });
+    expect(unlockBtn).not.toBeDisabled();
+    fireEvent.click(unlockBtn);
+
+    // 断言解锁请求：POST /api/me/card-slots/unlock；成功后面板按返回体刷新（卡位 4/6）
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(([p]) => p === '/api/me/card-slots/unlock');
+      expect(call).toBeTruthy();
+      expect((call![1] as { method?: string })?.method).toBe('POST');
+    });
+    expect(await screen.findByText('4/6')).toBeInTheDocument();
+  });
+
+  it('云端版本表渲染「历练」列；未达阈值时解锁按钮禁用', async () => {
+    fetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/assets/characters/mine') {
+        return [
+          {
+            id: 'cc1',
+            localCardId: '沈霜卡',
+            version: 1,
+            rightsDeclaration: 'original',
+            moderation: 'approved',
+            withdrawn: false,
+            createdAt: 1,
+            mileage: 120,
+          },
+        ];
+      }
+      // 未达标：40 < 200 → 解锁按钮禁用
+      if (path === '/api/me/progression') return { totalMileage: 40, cardSlots: 3, maxSlots: 6, nextSlotAt: 200 };
+      throw new Error(`unexpected ${path}`);
+    });
+
+    renderPublish();
+
+    // 「历练」列头 + 行内 mileage 数值
+    expect(await screen.findByText('沈霜卡')).toBeInTheDocument();
+    expect(screen.getByText('历练')).toBeInTheDocument();
+    expect(screen.getByText('120')).toBeInTheDocument();
+
+    // 未达阈值 → 按钮禁用，并提示还差多少
+    expect(await screen.findByRole('button', { name: '解锁卡位' })).toBeDisabled();
+    expect(screen.getByText(/还差 160/)).toBeInTheDocument();
   });
 });

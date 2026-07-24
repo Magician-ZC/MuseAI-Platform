@@ -22,6 +22,7 @@ import {
   Modal,
   Tooltip,
   Input,
+  Progress,
   message,
 } from 'antd';
 import {
@@ -42,6 +43,7 @@ import {
   type CloudCharacter,
   type CloudCharacterStatus,
   type CharacterAppeal,
+  type Progression,
 } from '../../stores/usePlatformStore';
 
 const { Title, Text, Paragraph } = Typography;
@@ -73,6 +75,11 @@ const CharacterPublish: React.FC = () => {
   const [mine, setMine] = useState<CloudCharacter[]>([]);
   const [mineLoading, setMineLoading] = useState(false);
   const [mineError, setMineError] = useState<string | null>(null);
+
+  // 历练与卡位（波次 2）：总历练 = 未撤回卡 mileage 之和，达 nextSlotAt 阈值可解锁下一卡位（上限 6）。
+  const [progression, setProgression] = useState<Progression | null>(null);
+  const [progressionError, setProgressionError] = useState<string | null>(null);
+  const [unlocking, setUnlocking] = useState(false);
 
   // 角色头像：目标为已发布的云端角色（头像挂在云端角色上，需其 id）。
   const [avatarCharId, setAvatarCharId] = useState<string | null>(null);
@@ -112,7 +119,39 @@ const CharacterPublish: React.FC = () => {
     );
   };
 
+  // 历练进度独立加载（best-effort）：失败不阻塞发布主流程，面板内降级并可重试。
+  const loadProgression = async () => {
+    setProgressionError(null);
+    try {
+      const p = await cloudFetch<Progression>('/api/me/progression');
+      if (aliveRef.current) setProgression(p);
+    } catch (e) {
+      if (aliveRef.current) setProgressionError(describeCloudError(e));
+    }
+  };
+
+  // 解锁卡位：达标才可点（disabled 兜底），400（未达/已满）/409（并发）直接透出服务端中文文案。
+  const unlockSlot = async () => {
+    setUnlocking(true);
+    try {
+      const p = await cloudFetch<Progression>('/api/me/card-slots/unlock', {
+        method: 'POST',
+        idempotent: true,
+      });
+      if (aliveRef.current) setProgression(p);
+      message.success(`已解锁新卡位（${p.cardSlots}/${p.maxSlots}）`);
+    } catch (e) {
+      message.error(describeCloudError(e));
+      // 服务端拒绝多因本地进度过期（他端撤回/解锁）：拉回权威进度。
+      void loadProgression();
+    } finally {
+      if (aliveRef.current) setUnlocking(false);
+    }
+  };
+
   const loadMine = async () => {
+    // 撤回/删除会改变总历练（只计未撤回卡）与卡位占用：同步刷新进度（best-effort，不 await）。
+    void loadProgression();
     setMineLoading(true);
     setMineError(null);
     try {
@@ -479,6 +518,72 @@ const CharacterPublish: React.FC = () => {
         )}
       </Card>
 
+      {/* 历练与卡位：总历练（未撤回卡 mileage 之和）→ 达阈值解锁卡位（默认 3，上限 6）。 */}
+      <Card
+        title="历练与卡位"
+        style={{ marginTop: 20, borderRadius: 12, border: 'none', boxShadow: '0 1px 3px rgba(0,0,0,0.05)' }}
+        styles={{ body: { padding: 20 } }}
+      >
+        {progression ? (
+          <Space direction="vertical" size={10} style={{ width: '100%' }}>
+            <Space size={24} wrap align="center">
+              <Text>
+                总历练：
+                <Text strong style={{ fontSize: 16 }}>
+                  {progression.totalMileage}
+                </Text>
+              </Text>
+              <Text>
+                卡位：
+                <Text strong style={{ fontSize: 16 }}>
+                  {progression.cardSlots}/{progression.maxSlots}
+                </Text>
+              </Text>
+              {progression.nextSlotAt === null ? (
+                <Tag color="green">卡位已达上限</Tag>
+              ) : (
+                <Button
+                  size="small"
+                  type="primary"
+                  loading={unlocking}
+                  disabled={progression.totalMileage < progression.nextSlotAt}
+                  onClick={() => void unlockSlot()}
+                >
+                  解锁卡位
+                </Button>
+              )}
+            </Space>
+            {progression.nextSlotAt !== null && (
+              <>
+                <Progress
+                  percent={Math.min(100, Math.floor((progression.totalMileage / progression.nextSlotAt) * 100))}
+                  showInfo={false}
+                  strokeColor="#d97757"
+                  size="small"
+                />
+                <Text type="secondary" style={{ fontSize: 12 }}>
+                  {progression.totalMileage >= progression.nextSlotAt
+                    ? `已达到解锁条件（需总历练 ${progression.nextSlotAt}），可解锁第 ${progression.cardSlots + 1} 个卡位`
+                    : `解锁下一卡位需总历练 ${progression.nextSlotAt}，还差 ${progression.nextSlotAt - progression.totalMileage}`}
+                </Text>
+              </>
+            )}
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              历练由角色在世界中的参与产出（挂在云端角色卡上），只用于卡位等准入与解锁，不影响剧情判定。
+            </Text>
+          </Space>
+        ) : progressionError ? (
+          <Space size={12} wrap>
+            <Text type="secondary">历练信息暂不可用：{progressionError}</Text>
+            <Button size="small" onClick={() => void loadProgression()}>
+              重试
+            </Button>
+          </Space>
+        ) : (
+          <Text type="secondary">历练信息加载中…</Text>
+        )}
+      </Card>
+
       {/* 我的云端版本 */}
       <Card
         title="我的云端版本"
@@ -516,6 +621,8 @@ const CharacterPublish: React.FC = () => {
               },
               { title: '本地卡', dataIndex: 'localCardId', ellipsis: true },
               { title: '版本', dataIndex: 'version', width: 70, render: (v: number) => `v${v}` },
+              // 历练：挂卡成长值（老服务端缺席按 0 展示）；星级≥3 的世界按此设投放门槛。
+              { title: '历练', dataIndex: 'mileage', width: 80, render: (v?: number) => v ?? 0 },
               { title: '权利', dataIndex: 'rightsDeclaration', width: 120, render: rightsLabel },
               {
                 title: '审核态',

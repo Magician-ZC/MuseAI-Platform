@@ -548,6 +548,113 @@ async fn create_template_rejects_dangling_references() {
     assert_eq!(st, StatusCode::BAD_REQUEST, "世界角色悬空 carriedItemIds 应拒绝");
 }
 
+// ---------------- 波次 3：模板星级 curation（RBAC / 范围校验 / audit 留痕 / star_source 翻转） ----------------
+
+/// 建一个模板并返回 id（admin 建，star_rating/star_source 走 0020 列默认值 1/'auto'）。
+async fn seed_template_for_star(app: &axum::Router, state: &AppState) -> String {
+    let (st, body) = post(
+        app,
+        "/api/admin/world-templates",
+        Some(&admin_token(state)),
+        json!({ "title": "星级候选模板", "roomType": "chapter", "skeletonJson": { "mainlineNodes": [] } }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    body["templateId"].as_str().unwrap().to_string()
+}
+
+async fn star_row(state: &AppState, id: &str) -> (i64, String) {
+    sqlx::query_as("SELECT star_rating, star_source FROM world_templates WHERE id = ?")
+        .bind(id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn template_star_curation_rbac_and_source_flip() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let tpl_id = seed_template_for_star(&app, &state).await;
+    assert_eq!(star_row(&state, &tpl_id).await, (1, "auto".into()), "新模板默认 1★/auto");
+    let uri = format!("/api/admin/world-templates/{tpl_id}/star");
+
+    // RBAC：reviewer/finance/support → 403（且不改星级、不落审计）。
+    for role in ["reviewer", "finance", "support"] {
+        let t = role_token(&state, role);
+        let (st, _) = post(&app, &uri, Some(&t), json!({ "star": 4, "reason": "越权尝试" })).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{role} 应 403");
+    }
+    assert_eq!(star_row(&state, &tpl_id).await.0, 1, "越权请求不得改星级");
+    assert_eq!(count(&state, "SELECT COUNT(*) AS n FROM audit_logs WHERE action='template_star'").await, 0);
+
+    // operator → 200：star_rating=4 + star_source 翻转为 curated + audit 留痕（action=template_star）。
+    let operator = role_token(&state, "operator");
+    let (st, v) =
+        post(&app, &uri, Some(&operator), json!({ "star": 4, "reason": "结构厚度与完读数据达标，晋升四星" })).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["starRating"], 4);
+    assert_eq!(v["starSource"], "curated");
+    assert_eq!(star_row(&state, &tpl_id).await, (4, "curated".into()), "star_source 应翻转为 curated");
+    let n = count(
+        &state,
+        &format!("SELECT COUNT(*) AS n FROM audit_logs WHERE action='template_star' AND subject='{tpl_id}'"),
+    )
+    .await;
+    assert_eq!(n, 1, "curation 应恰好一条 audit_logs 留痕");
+
+    // admin 直通：定 5★。
+    let (st, v) = post(&app, &uri, Some(&admin_token(&state)), json!({ "star": 5, "reason": "周年运营位" })).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(star_row(&state, &tpl_id).await.0, 5);
+
+    // admin 模板列表投影补 starRating/starSource。
+    let (st, lst) = get(&app, "/api/admin/world-templates", Some(&admin_token(&state))).await;
+    assert_eq!(st, StatusCode::OK);
+    let item = lst["templates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == tpl_id.as_str())
+        .expect("列表应含该模板")
+        .clone();
+    assert_eq!(item["starRating"], 5, "admin 模板列表应带 starRating");
+    assert_eq!(item["starSource"], "curated");
+}
+
+#[tokio::test]
+async fn template_star_rejects_bad_range_reason_and_missing() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+    let tpl_id = seed_template_for_star(&app, &state).await;
+    let uri = format!("/api/admin/world-templates/{tpl_id}/star");
+
+    // 范围非法：0 / 6 → 400。
+    for bad in [0, 6] {
+        let (st, _) = post(&app, &uri, Some(&admin), json!({ "star": bad, "reason": "范围试探" })).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "star={bad} 应 400");
+    }
+    // 理由非法：空 / 全空白 / 超 500 字符 → 400。
+    let (st, _) = post(&app, &uri, Some(&admin), json!({ "star": 3, "reason": "" })).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "空 reason 应 400");
+    let (st, _) = post(&app, &uri, Some(&admin), json!({ "star": 3, "reason": "   " })).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "全空白 reason 应 400");
+    let (st, _) = post(&app, &uri, Some(&admin), json!({ "star": 3, "reason": "长".repeat(501) })).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "超长 reason 应 400");
+    // 恰 500 字符 → 合法边界。
+    let (st, _) = post(&app, &uri, Some(&admin), json!({ "star": 3, "reason": "长".repeat(500) })).await;
+    assert_eq!(st, StatusCode::OK, "500 字符 reason 应通过");
+
+    // 模板不存在 → 404。
+    let (st, _) =
+        post(&app, "/api/admin/world-templates/ghost/star", Some(&admin), json!({ "star": 3, "reason": "不存在" })).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // 非法请求全程未污染星级（最终为上面 500 字符那次合法定档的 3★）。
+    assert_eq!(star_row(&state, &tpl_id).await, (3, "curated".into()));
+}
+
 // ---------------- Prompt 版本化 / 激活互斥 / 灰度 ----------------
 
 #[tokio::test]

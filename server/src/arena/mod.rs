@@ -31,7 +31,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sqlx::{AnyPool, Row};
+use sqlx::{Any, AnyPool, Row, Transaction};
 
 use crate::app::AppState;
 use crate::auth::AuthUser;
@@ -695,6 +695,10 @@ async fn mark_elim(db: &AnyPool, world_id: &str, character_id: &str, status: &st
 
 /// 唯一胜者收敛：现役参赛角色（active 成员）扣除已落定淘汰后仅剩 1 人 → winner + concluded + 荣誉奖励。
 /// 需至少 2 人成局，避免空局/单人误判。
+///
+/// 波次 2（历练）：收敛落定改为**一次事务**——phase CAS（非 concluded → concluded）命中那一次，
+/// 同事务内发冠军荣誉 + 参赛/冠军历练；重复 settle 命中 0 行即已落定，全部跳过不双发
+/// （历练是累加量，不能靠 ON CONFLICT 幂等，必须靠转变沿只发一次）。
 async fn recompute_winner(state: &AppState, world_id: &str) -> Result<(), ApiError> {
     let roster: Vec<(String,)> =
         sqlx::query_as("SELECT cloud_character_id FROM world_members WHERE world_id=? AND status='active'")
@@ -707,17 +711,46 @@ async fn recompute_winner(state: &AppState, world_id: &str) -> Result<(), ApiErr
     }
 
     let elim = eliminations_of(&state.db, world_id).await?;
-    let remaining: Vec<String> = roster.into_iter().filter(|c| !elim.contains(c)).collect();
+    let remaining: Vec<String> = roster.iter().filter(|c| !elim.contains(c)).cloned().collect();
     if remaining.len() == 1 {
         let winner = &remaining[0];
-        sqlx::query("UPDATE arena_matches SET winner_char_id=?, phase='concluded', updated_at=? WHERE world_id=?")
-            .bind(winner)
-            .bind(now_ms())
-            .bind(world_id)
-            .execute(&state.db)
+        let mut tx = state.db.begin().await?;
+        // CAS：仅首次收敛（phase 尚非 concluded）才落定并发奖；重复/并发 settle 0 行命中 → 回滚跳过。
+        let cas = sqlx::query(
+            "UPDATE arena_matches SET winner_char_id=?, phase='concluded', updated_at=? \
+             WHERE world_id=? AND phase != 'concluded'",
+        )
+        .bind(winner)
+        .bind(now_ms())
+        .bind(world_id)
+        .execute(&mut *tx)
+        .await?;
+        if cas.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Ok(());
+        }
+        grant_champion_reward_tx(&mut tx, world_id, winner).await?;
+        // 参赛历练：结算落定时在场 roster 全体（含冠军、含已淘汰但仍 active 的成员）各 +40；
+        // 冠军历练：唯一胜者另 +120。与胜者落定同一事务——结算失败回滚则历练不发。
+        // 红线：历练只作准入与解锁，不写任何强度/属性，也绝不回流引擎决策。
+        for cid in &roster {
+            crate::progression::grant_mileage_tx(
+                &mut tx,
+                cid,
+                crate::progression::MILEAGE_ARENA_PARTICIPANT,
+                "arena_participation",
+            )
             .await?;
-        grant_champion_reward(&state.db, world_id, winner).await?;
-        // 胜者落定进流：public 系统事件（荣誉性，非强度；事后广播，失败不回滚）。
+        }
+        crate::progression::grant_mileage_tx(
+            &mut tx,
+            winner,
+            crate::progression::MILEAGE_ARENA_CHAMPION,
+            "arena_champion",
+        )
+        .await?;
+        tx.commit().await?;
+        // 胜者落定进流：public 系统事件（荣誉性，非强度；事后广播，失败不回滚已提交的落定）。
         emit_arena_event(
             state,
             world_id,
@@ -733,7 +766,12 @@ async fn recompute_winner(state: &AppState, world_id: &str) -> Result<(), ApiErr
 
 /// 胜者荣誉奖励（非强度）：称号。幂等（唯一索引 world+char+kind）。
 /// 红线：奖励只入 arena_rewards（称号/立绘框/榜单），绝不写任何强度/属性加成。
-async fn grant_champion_reward(db: &AnyPool, world_id: &str, character_id: &str) -> Result<(), ApiError> {
+/// 波次 2 起在收敛落定事务内执行（与历练发放同成同败）。
+async fn grant_champion_reward_tx(
+    tx: &mut Transaction<'_, Any>,
+    world_id: &str,
+    character_id: &str,
+) -> Result<(), ApiError> {
     sqlx::query(
         "INSERT INTO arena_rewards (id, world_id, character_id, kind, label, season, created_at) \
          VALUES (?, ?, ?, 'title', '赛事冠军', NULL, ?) \
@@ -743,7 +781,7 @@ async fn grant_champion_reward(db: &AnyPool, world_id: &str, character_id: &str)
     .bind(world_id)
     .bind(character_id)
     .bind(now_ms())
-    .execute(db)
+    .execute(&mut **tx)
     .await?;
     Ok(())
 }

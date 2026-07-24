@@ -1953,3 +1953,57 @@ fn stall_tracker_isolated_per_world() {
     t.clear("w-d2");
     assert!(t.hint("w-d1").is_some(), "清别的世界不影响本世界");
 }
+
+// ==================== 波次 2：idle 终局历练（每在场卡 +60，与终局停机同事务、只发一次） ====================
+
+/// idle 房终局：真正结算（Concluded）那一次，每张在场卡 +60，与 end_world/终局产出同事务；
+/// ended 后的遗留 tick（world_not_running noop）不重复结算、不再发历练。
+/// 发放实现收在 progression 模块（settle_idle_world_ending_tx）——runtime/mod.rs 源码级不引用
+/// 历练字段（红线 grep 断言见 progression::tests）。
+#[tokio::test]
+async fn idle_world_ending_grants_growth_to_present_cards_once() {
+    let state = test_state().await;
+    seed_template_with_endgame(
+        &state.db,
+        "tpl-mlg",
+        "idle",
+        json!([{ "id": "n1", "summary": "寒暄", "constraint": "soft" }]),
+        json!({ "minWorldTicks": 0, "maxWorldTicks": 1 }),
+    )
+    .await;
+    let wid = running_world_for_endgame(&state, "mlg", "tpl-mlg", "event", "idle").await;
+    let model: Arc<dyn ModelClient> = Arc::new(MockModel { input_tokens: 10, output_tokens: 20 });
+
+    // tick 0：未到上限 → Done，世界仍 running，不发终局历练。
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 0, model.clone()).await.unwrap(), TickStatus::Done);
+    assert_eq!(i64_one(&state.db, "SELECT mileage FROM cloud_characters WHERE id=?", "cmlgA").await, 0);
+    assert_eq!(i64_one(&state.db, "SELECT mileage FROM cloud_characters WHERE id=?", "cmlgB").await, 0);
+
+    // tick 1：到 max_world_ticks → Concluded（真正结算那一次）→ 两张在场卡各 +60。
+    insert_tick(&state.db, &wid, 1, 1).await.unwrap();
+    assert_eq!(
+        process_tick_with_model(&state, &wid, 1, model.clone()).await.unwrap(),
+        TickStatus::Concluded
+    );
+    assert_eq!(world_status(&state.db, &wid).await, "ended");
+    assert_eq!(
+        i64_one(&state.db, "SELECT mileage FROM cloud_characters WHERE id=?", "cmlgA").await,
+        60,
+        "idle 终局每在场卡 +60（与终局停机同事务）"
+    );
+    assert_eq!(
+        i64_one(&state.db, "SELECT mileage FROM cloud_characters WHERE id=?", "cmlgB").await,
+        60,
+        "两张在场卡都应获得终局历练"
+    );
+
+    // 遗留 tick：world_not_running noop → 不重复结算、不双发历练。
+    insert_tick(&state.db, &wid, 2, 2).await.unwrap();
+    assert_eq!(
+        process_tick_with_model(&state, &wid, 2, model.clone()).await.unwrap(),
+        TickStatus::Skipped("world_not_running")
+    );
+    assert_eq!(i64_one(&state.db, "SELECT mileage FROM cloud_characters WHERE id=?", "cmlgA").await, 60);
+    assert_eq!(i64_one(&state.db, "SELECT mileage FROM cloud_characters WHERE id=?", "cmlgB").await, 60);
+}

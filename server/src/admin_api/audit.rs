@@ -1,4 +1,7 @@
-//! 内容审核：审核队列（机审结果 + 人审操作）。approve/reject 同步回写主体 moderation。
+//! 内容审核：审核队列（机审结果 + 人审操作）。approve/reject 同步回写主体 moderation，
+//! reject 另将理由落 audit_queue.reject_reason（用户侧 status 端点回显）。
+//! 申诉复审：GET /admin/appeals 列表 + POST /admin/appeals/{id}/resolve（overturn/uphold）——
+//! resolve 是机审/人审驳回后的唯一改判路径，必留 audit_logs。
 
 use axum::extract::{Path, Query, State};
 use axum::Json;
@@ -201,13 +204,19 @@ async fn review(
         return Err(ApiError::Conflict("already_reviewed".into()));
     }
 
-    sqlx::query("UPDATE audit_queue SET status = ?, reviewer_id = ?, reviewed_at = ? WHERE id = ?")
-        .bind(verdict)
-        .bind(&actor.user_id)
-        .bind(now_ms())
-        .bind(queue_id)
-        .execute(&state.db)
-        .await?;
+    // 人审驳回理由同步落队列行 reject_reason（供用户侧 status 端点回显）；approve 不写（保持 NULL）。
+    let reject_reason: Option<&str> =
+        if verdict == "rejected" && !reason.trim().is_empty() { Some(reason) } else { None };
+    sqlx::query(
+        "UPDATE audit_queue SET status = ?, reviewer_id = ?, reviewed_at = ?, reject_reason = ? WHERE id = ?",
+    )
+    .bind(verdict)
+    .bind(&actor.user_id)
+    .bind(now_ms())
+    .bind(reject_reason)
+    .bind(queue_id)
+    .execute(&state.db)
+    .await?;
 
     // 回写主体 moderation：character→cloud_characters，template→world_templates。
     let moderation = if verdict == "approved" { "approved" } else { "rejected" };
@@ -247,4 +256,182 @@ async fn review(
         "subjectId": subject_id,
         "moderation": moderation,
     })))
+}
+
+// ---------------- 申诉复审（内容风控申诉，reviewer/admin） ----------------
+
+#[derive(Debug, Deserialize)]
+pub(super) struct AppealsQuery {
+    status: Option<String>,
+}
+
+/// 申诉行 → camelCase JSON（列表与 resolve 响应共用同一形状）。
+fn appeal_json(row: &sqlx::any::AnyRow) -> Result<Value, ApiError> {
+    Ok(json!({
+        "id": row.try_get::<String, _>("id")?,
+        "subjectKind": row.try_get::<String, _>("subject_kind")?,
+        "subjectId": row.try_get::<String, _>("subject_id")?,
+        "ownerId": row.try_get::<String, _>("owner_id")?,
+        "appealText": row.try_get::<String, _>("appeal_text")?,
+        "status": row.try_get::<String, _>("status")?,
+        "resolutionReason": row.try_get::<Option<String>, _>("resolution_reason")?,
+        "reviewerId": row.try_get::<Option<String>, _>("reviewer_id")?,
+        "createdAt": row.try_get::<i64, _>("created_at")?,
+        "resolvedAt": row.try_get::<Option<i64>, _>("resolved_at")?,
+    }))
+}
+
+/// GET /admin/appeals?status=pending|upheld|overturned|all（默认 pending）：申诉列表 + 主体摘要。
+/// character 主体摘要：名字（card_json identity.name）、moderation、avatar_moderation、owner_id。
+pub(super) async fn list_appeals(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Query(q): Query<AppealsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    require_role(&admin, &["reviewer"])?;
+    let status = q.status.unwrap_or_else(|| "pending".into());
+    if !matches!(status.as_str(), "pending" | "upheld" | "overturned" | "all") {
+        return Err(ApiError::BadRequest("status 仅支持 pending/upheld/overturned/all".into()));
+    }
+
+    let mut sql = String::from(
+        "SELECT id, subject_kind, subject_id, owner_id, appeal_text, status, resolution_reason, \
+         reviewer_id, created_at, resolved_at FROM moderation_appeals",
+    );
+    if status != "all" {
+        sql.push_str(" WHERE status = ?");
+    }
+    sql.push_str(" ORDER BY created_at DESC, id DESC");
+    let mut query = sqlx::query(&sql);
+    if status != "all" {
+        query = query.bind(&status);
+    }
+    let rows = query.fetch_all(&state.db).await?;
+
+    let mut items = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let mut item = appeal_json(row)?;
+        let subject_kind: String = row.try_get("subject_kind")?;
+        let subject_id: String = row.try_get("subject_id")?;
+        // 主体摘要：当前仅 character；主体缺失（已删除）留 null，申诉行本身仍可见。
+        let mut subject = Value::Null;
+        if subject_kind == "character" {
+            if let Some(crow) = sqlx::query(
+                "SELECT owner_id, card_json, moderation, avatar_moderation FROM cloud_characters WHERE id = ?",
+            )
+            .bind(&subject_id)
+            .fetch_optional(&state.db)
+            .await?
+            {
+                let card_text: String = crow.try_get("card_json")?;
+                let name = serde_json::from_str::<Value>(&card_text)
+                    .ok()
+                    .and_then(|c| c["identity"]["name"].as_str().map(|s| s.to_string()))
+                    .unwrap_or_default();
+                subject = json!({
+                    "name": name,
+                    "moderation": crow.try_get::<String, _>("moderation")?,
+                    "avatarModeration": crow.try_get::<Option<String>, _>("avatar_moderation")?,
+                    "ownerId": crow.try_get::<String, _>("owner_id")?,
+                });
+            }
+        }
+        item["subject"] = subject;
+        items.push(item);
+    }
+    Ok(Json(json!({ "items": items })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ResolveAppealReq {
+    decision: String,
+    #[serde(default)]
+    reason: String,
+}
+
+/// POST /admin/appeals/{id}/resolve body {decision:'overturn'|'uphold', reason}：申诉复审裁决。
+///
+/// overturn 是驳回后的**唯一改判路径**：只翻转「当时处于 rejected 的那个维度」——
+/// 卡 moderation=='rejected' 则改卡为 approved；仅当卡不处于 rejected 而头像
+/// avatar_moderation=='rejected' 时才改头像为 approved。不整体放行（卡与头像分开审、分开改判，
+/// 避免申诉卡文案却顺带放行未过审头像）。uphold 维持原判，任何 moderation 不动。
+/// 两者都：更新申诉行 + audit_logs 留痕（appeal_overturn/appeal_uphold）。
+pub(super) async fn resolve_appeal(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path(id): Path<String>,
+    Json(req): Json<ResolveAppealReq>,
+) -> Result<Json<Value>, ApiError> {
+    require_role(&admin, &["reviewer"])?;
+    if !matches!(req.decision.as_str(), "overturn" | "uphold") {
+        return Err(ApiError::BadRequest("decision 仅支持 overturn/uphold".into()));
+    }
+    let reason = req.reason.trim().to_string();
+    let reason_chars = reason.chars().count();
+    if reason_chars == 0 || reason_chars > 500 {
+        return Err(ApiError::BadRequest("复审理由必填且不超过 500 字符".into()));
+    }
+
+    let row = sqlx::query("SELECT subject_kind, subject_id, status FROM moderation_appeals WHERE id = ?")
+        .bind(&id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let subject_kind: String = row.try_get("subject_kind")?;
+    let subject_id: String = row.try_get("subject_id")?;
+    let cur_status: String = row.try_get("status")?;
+    if cur_status != "pending" {
+        return Err(ApiError::Conflict("该申诉已处理，不可重复裁决".into()));
+    }
+
+    if req.decision == "overturn" && subject_kind == "character" {
+        // 改判只翻转当时处于 rejected 的那个维度（见函数注释）：卡优先，头像仅在卡未被驳回时翻转。
+        let dims: Option<(String, Option<String>)> =
+            sqlx::query_as("SELECT moderation, avatar_moderation FROM cloud_characters WHERE id = ?")
+                .bind(&subject_id)
+                .fetch_optional(&state.db)
+                .await?;
+        if let Some((moderation, avatar_moderation)) = dims {
+            if moderation == "rejected" {
+                sqlx::query("UPDATE cloud_characters SET moderation = 'approved' WHERE id = ?")
+                    .bind(&subject_id)
+                    .execute(&state.db)
+                    .await?;
+            } else if avatar_moderation.as_deref() == Some("rejected") {
+                sqlx::query("UPDATE cloud_characters SET avatar_moderation = 'approved' WHERE id = ?")
+                    .bind(&subject_id)
+                    .execute(&state.db)
+                    .await?;
+            }
+        }
+    }
+    // uphold：主体 moderation 一律不动（维持原判）。
+
+    let (new_status, action) = if req.decision == "overturn" {
+        ("overturned", "appeal_overturn")
+    } else {
+        ("upheld", "appeal_uphold")
+    };
+    sqlx::query(
+        "UPDATE moderation_appeals SET status = ?, resolution_reason = ?, reviewer_id = ?, resolved_at = ? WHERE id = ?",
+    )
+    .bind(new_status)
+    .bind(&reason)
+    .bind(&admin.0.user_id)
+    .bind(now_ms())
+    .bind(&id)
+    .execute(&state.db)
+    .await?;
+
+    audit(&state.db, &admin.0, action, &format!("{subject_kind}:{subject_id}"), &reason).await?;
+
+    let row = sqlx::query(
+        "SELECT id, subject_kind, subject_id, owner_id, appeal_text, status, resolution_reason, \
+         reviewer_id, created_at, resolved_at FROM moderation_appeals WHERE id = ?",
+    )
+    .bind(&id)
+    .fetch_one(&state.db)
+    .await?;
+    Ok(Json(appeal_json(&row)?))
 }

@@ -799,6 +799,171 @@ async fn metrics_overview_aggregates() {
     assert_eq!(m["tokenCostByWorld"][0]["tokens"], 150);
 }
 
+// ---------------- 数据看板：按天趋势（GET /admin/metrics/trends） ----------------
+// 分桶口径与后端一致：UTC 日界、固定 86_400_000ms 桶宽——种子取 now-2天/now，恒落在窗口首/末桶，无跨日抖动。
+
+const DAY_MS: i64 = 86_400_000;
+
+/// 与后端同口径的 UTC 日标签（趋势断言用，对齐 runtime::day_string）。
+fn utc_day(ms: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms).unwrap().format("%Y-%m-%d").to_string()
+}
+
+async fn ins_user_at(state: &AppState, id: &str, created_at: i64) {
+    sqlx::query(
+        "INSERT INTO users (id, phone, nickname, age_declared, role, status, created_at, updated_at) \
+         VALUES (?, NULL, '趋势用户', 1, 'user', 'active', ?, ?)",
+    )
+    .bind(id).bind(created_at).bind(created_at)
+    .execute(&state.db).await.unwrap();
+}
+
+async fn ins_tick_at(state: &AppState, id: &str, world: &str, tick_no: i64, tokens: i64, created_at: i64) {
+    sqlx::query(
+        "INSERT INTO world_ticks (id, world_id, tick_no, base_revision, status, cost_tokens, created_at) \
+         VALUES (?, ?, ?, 0, 'done', ?, ?)",
+    )
+    .bind(id).bind(world).bind(tick_no).bind(tokens).bind(created_at)
+    .execute(&state.db).await.unwrap();
+}
+
+async fn ins_event_at(state: &AppState, id: &str, occurred_at: i64) {
+    sqlx::query(
+        "INSERT INTO world_events (id, world_id, tick_no, sequence, domain_event_id, event_type, \
+         actors_json, visibility, occurred_at) VALUES (?, 'w_tr', 0, 0, ?, 'social', '[]', 'public', ?)",
+    )
+    .bind(id).bind(id).bind(occurred_at)
+    .execute(&state.db).await.unwrap();
+}
+
+async fn ins_gift_at(state: &AppState, id: &str, cnt: i64, created_at: i64) {
+    sqlx::query(
+        "INSERT INTO gift_events (id, world_id, sku, gift_count, mapped, created_at) \
+         VALUES (?, 'w_tr', 'rose', ?, 1, ?)",
+    )
+    .bind(id).bind(cnt).bind(created_at)
+    .execute(&state.db).await.unwrap();
+}
+
+/// 带业务时间的复式分录（趋势按 postings.created_at 分桶；账户/journal 复用对账测试的 ins_account/ins_journal）。
+async fn ins_posting_at(state: &AppState, id: &str, journal_id: &str, account_id: &str, delta: i64, created_at: i64) {
+    sqlx::query("INSERT INTO ledger_postings (id, journal_id, account_id, delta_cents, created_at) VALUES (?, ?, ?, ?, ?)")
+        .bind(id).bind(journal_id).bind(account_id).bind(delta).bind(created_at)
+        .execute(&state.db).await.unwrap();
+}
+
+#[tokio::test]
+async fn metrics_trends_buckets_by_day_and_zero_fills() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+
+    let now = now_ms();
+    let day_a = now - 2 * DAY_MS; // 前天
+    let day_b = now - DAY_MS; // 昨天：不播种，验证空天补零
+
+    // 收入科目 + 对手方钱包（贷方净增只数 platform_revenue 行，钱包行不得计入）。
+    ins_account(&state, "acct_rev_tr", "platform_revenue", None, 320).await;
+    ins_account(&state, "acct_wal_tr", "user_wallet", Some("u_tr_pay"), -320).await;
+    ins_journal(&state, "j_tr_a", "gift").await;
+    ins_journal(&state, "j_tr_c", "gift").await;
+
+    // ---- 前天：2 用户 / 同一世界 2 tick（100+50）/ 1 事件 / 礼物 3 / 平台收入 +120 ----
+    ins_user_at(&state, "u_tr_a1", day_a).await;
+    ins_user_at(&state, "u_tr_a2", day_a).await;
+    ins_tick_at(&state, "t_tr_a1", "w_tr_a", 0, 100, day_a).await;
+    ins_tick_at(&state, "t_tr_a2", "w_tr_a", 1, 50, day_a).await;
+    ins_event_at(&state, "ev_tr_a1", day_a).await;
+    ins_gift_at(&state, "g_tr_a1", 3, day_a).await;
+    ins_posting_at(&state, "p_tr_a1", "j_tr_a", "acct_rev_tr", 120, day_a).await;
+    ins_posting_at(&state, "p_tr_a2", "j_tr_a", "acct_wal_tr", -120, day_a).await;
+
+    // ---- 今天：1 用户 / 两世界各 1 tick（30+70）/ 2 事件 / 礼物 5 / 收入 +300−100=200（净增）----
+    ins_user_at(&state, "u_tr_c1", now).await;
+    ins_tick_at(&state, "t_tr_c1", "w_tr_a", 2, 30, now).await;
+    ins_tick_at(&state, "t_tr_c2", "w_tr_b", 0, 70, now).await;
+    ins_event_at(&state, "ev_tr_c1", now).await;
+    ins_event_at(&state, "ev_tr_c2", now).await;
+    ins_gift_at(&state, "g_tr_c1", 5, now).await;
+    ins_posting_at(&state, "p_tr_c1", "j_tr_c", "acct_rev_tr", 300, now).await;
+    ins_posting_at(&state, "p_tr_c2", "j_tr_c", "acct_rev_tr", -100, now).await;
+    ins_posting_at(&state, "p_tr_c3", "j_tr_c", "acct_wal_tr", -200, now).await;
+
+    let (st, body) = get(&app, "/api/admin/metrics/trends?days=3", Some(&admin)).await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+    let arr = body["days"].as_array().unwrap();
+    assert_eq!(arr.len(), 3);
+
+    // 按天升序 + UTC 日标签，含今天。
+    assert_eq!(arr[0]["day"], utc_day(day_a).as_str());
+    assert_eq!(arr[1]["day"], utc_day(day_b).as_str());
+    assert_eq!(arr[2]["day"], utc_day(now).as_str());
+
+    // 前天分桶正确。
+    assert_eq!(arr[0]["newUsers"], 2);
+    assert_eq!(arr[0]["activeWorlds"], 1, "同一世界两次 tick 只计一个活跃世界");
+    assert_eq!(arr[0]["events"], 1);
+    assert_eq!(arr[0]["tickTokens"], 150);
+    assert_eq!(arr[0]["giftCount"], 3);
+    assert_eq!(arr[0]["revenueCents"], 120);
+
+    // 昨天无数据 → 全部补零。
+    for k in ["newUsers", "activeWorlds", "events", "tickTokens", "giftCount", "revenueCents"] {
+        assert_eq!(arr[1][k], 0, "空天 {k} 应补零: {:?}", arr[1]);
+    }
+
+    // 今天分桶正确；revenueCents 为贷方净增（+300−100），钱包对手方行不计。
+    assert_eq!(arr[2]["newUsers"], 1);
+    assert_eq!(arr[2]["activeWorlds"], 2);
+    assert_eq!(arr[2]["events"], 2);
+    assert_eq!(arr[2]["tickTokens"], 100);
+    assert_eq!(arr[2]["giftCount"], 5);
+    assert_eq!(arr[2]["revenueCents"], 200);
+}
+
+#[tokio::test]
+async fn metrics_trends_days_clamp_and_default() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+
+    // 缺省 → 14 天。
+    let (st, body) = get(&app, "/api/admin/metrics/trends", Some(&admin)).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body["days"].as_array().unwrap().len(), 14);
+    // 空库：每天各指标恒为 0（含 revenueCents 字段存在且为 0）。
+    for d in body["days"].as_array().unwrap() {
+        assert_eq!(d["newUsers"], 0);
+        assert_eq!(d["revenueCents"], 0);
+    }
+
+    // 下限 clamp：0 → 1 天，且唯一一天即今天（UTC）。
+    let (st, body) = get(&app, "/api/admin/metrics/trends?days=0", Some(&admin)).await;
+    assert_eq!(st, StatusCode::OK);
+    let arr = body["days"].as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["day"], utc_day(now_ms()).as_str());
+
+    // 上限 clamp：999 → 60 天。
+    let (st, body) = get(&app, "/api/admin/metrics/trends?days=999", Some(&admin)).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body["days"].as_array().unwrap().len(), 60);
+}
+
+#[tokio::test]
+async fn metrics_trends_role_gate_operator_finance_admin() {
+    // operator/finance/admin 放行；support/reviewer/user 越权 403；无 token 401（对齐 metrics_overview gate）。
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    assert_eq!(get(&app, "/api/admin/metrics/trends", Some(&admin_token(&state))).await.0, StatusCode::OK);
+    assert_eq!(get(&app, "/api/admin/metrics/trends", Some(&role_token(&state, "operator"))).await.0, StatusCode::OK);
+    assert_eq!(get(&app, "/api/admin/metrics/trends", Some(&role_token(&state, "finance"))).await.0, StatusCode::OK);
+    assert_eq!(get(&app, "/api/admin/metrics/trends", Some(&role_token(&state, "support"))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(get(&app, "/api/admin/metrics/trends", Some(&role_token(&state, "reviewer"))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(get(&app, "/api/admin/metrics/trends", Some(&user_token(&state))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(get(&app, "/api/admin/metrics/trends", None).await.0, StatusCode::UNAUTHORIZED);
+}
+
 // ---------------- 经济运营：真实只读聚合 ----------------
 
 #[tokio::test]
@@ -1072,4 +1237,308 @@ async fn delete_data_request_stays_pending_not_marked_done() {
     assert_eq!(s, "pending");
     // 但尝试有审计留痕。
     assert_eq!(count(&state, "SELECT COUNT(*) AS n FROM audit_logs WHERE action='data_request.run_deferred'").await, 1);
+}
+
+// ---------------- 内容风控申诉复审（moderation_appeals） ----------------
+
+/// 播种云端角色（card_json 带 identity.name，供申诉列表主体摘要断言）。
+async fn seed_character(
+    state: &AppState,
+    id: &str,
+    owner: &str,
+    name: &str,
+    moderation: &str,
+    avatar_moderation: Option<&str>,
+) {
+    sqlx::query(
+        "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, \
+         rights_declaration, moderation, withdrawn, avatar_moderation, created_at) \
+         VALUES (?, ?, 'loc', 1, ?, 'original', ?, 0, ?, ?)",
+    )
+    .bind(id)
+    .bind(owner)
+    .bind(format!("{{\"identity\":{{\"name\":\"{name}\"}}}}"))
+    .bind(moderation)
+    .bind(avatar_moderation)
+    .bind(now_ms())
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+async fn seed_appeal(state: &AppState, id: &str, subject_id: &str, owner: &str, status: &str, created_at: i64) {
+    sqlx::query(
+        "INSERT INTO moderation_appeals (id, subject_kind, subject_id, owner_id, appeal_text, status, created_at) \
+         VALUES (?, 'character', ?, ?, '申诉正文', ?, ?)",
+    )
+    .bind(id)
+    .bind(subject_id)
+    .bind(owner)
+    .bind(status)
+    .bind(created_at)
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+/// 人审 reject 的理由须同步落 audit_queue.reject_reason（用户侧回显用）；approve 保持 NULL。
+#[tokio::test]
+async fn review_reject_writes_reject_reason_to_queue_row() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+    seed_character(&state, "ch_rr", "uRR", "被驳者", "pending", None).await;
+    seed_character(&state, "ch_ok", "uRR", "过审者", "pending", None).await;
+    for (aq, subject) in [("aq_rr", "ch_rr"), ("aq_ok", "ch_ok")] {
+        sqlx::query(
+            "INSERT INTO audit_queue (id, subject_kind, subject_id, machine_verdict, status, created_at) \
+             VALUES (?, 'character', ?, 'flagged', 'open', ?)",
+        )
+        .bind(aq).bind(subject).bind(now_ms()).execute(&state.db).await.unwrap();
+    }
+
+    // reject?reason=含违禁词（%E5%90%AB%E8%BF%9D%E7%A6%81%E8%AF%8D）→ 理由落队列行。
+    let (st, _) = post(
+        &app,
+        "/api/admin/audit-queue/aq_rr/reject?reason=%E5%90%AB%E8%BF%9D%E7%A6%81%E8%AF%8D",
+        Some(&admin),
+        json!({}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let reason = sqlx::query("SELECT reject_reason FROM audit_queue WHERE id='aq_rr'")
+        .fetch_one(&state.db).await.unwrap().try_get::<Option<String>, _>("reject_reason").unwrap();
+    assert_eq!(reason.as_deref(), Some("含违禁词"), "reject 理由应落 audit_queue.reject_reason");
+
+    // approve 不写 reject_reason（保持 NULL）；现有回写/留痕行为不回退。
+    let (st, _) = post(&app, "/api/admin/audit-queue/aq_ok/approve?reason=ok", Some(&admin), json!({})).await;
+    assert_eq!(st, StatusCode::OK);
+    let reason = sqlx::query("SELECT reject_reason FROM audit_queue WHERE id='aq_ok'")
+        .fetch_one(&state.db).await.unwrap().try_get::<Option<String>, _>("reject_reason").unwrap();
+    assert!(reason.is_none(), "approve 不得写 reject_reason");
+    let m = sqlx::query("SELECT moderation FROM cloud_characters WHERE id='ch_rr'")
+        .fetch_one(&state.db).await.unwrap().try_get::<String, _>("moderation").unwrap();
+    assert_eq!(m, "rejected", "reject 仍回写主体 moderation");
+}
+
+/// 列表：默认只出 pending；status 过滤 / all；含主体摘要（名字/moderation/avatar_moderation/owner）；非法 status → 400。
+#[tokio::test]
+async fn appeals_list_filters_status_and_returns_subject_summary() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+    let now = now_ms();
+
+    seed_character(&state, "ch_ap1", "uA", "阿黎", "rejected", None).await;
+    seed_character(&state, "ch_ap2", "uB", "沈镜", "approved", Some("rejected")).await;
+    seed_appeal(&state, "apl_1", "ch_ap1", "uA", "pending", now).await;
+    seed_appeal(&state, "apl_2", "ch_ap2", "uB", "upheld", now - 1000).await;
+
+    // 默认 pending。
+    let (st, body) = get(&app, "/api/admin/appeals", Some(&admin)).await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "默认只列 pending: {items:?}");
+    assert_eq!(items[0]["id"], "apl_1");
+    assert_eq!(items[0]["subjectKind"], "character");
+    assert_eq!(items[0]["appealText"], "申诉正文");
+    // 主体摘要。
+    assert_eq!(items[0]["subject"]["name"], "阿黎");
+    assert_eq!(items[0]["subject"]["moderation"], "rejected");
+    assert!(items[0]["subject"]["avatarModeration"].is_null());
+    assert_eq!(items[0]["subject"]["ownerId"], "uA");
+
+    // status=upheld 过滤。
+    let (st, body) = get(&app, "/api/admin/appeals?status=upheld", Some(&admin)).await;
+    assert_eq!(st, StatusCode::OK);
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["id"], "apl_2");
+    assert_eq!(items[0]["subject"]["avatarModeration"], "rejected");
+
+    // all：两条，新在前。
+    let (st, body) = get(&app, "/api/admin/appeals?status=all", Some(&admin)).await;
+    assert_eq!(st, StatusCode::OK);
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["id"], "apl_1");
+    assert_eq!(items[1]["id"], "apl_2");
+
+    // 非法 status → 400。
+    let (st, _) = get(&app, "/api/admin/appeals?status=bogus", Some(&admin)).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+}
+
+/// overturn 只翻转「当时处于 rejected 的那个维度」：卡驳回改卡；仅头像驳回改头像；
+/// 双驳回时卡优先、头像不顺带放行。留痕 + 申诉行落结论 + 重复 resolve → 409。
+#[tokio::test]
+async fn appeal_resolve_overturn_flips_only_rejected_dimension_and_audits() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+    let now = now_ms();
+
+    // 场景一：卡 rejected → overturn → 卡 approved。
+    seed_character(&state, "ch_ov1", "uO", "翻案者", "rejected", None).await;
+    seed_appeal(&state, "apl_ov1", "ch_ov1", "uO", "pending", now).await;
+    let (st, body) = post(
+        &app,
+        "/api/admin/appeals/apl_ov1/resolve",
+        Some(&admin),
+        json!({ "decision": "overturn", "reason": "复核为误判，改判通过。" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+    assert_eq!(body["status"], "overturned");
+    assert_eq!(body["resolutionReason"], "复核为误判，改判通过。");
+    assert_eq!(body["reviewerId"], "admin1");
+    assert!(body["resolvedAt"].is_number());
+    let m = sqlx::query("SELECT moderation FROM cloud_characters WHERE id='ch_ov1'")
+        .fetch_one(&state.db).await.unwrap().try_get::<String, _>("moderation").unwrap();
+    assert_eq!(m, "approved", "overturn 应把 rejected 卡改为 approved");
+    assert_eq!(count(&state, "SELECT COUNT(*) AS n FROM audit_logs WHERE action='appeal_overturn'").await, 1);
+
+    // 重复 resolve → 409（非 pending 不可再裁决）。
+    let (st, _) = post(
+        &app,
+        "/api/admin/appeals/apl_ov1/resolve",
+        Some(&admin),
+        json!({ "decision": "uphold", "reason": "再裁一次" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+
+    // 场景二：卡 approved、头像 rejected → overturn 只改头像维度。
+    seed_character(&state, "ch_ov2", "uO", "头像翻案", "approved", Some("rejected")).await;
+    seed_appeal(&state, "apl_ov2", "ch_ov2", "uO", "pending", now).await;
+    let (st, _) = post(
+        &app,
+        "/api/admin/appeals/apl_ov2/resolve",
+        Some(&admin),
+        json!({ "decision": "overturn", "reason": "头像复核通过。" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let row = sqlx::query("SELECT moderation, avatar_moderation FROM cloud_characters WHERE id='ch_ov2'")
+        .fetch_one(&state.db).await.unwrap();
+    assert_eq!(row.try_get::<String, _>("moderation").unwrap(), "approved");
+    assert_eq!(row.try_get::<Option<String>, _>("avatar_moderation").unwrap().as_deref(), Some("approved"));
+
+    // 场景三：卡与头像同为 rejected → 只翻卡（卡优先），头像不顺带放行。
+    seed_character(&state, "ch_ov3", "uO", "双驳者", "rejected", Some("rejected")).await;
+    seed_appeal(&state, "apl_ov3", "ch_ov3", "uO", "pending", now).await;
+    let (st, _) = post(
+        &app,
+        "/api/admin/appeals/apl_ov3/resolve",
+        Some(&admin),
+        json!({ "decision": "overturn", "reason": "卡文案复核通过。" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let row = sqlx::query("SELECT moderation, avatar_moderation FROM cloud_characters WHERE id='ch_ov3'")
+        .fetch_one(&state.db).await.unwrap();
+    assert_eq!(row.try_get::<String, _>("moderation").unwrap(), "approved", "卡维度翻转");
+    assert_eq!(
+        row.try_get::<Option<String>, _>("avatar_moderation").unwrap().as_deref(),
+        Some("rejected"),
+        "头像维度不得顺带放行"
+    );
+}
+
+/// uphold 维持原判：moderation 不动、申诉行落 upheld、留痕。
+#[tokio::test]
+async fn appeal_resolve_uphold_keeps_moderation_and_audits() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+    seed_character(&state, "ch_up", "uU", "维持者", "rejected", None).await;
+    seed_appeal(&state, "apl_up", "ch_up", "uU", "pending", now_ms()).await;
+
+    let (st, body) = post(
+        &app,
+        "/api/admin/appeals/apl_up/resolve",
+        Some(&admin),
+        json!({ "decision": "uphold", "reason": "复核确认违规，维持原判。" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+    assert_eq!(body["status"], "upheld");
+    let m = sqlx::query("SELECT moderation FROM cloud_characters WHERE id='ch_up'")
+        .fetch_one(&state.db).await.unwrap().try_get::<String, _>("moderation").unwrap();
+    assert_eq!(m, "rejected", "uphold 后 moderation 必须仍为 rejected");
+    assert_eq!(count(&state, "SELECT COUNT(*) AS n FROM audit_logs WHERE action='appeal_uphold'").await, 1);
+}
+
+/// resolve 入参校验：未知申诉 404；decision 非法 400；reason 空/超 500 字符 400（校验失败不落任何变更）。
+#[tokio::test]
+async fn appeal_resolve_validation_and_not_found() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+    seed_character(&state, "ch_val", "uV", "校验者", "rejected", None).await;
+    seed_appeal(&state, "apl_val", "ch_val", "uV", "pending", now_ms()).await;
+
+    let (st, _) = post(&app, "/api/admin/appeals/nope/resolve", Some(&admin), json!({ "decision": "uphold", "reason": "x" })).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = post(&app, "/api/admin/appeals/apl_val/resolve", Some(&admin), json!({ "decision": "maybe", "reason": "x" })).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = post(&app, "/api/admin/appeals/apl_val/resolve", Some(&admin), json!({ "decision": "uphold", "reason": "  " })).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = post(
+        &app,
+        "/api/admin/appeals/apl_val/resolve",
+        Some(&admin),
+        json!({ "decision": "uphold", "reason": "长".repeat(501) }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // 全部被拒后：申诉仍 pending、主体 moderation 未动。
+    let s = sqlx::query("SELECT status FROM moderation_appeals WHERE id='apl_val'")
+        .fetch_one(&state.db).await.unwrap().try_get::<String, _>("status").unwrap();
+    assert_eq!(s, "pending");
+    let m = sqlx::query("SELECT moderation FROM cloud_characters WHERE id='ch_val'")
+        .fetch_one(&state.db).await.unwrap().try_get::<String, _>("moderation").unwrap();
+    assert_eq!(m, "rejected");
+}
+
+/// RBAC：申诉列表与 resolve 仅 reviewer/admin；support/operator/finance/user 越权 403，无 token 401。
+#[tokio::test]
+async fn appeals_rbac_reviewer_and_admin_only() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    seed_character(&state, "ch_rb", "uR", "权限者", "rejected", None).await;
+    seed_appeal(&state, "apl_rb", "ch_rb", "uR", "pending", now_ms()).await;
+
+    // 列表。
+    assert_eq!(get(&app, "/api/admin/appeals", Some(&admin_token(&state))).await.0, StatusCode::OK);
+    assert_eq!(get(&app, "/api/admin/appeals", Some(&role_token(&state, "reviewer"))).await.0, StatusCode::OK);
+    assert_eq!(get(&app, "/api/admin/appeals", Some(&role_token(&state, "support"))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(get(&app, "/api/admin/appeals", Some(&role_token(&state, "operator"))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(get(&app, "/api/admin/appeals", Some(&role_token(&state, "finance"))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(get(&app, "/api/admin/appeals", Some(&user_token(&state))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(get(&app, "/api/admin/appeals", None).await.0, StatusCode::UNAUTHORIZED);
+
+    // resolve：越权角色带合法 body 仍 403（校验前先过角色门），且申诉保持 pending。
+    let body = json!({ "decision": "overturn", "reason": "越权尝试" });
+    for role in ["support", "operator", "finance"] {
+        let (st, _) = post(&app, "/api/admin/appeals/apl_rb/resolve", Some(&role_token(&state, role)), body.clone()).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{role} 不得 resolve");
+    }
+    assert_eq!(post(&app, "/api/admin/appeals/apl_rb/resolve", Some(&user_token(&state)), body.clone()).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(post(&app, "/api/admin/appeals/apl_rb/resolve", None, body.clone()).await.0, StatusCode::UNAUTHORIZED);
+    let s = sqlx::query("SELECT status FROM moderation_appeals WHERE id='apl_rb'")
+        .fetch_one(&state.db).await.unwrap().try_get::<String, _>("status").unwrap();
+    assert_eq!(s, "pending", "越权请求不得改动申诉");
+    let m = sqlx::query("SELECT moderation FROM cloud_characters WHERE id='ch_rb'")
+        .fetch_one(&state.db).await.unwrap().try_get::<String, _>("moderation").unwrap();
+    assert_eq!(m, "rejected", "越权请求不得改判");
+
+    // reviewer 放行并成为唯一改判路径。
+    let (st, ok) = post(&app, "/api/admin/appeals/apl_rb/resolve", Some(&role_token(&state, "reviewer")), json!({ "decision": "overturn", "reason": "复核通过" })).await;
+    assert_eq!(st, StatusCode::OK, "{ok:?}");
+    assert_eq!(ok["reviewerId"], "actor_reviewer");
+    let m = sqlx::query("SELECT moderation FROM cloud_characters WHERE id='ch_rb'")
+        .fetch_one(&state.db).await.unwrap().try_get::<String, _>("moderation").unwrap();
+    assert_eq!(m, "approved");
 }

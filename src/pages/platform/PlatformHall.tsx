@@ -1,6 +1,6 @@
-// 世界大厅（C1，规格 §2.1）：房型筛选 + 世界卡列表 + 我的世界（未读日报角标）。
+// 世界大厅（C1，规格 §2.1）：房型筛选 + 标题搜索 + 最新/热门排序 + 世界卡列表 + 我的世界（未读日报角标）。
 // P4a 仅放置房；其余房型标注「未开放」（§2.1 不展示未来空能力）。云端不可用时优雅降级。
-import React, { useEffect } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Row,
   Col,
@@ -15,14 +15,23 @@ import {
   Badge,
   Space,
   Divider,
+  Input,
 } from 'antd';
-import { GlobalOutlined, TeamOutlined, ThunderboltOutlined, EyeOutlined, RightOutlined } from '@ant-design/icons';
+import {
+  GlobalOutlined,
+  TeamOutlined,
+  ThunderboltOutlined,
+  EyeOutlined,
+  RightOutlined,
+  FireOutlined,
+} from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
 import {
   usePlatformStore,
   roomTypeLabel,
   type WorldSummary,
   type RoomTypeFilter,
+  type WorldsSort,
 } from '../../stores/usePlatformStore';
 
 const { Title, Text } = Typography;
@@ -31,6 +40,11 @@ const ROOM_OPTIONS = [
   { label: '放置房', value: 'idle' as RoomTypeFilter },
   { label: '章节房（未开放）', value: 'chapter' as RoomTypeFilter, disabled: true },
   { label: '赛事房（未开放）', value: 'arena' as RoomTypeFilter, disabled: true },
+];
+
+const SORT_OPTIONS = [
+  { label: '最新', value: 'new' as WorldsSort },
+  { label: '热门', value: 'hot' as WorldsSort },
 ];
 
 const statusMeta = (status: string): { label: string; color: string } => {
@@ -69,6 +83,11 @@ const WorldCard: React.FC<{ world: WorldSummary; onEnter: () => void; onSpectate
         <Space size={6} wrap>
           <Tag color="orange">{roomTypeLabel(world.roomType)}</Tag>
           {world.aiLabel?.visible !== false && <Tag>AI 生成</Tag>}
+          {typeof world.hotScore === 'number' && (
+            <Tag color="volcano">
+              <FireOutlined /> 热度 {world.hotScore}
+            </Tag>
+          )}
         </Space>
         <Space size={20} style={{ color: '#8c857b', fontSize: 13 }}>
           <span>
@@ -109,6 +128,8 @@ const PlatformHall: React.FC = () => {
   const navigate = useNavigate();
   const {
     roomTypeFilter,
+    worldsQuery,
+    worldsSort,
     worlds,
     worldsLoading,
     worldsError,
@@ -116,9 +137,14 @@ const PlatformHall: React.FC = () => {
     myWorlds,
     worldTitles,
     setRoomTypeFilter,
+    setWorldsQuery,
+    setWorldsSort,
     loadWorlds,
     loadReports,
   } = usePlatformStore();
+
+  // 搜索框受控值：初值取 store（跨导航保留已生效的搜索词），仅回车/点按/清空时才提交请求。
+  const [searchText, setSearchText] = useState(worldsQuery);
 
   useEffect(() => {
     void loadWorlds(true);
@@ -179,12 +205,33 @@ const PlatformHall: React.FC = () => {
         </Card>
       )}
 
-      <Segmented
-        options={ROOM_OPTIONS}
-        value={roomTypeFilter}
-        onChange={(v) => void setRoomTypeFilter(v as RoomTypeFilter)}
-        style={{ marginBottom: 20 }}
-      />
+      <Space size={12} wrap style={{ marginBottom: 20, width: '100%', justifyContent: 'space-between' }}>
+        <Segmented
+          options={ROOM_OPTIONS}
+          value={roomTypeFilter}
+          onChange={(v) => void setRoomTypeFilter(v as RoomTypeFilter)}
+        />
+        <Space size={12} wrap>
+          <Input.Search
+            allowClear
+            placeholder="搜索世界标题"
+            value={searchText}
+            style={{ width: 240 }}
+            onChange={(e) => {
+              const v = e.target.value;
+              setSearchText(v);
+              // 清空（点 × 或删光）即恢复未搜索列表；键入过程不发请求。
+              if (v === '' && worldsQuery !== '') void setWorldsQuery('');
+            }}
+            onSearch={(v) => void setWorldsQuery(v)}
+          />
+          <Segmented
+            options={SORT_OPTIONS}
+            value={worldsSort}
+            onChange={(v) => void setWorldsSort(v as WorldsSort)}
+          />
+        </Space>
+      </Space>
 
       {worldsError ? (
         <Alert
@@ -203,7 +250,10 @@ const PlatformHall: React.FC = () => {
           <Spin />
         </div>
       ) : worlds.length === 0 ? (
-        <Empty description="暂无开放世界，稍后再来看看" style={{ padding: 60 }} />
+        <Empty
+          description={worldsQuery ? '没有匹配的世界，换个关键词试试' : '暂无开放世界，稍后再来看看'}
+          style={{ padding: 60 }}
+        />
       ) : (
         <>
           <Row gutter={[16, 16]}>
@@ -217,7 +267,8 @@ const PlatformHall: React.FC = () => {
               </Col>
             ))}
           </Row>
-          {worldsHasMore && (
+          {/* 热门是快照榜不分页：即便切换瞬间残留 hasMore 也不展示加载更多 */}
+          {worldsSort !== 'hot' && worldsHasMore && (
             <div style={{ textAlign: 'center', marginTop: 24 }}>
               <Button loading={worldsLoading} onClick={() => void loadWorlds(false)}>
                 加载更多

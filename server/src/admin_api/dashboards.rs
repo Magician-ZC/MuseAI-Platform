@@ -1,12 +1,16 @@
-//! 数据看板 + 经济运营。二者均为只读 SQL 聚合（COUNT/SUM），不产生副作用、不建结算。
+//! 数据看板（总览 + 按天趋势）+ 经济运营。均为只读 SQL 聚合/取数，不产生副作用、不建结算。
 
-use axum::extract::State;
+use std::collections::HashSet;
+
+use axum::extract::{Query, State};
 use axum::Json;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::{AnyPool, Row};
 
 use crate::app::AppState;
 use crate::auth::AdminUser;
+use crate::db::now_ms;
 use crate::error::ApiError;
 
 use super::require_role;
@@ -111,6 +115,148 @@ pub(super) async fn metrics_overview(
         "riskEvents": risk_total,
         "dataRequestsPending": data_requests_pending,
     })))
+}
+
+// ---------------- 按天趋势 ----------------
+
+const DAY_MS: i64 = 86_400_000;
+
+#[derive(Debug, Deserialize)]
+pub(super) struct TrendsQuery {
+    days: Option<i64>,
+}
+
+/// ms 时间戳 → 所在天的 UTC 0 点 ms。
+/// 时区口径与 `reports::day_bounds` / `runtime::day_string` 一致：**UTC 日界**，
+/// 桶恒为 `[UTC 0 点, +86_400_000)`（全仓禁 SQL 日期函数，SQL 只做 BIGINT ms 范围过滤）。
+fn utc_day_start_ms(ms: i64) -> i64 {
+    use chrono::NaiveTime;
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
+        .map(|d| d.date_naive().and_time(NaiveTime::MIN).and_utc().timestamp_millis())
+        .unwrap_or(0)
+}
+
+/// GET /admin/metrics/trends?days=N：运营看板按天趋势（operator/finance，admin 直通）。
+///
+/// days clamp 到 [1,60]，默认 14；按天升序返回、含今天（UTC 口径），无数据的天补零。
+/// 查询策略：**每张来源表一条全区间查询**取出 ms 时间戳列，Rust 侧 chrono 分桶到天——
+/// 避免 N 天 × N 指标的查询风暴；窗口起点为 UTC 0 点、桶宽固定一天，整除即得天序号。
+pub(super) async fn metrics_trends(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Query(q): Query<TrendsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    require_role(&admin, &["operator", "finance"])?;
+    let db = &state.db;
+
+    let days = q.days.unwrap_or(14).clamp(1, 60);
+    let today_start = utc_day_start_ms(now_ms());
+    let start = today_start - (days - 1) * DAY_MS;
+    let end = today_start + DAY_MS; // 右开区间，含今天整天。
+
+    let n = days as usize;
+    let mut new_users = vec![0i64; n];
+    let mut events = vec![0i64; n];
+    let mut tick_tokens = vec![0i64; n];
+    let mut gift_count = vec![0i64; n];
+    let mut revenue_cents = vec![0i64; n];
+    let mut active_worlds = vec![HashSet::<String>::new(); n];
+
+    // 分桶：窗口起点即 UTC 0 点，(ts-start)/天宽 整除即天序号；SQL 已按 [start,end) 过滤，越界防御性跳过。
+    let bucket = |ts: i64| -> Option<usize> {
+        if ts < start || ts >= end {
+            return None;
+        }
+        Some(((ts - start) / DAY_MS) as usize)
+    };
+
+    // ① 新增用户（users.created_at）。
+    let rows = sqlx::query("SELECT created_at FROM users WHERE created_at >= ? AND created_at < ?")
+        .bind(start)
+        .bind(end)
+        .fetch_all(db)
+        .await?;
+    for r in &rows {
+        if let Some(i) = bucket(r.try_get::<i64, _>("created_at")?) {
+            new_users[i] += 1;
+        }
+    }
+
+    // ② tick：一条查询同时喂两个指标——当日有 tick 的 distinct 世界数 + 当日 token 消耗。
+    let rows = sqlx::query(
+        "SELECT world_id, cost_tokens, created_at FROM world_ticks \
+         WHERE created_at >= ? AND created_at < ?",
+    )
+    .bind(start)
+    .bind(end)
+    .fetch_all(db)
+    .await?;
+    for r in &rows {
+        if let Some(i) = bucket(r.try_get::<i64, _>("created_at")?) {
+            active_worlds[i].insert(r.try_get::<String, _>("world_id")?);
+            tick_tokens[i] += r.try_get::<i64, _>("cost_tokens")?;
+        }
+    }
+
+    // ③ 世界事件（口径 world_events.occurred_at）。
+    let rows =
+        sqlx::query("SELECT occurred_at FROM world_events WHERE occurred_at >= ? AND occurred_at < ?")
+            .bind(start)
+            .bind(end)
+            .fetch_all(db)
+            .await?;
+    for r in &rows {
+        if let Some(i) = bucket(r.try_get::<i64, _>("occurred_at")?) {
+            events[i] += 1;
+        }
+    }
+
+    // ④ 礼物量（gift_events.gift_count；INTEGER 列 CAST 成 BIGINT 保证双库解码一致）。
+    let rows = sqlx::query(
+        "SELECT CAST(gift_count AS BIGINT) AS gift_count, created_at FROM gift_events \
+         WHERE created_at >= ? AND created_at < ?",
+    )
+    .bind(start)
+    .bind(end)
+    .fetch_all(db)
+    .await?;
+    for r in &rows {
+        if let Some(i) = bucket(r.try_get::<i64, _>("created_at")?) {
+            gift_count[i] += r.try_get::<i64, _>("gift_count")?;
+        }
+    }
+
+    // ⑤ 平台收入贷方净增：platform_revenue 科目当日 postings 净额（正=入账、负=冲销，净和即贷方净增）。
+    //    postings.created_at 由 ledger::post_journal 以业务时间写入（与 journal 同刻），无需 JOIN journals。
+    let rows = sqlx::query(
+        "SELECT p.delta_cents, p.created_at FROM ledger_postings p \
+         JOIN ledger_accounts a ON a.id = p.account_id \
+         WHERE a.kind = 'platform_revenue' AND p.created_at >= ? AND p.created_at < ?",
+    )
+    .bind(start)
+    .bind(end)
+    .fetch_all(db)
+    .await?;
+    for r in &rows {
+        if let Some(i) = bucket(r.try_get::<i64, _>("created_at")?) {
+            revenue_cents[i] += r.try_get::<i64, _>("delta_cents")?;
+        }
+    }
+
+    // 组装：按天升序，空天各指标自然为 0（vec 初始化即补零）。
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        out.push(json!({
+            "day": crate::runtime::day_string(start + i as i64 * DAY_MS),
+            "newUsers": new_users[i],
+            "activeWorlds": active_worlds[i].len() as i64,
+            "events": events[i],
+            "tickTokens": tick_tokens[i],
+            "giftCount": gift_count[i],
+            "revenueCents": revenue_cents[i],
+        }));
+    }
+    Ok(Json(json!({ "days": out })))
 }
 
 /// GET /admin/economy/overview：真实只读经济聚合（finance/admin）。

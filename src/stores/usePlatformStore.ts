@@ -25,7 +25,12 @@ export interface WorldSummary {
   memberCount: number;
   tickPerDay: number;
   aiLabel?: AiLabel;
+  /** 热度分：仅 sort=hot 快照榜下发（近 48h 事件 + 近 7 天打赏 + active 成员加权），最新模式缺席。 */
+  hotScore?: number;
 }
+
+/** 大厅排序：new=最新（cursor 分页）| hot=热度快照榜（不分页）。 */
+export type WorldsSort = 'new' | 'hot';
 
 export interface WorldRosterEntry {
   cloudCharacterId: string;
@@ -111,6 +116,16 @@ export interface WorldStateSummary {
   positions?: Record<string, string>;
 }
 
+/** 驳回申诉行（status 端点内联 / POST appeal 返回体）：每主体终身一次，提交不改 moderation。 */
+export interface CharacterAppeal {
+  status: 'pending' | 'upheld' | 'overturned';
+  appealText: string;
+  /** 复核理由：仅已裁决（upheld/overturned）时可能有值。 */
+  resolutionReason: string | null;
+  createdAt: number;
+  resolvedAt: number | null;
+}
+
 export interface CloudCharacter {
   id: string;
   localCardId: string;
@@ -121,6 +136,20 @@ export interface CloudCharacter {
   createdAt: number;
   /** 角色头像回读路径（相对 /api/...）：过审后非空，否则 null。需经 resolveObjectUrl 拼 base 才可直连。 */
   avatarUrl?: string | null;
+  /** 驳回理由：仅 status 端点下发（moderation=rejected 时有值，机审兜底「未通过机器审核」），列表端点缺席。 */
+  rejectReason?: string | null;
+  /** 申诉状态：仅 status 端点下发；无申诉 → null。 */
+  appeal?: CharacterAppeal | null;
+}
+
+/** GET /assets/characters/{id}/status 返回体（含驳回理由与申诉状态回显）。 */
+export interface CloudCharacterStatus {
+  id: string;
+  moderation: string;
+  version: number;
+  withdrawn: boolean;
+  rejectReason: string | null;
+  appeal: CharacterAppeal | null;
 }
 
 export interface ReportListItem {
@@ -451,6 +480,20 @@ export function moderationMeta(m: string): { label: string; color: string } {
   }
 }
 
+/** 申诉状态 → 展示标签与色彩（pending=申诉中 / overturned=已改判通过 / upheld=维持原判）。 */
+export function appealStatusMeta(s: string): { label: string; color: string } {
+  switch (s) {
+    case 'pending':
+      return { label: '申诉中', color: 'processing' };
+    case 'overturned':
+      return { label: '已改判通过', color: 'green' };
+    case 'upheld':
+      return { label: '维持原判', color: 'default' };
+    default:
+      return { label: s, color: 'default' };
+  }
+}
+
 /** 日报来源分层（公开事实 / 私密视角 / 模型推断）→ 展示元数据（§2.5 必须明确区分）。 */
 export function provenanceMeta(kind: ProvenanceKind): { label: string; color: string; hint: string } {
   switch (kind) {
@@ -472,6 +515,10 @@ export type RoomView = 'stream' | 'cards' | 'graph' | 'map' | 'scene' | 'status'
 interface PlatformState {
   // 世界大厅
   roomTypeFilter: RoomTypeFilter;
+  /** 标题搜索词（跨导航保留；空串等同不搜索，不随 UI 偏好持久化）。 */
+  worldsQuery: string;
+  /** 大厅排序（new=最新分页 / hot=热度快照榜）。 */
+  worldsSort: WorldsSort;
   worlds: WorldSummary[];
   worldsCursor: string | null;
   worldsHasMore: boolean;
@@ -499,6 +546,8 @@ interface PlatformState {
   roomView: RoomView;
 
   setRoomTypeFilter: (filter: RoomTypeFilter) => Promise<void>;
+  setWorldsQuery: (q: string) => Promise<void>;
+  setWorldsSort: (sort: WorldsSort) => Promise<void>;
   loadWorlds: (reset?: boolean) => Promise<void>;
   loadReports: () => Promise<void>;
   loadMemberships: () => Promise<Membership[]>;
@@ -510,6 +559,8 @@ interface PlatformState {
 }
 
 const initialListState = {
+  worldsQuery: '',
+  worldsSort: 'new' as WorldsSort,
   worlds: [] as WorldSummary[],
   worldsCursor: null as string | null,
   worldsHasMore: false,
@@ -540,13 +591,28 @@ export const usePlatformStore = create<PlatformState>()(
         await get().loadWorlds(true);
       },
 
+      setWorldsQuery: async (q) => {
+        set({ worldsQuery: q });
+        await get().loadWorlds(true);
+      },
+
+      setWorldsSort: async (sort) => {
+        set({ worldsSort: sort });
+        await get().loadWorlds(true);
+      },
+
       loadWorlds: async (reset = true) => {
-        const { roomTypeFilter, worldsCursor } = get();
+        const { roomTypeFilter, worldsCursor, worldsQuery, worldsSort } = get();
         set({ worldsLoading: true, worldsError: null });
         try {
           const params = new URLSearchParams();
           if (roomTypeFilter !== 'all') params.set('type', roomTypeFilter);
-          if (!reset && worldsCursor) params.set('cursor', worldsCursor);
+          // q：标题包含匹配；空串等同不传（URLSearchParams 负责百分号等特殊字符编码）。
+          const q = worldsQuery.trim();
+          if (q) params.set('q', q);
+          // sort=hot：热度快照榜不分页（服务端忽略 cursor、nextCursor 恒 null）；缺省即 new 现行为。
+          if (worldsSort === 'hot') params.set('sort', 'hot');
+          if (worldsSort !== 'hot' && !reset && worldsCursor) params.set('cursor', worldsCursor);
           const qs = params.toString();
           const data = await cloudFetch<{ worlds: WorldSummary[]; nextCursor: string | null }>(
             `/api/worlds${qs ? `?${qs}` : ''}`,
@@ -555,7 +621,7 @@ export const usePlatformStore = create<PlatformState>()(
           set((s) => ({
             worlds: reset ? incoming : [...s.worlds, ...incoming],
             worldsCursor: data.nextCursor ?? null,
-            worldsHasMore: !!data.nextCursor,
+            worldsHasMore: worldsSort !== 'hot' && !!data.nextCursor,
             worldsLoading: false,
           }));
         } catch (e) {

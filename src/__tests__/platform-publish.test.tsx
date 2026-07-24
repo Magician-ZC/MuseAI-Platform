@@ -132,4 +132,70 @@ describe('CharacterPublish', () => {
     await screen.findByText('头像已通过审核并更新');
     expect(uploadAvatarMock).toHaveBeenCalledWith('cc1', 'BASE64DATA', 'image/png');
   });
+
+  it('驳回行：回显驳回理由与申诉按钮，提交申诉后行内显示「申诉中」', async () => {
+    fetchMock.mockImplementation(async (path: string, opts?: { method?: string; body?: unknown }) => {
+      if (path === '/api/assets/characters/mine') {
+        return [
+          {
+            id: 'cc9',
+            localCardId: '沈霜卡',
+            version: 2,
+            rightsDeclaration: 'original',
+            moderation: 'rejected',
+            withdrawn: false,
+            createdAt: 1,
+          },
+        ];
+      }
+      // 驳回理由与申诉状态仅 status 端点下发（列表端点缺席）。
+      if (path === '/api/assets/characters/cc9/status') {
+        return {
+          id: 'cc9',
+          moderation: 'rejected',
+          version: 2,
+          withdrawn: false,
+          rejectReason: '包含未授权改编内容',
+          appeal: null,
+        };
+      }
+      if (path === '/api/assets/characters/cc9/appeal' && opts?.method === 'POST') {
+        return {
+          id: 'apl1',
+          subjectKind: 'character',
+          subjectId: 'cc9',
+          status: 'pending',
+          appealText: '这是原创角色，权利证明见本地证据账本',
+          resolutionReason: null,
+          createdAt: 2,
+          resolvedAt: null,
+        };
+      }
+      throw new Error(`unexpected ${path}`);
+    });
+
+    renderPublish();
+
+    // rejected 行：渲染 status 端点回填的驳回理由 + 申诉入口
+    expect(await screen.findByText('包含未授权改编内容')).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole('button', { name: '申诉' }));
+
+    // Modal：必填 TextArea（≤500 字）→ 提交
+    const textarea = await screen.findByPlaceholderText(/请说明理由/);
+    fireEvent.change(textarea, { target: { value: '这是原创角色，权利证明见本地证据账本' } });
+    fireEvent.click(screen.getByRole('button', { name: '提交申诉' }));
+
+    // POST body 只带 trim 后的 text（红线：提交不改 moderation，由服务端保证）
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(([p]) => p === '/api/assets/characters/cc9/appeal');
+      expect(call).toBeTruthy();
+      expect((call![1] as { method?: string; body?: unknown }).method).toBe('POST');
+      expect((call![1] as { body?: unknown }).body).toEqual({ text: '这是原创角色，权利证明见本地证据账本' });
+    });
+
+    // 成功后行内显示申诉状态 Tag（pending → 申诉中）
+    expect(await screen.findByText('申诉中')).toBeInTheDocument();
+    // 已有申诉：不再显示申诉按钮
+    expect(screen.queryByRole('button', { name: '申诉' })).toBeNull();
+  });
 });

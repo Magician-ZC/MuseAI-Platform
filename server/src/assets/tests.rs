@@ -415,6 +415,304 @@ async fn object_read_rejects_path_traversal() {
     assert_eq!(st3, StatusCode::NOT_FOUND, "缺失对象应 404");
 }
 
+// ---------------- 内容风控申诉复审（moderation_appeals） ----------------
+
+/// 后台 token（申诉 E2E 需经 /admin 端点裁决；与 admin_api 测试同款签发）。
+fn admin_token(state: &crate::app::AppState) -> String {
+    crate::auth::issue_access(&state.config.jwt_secret, "admin_e2e", "admin", 3600).unwrap()
+}
+
+/// 直接把卡置为机审驳回态（dev 机审 stub 恒过，测试经 SQL 模拟 Rejected 直拒——不产生 audit_queue 行）。
+async fn force_reject_card(state: &crate::app::AppState, id: &str) {
+    sqlx::query("UPDATE cloud_characters SET moderation = 'rejected' WHERE id = ?")
+        .bind(id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+}
+
+/// owner 对 rejected 卡提交申诉 → pending 且 moderation 仍 rejected（红线：申诉提交不改任何审核态）；
+/// status 端点回显申诉状态 + 机审直拒兜底 rejectReason；重复申诉 → 409（每主体终身一次）。
+#[tokio::test]
+async fn appeal_submit_keeps_moderation_and_is_once_per_subject() {
+    let (app, state) = build_app().await;
+    let (access, _r, _u) = login_new_user(&app, "13900000030").await;
+    let (_st, v) =
+        send(&app, "POST", "/api/assets/characters", Some(&access), Some("ap1"), Some(publish_body("card-AP", "被驳者"))).await;
+    let id = v["id"].as_str().unwrap().to_string();
+    force_reject_card(&state, &id).await;
+
+    let (st, a) = send(
+        &app,
+        "POST",
+        &format!("/api/assets/characters/{id}/appeal"),
+        Some(&access),
+        None,
+        Some(json!({ "text": "  卡片为原创设定，未包含违规内容，请复核。  " })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{a:?}");
+    assert_eq!(a["status"], "pending");
+    assert_eq!(a["subjectKind"], "character");
+    assert_eq!(a["subjectId"], id.as_str());
+    assert_eq!(a["appealText"], "卡片为原创设定，未包含违规内容，请复核。", "正文应 trim 后落库");
+    assert!(a["resolutionReason"].is_null());
+    assert!(a["resolvedAt"].is_null());
+
+    // 红线：申诉提交不改任何 moderation——未过审继续不外泄。
+    let m: String = sqlx::query_scalar("SELECT moderation FROM cloud_characters WHERE id = ?")
+        .bind(&id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(m, "rejected", "申诉提交后 moderation 必须仍为 rejected");
+
+    // status 回显：机审直拒无 audit_queue 行 → 中文兜底；appeal 状态内联。
+    let (st, s) = send(&app, "GET", &format!("/api/assets/characters/{id}/status"), Some(&access), None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(s["moderation"], "rejected");
+    assert_eq!(s["rejectReason"], "未通过机器审核", "机审直拒（无队列行）应回中文兜底理由");
+    assert_eq!(s["appeal"]["status"], "pending");
+    assert_eq!(s["appeal"]["appealText"], "卡片为原创设定，未包含违规内容，请复核。");
+    assert!(s["appeal"]["resolutionReason"].is_null());
+
+    // 每主体终身一次：重复申诉 → 409。
+    let (st, dup) = send(
+        &app,
+        "POST",
+        &format!("/api/assets/characters/{id}/appeal"),
+        Some(&access),
+        None,
+        Some(json!({ "text": "再次申诉" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{dup:?}");
+    assert!(
+        dup["error"]["message"].as_str().unwrap_or_default().contains("仅可申诉一次"),
+        "409 文案应说明每个内容仅可申诉一次: {dup:?}"
+    );
+}
+
+/// 非 owner 申诉 → 404（不泄露存在性，与 status 一致）。
+#[tokio::test]
+async fn appeal_rejects_non_owner_with_404() {
+    let (app, state) = build_app().await;
+    let (owner, _r, _u) = login_new_user(&app, "13900000031").await;
+    let (_st, v) =
+        send(&app, "POST", "/api/assets/characters", Some(&owner), Some("ap2"), Some(publish_body("card-AP2", "属主"))).await;
+    let id = v["id"].as_str().unwrap().to_string();
+    force_reject_card(&state, &id).await;
+
+    let (other, _r, _u) = login_new_user(&app, "13900000131").await;
+    let (st, _) = send(
+        &app,
+        "POST",
+        &format!("/api/assets/characters/{id}/appeal"),
+        Some(&other),
+        None,
+        Some(json!({ "text": "冒名申诉" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "非 owner 申诉应 404 硬隔离");
+}
+
+/// 非驳回态（approved）不允许申诉 → 400；正文 trim 后空/超 500 字符 → 400。
+#[tokio::test]
+async fn appeal_rejects_non_rejected_subject_and_bad_text() {
+    let (app, state) = build_app().await;
+    let (access, _r, _u) = login_new_user(&app, "13900000032").await;
+    let (_st, v) =
+        send(&app, "POST", "/api/assets/characters", Some(&access), Some("ap3"), Some(publish_body("card-AP3", "过审者"))).await;
+    let id = v["id"].as_str().unwrap().to_string();
+
+    // approved（dev stub 直过）→ 400。
+    let (st, e) = send(
+        &app,
+        "POST",
+        &format!("/api/assets/characters/{id}/appeal"),
+        Some(&access),
+        None,
+        Some(json!({ "text": "没被驳回也要申诉" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e:?}");
+    assert!(
+        e["error"]["message"].as_str().unwrap_or_default().contains("审核未通过"),
+        "400 应中文说明仅驳回内容可申诉: {e:?}"
+    );
+
+    // 驳回后：空正文 / 超长正文 → 400。
+    force_reject_card(&state, &id).await;
+    let (st, _) = send(
+        &app,
+        "POST",
+        &format!("/api/assets/characters/{id}/appeal"),
+        Some(&access),
+        None,
+        Some(json!({ "text": "   " })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "trim 后空正文应 400");
+    let long_text: String = "申".repeat(501);
+    let (st, _) = send(
+        &app,
+        "POST",
+        &format!("/api/assets/characters/{id}/appeal"),
+        Some(&access),
+        None,
+        Some(json!({ "text": long_text })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "超过 500 字符应 400");
+
+    // 恰 500 字符合法。
+    let ok_text: String = "诉".repeat(500);
+    let (st, a) = send(
+        &app,
+        "POST",
+        &format!("/api/assets/characters/{id}/appeal"),
+        Some(&access),
+        None,
+        Some(json!({ "text": ok_text })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "恰 500 字符应通过: {a:?}");
+}
+
+/// 卡 approved 但头像 avatar_moderation=='rejected' → 允许申诉（任一维度驳回即可）。
+#[tokio::test]
+async fn appeal_allowed_when_only_avatar_rejected() {
+    let (app, state) = build_app().await;
+    let (access, _r, _u) = login_new_user(&app, "13900000033").await;
+    let (_st, v) =
+        send(&app, "POST", "/api/assets/characters", Some(&access), Some("ap4"), Some(publish_body("card-AP4", "头像被驳"))).await;
+    let id = v["id"].as_str().unwrap().to_string();
+    sqlx::query("UPDATE cloud_characters SET avatar_moderation = 'rejected' WHERE id = ?")
+        .bind(&id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    let (st, a) = send(
+        &app,
+        "POST",
+        &format!("/api/assets/characters/{id}/appeal"),
+        Some(&access),
+        None,
+        Some(json!({ "text": "头像为原创绘制，请复核。" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{a:?}");
+    assert_eq!(a["status"], "pending");
+    // 卡 moderation 非 rejected → status.rejectReason 为 null（rejectReason 只挂卡维度）。
+    let (_st, s) = send(&app, "GET", &format!("/api/assets/characters/{id}/status"), Some(&access), None, None).await;
+    assert!(s["rejectReason"].is_null());
+    assert_eq!(s["appeal"]["status"], "pending");
+}
+
+/// E2E：人审驳回（理由落 audit_queue.reject_reason）→ status 回显该理由 → 申诉 → 后台 overturn 改判
+/// → moderation 恢复 approved、/mine 恢复可见、audit_logs 留痕、status 内联申诉结论。
+#[tokio::test]
+async fn appeal_e2e_human_reject_reason_then_overturn_restores_visibility() {
+    let (app, state) = build_app().await;
+    let (access, _r, _u) = login_new_user(&app, "13900000034").await;
+    // 注入命中卡 → pending 入 audit_queue。
+    let (st, v) = send(
+        &app,
+        "POST",
+        "/api/assets/characters",
+        Some(&access),
+        Some("ap5"),
+        Some(injection_publish_body("card-AP5")),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v:?}");
+    let id = v["id"].as_str().unwrap().to_string();
+    assert_eq!(v["moderation"], "pending");
+    let aq_id: String = sqlx::query_scalar("SELECT id FROM audit_queue WHERE subject_id = ?")
+        .bind(&id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+
+    // 人审驳回，理由「违规」（%E8%BF%9D%E8%A7%84）经 query 传入 → 落 reject_reason。
+    let admin = admin_token(&state);
+    let (st, r) = send(
+        &app,
+        "POST",
+        &format!("/api/admin/audit-queue/{aq_id}/reject?reason=%E8%BF%9D%E8%A7%84"),
+        Some(&admin),
+        None,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r:?}");
+
+    // status 回显人审驳回理由（非兜底文案）。
+    let (st, s) = send(&app, "GET", &format!("/api/assets/characters/{id}/status"), Some(&access), None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(s["moderation"], "rejected");
+    assert_eq!(s["rejectReason"], "违规", "人审驳回后应回显 audit_queue.reject_reason");
+    assert!(s["appeal"].is_null(), "未申诉时 appeal 为 null");
+
+    // owner 申诉 → pending。
+    let (st, _a) = send(
+        &app,
+        "POST",
+        &format!("/api/assets/characters/{id}/appeal"),
+        Some(&access),
+        None,
+        Some(json!({ "text": "该词为剧情引用，非违规使用，请复核。" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let appeal_id: String = sqlx::query_scalar("SELECT id FROM moderation_appeals WHERE subject_id = ?")
+        .bind(&id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+
+    // 后台 overturn 改判（唯一改判路径）→ moderation 恢复 approved。
+    let (st, res) = send(
+        &app,
+        "POST",
+        &format!("/api/admin/appeals/{appeal_id}/resolve"),
+        Some(&admin),
+        None,
+        Some(json!({ "decision": "overturn", "reason": "复核确认为剧情引用，改判通过。" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{res:?}");
+    assert_eq!(res["status"], "overturned");
+
+    let m: String = sqlx::query_scalar("SELECT moderation FROM cloud_characters WHERE id = ?")
+        .bind(&id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(m, "approved", "overturn 后卡应恢复 approved");
+
+    // /mine 的 CharacterView 恢复可见（moderation=approved）。
+    let (_st, mine) = send(&app, "GET", "/api/assets/characters/mine", Some(&access), None, None).await;
+    let item = mine.as_array().unwrap().iter().find(|c| c["id"] == id.as_str()).expect("mine 应含该卡");
+    assert_eq!(item["moderation"], "approved");
+
+    // audit_logs 留痕。
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_logs WHERE action = 'appeal_overturn'")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(n, 1, "改判必须留 audit_logs 痕");
+
+    // status：改判后 rejectReason 归 null，appeal 内联结论。
+    let (_st, s) = send(&app, "GET", &format!("/api/assets/characters/{id}/status"), Some(&access), None, None).await;
+    assert_eq!(s["moderation"], "approved");
+    assert!(s["rejectReason"].is_null());
+    assert_eq!(s["appeal"]["status"], "overturned");
+    assert_eq!(s["appeal"]["resolutionReason"], "复核确认为剧情引用，改判通过。");
+    assert!(s["appeal"]["resolvedAt"].is_number());
+}
+
 /// 正常卡（provider Approved 且无注入）→ 直过 approved，不入队、不记险。
 #[tokio::test]
 async fn approved_card_writes_no_audit_no_risk() {

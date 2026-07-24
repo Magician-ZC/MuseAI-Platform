@@ -4,6 +4,7 @@
 // 主读端点的 require_role 白名单，只做「收敛可见模块 + 越权提示」的前端纵深，不放宽任何权限。
 //   users    GET /admin/users            → require_role(support)                     ⇒ support
 //   audit    GET /admin/audit-queue      → require_role(reviewer)                    ⇒ reviewer
+//            （申诉复审 GET/POST /admin/appeals* 同 require_role(reviewer)，归本模块）
 //   worlds   GET /admin/worlds           → require_role(operator)                    ⇒ operator
 //   economy  GET /admin/economy/overview → require_role(finance)                     ⇒ finance
 //   metrics  GET /admin/metrics/overview → require_role(operator, finance)           ⇒ operator, finance

@@ -546,6 +546,234 @@ async fn events_query_enforces_audience_isolation() {
     assert_eq!(b_events[0]["visibility"], "public");
 }
 
+// ---------- 世界发现：标题搜索 q + 热门排序 sort=hot（0017） ----------
+
+mod discovery {
+    //! GET /worlds 发现能力：q 大小写不敏感/通配符转义、sort=hot 热度分与快照语义、
+    //! sort=new + q 组合分页、非法 sort 400、默认行为零回归。
+    use super::*;
+    use sqlx::AnyPool;
+
+    /// 造 world_events 行（仅 NOT NULL 无默认列），occurred_at 由调用方指定以控 48h 热度窗。
+    async fn seed_world_event(db: &AnyPool, world_id: &str, occurred_at: i64) {
+        sqlx::query(
+            "INSERT INTO world_events (id, world_id, tick_no, sequence, domain_event_id, event_type, visibility, occurred_at) \
+             VALUES (?, ?, 0, 0, ?, 'dialogue_spoken', 'public', ?)",
+        )
+        .bind(new_id("we"))
+        .bind(world_id)
+        .bind(new_id("de"))
+        .bind(occurred_at)
+        .execute(db)
+        .await
+        .unwrap();
+    }
+
+    /// 造 gift_events 行，created_at 由调用方指定以控 7 天打赏窗。
+    async fn seed_gift(db: &AnyPool, world_id: &str, gift_count: i64, created_at: i64) {
+        sqlx::query(
+            "INSERT INTO gift_events (id, world_id, sku, gift_count, created_at) VALUES (?, ?, 'rose', ?, ?)",
+        )
+        .bind(new_id("ge"))
+        .bind(world_id)
+        .bind(gift_count)
+        .bind(created_at)
+        .execute(db)
+        .await
+        .unwrap();
+    }
+
+    /// 造 active 成员行（status 默认 active；schema 无外键约束，直插即可）。
+    async fn seed_member(db: &AnyPool, world_id: &str, character_id: &str) {
+        sqlx::query(
+            "INSERT INTO world_members (id, world_id, user_id, cloud_character_id, joined_at) VALUES (?, ?, 'usrD', ?, ?)",
+        )
+        .bind(new_id("wm"))
+        .bind(world_id)
+        .bind(character_id)
+        .bind(now_ms())
+        .execute(db)
+        .await
+        .unwrap();
+    }
+
+    fn titles(body: &Value) -> Vec<String> {
+        body["worlds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w["title"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn list_worlds_default_behavior_regression() {
+        // 零回归：无 q/sort 时现行为不变——只出 open/running + official/public，
+        // created_at DESC，现有字段齐全且不带 hotScore，type 过滤仍工作。
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_user(&state, "usrD").await;
+        let tk = token(&state, "usrD");
+
+        let wid = create_world(&state.db, CreateWorldParams::official("tpl", 1, "公开世界")).await.unwrap();
+        let mut p = CreateWorldParams::official("tpl", 1, "私有世界");
+        p.visibility = "private".into();
+        create_world(&state.db, p).await.unwrap();
+
+        let (st, body) = get_json(&app, "/api/worlds", &tk).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        let ws = body["worlds"].as_array().unwrap();
+        assert_eq!(ws.len(), 1, "私有世界不应出现在大厅");
+        assert_eq!(ws[0]["id"], wid.as_str());
+        for key in ["roomType", "title", "status", "visibility", "memberLimit", "memberCount", "tickPerDay", "aiLabel"] {
+            assert!(ws[0].get(key).is_some(), "现有字段缺失: {key}");
+        }
+        assert!(ws[0].get("hotScore").is_none(), "默认（sort=new）不应带 hotScore");
+        assert!(body["nextCursor"].is_null(), "不足一页 nextCursor 应为 null");
+
+        // type 过滤照旧。
+        let (st2, body2) = get_json(&app, "/api/worlds?type=arena", &tk).await;
+        assert_eq!(st2, StatusCode::OK);
+        assert!(body2["worlds"].as_array().unwrap().is_empty(), "idle 世界不应命中 type=arena");
+    }
+
+    #[tokio::test]
+    async fn list_worlds_q_matches_case_insensitive_and_escapes_wildcards() {
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_user(&state, "usrD").await;
+        let tk = token(&state, "usrD");
+
+        create_world(&state.db, CreateWorldParams::official("tpl", 1, "魔法学院Alpha")).await.unwrap();
+        create_world(&state.db, CreateWorldParams::official("tpl", 1, "剑与远征")).await.unwrap();
+        create_world(&state.db, CreateWorldParams::official("tpl", 1, "折扣50%世界")).await.unwrap();
+        create_world(&state.db, CreateWorldParams::official("tpl", 1, "under_score")).await.unwrap();
+
+        // 命中：大小写不敏感（ALPHA 命中 Alpha）。
+        let (st, body) = get_json(&app, "/api/worlds?q=ALPHA", &tk).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert_eq!(titles(&body), vec!["魔法学院Alpha"]);
+
+        // 不命中 → 空列表。
+        let (_st, body) = get_json(&app, "/api/worlds?q=neverland", &tk).await;
+        assert!(body["worlds"].as_array().unwrap().is_empty(), "不命中应返回空列表");
+
+        // 转义：q='%'（URL 编码 %25）只命中标题真含 % 的世界，不得当通配符匹配全部。
+        let (_st, body) = get_json(&app, "/api/worlds?q=%25", &tk).await;
+        assert_eq!(titles(&body), vec!["折扣50%世界"], "'%' 不得通配误匹配");
+
+        // 转义：q='_' 只命中标题真含下划线的世界（'_' 不得当单字符通配）。
+        let (_st, body) = get_json(&app, "/api/worlds?q=_", &tk).await;
+        assert_eq!(titles(&body), vec!["under_score"], "'_' 不得通配误匹配");
+
+        // 空串 q 视为无搜索 → 全部可见世界。
+        let (_st, body) = get_json(&app, "/api/worlds?q=", &tk).await;
+        assert_eq!(body["worlds"].as_array().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn list_worlds_hot_ranks_by_recent_activity_with_hot_score() {
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_user(&state, "usrD").await;
+        let tk = token(&state, "usrD");
+        let now = now_ms();
+        let hour = 3600 * 1000_i64;
+
+        let hot = create_world(&state.db, CreateWorldParams::official("tpl", 1, "火热世界")).await.unwrap();
+        let cold = create_world(&state.db, CreateWorldParams::official("tpl", 1, "冷清世界")).await.unwrap();
+        // 钉死 created_at：hot 更旧、cold 更新 → sort=new 下 cold 在前，热度榜必须逆转该顺序。
+        sqlx::query("UPDATE worlds SET created_at=? WHERE id=?").bind(now - 10_000).bind(&hot).execute(&state.db).await.unwrap();
+        sqlx::query("UPDATE worlds SET created_at=? WHERE id=?").bind(now).bind(&cold).execute(&state.db).await.unwrap();
+
+        // 热世界：近 48h 事件 3 条 + 近 7 天打赏 gift_count 共 4 + active 成员 1 → 3×1 + 4×5 + 1×2 = 25。
+        seed_world_event(&state.db, &hot, now - hour).await;
+        seed_world_event(&state.db, &hot, now - 2 * hour).await;
+        seed_world_event(&state.db, &hot, now - 47 * hour).await; // 贴近窗沿，仍在 48h 内
+        seed_gift(&state.db, &hot, 3, now - 24 * hour).await;
+        seed_gift(&state.db, &hot, 1, now - 6 * 24 * hour).await; // 仍在 7 天内
+        seed_member(&state.db, &hot, "chHot1").await;
+
+        // 冷世界：事件在 48h 窗外、打赏在 7 天窗外、无成员 → 热度 0（窗外活动不计分）。
+        seed_world_event(&state.db, &cold, now - 72 * hour).await;
+        seed_world_event(&state.db, &cold, now - 72 * hour).await;
+        seed_gift(&state.db, &cold, 9, now - 8 * 24 * hour).await;
+
+        // 基线（sort=new）：cold 更新在前。
+        let (st_new, body_new) = get_json(&app, "/api/worlds", &tk).await;
+        assert_eq!(st_new, StatusCode::OK, "{body_new}");
+        assert_eq!(titles(&body_new), vec!["冷清世界", "火热世界"]);
+
+        // sort=hot：热度逆转顺序，每项带 hotScore，快照榜 nextCursor 恒 null。
+        let (st, body) = get_json(&app, "/api/worlds?sort=hot", &tk).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert_eq!(titles(&body), vec!["火热世界", "冷清世界"]);
+        let ws = body["worlds"].as_array().unwrap();
+        assert_eq!(ws[0]["hotScore"], 25, "3事件×1 + 4打赏×5 + 1成员×2 = 25");
+        assert_eq!(ws[0]["memberCount"], 1);
+        assert_eq!(ws[1]["hotScore"], 0, "窗外事件/打赏不计分");
+        assert!(body["nextCursor"].is_null(), "热度榜是快照，不返回游标");
+
+        // hot 叠加 q：仍按热度出、带 hotScore。
+        let (st_q, body_q) = get_json(&app, "/api/worlds?sort=hot&q=%E7%81%AB%E7%83%AD", &tk).await; // q=火热
+        assert_eq!(st_q, StatusCode::OK, "{body_q}");
+        assert_eq!(titles(&body_q), vec!["火热世界"]);
+        assert_eq!(body_q["worlds"][0]["hotScore"], 25);
+    }
+
+    #[tokio::test]
+    async fn list_worlds_new_with_q_paginates_with_cursor() {
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_user(&state, "usrD").await;
+        let tk = token(&state, "usrD");
+
+        for i in 1..=3 {
+            create_world(&state.db, CreateWorldParams::official("tpl", 1, format!("搜索目标world{i}"))).await.unwrap();
+        }
+        create_world(&state.db, CreateWorldParams::official("tpl", 1, "无关世界")).await.unwrap();
+
+        // 第一页：q + limit=2 → 2 条命中 + nextCursor。
+        let (st, p1) = get_json(&app, "/api/worlds?q=world&limit=2", &tk).await;
+        assert_eq!(st, StatusCode::OK, "{p1}");
+        assert_eq!(p1["worlds"].as_array().unwrap().len(), 2);
+        let cur = p1["nextCursor"].as_str().expect("第一页应有 nextCursor").to_string();
+
+        // 第二页：cursor + 同 q → 剩余 1 条，翻页尽头 nextCursor=null。
+        let (st2, p2) = get_json(&app, &format!("/api/worlds?q=world&limit=2&cursor={cur}"), &tk).await;
+        assert_eq!(st2, StatusCode::OK, "{p2}");
+        assert_eq!(p2["worlds"].as_array().unwrap().len(), 1);
+        assert!(p2["nextCursor"].is_null());
+
+        // 两页合计 3 条、无重复、全命中 q（"无关世界"不出现）。
+        let mut all = titles(&p1);
+        all.extend(titles(&p2));
+        assert_eq!(all.len(), 3);
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), 3, "翻页不得重复");
+        assert!(all.iter().all(|t| t.contains("world")), "{all:?}");
+    }
+
+    #[tokio::test]
+    async fn list_worlds_rejects_invalid_sort() {
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_user(&state, "usrD").await;
+        let tk = token(&state, "usrD");
+
+        let (st, body) = get_json(&app, "/api/worlds?sort=hottest", &tk).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["code"], "bad_request");
+
+        // 显式 sort=new / sort=hot 均合法。
+        let (st_new, _) = get_json(&app, "/api/worlds?sort=new", &tk).await;
+        assert_eq!(st_new, StatusCode::OK);
+        let (st_hot, _) = get_json(&app, "/api/worlds?sort=hot", &tk).await;
+        assert_eq!(st_hot, StatusCode::OK);
+    }
+}
+
 // ---------- P2 房主建房 POST /worlds + 开房费 charge（feature=billing/arena 才装配该端点） ----------
 
 #[cfg(any(feature = "billing", feature = "arena"))]

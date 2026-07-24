@@ -1,11 +1,13 @@
-// 内容审核：审核队列（机审预标注 + 人审）+ 详情抽屉 + approve/reject。
+// 内容审核：Tab「审核队列」（机审预标注 + 人审 + 详情抽屉 + approve/reject）
+// + Tab「申诉复审」（components/AuditAppeals，被驳回内容的申诉裁决）。
 // #10b（§10）：详情抽屉展示「卡片全文 cardJson + 机审命中点 + 同作者历史」。
 // 卡片全文/历史由审核详情端点（G-ASSETS #10a 契约）提供；端点未就绪时优雅降级——
 // 仍展示机审命中并标注「卡片全文需后端支持」，不崩溃。
 import { useEffect, useRef, useState } from 'react';
-import { Alert, Button, Descriptions, Drawer, message, Select, Space, Spin, Table, Tag, Typography } from 'antd';
+import { Alert, Button, Descriptions, Drawer, message, Select, Space, Spin, Table, Tabs, Tag, Typography } from 'antd';
 import type { TableColumnsType } from 'antd';
 import { adminFetch } from '../api';
+import AuditAppeals from '../components/AuditAppeals';
 import { ErrorAlert, formatTime, friendlyError, ReasonModal, usePagedList } from '../components/shared';
 
 interface AuditRow {
@@ -253,9 +255,9 @@ export default function Audit() {
 
   const machineHits = enriched?.machineHits ?? detail?.machineHits;
 
-  return (
-    <div>
-      <Typography.Title level={4}>内容审核</Typography.Title>
+  // Tab「审核队列」：原有筛选 + 列表（详情抽屉与理由 Modal 为浮层，保持在 Tabs 外）。
+  const queuePane = (
+    <>
       <Space style={{ marginBottom: 16 }}>
         <span>状态筛选：</span>
         <Select style={{ width: 160 }} value={status} onChange={setStatus} options={STATUS_OPTIONS} />
@@ -279,6 +281,20 @@ export default function Audit() {
           <Button onClick={list.loadMore} loading={list.loading}>加载更多</Button>
         </div>
       )}
+    </>
+  );
+
+  return (
+    <div>
+      <Typography.Title level={4}>内容审核</Typography.Title>
+      <Tabs
+        defaultActiveKey="queue"
+        items={[
+          { key: 'queue', label: '审核队列', children: queuePane },
+          // 申诉复审：被驳回内容的申诉裁决（改判通过 / 维持原判），惰性挂载，切到该 Tab 才拉取。
+          { key: 'appeals', label: '申诉复审', children: <AuditAppeals /> },
+        ]}
+      />
 
       <Drawer
         title="审核详情"

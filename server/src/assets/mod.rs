@@ -5,7 +5,8 @@
 //!                                      → 机审 safety::moderate_and_queue(唯一入队/记险方) → cloud_characters(pending|approved)
 //!                                      → audit_queue / risk_events 由 moderate_and_queue 统一落库，本模块不二次写；Idempotency-Key 必须
 //! GET    /assets/characters/mine       我的云端版本列表（含审核态）
-//! GET    /assets/characters/{id}/status
+//! GET    /assets/characters/{id}/status     审核态 + rejectReason（驳回理由回显）+ appeal（申诉状态）
+//! POST   /assets/characters/{id}/appeal     对机审/人审驳回发起申诉（owner-only，每主体终身一次；不改 moderation）
 //! POST   /assets/characters/{id}/withdraw   停止后续投放（withdrawn=1；运行中世界按入场协议处理，S3 消费）
 //! DELETE /assets/characters/{id}       异步删除任务（data_requests）：从未投放 → 立删；已投放 → 标记 + 任务清理
 //!
@@ -41,6 +42,7 @@ pub fn router() -> Router<AppState> {
         .route("/assets/characters", post(publish))
         .route("/assets/characters/mine", get(list_mine))
         .route("/assets/characters/{id}/status", get(status))
+        .route("/assets/characters/{id}/appeal", post(appeal))
         .route("/assets/characters/{id}/manifest", get(manifest))
         .route("/assets/characters/{id}/avatar", post(upload_avatar))
         .route("/assets/characters/{id}/withdraw", post(withdraw))
@@ -330,8 +332,36 @@ async fn list_mine(State(state): State<AppState>, user: AuthUser) -> Result<Resp
     Ok(json_response(body))
 }
 
+/// 主体申诉行的用户侧视图（status 端点内联回显）：无申诉 → null。
+async fn fetch_appeal_view(
+    state: &AppState,
+    subject_kind: &str,
+    subject_id: &str,
+) -> Result<serde_json::Value, ApiError> {
+    let row: Option<(String, String, Option<String>, i64, Option<i64>)> = sqlx::query_as(
+        "SELECT status, appeal_text, resolution_reason, created_at, resolved_at \
+         FROM moderation_appeals WHERE subject_kind = ? AND subject_id = ?",
+    )
+    .bind(subject_kind)
+    .bind(subject_id)
+    .fetch_optional(&state.db)
+    .await?;
+    Ok(match row {
+        Some((status, text, resolution, created_at, resolved_at)) => serde_json::json!({
+            "status": status,
+            "appealText": text,
+            "resolutionReason": resolution,
+            "createdAt": created_at,
+            "resolvedAt": resolved_at,
+        }),
+        None => serde_json::Value::Null,
+    })
+}
+
 /// GET /assets/characters/{id}/status：审核态查询（owner 隔离，非本人 → 404 不泄露存在性）。
 /// 内联可审计 manifest（§2.3），发布方可直接预览云端副本的字段/用途/可见范围/删除策略。
+/// 另回显 rejectReason（卡被驳回时：最新 audit_queue.reject_reason 人审理由；机审直拒不入队，
+/// 无队列行/无理由则中文兜底）与 appeal（该主体申诉行，无则 null）。
 async fn status(State(state): State<AppState>, user: AuthUser, Path(id): Path<String>) -> Result<Response, ApiError> {
     let row: Option<(String, i64, i64, Option<String>)> = sqlx::query_as(
         "SELECT moderation, version, withdrawn, manifest_json FROM cloud_characters WHERE id = ? AND owner_id = ?",
@@ -344,12 +374,109 @@ async fn status(State(state): State<AppState>, user: AuthUser, Path(id): Path<St
     let manifest = manifest_json
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .unwrap_or(serde_json::Value::Null);
+
+    // rejectReason：仅 moderation=='rejected' 时给值，否则 null。
+    let reject_reason = if moderation == "rejected" {
+        let reason: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT reject_reason FROM audit_queue WHERE subject_kind = 'character' AND subject_id = ? \
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(&id)
+        .fetch_optional(&state.db)
+        .await?;
+        let text = reason
+            .flatten()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "未通过机器审核".to_string());
+        serde_json::Value::String(text)
+    } else {
+        serde_json::Value::Null
+    };
+
+    let appeal = fetch_appeal_view(&state, "character", &id).await?;
+
     let resp = serde_json::json!({
         "id": id,
         "moderation": moderation,
         "version": version,
         "withdrawn": withdrawn != 0,
         "manifest": manifest,
+        "rejectReason": reject_reason,
+        "appeal": appeal,
+    });
+    Ok(json_response(serde_json::to_string(&resp).unwrap()))
+}
+
+/// 申诉提交请求。
+#[derive(Debug, Deserialize)]
+struct AppealReq {
+    text: String,
+}
+
+/// POST /assets/characters/{id}/appeal body {text}：对机审/人审驳回发起申诉（每主体终身一次）。
+///
+/// 红线：提交**不改任何 moderation**——改判前「未过审不外泄」继续成立（roster/CharacterView 的
+/// approved 门不受影响）；唯一改判路径是后台 POST /admin/appeals/{id}/resolve（必留 audit_logs）。
+/// 仅当卡 moderation=='rejected' 或头像 avatar_moderation=='rejected' 才允许申诉；
+/// 非 owner → 404 不泄露存在性（与 status 一致）。
+async fn appeal(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<String>,
+    Json(req): Json<AppealReq>,
+) -> Result<Response, ApiError> {
+    // owner 鉴权：非本人或不存在 → 404（硬隔离）。
+    let row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT moderation, avatar_moderation FROM cloud_characters WHERE id = ? AND owner_id = ?",
+    )
+    .bind(&id)
+    .bind(&user.user_id)
+    .fetch_optional(&state.db)
+    .await?;
+    let (moderation, avatar_moderation) = row.ok_or(ApiError::NotFound)?;
+
+    // 仅驳回态（卡或头像任一维度 rejected）可申诉。
+    if moderation != "rejected" && avatar_moderation.as_deref() != Some("rejected") {
+        return Err(ApiError::BadRequest("仅审核未通过的内容可发起申诉".into()));
+    }
+
+    let text = req.text.trim().to_string();
+    let chars = text.chars().count();
+    if chars == 0 || chars > 500 {
+        return Err(ApiError::BadRequest("申诉内容必填且不超过 500 字符".into()));
+    }
+
+    let appeal_id = new_id("apl");
+    let now = now_ms();
+    // 每主体终身一次：唯一索引 (subject_kind, subject_id) 冲突 → 409。
+    let inserted = sqlx::query(
+        "INSERT INTO moderation_appeals (id, subject_kind, subject_id, owner_id, appeal_text, status, created_at) \
+         VALUES (?, 'character', ?, ?, ?, 'pending', ?)",
+    )
+    .bind(&appeal_id)
+    .bind(&id)
+    .bind(&user.user_id)
+    .bind(&text)
+    .bind(now)
+    .execute(&state.db)
+    .await;
+    match inserted {
+        Ok(_) => {}
+        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+            return Err(ApiError::Conflict("该内容已申诉过，每个内容仅可申诉一次".into()));
+        }
+        Err(e) => return Err(e.into()),
+    }
+
+    let resp = serde_json::json!({
+        "id": appeal_id,
+        "subjectKind": "character",
+        "subjectId": id,
+        "status": "pending",
+        "appealText": text,
+        "resolutionReason": serde_json::Value::Null,
+        "createdAt": now,
+        "resolvedAt": serde_json::Value::Null,
     });
     Ok(json_response(serde_json::to_string(&resp).unwrap()))
 }

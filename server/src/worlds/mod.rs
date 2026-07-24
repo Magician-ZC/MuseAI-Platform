@@ -1,7 +1,12 @@
 //! 世界生命周期（S2）：大厅列表 / 详情 / 投放(join) / 离场(leave) + 内部 create_world。
 //!
 //! 端点：
-//! GET  /worlds?type=idle|chapter|arena   大厅列表（cursor 分页；只出 open/running 且 official/public）
+//! GET  /worlds?type=idle|chapter|arena&q=…&sort=new|hot
+//!   大厅列表（只出 open/running 且 official/public）：
+//!   - q：标题大小写不敏感包含搜索（% _ \ 转义；空串视为无搜索）
+//!   - sort=new（默认）：created_at DESC + cursor 分页（现行为）
+//!   - sort=hot：热度榜快照（近 48h 事件×1 + 近 7 天打赏×5 + active 成员×2），
+//!     每项附 hotScore，LIMIT ≤50，不支持 cursor（nextCursor 恒为 null）
 //! GET  /worlds/{id}                      详情（世界书简介/规则/公开阵容/AI 标识展示）
 //! POST /worlds/{id}/join                 投放角色：AuthUser + Idempotency-Key + cloudCharacterId + boundary
 //!   服务端权威校验（§9.6）：角色 approved 且未 withdrawn 且属于本人；人数上限；写 world_members
@@ -99,6 +104,10 @@ struct ListParams {
     room_type: Option<String>,
     cursor: Option<String>,
     limit: Option<i64>,
+    /// 标题搜索：大小写不敏感 LIKE 包含匹配；空串/全空白视为无搜索。
+    q: Option<String>,
+    /// 排序："new"（默认，created_at DESC + cursor 分页）| "hot"（热度快照）；其余值 400。
+    sort: Option<String>,
 }
 
 /// cursor 编码为 `{created_at}:{id}`（created_at 无冒号，按首个冒号切分）。
@@ -107,10 +116,64 @@ fn parse_cursor(cursor: &str) -> Option<(i64, String)> {
     Some((ts.parse().ok()?, id.to_string()))
 }
 
+/// LIKE 模式转义：% _ \ 前置 \（配合 `ESCAPE '\'`），防用户输入被当通配符误匹配。
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// 热度时间窗（毫秒）：事件近 48h、打赏近 7 天。
+/// 边界在 Rust 侧按 now_ms 计算后以参数传入——双库约束禁 SQL 日期函数（db.rs）。
+const HOT_EVENTS_WINDOW_MS: i64 = 48 * 3600 * 1000;
+const HOT_GIFTS_WINDOW_MS: i64 = 7 * 24 * 3600 * 1000;
+
+/// 列表项投影（new/hot 共用；hot 分支再追加 hotScore）。
+fn world_list_item(row: &sqlx::any::AnyRow, id: &str) -> Result<Value, ApiError> {
+    Ok(json!({
+        "id": id,
+        "roomType": row.try_get::<String, _>("room_type")?,
+        "title": row.try_get::<String, _>("title")?,
+        "status": row.try_get::<String, _>("status")?,
+        "visibility": row.try_get::<String, _>("visibility")?,
+        "memberLimit": row.try_get::<i64, _>("member_limit")?,
+        "memberCount": row.try_get::<i64, _>("member_count")?,
+        "tickPerDay": row.try_get::<i64, _>("tick_per_day")?,
+        "aiLabel": { "visible": true },
+    }))
+}
+
 async fn list_worlds(
     State(state): State<AppState>,
     _user: AuthUser,
     Query(params): Query<ListParams>,
+) -> Result<Json<Value>, ApiError> {
+    // q 归一化：空串/全空白视为无搜索；否则转义为 %包含% 模式。
+    // 大小写一致性：SQLite LIKE 对 ASCII 天然不敏感而 PG 敏感，统一 LOWER(title) LIKE LOWER(?) 拉平双库。
+    let like = params
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("%{}%", escape_like(s)));
+
+    match params.sort.as_deref() {
+        None | Some("new") => list_worlds_new(&state, &params, like).await,
+        Some("hot") => list_worlds_hot(&state, &params, like).await,
+        Some(other) => Err(ApiError::BadRequest(format!("非法 sort 值「{other}」：仅支持 new / hot"))),
+    }
+}
+
+/// sort=new（默认）：现行为不变——created_at DESC + cursor 分页；q 仅叠加 WHERE。
+async fn list_worlds_new(
+    state: &AppState,
+    params: &ListParams,
+    like: Option<String>,
 ) -> Result<Json<Value>, ApiError> {
     let page = params.limit.unwrap_or(20).clamp(1, 100);
     // 仅可见世界：open/running 且 official/public。
@@ -123,6 +186,9 @@ async fn list_worlds(
     if params.room_type.is_some() {
         sql.push_str(" AND room_type = ?");
     }
+    if like.is_some() {
+        sql.push_str(" AND LOWER(title) LIKE LOWER(?) ESCAPE '\\'");
+    }
     let cursor = params.cursor.as_deref().and_then(parse_cursor);
     if cursor.is_some() {
         sql.push_str(" AND (created_at < ? OR (created_at = ? AND id < ?))");
@@ -132,6 +198,9 @@ async fn list_worlds(
     let mut q = sqlx::query(&sql);
     if let Some(rt) = &params.room_type {
         q = q.bind(rt);
+    }
+    if let Some(pat) = &like {
+        q = q.bind(pat);
     }
     if let Some((ts, id)) = &cursor {
         q = q.bind(*ts).bind(*ts).bind(id);
@@ -149,22 +218,66 @@ async fn list_worlds(
         let created_at: i64 = row.try_get("created_at")?;
         let id: String = row.try_get("id")?;
         next_cursor = Some(format!("{created_at}:{id}"));
-        items.push(json!({
-            "id": id,
-            "roomType": row.try_get::<String, _>("room_type")?,
-            "title": row.try_get::<String, _>("title")?,
-            "status": row.try_get::<String, _>("status")?,
-            "visibility": row.try_get::<String, _>("visibility")?,
-            "memberLimit": row.try_get::<i64, _>("member_limit")?,
-            "memberCount": row.try_get::<i64, _>("member_count")?,
-            "tickPerDay": row.try_get::<i64, _>("tick_per_day")?,
-            "aiLabel": { "visible": true },
-        }));
+        items.push(world_list_item(row, &id)?);
     }
     if !has_more {
         next_cursor = None;
     }
     Ok(Json(json!({ "worlds": items, "nextCursor": next_cursor })))
+}
+
+/// sort=hot：热度榜快照。热度分 = 近 48h 事件数×1 + 近 7 天打赏 gift_count 总和×5 + active 成员数×2。
+/// 对候选世界（status/visibility/type/q 过滤后）逐行子查询聚合；LIMIT clamp ≤50；
+/// 不支持 cursor（快照榜，忽略 cursor 参数，nextCursor 恒为 null）；每项附 hotScore（BIGINT）。
+async fn list_worlds_hot(
+    state: &AppState,
+    params: &ListParams,
+    like: Option<String>,
+) -> Result<Json<Value>, ApiError> {
+    let page = params.limit.unwrap_or(20).clamp(1, 50);
+    let now = now_ms();
+    let events_since = now - HOT_EVENTS_WINDOW_MS;
+    let gifts_since = now - HOT_GIFTS_WINDOW_MS;
+
+    // SUM 可移植性：CAST(COALESCE(SUM(x),0) AS BIGINT)（先例 admin_api/reconcile.rs）；
+    // 整体分再 CAST 一次，保证双库返回 BIGINT。gift_events 表恒存在（迁移不随 feature 门控）。
+    let mut sql = String::from(
+        "SELECT id, room_type, title, status, visibility, member_limit, tick_per_day, created_at, \
+         (SELECT COUNT(*) FROM world_members m WHERE m.world_id = worlds.id AND m.status='active') AS member_count, \
+         CAST( \
+           (SELECT COUNT(*) FROM world_events e WHERE e.world_id = worlds.id AND e.occurred_at >= ?) \
+           + (SELECT CAST(COALESCE(SUM(g.gift_count),0) AS BIGINT) FROM gift_events g WHERE g.world_id = worlds.id AND g.created_at >= ?) * 5 \
+           + (SELECT COUNT(*) FROM world_members m2 WHERE m2.world_id = worlds.id AND m2.status='active') * 2 \
+         AS BIGINT) AS hot_score \
+         FROM worlds \
+         WHERE status IN ('open','running') AND visibility IN ('official','public')",
+    );
+    if params.room_type.is_some() {
+        sql.push_str(" AND room_type = ?");
+    }
+    if like.is_some() {
+        sql.push_str(" AND LOWER(title) LIKE LOWER(?) ESCAPE '\\'");
+    }
+    sql.push_str(" ORDER BY hot_score DESC, created_at DESC, id DESC LIMIT ?");
+
+    let mut q = sqlx::query(&sql).bind(events_since).bind(gifts_since);
+    if let Some(rt) = &params.room_type {
+        q = q.bind(rt);
+    }
+    if let Some(pat) = &like {
+        q = q.bind(pat);
+    }
+    q = q.bind(page);
+
+    let rows = q.fetch_all(&state.db).await?;
+    let mut items = Vec::new();
+    for row in &rows {
+        let id: String = row.try_get("id")?;
+        let mut item = world_list_item(row, &id)?;
+        item["hotScore"] = json!(row.try_get::<i64, _>("hot_score")?);
+        items.push(item);
+    }
+    Ok(Json(json!({ "worlds": items, "nextCursor": null })))
 }
 
 // ---------- 世界详情 ----------

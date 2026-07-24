@@ -19,6 +19,10 @@ import {
   Avatar,
   Upload,
   Select,
+  Modal,
+  Tooltip,
+  Input,
+  message,
 } from 'antd';
 import {
   CloudUploadOutlined,
@@ -31,7 +35,14 @@ import { usePartnerStore } from '../../stores/usePartnerStore';
 import type { CharacterCardV2 } from '../../utils/characterCardV2';
 import { cloudFetch, CloudError, uploadAvatar, resolveObjectUrl } from '../../utils/cloudApi';
 import { compressAvatarImage, ACCEPTED_AVATAR_MIME } from '../../utils/imageAvatar';
-import { describeCloudError, moderationMeta, type CloudCharacter } from '../../stores/usePlatformStore';
+import {
+  describeCloudError,
+  moderationMeta,
+  appealStatusMeta,
+  type CloudCharacter,
+  type CloudCharacterStatus,
+  type CharacterAppeal,
+} from '../../stores/usePlatformStore';
 
 const { Title, Text, Paragraph } = Typography;
 
@@ -70,16 +81,50 @@ const CharacterPublish: React.FC = () => {
     null,
   );
 
+  // 驳回申诉：目标行 + 申诉正文（Modal 内 TextArea，trim 后 1..=500 必填）。
+  const [appealTarget, setAppealTarget] = useState<CloudCharacter | null>(null);
+  const [appealText, setAppealText] = useState('');
+  const [appealSubmitting, setAppealSubmitting] = useState(false);
+
   const selected: CharacterCardV2 | undefined = cards.find((c) => c.id === selectedId);
   const avatarChar = mine.find((c) => c.id === avatarCharId);
   const currentAvatarUrl = resolveObjectUrl(avatarChar?.avatarUrl);
+
+  // 卸载守卫：status 补拉是浮动 promise（loadMine 逐行 best-effort + refreshStatus），
+  // 组件卸载后 resolve 再 setState 会在测试里触发环境销毁后的调度（window is not defined）。
+  const aliveRef = React.useRef(true);
+  useEffect(() => {
+    aliveRef.current = true;
+    return () => {
+      aliveRef.current = false;
+    };
+  }, []);
+
+  // 把 status 端点回读（审核态 + 驳回理由 + 申诉状态）合并进对应行。
+  const mergeStatus = (id: string, s: CloudCharacterStatus) => {
+    if (!aliveRef.current) return; // 卸载后丢弃迟到的回读
+    setMine((prev) =>
+      prev.map((c) =>
+        c.id === id
+          ? { ...c, moderation: s.moderation, withdrawn: s.withdrawn, rejectReason: s.rejectReason, appeal: s.appeal }
+          : c,
+      ),
+    );
+  };
 
   const loadMine = async () => {
     setMineLoading(true);
     setMineError(null);
     try {
       const data = await cloudFetch<CloudCharacter[]>('/api/assets/characters/mine');
-      setMine(Array.isArray(data) ? data : []);
+      const list = Array.isArray(data) ? data : [];
+      setMine(list);
+      // 驳回理由与申诉状态仅 status 端点下发：对 rejected 行补拉（best-effort，单行失败静默不阻塞列表）。
+      for (const c of list.filter((x) => x.moderation === 'rejected')) {
+        void cloudFetch<CloudCharacterStatus>(`/api/assets/characters/${c.id}/status`)
+          .then((s) => mergeStatus(c.id, s))
+          .catch(() => {});
+      }
     } catch (e) {
       setMineError(describeCloudError(e));
     } finally {
@@ -158,12 +203,54 @@ const CharacterPublish: React.FC = () => {
 
   const refreshStatus = async (id: string) => {
     try {
-      const s = await cloudFetch<{ id: string; moderation: string; version: number; withdrawn: boolean }>(
-        `/api/assets/characters/${id}/status`,
-      );
-      setMine((prev) => prev.map((c) => (c.id === id ? { ...c, moderation: s.moderation, withdrawn: s.withdrawn } : c)));
+      const s = await cloudFetch<CloudCharacterStatus>(`/api/assets/characters/${id}/status`);
+      mergeStatus(id, s);
     } catch (e) {
       setMineError(describeCloudError(e));
+    }
+  };
+
+  // 提交申诉：仅驳回内容可申诉；红线——提交不改 moderation，改判仅由后台复核完成。
+  const submitAppeal = async () => {
+    if (!appealTarget) return;
+    const text = appealText.trim();
+    if (!text) return;
+    setAppealSubmitting(true);
+    try {
+      const row = await cloudFetch<CharacterAppeal>(`/api/assets/characters/${appealTarget.id}/appeal`, {
+        method: 'POST',
+        idempotent: true,
+        body: { text },
+      });
+      setMine((prev) =>
+        prev.map((c) =>
+          c.id === appealTarget.id
+            ? {
+                ...c,
+                appeal: {
+                  status: row.status,
+                  appealText: row.appealText,
+                  resolutionReason: row.resolutionReason,
+                  createdAt: row.createdAt,
+                  resolvedAt: row.resolvedAt,
+                },
+              }
+            : c,
+        ),
+      );
+      setAppealTarget(null);
+      setAppealText('');
+      message.success('申诉已提交，复核结果将在此处更新');
+    } catch (e) {
+      // 409（已申诉过）/ 400（非驳回态、字数不合规）等：直接透出服务端中文文案。
+      message.error(describeCloudError(e));
+      if (e instanceof CloudError && e.status === 409) {
+        // 已存在申诉（如另一端提交过）：拉回该行申诉状态并收起弹窗。
+        void refreshStatus(appealTarget.id);
+        setAppealTarget(null);
+      }
+    } finally {
+      setAppealSubmitting(false);
     }
   };
 
@@ -433,10 +520,21 @@ const CharacterPublish: React.FC = () => {
               {
                 title: '审核态',
                 dataIndex: 'moderation',
-                width: 90,
-                render: (m: string) => {
+                width: 150,
+                render: (m: string, r: CloudCharacter) => {
                   const meta = moderationMeta(m);
-                  return <Tag color={meta.color}>{meta.label}</Tag>;
+                  return (
+                    <Space direction="vertical" size={2}>
+                      <Tag color={meta.color}>{meta.label}</Tag>
+                      {m === 'rejected' && r.rejectReason && (
+                        <Tooltip title={`驳回理由：${r.rejectReason}`}>
+                          <Text type="danger" style={{ fontSize: 12 }}>
+                            {r.rejectReason}
+                          </Text>
+                        </Tooltip>
+                      )}
+                    </Space>
+                  );
                 },
               },
               {
@@ -448,26 +546,53 @@ const CharacterPublish: React.FC = () => {
               {
                 title: '操作',
                 key: 'ops',
-                width: 200,
-                render: (_: unknown, r: CloudCharacter) => (
-                  <Space size={4}>
-                    <Button size="small" type="link" onClick={() => void refreshStatus(r.id)}>
-                      刷新态
-                    </Button>
-                    {!r.withdrawn && (
-                      <Popconfirm title="撤回后停止后续投放，确认？" onConfirm={() => void withdraw(r.id)}>
-                        <Button size="small" type="link">
-                          撤回
+                width: 250,
+                render: (_: unknown, r: CloudCharacter) => {
+                  const appealMeta = r.appeal ? appealStatusMeta(r.appeal.status) : null;
+                  const appealTag = appealMeta && r.appeal && (
+                    <Tag color={appealMeta.color} style={{ marginInlineEnd: 0 }}>
+                      {appealMeta.label}
+                    </Tag>
+                  );
+                  return (
+                    <Space size={4}>
+                      <Button size="small" type="link" onClick={() => void refreshStatus(r.id)}>
+                        刷新态
+                      </Button>
+                      {!r.withdrawn && (
+                        <Popconfirm title="撤回后停止后续投放，确认？" onConfirm={() => void withdraw(r.id)}>
+                          <Button size="small" type="link">
+                            撤回
+                          </Button>
+                        </Popconfirm>
+                      )}
+                      <Popconfirm title="删除云端资产？运行中世界按入场协议处理" onConfirm={() => void remove(r.id)}>
+                        <Button size="small" type="link" danger>
+                          删除
                         </Button>
                       </Popconfirm>
-                    )}
-                    <Popconfirm title="删除云端资产？运行中世界按入场协议处理" onConfirm={() => void remove(r.id)}>
-                      <Button size="small" type="link" danger>
-                        删除
-                      </Button>
-                    </Popconfirm>
-                  </Space>
-                ),
+                      {/* 申诉入口：仅驳回且尚未申诉时展示；已有申诉只展示状态（每主体终身一次）。 */}
+                      {r.appeal ? (
+                        r.appeal.resolutionReason ? (
+                          <Tooltip title={`复核理由：${r.appeal.resolutionReason}`}>{appealTag}</Tooltip>
+                        ) : (
+                          appealTag
+                        )
+                      ) : r.moderation === 'rejected' ? (
+                        <Button
+                          size="small"
+                          type="link"
+                          onClick={() => {
+                            setAppealTarget(r);
+                            setAppealText('');
+                          }}
+                        >
+                          申诉
+                        </Button>
+                      ) : null}
+                    </Space>
+                  );
+                },
               },
             ]}
           />
@@ -477,6 +602,35 @@ const CharacterPublish: React.FC = () => {
       <Paragraph type="secondary" style={{ fontSize: 12, marginTop: 16 }}>
         私密房只降低发现与传播范围，不豁免平台的数据、内容与版权义务；公开分发会叠加更严格的权利证明与人审。
       </Paragraph>
+
+      {/* 申诉弹窗：提交进入人工复核队列；改判前原审核结果继续生效（提交不改 moderation）。 */}
+      <Modal
+        title="对审核结果发起申诉"
+        open={!!appealTarget}
+        onCancel={() => setAppealTarget(null)}
+        onOk={() => void submitAppeal()}
+        okText="提交申诉"
+        cancelText="取消"
+        confirmLoading={appealSubmitting}
+        okButtonProps={{ disabled: !appealText.trim() }}
+      >
+        <Space direction="vertical" size={10} style={{ width: '100%' }}>
+          {appealTarget?.rejectReason && (
+            <Alert type="warning" showIcon message={`驳回理由：${appealTarget.rejectReason}`} />
+          )}
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            每个内容仅可申诉一次，提交后进入人工复核；复核改判前，原审核结果继续生效。
+          </Text>
+          <Input.TextArea
+            rows={4}
+            maxLength={500}
+            showCount
+            placeholder="请说明理由（必填，500 字以内），如权利证明、误判说明等"
+            value={appealText}
+            onChange={(e) => setAppealText(e.target.value)}
+          />
+        </Space>
+      </Modal>
     </div>
   );
 };

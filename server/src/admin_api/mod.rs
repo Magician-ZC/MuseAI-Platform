@@ -5,11 +5,12 @@
 //!   引导：    POST /admin/dev-login（dev 引导登录 → admin token）
 //!   用户管理：GET /admin/users?query=&cursor=、POST /admin/users/{id}/ban|unban
 //!   内容审核：GET /admin/audit-queue?status=、POST /admin/audit-queue/{id}/approve|reject（回写主体 moderation）
+//!   申诉复审：GET /admin/appeals?status=、POST /admin/appeals/{id}/resolve（overturn/uphold，唯一改判路径）
 //!   世界运营：GET /admin/worlds?status=、GET /admin/worlds/{id}/diagnostics（脱敏诊断）、
 //!            POST /admin/worlds/{id}/pause|resume、POST /admin/worlds（官方建房）、GET/POST /admin/world-templates
 //!   经济运营：GET /admin/economy/overview（真实只读聚合：充值/退款/余额/礼物/订单状态，不建结算）
 //!            GET /admin/ledger/reconcile（P4：全账复式恒等 SUM=0 + 账户物化余额对账，finance 只读，无提现）
-//!   数据看板：GET /admin/metrics/overview（SQL 聚合）
+//!   数据看板：GET /admin/metrics/overview（SQL 聚合）、GET /admin/metrics/trends?days=（按天趋势，UTC 日界）
 //!   治理：    GET/POST /admin/prompts、POST /admin/prompts/{id}/activate|canary、
 //!            GET/POST /admin/model-routes、POST /admin/model-routes/{id}/activate（一键回滚=激活旧版本）
 //!   风控：    GET /admin/risk-events?kind=&cursor=
@@ -58,6 +59,9 @@ pub fn router() -> Router<AppState> {
         .route("/admin/audit-queue/{id}", get(audit::detail))
         .route("/admin/audit-queue/{id}/approve", post(audit::approve))
         .route("/admin/audit-queue/{id}/reject", post(audit::reject))
+        // 申诉复审（内容风控申诉：机审/人审驳回后的唯一改判路径）
+        .route("/admin/appeals", get(audit::list_appeals))
+        .route("/admin/appeals/{id}/resolve", post(audit::resolve_appeal))
         // 世界运营
         .route("/admin/worlds", get(worlds_ops::list_worlds).post(worlds_ops::create_world))
         .route("/admin/worlds/{id}/diagnostics", get(worlds_ops::diagnostics))
@@ -73,6 +77,7 @@ pub fn router() -> Router<AppState> {
         .route("/admin/ledger/reconcile", get(reconcile::ledger_reconcile))
         // 数据看板
         .route("/admin/metrics/overview", get(dashboards::metrics_overview))
+        .route("/admin/metrics/trends", get(dashboards::metrics_trends))
         // 模型与 Prompt 治理
         .route("/admin/prompts", get(governance::list_prompts).post(governance::create_prompt))
         .route("/admin/prompts/{id}/activate", post(governance::activate_prompt))

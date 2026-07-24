@@ -30,12 +30,15 @@ export interface ForceGraphProps {
   testId?: string;
   /** 空数据文案。 */
   emptyText?: string;
+  /** 节点标签位置（默认 'right'；头像节点建议 'bottom'）。 */
+  labelPosition?: string;
 }
 
 interface EchartsNodeDatum {
   id: string;
   name: string;
   value: number;
+  symbol: string;
   symbolSize: number;
   category?: number;
   itemStyle: { color: string; borderColor?: string; borderWidth?: number };
@@ -46,13 +49,14 @@ function buildOption(
   nodes: GraphNode[],
   links: GraphLink[],
   categories: GraphCategory[],
-  opts: { highlightNeighbors: boolean; legend: boolean; repulsion: number; edgeLength: number },
+  opts: { highlightNeighbors: boolean; legend: boolean; repulsion: number; edgeLength: number; labelPosition: string },
 ): echarts.EChartsCoreOption {
   const maxWeight = Math.max(1, ...links.map((l) => Math.abs(l.weight)));
   const data: EchartsNodeDatum[] = nodes.map((n) => ({
     id: n.id,
     name: n.label,
     value: n.size,
+    symbol: n.symbol ?? 'circle',
     symbolSize: n.size,
     category: n.category,
     itemStyle: {
@@ -102,8 +106,9 @@ function buildOption(
         categories: categories.length > 0 ? categories : undefined,
         label: {
           show: true,
-          position: 'right',
+          position: opts.labelPosition,
           color: '#33312e',
+          fontSize: 12,
           formatter: (p: { data?: { name?: string } }) => p.data?.name ?? '',
         },
         lineStyle: { color: '#cbb7a3', curveness: 0.08 },
@@ -135,6 +140,7 @@ const ForceGraph: React.FC<ForceGraphProps> = ({
   edgeLength = 110,
   testId = 'echarts-graph',
   emptyText = '暂无数据',
+  labelPosition = 'right',
 }) => {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<echarts.ECharts | null>(null);
@@ -149,8 +155,9 @@ const ForceGraph: React.FC<ForceGraphProps> = ({
         legend: showLegend,
         repulsion,
         edgeLength,
+        labelPosition,
       }),
-    [nodes, links, categories, highlightNeighbors, showLegend, repulsion, edgeLength],
+    [nodes, links, categories, highlightNeighbors, showLegend, repulsion, edgeLength, labelPosition],
   );
 
   // 回调 ref：init effect 只跑一次，事件里始终读到最新 onNodeClick / highlightCategory / nodes。

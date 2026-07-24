@@ -25,6 +25,7 @@ import { Card, Empty, List, Space, Tag, Typography } from 'antd';
 import { EnvironmentOutlined, LockOutlined } from '@ant-design/icons';
 import type { WorldLocation, WorldRosterEntry, WorldEventItem } from '../../stores/usePlatformStore';
 import { MINE_RING_COLOR } from './model';
+import { locationIconDataUri } from './glyphs';
 
 const { Text, Paragraph } = Typography;
 
@@ -195,20 +196,15 @@ function buildSceneOption(
         name: `L:${p.id}`,
         x: p.x,
         y: p.y,
-        symbol: secret ? 'diamond' : 'circle',
-        symbolSize: Math.min(64, 34 + d * 7),
-        itemStyle: {
-          color: secret ? SECRET_COLOR : LOCATION_COLOR,
-          borderColor: secret ? '#7a4f86' : '#5f5142',
-          borderWidth: secret ? 2.5 : 1,
-          borderType: secret ? 'dashed' : 'solid',
-        },
+        symbol: locationIconDataUri({ name: locName(loc, p.id), secret }),
+        symbolSize: Math.min(58, 40 + d * 5),
+        itemStyle: {},
         label: {
           show: true,
           position: 'bottom',
           color: '#33312e',
           fontSize: 12,
-          formatter: `${secret ? '🔒 ' : ''}${locName(loc, p.id)}`,
+          formatter: locName(loc, p.id),
         },
         __meta: { kind: 'location', id: p.id },
       });

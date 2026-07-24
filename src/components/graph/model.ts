@@ -7,6 +7,7 @@ import type {
   WorldRosterEntry,
   WorldEventItem,
 } from '../../stores/usePlatformStore';
+import { charAvatarDataUri } from './glyphs';
 
 // ---------- 通用图模型（对外契约，供 ForceGraph 与 P1/P2 复用） ----------
 
@@ -28,6 +29,8 @@ export interface GraphNode {
   arcStage?: string;
   /** 侧栏角色状态卡用：活跃度。 */
   activity?: number;
+  /** echarts `image://` symbol（角色首字头像 / 地点图标）；缺省时 ForceGraph 用圆点。 */
+  symbol?: string;
 }
 
 /** 一条图边：{source,target,weight,kind,dim} 为契约必备，其余为呈现可选增强。 */
@@ -148,9 +151,13 @@ function relationLinkColor(value: number): string {
 }
 
 function relationNodeSize(activity: number | undefined): number {
-  if (typeof activity !== 'number' || !Number.isFinite(activity)) return 20;
-  return Math.max(16, Math.min(16 + activity * 4, 52));
+  // 头像节点需足够大以看清首字（≥38）。
+  if (typeof activity !== 'number' || !Number.isFinite(activity)) return 42;
+  return Math.max(38, Math.min(40 + activity * 4, 62));
 }
+
+/** 非我方角色头像描边环色（暖白，与主题一致）。我方用 MINE_RING_COLOR。 */
+const OTHER_RING_COLOR = '#f3ece0';
 
 // ---------- 权威关系图（#3）：节点∝活跃度·弧光五色，边按所选维度绿正红负 ----------
 
@@ -180,15 +187,19 @@ export function buildRelationGraph(input: {
     let n = nodes.get(id);
     if (!n) {
       const st = stateOf.get(id);
+      const label = nameOf.get(id) || id;
+      const color = arcStageColor(st?.arcStage);
+      const isMine = mine.has(id);
       n = {
         id,
-        label: nameOf.get(id) || id,
+        label,
         size: relationNodeSize(st?.activity),
-        color: arcStageColor(st?.arcStage),
+        color,
         kind: st?.arcStage ?? 'unknown',
-        mine: mine.has(id),
+        mine: isMine,
         arcStage: st?.arcStage,
         activity: st?.activity,
+        symbol: charAvatarDataUri({ name: label, fill: color, ring: isMine ? MINE_RING_COLOR : OTHER_RING_COLOR }),
       };
       nodes.set(id, n);
     }
@@ -269,13 +280,17 @@ export function buildCooccurrenceGraph(input: {
 
   const nodes: GraphNode[] = order.map((id) => {
     const w = weight.get(id) ?? 1;
+    const label = nameOf.get(id) || id;
+    const isMine = mine.has(id);
+    const color = isMine ? MINE_RING_COLOR : OTHER_NODE_COLOR;
     return {
       id,
-      label: nameOf.get(id) || id,
-      size: Math.min(18 + w * 3, 48),
-      color: mine.has(id) ? MINE_RING_COLOR : OTHER_NODE_COLOR,
+      label,
+      size: Math.max(38, Math.min(38 + w * 3, 58)),
+      color,
       kind: 'coocc',
-      mine: mine.has(id),
+      mine: isMine,
+      symbol: charAvatarDataUri({ name: label, fill: color, ring: isMine ? MINE_RING_COLOR : OTHER_RING_COLOR }),
     };
   });
 
@@ -378,14 +393,18 @@ export function buildPowerHierarchy(input: {
   const nodes: GraphNode[] = ids.map((id) => {
     const category = rootToFaction.get(find(id)) as number;
     const w = weight.get(id) ?? 1;
+    const label = nameOf.get(id) as string;
+    const isMine = mine.has(id);
+    const color = FACTION_PALETTE[category % FACTION_PALETTE.length];
     return {
       id,
-      label: nameOf.get(id) as string,
-      size: Math.min(18 + w * 3, 46),
-      color: FACTION_PALETTE[category % FACTION_PALETTE.length],
+      label,
+      size: Math.max(38, Math.min(38 + w * 3, 56)),
+      color,
       kind: 'faction',
       category,
-      mine: mine.has(id),
+      mine: isMine,
+      symbol: charAvatarDataUri({ name: label, fill: color, ring: isMine ? MINE_RING_COLOR : OTHER_RING_COLOR }),
     };
   });
 

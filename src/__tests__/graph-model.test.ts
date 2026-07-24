@@ -64,7 +64,8 @@ describe('buildRelationGraph', () => {
 
     const a = byId.get('a')!;
     expect(a.color).toBe(ARC_STAGE_COLOR.rising);
-    expect(a.size).toBe(16 + 5 * 4); // 36
+    expect(a.size).toBe(60); // 头像节点：relationNodeSize(5)=max(38, 40+5*4)
+    expect(a.symbol?.startsWith('image://data:image/svg+xml')).toBe(true); // 首字头像 SVG
     expect(a.mine).toBe(true);
     expect(a.arcStage).toBe('rising');
     expect(a.activity).toBe(5);
@@ -73,8 +74,8 @@ describe('buildRelationGraph', () => {
     expect(b.color).toBe(ARC_STAGE_COLOR.climax);
     expect(b.mine).toBe(false);
 
-    // activity 0 → 保底最小尺寸 16
-    expect(byId.get('c')!.size).toBe(16);
+    // activity 0 → 头像最小尺寸 40
+    expect(byId.get('c')!.size).toBe(40);
   });
 
   it('边：所选维度绿(正)红(负)配色 + weight=|值|', () => {
@@ -146,9 +147,9 @@ describe('buildCooccurrenceGraph（回退路径）', () => {
     const byId = new Map(g.nodes.map((n) => [n.id, n]));
     expect(byId.get('a')!.color).toBe(MINE_RING_COLOR);
     expect(byId.get('b')!.color).toBe(OTHER_NODE_COLOR);
-    // a 参与 2 次 → weight 3 → size 18+3*3=27；b 参与 1 次 → 24
-    expect(byId.get('a')!.size).toBe(27);
-    expect(byId.get('b')!.size).toBe(24);
+    // a 参与 2 次 → weight 3 → size max(38, 38+3*3)=47；b 参与 1 次 → 44
+    expect(byId.get('a')!.size).toBe(47);
+    expect(byId.get('b')!.size).toBe(44);
     const link = g.links.find((l) => l.source === 'a' && l.target === 'b')!;
     expect(link.kind).toBe('coocc');
     expect(link.weight).toBe(1);

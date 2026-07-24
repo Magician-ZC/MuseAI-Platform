@@ -173,7 +173,8 @@ export const RelationForceGraph: React.FC<{
         nodes={model.nodes}
         links={model.links}
         onNodeClick={(n) => setSelected(n)}
-        height={380}
+        height={440}
+        labelPosition="bottom"
         testId={testId}
       />
       {selected && (

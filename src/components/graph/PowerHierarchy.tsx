@@ -5,6 +5,7 @@
 import React, { useMemo } from 'react';
 import { Alert, Empty, Space, Tag, Typography } from 'antd';
 import type { WorldRelation, WorldRosterEntry, WorldEventItem } from '../../stores/usePlatformStore';
+import { resolveObjectUrl } from '../../utils/cloudApi';
 import ForceGraph from './ForceGraph';
 import { buildPowerHierarchy, FACTION_PALETTE } from './model';
 
@@ -17,9 +18,14 @@ export const PowerHierarchy: React.FC<{
   myIds?: Set<string>;
 }> = ({ roster, events, relations, myIds }) => {
   const mine = myIds ?? new Set<string>();
+  // 相对 avatarUrl 预解析为完整 URL（同 RelationForceGraph），保持 model.ts 纯函数无 base 依赖。
+  const resolvedRoster = useMemo(
+    () => roster.map((r) => (r.avatarUrl ? { ...r, avatarUrl: resolveObjectUrl(r.avatarUrl) } : r)),
+    [roster],
+  );
   const model = useMemo(
-    () => buildPowerHierarchy({ roster, events, relations, myIds: mine }),
-    [roster, events, relations, mine],
+    () => buildPowerHierarchy({ roster: resolvedRoster, events, relations, myIds: mine }),
+    [resolvedRoster, events, relations, mine],
   );
 
   // 按 category 归组，供底部势力成员列表。

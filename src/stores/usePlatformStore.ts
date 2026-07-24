@@ -31,6 +31,9 @@ export interface WorldRosterEntry {
   cloudCharacterId: string;
   name: string;
   aiLabel?: AiLabel;
+  /** 角色头像回读路径（相对 /api/...）；仅当该角色头像过审时服务端才下发，否则字段缺席。
+   * 未过审 → 缺席 → 图节点自然回退首字头像。需经 resolveObjectUrl 拼平台 base 后才是完整 URL。 */
+  avatarUrl?: string;
 }
 
 export interface WorldDetail {
@@ -116,6 +119,8 @@ export interface CloudCharacter {
   moderation: string; // pending | approved | rejected
   withdrawn: boolean;
   createdAt: number;
+  /** 角色头像回读路径（相对 /api/...）：过审后非空，否则 null。需经 resolveObjectUrl 拼 base 才可直连。 */
+  avatarUrl?: string | null;
 }
 
 export interface ReportListItem {

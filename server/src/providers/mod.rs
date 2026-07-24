@@ -37,6 +37,14 @@ pub enum ModerationVerdict {
 #[async_trait]
 pub trait ModerationProvider: Send + Sync {
     async fn check_text(&self, text: &str) -> Result<ModerationVerdict, String>;
+
+    /// 图片机审（角色头像等二进制资产）。
+    /// dev 默认实现直过（Approved 占位）；生产待接第三方图审（阿里云内容安全 / 网易易盾 图片检测），
+    /// 命中涉政/色情/暴恐等应返回 Pending（进人审）或 Rejected（直拒）。
+    /// 红线：未过审头像绝不外泄——裁决落 avatar_moderation，读取面（roster / CharacterView）双过滤。
+    async fn check_image(&self, _bytes: &[u8]) -> Result<ModerationVerdict, String> {
+        Ok(ModerationVerdict::Approved)
+    }
 }
 
 /// dev：小型关键词表命中 → Pending（进人审队列），否则 Approved。

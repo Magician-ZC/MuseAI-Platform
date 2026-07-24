@@ -11,6 +11,7 @@ import type {
   WorldRosterEntry,
   WorldEventItem,
 } from '../../stores/usePlatformStore';
+import { resolveObjectUrl } from '../../utils/cloudApi';
 import ForceGraph from './ForceGraph';
 import {
   arcStageColor,
@@ -130,18 +131,24 @@ export const RelationForceGraph: React.FC<{
   const [dimension, setDimension] = useState<RelationDimension>('affinity');
   const [selected, setSelected] = useState<GraphNode | null>(null);
 
+  // 把 roster 的相对 avatarUrl 预解析成完整 URL 后再喂给纯函数 builder（model.ts 不依赖 getPlatformBase）。
+  const resolvedRoster = useMemo(
+    () => roster.map((r) => (r.avatarUrl ? { ...r, avatarUrl: resolveObjectUrl(r.avatarUrl) } : r)),
+    [roster],
+  );
+
   const model = useMemo(
     () =>
       authoritative
         ? buildRelationGraph({
-            roster,
+            roster: resolvedRoster,
             relations: relations as WorldRelation[],
             characters,
             myIds: mine,
             dimension,
           })
-        : buildCooccurrenceGraph({ roster, events, myIds: mine }),
-    [authoritative, roster, relations, characters, events, mine, dimension],
+        : buildCooccurrenceGraph({ roster: resolvedRoster, events, myIds: mine }),
+    [authoritative, resolvedRoster, relations, characters, events, mine, dimension],
   );
 
   const nameOf = useMemo(() => {

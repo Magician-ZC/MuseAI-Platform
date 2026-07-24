@@ -16,11 +16,21 @@ import {
   Typography,
   Empty,
   Popconfirm,
+  Avatar,
+  Upload,
+  Select,
 } from 'antd';
-import { CloudUploadOutlined, FileTextOutlined, ReloadOutlined } from '@ant-design/icons';
+import {
+  CloudUploadOutlined,
+  FileTextOutlined,
+  ReloadOutlined,
+  UploadOutlined,
+  UserOutlined,
+} from '@ant-design/icons';
 import { usePartnerStore } from '../../stores/usePartnerStore';
 import type { CharacterCardV2 } from '../../utils/characterCardV2';
-import { cloudFetch, CloudError } from '../../utils/cloudApi';
+import { cloudFetch, CloudError, uploadAvatar, resolveObjectUrl } from '../../utils/cloudApi';
+import { compressAvatarImage, ACCEPTED_AVATAR_MIME } from '../../utils/imageAvatar';
 import { describeCloudError, moderationMeta, type CloudCharacter } from '../../stores/usePlatformStore';
 
 const { Title, Text, Paragraph } = Typography;
@@ -53,7 +63,16 @@ const CharacterPublish: React.FC = () => {
   const [mineLoading, setMineLoading] = useState(false);
   const [mineError, setMineError] = useState<string | null>(null);
 
+  // 角色头像：目标为已发布的云端角色（头像挂在云端角色上，需其 id）。
+  const [avatarCharId, setAvatarCharId] = useState<string | null>(null);
+  const [avatarUploading, setAvatarUploading] = useState(false);
+  const [avatarFeedback, setAvatarFeedback] = useState<{ type: 'success' | 'info' | 'error'; text: string } | null>(
+    null,
+  );
+
   const selected: CharacterCardV2 | undefined = cards.find((c) => c.id === selectedId);
+  const avatarChar = mine.find((c) => c.id === avatarCharId);
+  const currentAvatarUrl = resolveObjectUrl(avatarChar?.avatarUrl);
 
   const loadMine = async () => {
     setMineLoading(true);
@@ -71,6 +90,43 @@ const CharacterPublish: React.FC = () => {
   useEffect(() => {
     void loadMine();
   }, []);
+
+  // mine 变化后维持一个有效的头像目标：保留当前选择，否则回落到首个云端角色。
+  useEffect(() => {
+    if (mine.length === 0) {
+      setAvatarCharId(null);
+      return;
+    }
+    setAvatarCharId((cur) => (cur && mine.some((c) => c.id === cur) ? cur : mine[0].id));
+  }, [mine]);
+
+  // 处理头像文件：校验 MIME → 压缩（最长边≤256）→ 纯 base64 → 上传 → 按审核态提示。
+  const handleAvatarFile = async (file: File) => {
+    if (!avatarCharId) return;
+    if (!(ACCEPTED_AVATAR_MIME as readonly string[]).includes(file.type)) {
+      setAvatarFeedback({ type: 'error', text: '仅支持 PNG / JPEG / WebP 格式的图片' });
+      return;
+    }
+    setAvatarUploading(true);
+    setAvatarFeedback(null);
+    try {
+      const { imageBase64, mime } = await compressAvatarImage(file);
+      const res = await uploadAvatar(avatarCharId, imageBase64, mime);
+      if (res.moderation === 'approved' && res.avatarUrl) {
+        const url = res.avatarUrl;
+        setMine((prev) => prev.map((c) => (c.id === avatarCharId ? { ...c, avatarUrl: url } : c)));
+        setAvatarFeedback({ type: 'success', text: '头像已通过审核并更新' });
+      } else if (res.moderation === 'pending') {
+        setAvatarFeedback({ type: 'info', text: '头像已提交，审核中；通过后将自动展示' });
+      } else {
+        setAvatarFeedback({ type: 'error', text: '头像未通过审核，请更换图片后重试' });
+      }
+    } catch (e) {
+      setAvatarFeedback({ type: 'error', text: describeCloudError(e) });
+    } finally {
+      setAvatarUploading(false);
+    }
+  };
 
   const publish = async () => {
     if (!selected) return;
@@ -268,6 +324,74 @@ const CharacterPublish: React.FC = () => {
         </Col>
       </Row>
 
+      {/* 角色头像（挂在已发布的云端角色上） */}
+      <Card
+        title="角色头像"
+        style={{ marginTop: 20, borderRadius: 12, border: 'none', boxShadow: '0 1px 3px rgba(0,0,0,0.05)' }}
+        styles={{ body: { padding: 20 } }}
+      >
+        {mine.length === 0 ? (
+          <Empty description="先发布角色到云端，再为其上传头像" image={Empty.PRESENTED_IMAGE_SIMPLE} />
+        ) : (
+          <Space direction="vertical" size={14} style={{ width: '100%' }}>
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              头像会经过内容审核，仅通过后才对外展示（未过审时各处自动回退为首字头像）。图片将压缩至最长边 256px 后上传。
+            </Text>
+            <Space size={16} wrap>
+              <Text strong style={{ fontSize: 13 }}>
+                选择云端角色
+              </Text>
+              <Select
+                value={avatarCharId ?? undefined}
+                onChange={(v) => {
+                  setAvatarCharId(v);
+                  setAvatarFeedback(null);
+                }}
+                style={{ minWidth: 280 }}
+                placeholder="选择一个已发布的角色"
+                options={mine.map((c) => ({
+                  value: c.id,
+                  label: `${c.localCardId} · v${c.version}（${moderationMeta(c.moderation).label}）`,
+                }))}
+              />
+            </Space>
+            <Space size={16} align="center" wrap>
+              <Avatar size={72} src={currentAvatarUrl} icon={<UserOutlined />} shape="circle">
+                {!currentAvatarUrl ? (avatarChar?.localCardId?.[0] ?? '角') : null}
+              </Avatar>
+              <Space direction="vertical" size={4}>
+                <Text type="secondary" style={{ fontSize: 12 }}>
+                  {currentAvatarUrl ? '当前头像（已过审）' : '该角色暂无已过审头像'}
+                </Text>
+                <Upload
+                  accept="image/png,image/jpeg,image/webp"
+                  showUploadList={false}
+                  disabled={!avatarCharId || avatarUploading}
+                  beforeUpload={(file) => {
+                    // 返回 false 阻止 antd 自动上传，自己走压缩 + uploadAvatar。
+                    void handleAvatarFile(file as File);
+                    return false;
+                  }}
+                >
+                  <Button icon={<UploadOutlined />} loading={avatarUploading} disabled={!avatarCharId}>
+                    上传头像
+                  </Button>
+                </Upload>
+              </Space>
+            </Space>
+            {avatarFeedback && (
+              <Alert
+                type={avatarFeedback.type}
+                showIcon
+                message={avatarFeedback.text}
+                closable
+                onClose={() => setAvatarFeedback(null)}
+              />
+            )}
+          </Space>
+        )}
+      </Card>
+
       {/* 我的云端版本 */}
       <Card
         title="我的云端版本"
@@ -290,6 +414,19 @@ const CharacterPublish: React.FC = () => {
             size="small"
             locale={{ emptyText: '尚无已发布版本' }}
             columns={[
+              {
+                title: '头像',
+                key: 'avatar',
+                width: 60,
+                render: (_: unknown, r: CloudCharacter) => {
+                  const url = resolveObjectUrl(r.avatarUrl);
+                  return (
+                    <Avatar size={32} src={url} icon={<UserOutlined />} shape="circle">
+                      {!url ? (r.localCardId?.[0] ?? '角') : null}
+                    </Avatar>
+                  );
+                },
+              },
               { title: '本地卡', dataIndex: 'localCardId', ellipsis: true },
               { title: '版本', dataIndex: 'version', width: 70, render: (v: number) => `v${v}` },
               { title: '权利', dataIndex: 'rightsDeclaration', width: 120, render: rightsLabel },

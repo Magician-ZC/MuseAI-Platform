@@ -195,3 +195,48 @@ describe('buildPowerHierarchy', () => {
     expect(g.links.some((l) => l.kind === 'conflict')).toBe(true);
   });
 });
+
+describe('头像节点 symbol（roster.avatarUrl，消费层已解析为完整 URL）', () => {
+  // 完整 URL（消费层用 resolveObjectUrl 把相对 /api 路径拼上平台 base 后传入）。
+  const AVATAR_URL = 'http://127.0.0.1:8787/api/assets/objects/avatars/a.png';
+  const ROSTER_WITH_AVATAR: WorldRosterEntry[] = [
+    { cloudCharacterId: 'a', name: '甲', avatarUrl: AVATAR_URL }, // 过审 → 有头像
+    { cloudCharacterId: 'b', name: '乙' }, // 无头像 → 回退首字
+    { cloudCharacterId: 'c', name: '丙' },
+  ];
+
+  it('buildRelationGraph：过审 → image://<完整URL>；缺席 → 回退首字头像 SVG', () => {
+    const g = buildRelationGraph({
+      roster: ROSTER_WITH_AVATAR,
+      relations: RELATIONS,
+      characters: CHARACTERS,
+      myIds: ['a'],
+      dimension: 'affinity',
+    });
+    const byId = new Map(g.nodes.map((n) => [n.id, n]));
+    expect(byId.get('a')!.symbol).toBe(`image://${AVATAR_URL}`);
+    expect(byId.get('b')!.symbol?.startsWith('image://data:image/svg')).toBe(true);
+  });
+
+  it('buildCooccurrenceGraph（回退路径）：同样优先头像，缺则首字', () => {
+    const g = buildCooccurrenceGraph({
+      roster: ROSTER_WITH_AVATAR,
+      events: [ev('dialogue', ['a', 'b'], 1)],
+      myIds: ['a'],
+    });
+    const byId = new Map(g.nodes.map((n) => [n.id, n]));
+    expect(byId.get('a')!.symbol).toBe(`image://${AVATAR_URL}`);
+    expect(byId.get('b')!.symbol?.startsWith('image://data:image/svg')).toBe(true);
+  });
+
+  it('buildPowerHierarchy：同样优先头像，缺则首字', () => {
+    const g = buildPowerHierarchy({
+      roster: ROSTER_WITH_AVATAR,
+      events: [ev('alliance', ['a', 'b'], 1)],
+      myIds: ['a'],
+    });
+    const byId = new Map(g.nodes.map((n) => [n.id, n]));
+    expect(byId.get('a')!.symbol).toBe(`image://${AVATAR_URL}`);
+    expect(byId.get('b')!.symbol?.startsWith('image://data:image/svg')).toBe(true);
+  });
+});

@@ -71,6 +71,42 @@ export async function cloudFetch<T>(path: string, options: CloudFetchOptions = {
   return data as T;
 }
 
+// ---------- 资产对象（头像等）：上传与相对路径解析 ----------
+
+/** POST /api/assets/characters/{id}/avatar 的返回体（Phase A 契约）。 */
+export interface AvatarUploadResult {
+  /** 相对 /api/assets/objects/... 路径；仅 moderation='approved' 时非 null。 */
+  avatarUrl: string | null;
+  moderation: 'approved' | 'pending' | 'rejected';
+}
+
+/**
+ * 上传角色头像（复用 cloudFetch 的 JSON 栈：图片以标准 base64 内联，不含 data: 前缀）。
+ * 非 owner → 404；MIME/解码失败/空/>512KB → 400（均经 describeCloudError 友好化）。
+ * 结果按 moderation 分流：approved 才有 avatarUrl，pending/rejected 不下发图。
+ */
+export function uploadAvatar(
+  cloudCharacterId: string,
+  imageBase64: string,
+  mime: 'image/png' | 'image/jpeg' | 'image/webp',
+): Promise<AvatarUploadResult> {
+  return cloudFetch<AvatarUploadResult>(`/api/assets/characters/${cloudCharacterId}/avatar`, {
+    method: 'POST',
+    idempotent: true,
+    body: { imageBase64, mime },
+  });
+}
+
+/**
+ * 把后端返回的相对资产路径（如 /api/assets/objects/avatars/xx.png）拼成完整 URL。
+ * 头像在平台后端（默认 :8787），页面可能在 :1420，故 <img>/echarts image:// 需完整 URL。
+ * 只拼 base，不猜测路径/扩展名；空值原样返回 undefined（调用方据此回退首字头像）。
+ */
+export function resolveObjectUrl(avatarUrl?: string | null): string | undefined {
+  if (!avatarUrl) return undefined;
+  return `${getPlatformBase()}${avatarUrl}`;
+}
+
 /** 订阅世界事件流（WS）；返回退订函数。断线自动重连并按 lastEventId 补偿。 */
 export function cloudStream(
   worldId: string,

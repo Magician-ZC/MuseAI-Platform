@@ -1,9 +1,30 @@
 //! 角色资产上云端到端测试（复用 auth 测试 helper）。
 
-use axum::http::StatusCode;
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use base64::Engine as _;
+use http_body_util::BodyExt;
 use serde_json::json;
+use tower::ServiceExt;
 
 use crate::auth::tests::{build_app, login_new_user, send};
+
+/// 原始字节 GET（对象回读返回二进制，非 JSON，故不能用 `send`）。返回 (status, 原始字节)。
+async fn get_raw(app: &axum::Router, uri: &str) -> (StatusCode, Vec<u8>) {
+    let req = Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let stat = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes().to_vec();
+    (stat, bytes)
+}
+
+/// 头像上传 body（base64 JSON）。
+fn avatar_body(bytes: &[u8], mime: &str) -> serde_json::Value {
+    json!({
+        "imageBase64": base64::engine::general_purpose::STANDARD.encode(bytes),
+        "mime": mime,
+    })
+}
 
 fn sample_card(name: &str) -> serde_json::Value {
     json!({
@@ -298,6 +319,100 @@ async fn manifest_endpoint_owner_scoped() {
     let (access2, _r, _u) = login_new_user(&app, "13900000098").await;
     let (st, _) = send(&app, "GET", &format!("/api/assets/characters/{id}/manifest"), Some(&access2), None, None).await;
     assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+// ---------------- 角色头像上传（Phase A） ----------------
+
+/// owner 上传头像 → 过审回传 avatarUrl → GET /assets/objects 回读得到原始字节。
+#[tokio::test]
+async fn avatar_upload_then_readback_returns_original_bytes() {
+    let (app, _s) = build_app().await;
+    let (access, _r, _u) = login_new_user(&app, "13900000020").await;
+    let (_st, v) =
+        send(&app, "POST", "/api/assets/characters", Some(&access), Some("av1"), Some(publish_body("card-AV", "头像者"))).await;
+    let id = v["id"].as_str().unwrap().to_string();
+
+    let raw: &[u8] = b"\x89PNG\r\n\x1a\n-fake-avatar-bytes-\x00\x01\x02\xff";
+    let (st, up) = send(
+        &app,
+        "POST",
+        &format!("/api/assets/characters/{id}/avatar"),
+        Some(&access),
+        None,
+        Some(avatar_body(raw, "image/png")),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{up:?}");
+    assert_eq!(up["moderation"], "approved", "dev 图审 stub 直过");
+    let url = up["avatarUrl"].as_str().expect("过审应回传 avatarUrl");
+    assert_eq!(url, format!("/api/assets/objects/avatars/{id}.png"));
+
+    // 回读得原始字节。
+    let (st, bytes) = get_raw(&app, url).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(bytes, raw, "回读应得上传的原始字节");
+
+    // /mine 也应带 avatarUrl（approved）。
+    let (_st, mine) = send(&app, "GET", "/api/assets/characters/mine", Some(&access), None, None).await;
+    assert_eq!(mine[0]["avatarUrl"].as_str(), Some(url));
+}
+
+/// 非 owner 上传头像被拒（404 硬隔离，不泄露存在性）。
+#[tokio::test]
+async fn avatar_upload_rejects_non_owner() {
+    let (app, _s) = build_app().await;
+    let (owner, _r, _u) = login_new_user(&app, "13900000021").await;
+    let (_st, v) =
+        send(&app, "POST", "/api/assets/characters", Some(&owner), Some("av2"), Some(publish_body("card-AV2", "属主"))).await;
+    let id = v["id"].as_str().unwrap().to_string();
+
+    let (other, _r, _u) = login_new_user(&app, "13900000121").await;
+    let (st, _) = send(
+        &app,
+        "POST",
+        &format!("/api/assets/characters/{id}/avatar"),
+        Some(&other),
+        None,
+        Some(avatar_body(b"\x89PNG-x", "image/png")),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "非 owner 上传应被拒");
+}
+
+/// 非法 MIME → 400（白名单仅 png/jpeg/webp）。
+#[tokio::test]
+async fn avatar_upload_rejects_bad_mime() {
+    let (app, _s) = build_app().await;
+    let (access, _r, _u) = login_new_user(&app, "13900000022").await;
+    let (_st, v) =
+        send(&app, "POST", "/api/assets/characters", Some(&access), Some("av3"), Some(publish_body("card-AV3", "格式"))).await;
+    let id = v["id"].as_str().unwrap().to_string();
+
+    let (st, _) = send(
+        &app,
+        "POST",
+        &format!("/api/assets/characters/{id}/avatar"),
+        Some(&access),
+        None,
+        Some(avatar_body(b"GIF89a", "image/gif")),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "非白名单 MIME 应 400");
+}
+
+/// 对象回读严防路径穿越：`avatars/../x` 等含 `..` / 非 avatars 前缀 key 一律 404。
+#[tokio::test]
+async fn object_read_rejects_path_traversal() {
+    let (app, _s) = build_app().await;
+    // 含 .. 的穿越 key。
+    let (st, _) = get_raw(&app, "/api/assets/objects/avatars/../x").await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "含 .. 的穿越 key 应 404");
+    // 非 avatars/ 前缀（越出头像目录）。
+    let (st2, _) = get_raw(&app, "/api/assets/objects/secret.png").await;
+    assert_eq!(st2, StatusCode::NOT_FOUND, "非 avatars 前缀应 404");
+    // 缺失对象 → 404（合法前缀但不存在）。
+    let (st3, _) = get_raw(&app, "/api/assets/objects/avatars/does-not-exist.png").await;
+    assert_eq!(st3, StatusCode::NOT_FOUND, "缺失对象应 404");
 }
 
 /// 正常卡（provider Approved 且无注入）→ 直过 approved，不入队、不记险。

@@ -325,6 +325,55 @@ async fn leave_marks_member_left() {
     assert_eq!(status, "left");
 }
 
+// ---------- 阵容头像按机审裁决过滤（Phase A 红线：未过审绝不下发） ----------
+
+#[tokio::test]
+async fn world_detail_roster_gates_avatar_on_moderation() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    seed_user(&state, "usrAV").await;
+    seed_char(&state, "chAV", "usrAV", "approved", 0).await;
+    let wid = create_world(&state.db, CreateWorldParams::official("tpl", 1, "头像世界")).await.unwrap();
+    // 投放该角色（active 成员）。
+    sqlx::query(
+        "INSERT INTO world_members (id, world_id, user_id, cloud_character_id, joined_at) VALUES (?, ?, 'usrAV', 'chAV', ?)",
+    )
+    .bind(new_id("wm"))
+    .bind(&wid)
+    .bind(now_ms())
+    .execute(&state.db)
+    .await
+    .unwrap();
+    let tk = token(&state, "usrAV");
+    let uri = format!("/api/worlds/{wid}");
+
+    // 无头像 → roster 不带 avatarUrl。
+    let (st, body) = get_json(&app, &uri, &tk).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(body["roster"][0]["cloudCharacterId"], "chAV");
+    assert!(body["roster"][0].get("avatarUrl").is_none(), "无头像不应带 avatarUrl");
+
+    // 过审头像 → roster 带 avatarUrl。
+    sqlx::query("UPDATE cloud_characters SET avatar_url = ?, avatar_moderation = 'approved' WHERE id = 'chAV'")
+        .bind("/api/assets/objects/avatars/chAV.png")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let (_st, body) = get_json(&app, &uri, &tk).await;
+    assert_eq!(
+        body["roster"][0]["avatarUrl"], "/api/assets/objects/avatars/chAV.png",
+        "过审头像应带 avatarUrl"
+    );
+
+    // 未过审（pending）→ roster 不带 avatarUrl（双过滤红线）。
+    sqlx::query("UPDATE cloud_characters SET avatar_moderation = 'pending' WHERE id = 'chAV'")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let (_st, body) = get_json(&app, &uri, &tk).await;
+    assert!(body["roster"][0].get("avatarUrl").is_none(), "未过审头像绝不下发");
+}
+
 // ---------- tick 幂等 ----------
 
 #[tokio::test]

@@ -191,9 +191,10 @@ async fn world_detail(
         }
     }
 
-    // 公开阵容：active 成员 + 角色公开名（AI 标识）。
+    // 公开阵容：active 成员 + 角色公开名（AI 标识）+ 头像（仅过审才带）。
     let member_rows = sqlx::query(
-        "SELECT wm.cloud_character_id AS cid, cc.card_json AS card \
+        "SELECT wm.cloud_character_id AS cid, cc.card_json AS card, \
+         cc.avatar_url AS avatar_url, cc.avatar_moderation AS avatar_moderation \
          FROM world_members wm JOIN cloud_characters cc ON cc.id = wm.cloud_character_id \
          WHERE wm.world_id = ? AND wm.status='active' ORDER BY wm.joined_at ASC",
     )
@@ -208,7 +209,16 @@ async fn world_detail(
             .ok()
             .and_then(|v| v["identity"]["name"].as_str().map(str::to_string))
             .unwrap_or_default();
-        roster.push(json!({ "cloudCharacterId": cid, "name": name, "aiLabel": { "visible": true } }));
+        let mut item = json!({ "cloudCharacterId": cid, "name": name, "aiLabel": { "visible": true } });
+        // 红线：仅头像机审 approved 才带 avatarUrl，否则不带该字段（前端回退首字头像）。
+        let avatar_url: Option<String> = r.try_get("avatar_url")?;
+        let avatar_moderation: Option<String> = r.try_get("avatar_moderation")?;
+        if avatar_moderation.as_deref() == Some("approved") {
+            if let Some(url) = avatar_url {
+                item["avatarUrl"] = json!(url);
+            }
+        }
+        roster.push(item);
     }
 
     Ok(Json(json!({

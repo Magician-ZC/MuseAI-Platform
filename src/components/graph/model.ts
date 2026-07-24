@@ -159,6 +159,23 @@ function relationNodeSize(activity: number | undefined): number {
 /** 非我方角色头像描边环色（暖白，与主题一致）。我方用 MINE_RING_COLOR。 */
 const OTHER_RING_COLOR = '#f3ece0';
 
+/** roster → 已过审头像的完整 URL 映射（缺席即未过审 → 回退首字头像）。
+ * roster.avatarUrl 由消费层预解析为完整 URL 后传入，本模块保持纯函数、不依赖 getPlatformBase。 */
+function avatarUrlMap(roster: WorldRosterEntry[]): Map<string, string> {
+  const m = new Map<string, string>();
+  for (const r of roster) if (r.avatarUrl) m.set(r.cloudCharacterId, r.avatarUrl);
+  return m;
+}
+
+/** 角色节点 echarts symbol：有过审头像（完整 URL）→ `image://<url>`；否则回退首字头像 SVG。 */
+function characterNodeSymbol(
+  avatarUrl: string | undefined,
+  fallback: { name: string; fill: string; ring: string },
+): string {
+  if (avatarUrl) return `image://${avatarUrl}`;
+  return charAvatarDataUri(fallback);
+}
+
 // ---------- 权威关系图（#3）：节点∝活跃度·弧光五色，边按所选维度绿正红负 ----------
 
 /**
@@ -182,6 +199,7 @@ export function buildRelationGraph(input: {
   const nodes = new Map<string, GraphNode>();
   const nameOf = new Map<string, string>();
   for (const r of roster) nameOf.set(r.cloudCharacterId, r.name || r.cloudCharacterId);
+  const avatarOf = avatarUrlMap(roster);
 
   const ensure = (id: string): GraphNode => {
     let n = nodes.get(id);
@@ -199,7 +217,11 @@ export function buildRelationGraph(input: {
         mine: isMine,
         arcStage: st?.arcStage,
         activity: st?.activity,
-        symbol: charAvatarDataUri({ name: label, fill: color, ring: isMine ? MINE_RING_COLOR : OTHER_RING_COLOR }),
+        symbol: characterNodeSymbol(avatarOf.get(id), {
+          name: label,
+          fill: color,
+          ring: isMine ? MINE_RING_COLOR : OTHER_RING_COLOR,
+        }),
       };
       nodes.set(id, n);
     }
@@ -239,6 +261,7 @@ export function buildCooccurrenceGraph(input: {
 }): GraphModel {
   const { roster, events } = input;
   const mine = toIdSet(input.myIds);
+  const avatarOf = avatarUrlMap(roster);
   const nameOf = new Map<string, string>();
   const weight = new Map<string, number>();
   const order: string[] = [];
@@ -290,7 +313,11 @@ export function buildCooccurrenceGraph(input: {
       color,
       kind: 'coocc',
       mine: isMine,
-      symbol: charAvatarDataUri({ name: label, fill: color, ring: isMine ? MINE_RING_COLOR : OTHER_RING_COLOR }),
+      symbol: characterNodeSymbol(avatarOf.get(id), {
+        name: label,
+        fill: color,
+        ring: isMine ? MINE_RING_COLOR : OTHER_RING_COLOR,
+      }),
     };
   });
 
@@ -313,6 +340,7 @@ export function buildPowerHierarchy(input: {
 }): GraphModel {
   const { roster, events, relations } = input;
   const mine = toIdSet(input.myIds);
+  const avatarOf = avatarUrlMap(roster);
 
   const nameOf = new Map<string, string>();
   const ids: string[] = [];
@@ -404,7 +432,11 @@ export function buildPowerHierarchy(input: {
       kind: 'faction',
       category,
       mine: isMine,
-      symbol: charAvatarDataUri({ name: label, fill: color, ring: isMine ? MINE_RING_COLOR : OTHER_RING_COLOR }),
+      symbol: characterNodeSymbol(avatarOf.get(id), {
+        name: label,
+        fill: color,
+        ring: isMine ? MINE_RING_COLOR : OTHER_RING_COLOR,
+      }),
     };
   });
 

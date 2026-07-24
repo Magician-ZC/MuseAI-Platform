@@ -8,6 +8,8 @@
 //! - 应用后命中任一 ForbiddenPredicate → Validation（整个 patch 拒绝，不部分提交）
 //! - 同 patch id 重复提交 → 幂等返回已提交结果（不重复应用）
 //! - 引用不存在的 characterId/关系端点 → Validation
+//!   （例外：关系**边**不存在但 from/to 均为已知角色时，写入路径以零值自动建边
+//!   （known_to=[from,to]）——关系演化 A 依赖；precondition 读取仍要求边已存在）
 
 use serde_json::Value;
 
@@ -193,18 +195,38 @@ fn apply_operation(next: &mut NarrativeState, op: &PatchOperation) -> Result<(),
             apply_character(c, field, op)
         }
         ParsedPath::Relation { from, to, field } => {
-            // 引用完整性：两端角色必须存在，关系必须存在（字段更新不创建关系）。
+            // 引用完整性：两端角色必须存在（悬空端点仍整 patch 拒绝——ghost 类未知角色行为不变）。
             if !next.characters.contains_key(from) {
                 return Err(dangling_char(from));
             }
             if !next.characters.contains_key(to) {
                 return Err(dangling_char(to));
             }
+            // 关系演化（A. relation_dynamics）：写入时若边不存在且 from/to 均为已知角色，
+            // 以零值自动建边（known_to=[from,to]）——新世界 relations 初始为空，首笔关系写入
+            // 即可落定。仅放宽「边必须先存在」这一点；白名单路径/端点校验机制不变，
+            // precondition 读取（read_current）仍要求边已存在。
+            if !next.relations.iter().any(|r| &r.from == from && &r.to == to) {
+                let mut known_to = vec![from.clone()];
+                if to != from {
+                    known_to.push(to.clone());
+                }
+                next.relations.push(RelationState {
+                    from: from.clone(),
+                    to: to.clone(),
+                    trust: 0.0,
+                    affinity: 0.0,
+                    fear: 0.0,
+                    debt: 0.0,
+                    known_to,
+                    notes: vec![],
+                });
+            }
             let r = next
                 .relations
                 .iter_mut()
                 .find(|r| &r.from == from && &r.to == to)
-                .ok_or_else(|| EngineError::Validation(format!("关系不存在: {from}->{to}")))?;
+                .expect("边已存在或刚建边，必可取到");
             apply_relation(r, field, op)
         }
         ParsedPath::OutlineNodeStatus { node_id } => {
@@ -715,6 +737,50 @@ mod tests {
         // 关系两端角色缺失
         let p = patch("p1", 0, vec![op(PatchOp::Set, "relations[li->ghost].trust", Some(json!(0.3)))]);
         assert_eq!(validate_and_apply(&s, &p).unwrap_err().code(), "validation");
+        // 反向亦然：from 为未知角色同样拒绝（自动建边仅限两端皆已知角色）。
+        let p2 = patch("p2", 0, vec![op(PatchOp::Set, "relations[ghost->li].trust", Some(json!(0.3)))]);
+        assert_eq!(validate_and_apply(&s, &p2).unwrap_err().code(), "validation");
+    }
+
+    // ---- 关系演化（A）：边不存在 + 两端已知角色 → 零值自动建边 ----
+
+    #[test]
+    fn relation_write_auto_creates_edge_with_known_to() {
+        // base_state 只有 li->wang；wang->li 不存在。Set 写入 → 零值自动建边后落定。
+        let s = base_state();
+        let p = patch("p1", 0, vec![op(PatchOp::Set, "relations[wang->li].fear", Some(json!(0.1)))]);
+        let next = validate_and_apply(&s, &p).unwrap();
+        let r = next.relations.iter().find(|r| r.from == "wang" && r.to == "li").expect("应自动建边");
+        assert!((r.fear - 0.1).abs() < 1e-6);
+        // 其余字段零值基线；known_to=[from,to]。
+        assert_eq!(r.trust, 0.0);
+        assert_eq!(r.affinity, 0.0);
+        assert_eq!(r.debt, 0.0);
+        assert_eq!(r.known_to, vec!["wang".to_string(), "li".to_string()]);
+        assert!(r.notes.is_empty());
+        // 既有 li->wang 边不受影响。
+        assert!((next.relations.iter().find(|r| r.from == "li" && r.to == "wang").unwrap().trust - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn relation_increment_auto_creates_edge_from_zero() {
+        let s = base_state();
+        let p = patch("p1", 0, vec![op(PatchOp::Increment, "relations[wang->li].trust", Some(json!(0.06)))]);
+        let next = validate_and_apply(&s, &p).unwrap();
+        let r = next.relations.iter().find(|r| r.from == "wang" && r.to == "li").unwrap();
+        assert!((r.trust - 0.06).abs() < 1e-6, "零值建边后 Increment 以 0 为基");
+    }
+
+    #[test]
+    fn relation_precondition_on_missing_edge_still_rejected() {
+        // 自动建边只放宽写入路径；precondition 读取仍要求边已存在（保持乐观校验语义）。
+        let s = base_state();
+        let mut o = op(PatchOp::Set, "relations[wang->li].trust", Some(json!(0.3)));
+        o.precondition = Some(json!(0.0));
+        let p = patch("p1", 0, vec![o]);
+        assert_eq!(validate_and_apply(&s, &p).unwrap_err().code(), "validation");
+        // 输入不变：未因失败留下半建的边。
+        assert!(s.relations.iter().all(|r| !(r.from == "wang" && r.to == "li")));
     }
 
     // ---- 类型合法性 ----

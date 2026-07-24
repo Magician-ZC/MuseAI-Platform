@@ -1901,3 +1901,55 @@ async fn event_arena_collision_by_location() {
     assert_eq!(st1.characters["npcN2"].location, "north");
     assert!(rev1 > rev0, "逐地点串行 → 两步各自独立 revision（rev1 > rev0）");
 }
+
+// ---------- 僵局打破提示（B. stall hint）：StallTracker 计数/清零/阈值触发（不跑 LLM） ----------
+
+#[test]
+fn stall_tracker_streak_below_threshold_no_hint() {
+    let t = crate::runtime::StallTracker::default();
+    // 初始无账 → 无提示。
+    assert!(t.hint("w-a").is_none());
+    // 1 次 blocked（streak=1 < 2）→ 仍无提示。
+    t.record_blocked("w-a", "仲裁阻断：甲的行动与硬约束冲突");
+    assert!(t.hint("w-a").is_none(), "streak=1 未达阈值不应给提示");
+}
+
+#[test]
+fn stall_tracker_hint_at_threshold_with_streak_and_reason() {
+    let t = crate::runtime::StallTracker::default();
+    t.record_blocked("w-b", "仲裁阻断：旧原因");
+    t.record_blocked("w-b", "仲裁阻断：乙的行动与硬约束冲突");
+    // streak=2 达阈值 → 提示含「最近一次」原因与连续次数。
+    let hint = t.hint("w-b").expect("streak=2 应给提示");
+    assert!(hint.contains("仲裁阻断：乙的行动与硬约束冲突"), "应含最近原因：{hint}");
+    assert!(hint.contains('2'), "应含连续次数：{hint}");
+    assert!(!hint.contains("旧原因"), "只保留最近原因：{hint}");
+    // 继续 blocked：streak=3 更新次数。
+    t.record_blocked("w-b", "仲裁阻断：乙的行动与硬约束冲突");
+    assert!(t.hint("w-b").unwrap().contains('3'));
+}
+
+#[test]
+fn stall_tracker_clear_resets_streak() {
+    let t = crate::runtime::StallTracker::default();
+    t.record_blocked("w-c", "原因");
+    t.record_blocked("w-c", "原因");
+    assert!(t.hint("w-c").is_some());
+    // 提交成功 → 清零；再次 blocked 从 1 重新计数。
+    t.clear("w-c");
+    assert!(t.hint("w-c").is_none(), "清零后不应再有提示");
+    t.record_blocked("w-c", "原因");
+    assert!(t.hint("w-c").is_none(), "清零后重新计数，1 次未达阈值");
+}
+
+#[test]
+fn stall_tracker_isolated_per_world() {
+    let t = crate::runtime::StallTracker::default();
+    t.record_blocked("w-d1", "原因一");
+    t.record_blocked("w-d1", "原因一");
+    // 世界间互不串账。
+    assert!(t.hint("w-d1").is_some());
+    assert!(t.hint("w-d2").is_none());
+    t.clear("w-d2");
+    assert!(t.hint("w-d1").is_some(), "清别的世界不影响本世界");
+}

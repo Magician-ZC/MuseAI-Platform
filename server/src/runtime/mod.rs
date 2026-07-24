@@ -10,9 +10,9 @@
 //! - CAS 冲突 = 终态化(C-2)，不再无限 re-enqueue；worker Err = 退避重试 + 上限终态化(C-9)。
 //! - dev 态：世界无模型配置 → tick 跳过并 warn，不 panic。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -123,6 +123,60 @@ impl HostEvents for TokenMeter {
             self.calls.fetch_add(1, Ordering::Relaxed);
         }
     }
+}
+
+// ---------- 僵局打破提示（B. stall hint） ----------
+
+/// 连续 blocked 达到该次数后，下一次 RoundInput 携带 stall_hint（织入导演 prompt 破局）。
+const STALL_HINT_MIN_STREAK: u32 = 2;
+
+/// 单个世界的僵局账：连续 blocked 次数 + 最近一次原因。
+#[derive(Debug, Clone)]
+struct StallEntry {
+    streak: u32,
+    reason: String,
+}
+
+/// 僵局追踪器：world_id → 连续 blocked 计数与最近原因。**进程内存态，不持久化**——
+/// 重启即清零属可接受降级（重新累计 STALL_HINT_MIN_STREAK 次后恢复提示）。
+/// 背景：高对抗场景 arbiter 连续 Blocked 时整回合不提交（硬约束保护，不变量不动），
+/// 但 pacingNotes 因未提交而丢失 → director 永远看不到僵局原因 → 空转烧 token。
+/// 此账把僵局原因经 RoundInput.stall_hint 回灌给引擎导演环节。
+#[derive(Default)]
+pub(crate) struct StallTracker {
+    inner: Mutex<HashMap<String, StallEntry>>,
+}
+
+impl StallTracker {
+    /// tick 结果 blocked：streak +1 并记住最近原因。
+    pub(crate) fn record_blocked(&self, world_id: &str, reason: &str) {
+        let mut g = self.inner.lock().expect("stall tracker 锁不可中毒");
+        let e = g
+            .entry(world_id.to_string())
+            .or_insert_with(|| StallEntry { streak: 0, reason: String::new() });
+        e.streak = e.streak.saturating_add(1);
+        e.reason = reason.to_string();
+    }
+
+    /// tick 提交成功：清零该世界的僵局账。
+    pub(crate) fn clear(&self, world_id: &str) {
+        self.inner.lock().expect("stall tracker 锁不可中毒").remove(world_id);
+    }
+
+    /// streak ≥ `STALL_HINT_MIN_STREAK` 时给出下一次 RoundInput 的 stall_hint
+    ///（含最近原因与连续次数）；未达阈值 → None。
+    pub(crate) fn hint(&self, world_id: &str) -> Option<String> {
+        let g = self.inner.lock().expect("stall tracker 锁不可中毒");
+        g.get(world_id)
+            .filter(|e| e.streak >= STALL_HINT_MIN_STREAK)
+            .map(|e| format!("{}（已连续 {} 回合）", e.reason, e.streak))
+    }
+}
+
+/// 进程级僵局追踪器单例（worker 池共享；Mutex 保护并发 tick）。
+fn stall_tracker() -> &'static StallTracker {
+    static TRACKER: OnceLock<StallTracker> = OnceLock::new();
+    TRACKER.get_or_init(StallTracker::default)
 }
 
 // ---------- 调度 ----------
@@ -1418,6 +1472,10 @@ async fn process_tick_inner(
     // 放置房终局策略 endgame_policy / 装配选定结局 selected_ending 已在 6a) 组装（供本段终局短路 +
     // commit_tick 事务内终局评估复用）。
 
+    // 9.6) 僵局打破提示（B. stall hint）：该世界连续 blocked ≥ 阈值 → 组装 stall_hint
+    //（含最近原因与连续次数），经 RoundInput 织入引擎导演 prompt，促使导演主动破局。
+    let stall_hint = stall_tracker().hint(world_id);
+
     // 10) run_round（失败重试一次）；每次尝试独立 TokenMeter，取成功尝试的实测 token 计费（B-1）。
     let mut last_err: Option<ApiError> = None;
     for attempt in 0..2u32 {
@@ -1451,6 +1509,8 @@ async fn process_tick_inner(
             // event 模式下 run_event_step 会用本步激活时刻 T 覆盖它（见 run_event_step 内 filtered.now_hint = t），
             // 故此处传 0 无副作用。
             now_hint: 0,
+            // 僵局打破提示（B）：连续 blocked ≥ 阈值时携带最近原因，None = 无僵局（默认路径零变化）。
+            stall_hint: stall_hint.clone(),
         };
         let cancel = CancelFlag::new();
         // 时间线模式分派（第二块 Phase 2）：event 世界走 DES 调度器 run_event_step（内部做 cohort 过滤 +
@@ -1501,13 +1561,16 @@ async fn process_tick_inner(
             Ok((outcome, terminal)) => {
                 if let Some(reason) = &outcome.blocked {
                     tracing::warn!(world_id, tick_no, reason = %reason, "tick blocked（硬节点/不变量不可满足），不提交状态");
+                    // 僵局账 +1 并记原因（B. stall hint）：streak ≥ 阈值时下一 tick 携带 stall_hint。
+                    // 「Blocked 不提交」不变量不动——仅在内存记账，不写任何状态。
+                    stall_tracker().record_blocked(world_id, reason);
                     finish_tick_noop(db, world_id, tick_no, Some("blocked")).await?;
                     return Ok(TickStatus::Skipped("blocked"));
                 }
                 // 实测 token（B-1）；模型未回报 token 时回退到引擎预估，保证预算仍累计。
                 let metered = meter.total_tokens();
                 let cost = if metered > 0 { metered } else { outcome.budget.spent_tokens };
-                return commit_tick(
+                let status = commit_tick(
                     state,
                     world_id,
                     tick_no,
@@ -1520,7 +1583,12 @@ async fn process_tick_inner(
                     terminal.as_ref(),
                     selected_ending.as_deref(),
                 )
-                .await;
+                .await?;
+                // 提交成功（Done/Concluded）→ 清零该世界的连续 blocked 计数（B. stall hint）。
+                if matches!(status, TickStatus::Done | TickStatus::Concluded) {
+                    stall_tracker().clear(world_id);
+                }
+                return Ok(status);
             }
             Err(e) => {
                 tracing::warn!(world_id, tick_no, attempt, error = %e, "run_round 失败");

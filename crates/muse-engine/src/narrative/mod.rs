@@ -11,6 +11,7 @@ pub mod constraints;
 pub mod continuity;
 pub mod decide;
 pub mod reducer;
+pub mod relation_dynamics;
 pub mod snapshot;
 pub mod state;
 pub mod types;
@@ -109,6 +110,11 @@ pub struct RoundInput {
     /// interval 模式（`run_round` 直调，老世界）默认 0。run_round 用它给事件打 `timestamp`、给
     /// `decision_id` 加时间段（防同角色跨步撞 id）。**不影响任何既有裁决/落定逻辑**，仅打戳与命名。
     pub now_hint: i64,
+    /// 僵局打破提示（B. stall hint）：前几回合连续 blocked 未提交时，由调用方（平台 runtime）
+    /// 传入的僵局原因摘要（含连续次数与最近原因）。引擎在导演设局 prompt 中织入该提示，
+    /// 促使导演主动改变局势打破僵局。`None` = 无提示（默认，向后兼容；桌面壳恒 None）。
+    /// **不动「Blocked 不提交」不变量**——仅影响导演 prompt 文本，不触碰裁决/提交路径。
+    pub stall_hint: Option<String>,
 }
 
 impl Default for RoundInput {
@@ -128,6 +134,7 @@ impl Default for RoundInput {
             world_controlled: Vec::new(),
             locations: BTreeMap::new(),
             now_hint: 0,
+            stall_hint: None,
         }
     }
 }
@@ -268,6 +275,7 @@ impl NarrativeEngine {
                 &current,
                 members,
                 loc,
+                input.stall_hint.as_deref(),
                 cancel,
             )
             .await?;
@@ -821,6 +829,7 @@ async fn call_director(
     state: &NarrativeState,
     active_ids: &[String],
     location_id: &str,
+    stall_hint: Option<&str>,
     cancel: &CancelFlag,
 ) -> Result<String, EngineError> {
     let outline: Vec<Value> = state
@@ -842,8 +851,16 @@ async fn call_director(
     } else {
         format!("当前地点：{location_id}\n")
     };
+    // 僵局打破提示（B. stall hint）：连续 blocked 未推进时织入原因，引导导演主动改变局势
+    //（不动「Blocked 不提交」不变量——僵局信息经调用方回灌，而非在 blocked 回合提交任何状态）。
+    let stall = match stall_hint {
+        Some(h) if !h.trim().is_empty() => format!(
+            "注意：前几回合因『{h}』僵持未能推进。请主动改变局势：拆散拥挤的角色、引入新要素或转移冲突焦点，打破僵局。\n"
+        ),
+        _ => String::new(),
+    };
     let user = format!(
-        "{place}当前活跃角色：{active}\n大纲节点：{outline}\n公共世界状态：{world}\n\n\
+        "{place}{stall}当前活跃角色：{active}\n大纲节点：{outline}\n公共世界状态：{world}\n\n\
 你是入场导演：为本回合设定一个把当前待推进节点自然展开的开放局势，给在场角色留出做出不同选择的空间，\
 不要替角色决定他们会怎么做。严格输出 JSON：{{\"situation\":\"...\"}}",
         active = active_ids.join("、"),
@@ -951,7 +968,9 @@ fn round_intensity(
 }
 
 /// 由仲裁结果生成本回合 StatePatch（走 reducer 白名单路径）：每个非 Invalid 结果追加一条
-/// pacingNotes（记录本回合节拍，可追溯）；有成功推进时把当前首个待推进节点标记 done。
+/// pacingNotes（记录本回合节拍，可追溯）；并由 relation_dynamics 确定性推导本回合关系数值
+/// 变更（`relations[<from>-><to>].*` Set，令 advance_when 关系谓词可被真实驱动）；
+/// 有成功推进时把当前首个待推进节点标记 done。
 /// **推进分两路（P1 放置房终局）**：
 /// - 阈值里程碑（`threshold.is_some()`）：本回合强度累积到 `world.milestoneProgress_<id>`（Increment，
 ///   单段键合规），达阈值且 `advance_when` 谓词命中才翻 Done（每回合至多推首个 Pending 里程碑）。
@@ -994,6 +1013,11 @@ fn build_patch(
             precondition: None,
         });
     }
+
+    // 关系演化（A. relation_dynamics）：由本回合已落定结果确定性推导 `relations[<from>-><to>].*`
+    // 数值 Set（同键先累加、clamp 后发终值、(from,to,field) 有序），并入同一 patch 原子提交。
+    // 不存在的边由 reducer 在写入时对已知角色端点零值自动建边（known_to=[from,to]）。
+    operations.extend(relation_dynamics::derive_relation_ops(decisions, outcomes, state));
 
     if let Some(node) = constraints::next_pending(&state.narrative.outline_nodes) {
         match node.threshold {
@@ -1483,6 +1507,7 @@ mod tests {
             world_controlled: Vec::new(),
             locations: BTreeMap::new(),
             now_hint: 0,
+            stall_hint: None,
         }
     }
 
@@ -2035,6 +2060,7 @@ mod tests {
             world_controlled: Vec::new(),
             locations: BTreeMap::new(),
             now_hint: 0,
+            stall_hint: None,
         }
     }
 
@@ -2665,6 +2691,175 @@ mod tests {
         assert!(!has_status_done(&fail, "n1"), "旧节点无 success 不推进");
     }
 
+    // ===== 关系演化（A. relation_dynamics）：build_patch 集成 + advance_when 复活回归 =====
+
+    /// 带角色目标的友善决策（willSpeak=false → 不叠加 speak 项，便于数值断言）。
+    fn friendly_decision_to(cid: &str, decision_id: &str, target: &str) -> RoleDecision {
+        RoleDecision {
+            decision_id: decision_id.into(),
+            character_id: cid.into(),
+            intent: "示好".into(),
+            action: "上前帮助整理行装".into(),
+            speak: SpeakIntent { will_speak: false, purpose: String::new() },
+            targets: vec![target.into()],
+            acceptable_costs: vec![],
+            predictions: vec![],
+            duration: 0,
+        }
+    }
+
+    #[test]
+    fn build_patch_emits_relation_ops() {
+        // 回归核心：此前 build_patch 从不产生 relations 操作 → 关系图恒无边、恒为 0。
+        let s = state_with_chars(&["li", "wang"]);
+        let decisions = vec![friendly_decision_to("li", "d", "wang")];
+        let outcomes = vec![outcome_of("li", "d", ArbiterResult::Success)];
+        let patch = build_patch(s.revision, &decisions, &outcomes, &s);
+        let rel_ops: Vec<&PatchOperation> =
+            patch.operations.iter().filter(|o| o.path.starts_with("relations[")).collect();
+        assert!(!rel_ops.is_empty(), "patch 应含关系操作：{:?}", patch.operations);
+        assert!(rel_ops.iter().all(|o| o.op == PatchOp::Set), "关系操作应为 clamp 后终值 Set");
+        assert!(
+            rel_ops.iter().any(|o| o.path == "relations[li->wang].affinity"),
+            "应含 li->wang affinity：{rel_ops:?}"
+        );
+        // 无角色目标的决策不产关系操作（既有回归不受影响）。
+        let silent = vec![silent_decision("li", "d")];
+        let p2 = build_patch(s.revision, &silent, &outcomes, &s);
+        assert!(!p2.operations.iter().any(|o| o.path.starts_with("relations[")));
+    }
+
+    #[test]
+    fn multi_round_friendly_interaction_revives_advance_when_predicate() {
+        // advanceWhen 复活回归：relations 初始为空、谓词 `relations[li->wang].affinity > 0.2`
+        // 此前永远无法命中；多回合友善互动（+0.08/回合）后应从未命中变命中。
+        let mut s = state_with_chars(&["li", "wang"]);
+        s.narrative.outline_nodes.push(milestone_node(
+            "m1",
+            1.0,
+            Some("relations[li->wang].affinity > 0.2"),
+            NodeStatus::Pending,
+        ));
+        let decisions = vec![friendly_decision_to("li", "d", "wang")];
+        let outcomes = vec![outcome_of("li", "d", ArbiterResult::Success)];
+
+        // 谓词按提交前状态评估：r1 看 0.0、r2 看 0.08、r3 看 0.16（皆未命中），
+        // r4 看 0.24 > 0.2 → 命中翻 Done。
+        let mut done_round: Option<u32> = None;
+        for round in 1..=4u32 {
+            let patch = build_patch(s.revision, &decisions, &outcomes, &s);
+            if has_status_done(&patch, "m1") {
+                done_round = Some(round);
+            }
+            s = reducer::validate_and_apply(&s, &patch).unwrap();
+            if done_round.is_some() {
+                break;
+            }
+        }
+        assert_eq!(done_round, Some(4), "第 4 回合谓词应从未命中变命中");
+        assert_eq!(s.narrative.outline_nodes[0].status, NodeStatus::Done);
+        // 自动建边落定（reducer 零值建边）：known_to=[from,to]，affinity 已越过谓词阈值。
+        let r = s.relations.iter().find(|r| r.from == "li" && r.to == "wang").expect("应自动建边");
+        assert!(r.affinity > 0.2, "友善累积应越过 0.2：{}", r.affinity);
+        assert_eq!(r.known_to, vec!["li".to_string(), "wang".to_string()]);
+        let back = s.relations.iter().find(|r| r.from == "wang" && r.to == "li").expect("反向边亦建");
+        assert!(back.affinity > 0.2);
+    }
+
+    // ===== 僵局打破提示（B. stall hint）：织入导演 prompt =====
+
+    /// 记录每次 ModelCallSpec 的脚本化模型：校验各环节实际收到的 prompt 文本。
+    struct RecordingModel {
+        responses: std::sync::Mutex<Vec<Result<String, EngineError>>>,
+        specs: Arc<std::sync::Mutex<Vec<crate::model::ModelCallSpec>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::model::ModelClient for RecordingModel {
+        async fn complete(
+            &self,
+            spec: &crate::model::ModelCallSpec,
+            cancel: &CancelFlag,
+        ) -> Result<crate::model::ModelOutput, EngineError> {
+            cancel.check()?;
+            self.specs.lock().unwrap().push(spec.clone());
+            let mut lock = self.responses.lock().unwrap();
+            if lock.is_empty() {
+                return Err(EngineError::Model { message: "脚本响应耗尽".into(), retryable: false });
+            }
+            lock.remove(0).map(|content| crate::model::ModelOutput {
+                content,
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+            })
+        }
+    }
+
+    fn recording_host(
+        responses: Vec<Result<String, EngineError>>,
+    ) -> (Arc<EngineHost>, Arc<std::sync::Mutex<Vec<crate::model::ModelCallSpec>>>) {
+        let specs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let host = Arc::new(EngineHost {
+            fs: Arc::new(MemFs::default()),
+            clock: Arc::new(FixedClock(1000)),
+            events: Arc::new(CollectEvents::default()),
+            model: Arc::new(RecordingModel {
+                responses: std::sync::Mutex::new(responses),
+                specs: specs.clone(),
+            }),
+        });
+        (host, specs)
+    }
+
+    fn happy_script() -> Vec<Result<String, EngineError>> {
+        vec![
+            Ok(r#"{"situation":"密室之中"}"#.to_string()),
+            Ok(benign_decision()),
+            Ok(benign_decision()),
+            Ok(r#"{"prose":"一幕。"}"#.to_string()),
+            Ok(r#"{"characterConsistencyIssues":[],"causalIssues":[],"revisionSuggestions":[]}"#.to_string()),
+        ]
+    }
+
+    #[tokio::test]
+    async fn stall_hint_woven_into_director_prompt() {
+        let (host, specs) = recording_host(happy_script());
+        init_run(host.as_ref(), "run-1", false);
+        let engine = NarrativeEngine::new(host.clone());
+        let mut input = round_input("run-1", big_budget());
+        input.stall_hint = Some("仲裁阻断：li 的行动与硬约束冲突（已连续 2 回合）".to_string());
+        let out = engine.run_round(&routes(), &prompts(), input, &CancelFlag::new()).await.unwrap();
+        assert!(out.blocked.is_none());
+        let specs = specs.lock().unwrap();
+        let director = specs.iter().find(|s| s.agent == "director").expect("应有导演调用");
+        assert!(
+            director.user.contains("仲裁阻断：li 的行动与硬约束冲突（已连续 2 回合）"),
+            "导演 prompt 应含僵局提示：{}",
+            director.user
+        );
+        assert!(director.user.contains("打破僵局"), "导演 prompt 应含打破僵局指引");
+        // 提示只织入导演环节，不进决策环节。
+        let decide = specs.iter().find(|s| s.agent == "roleDecide").expect("应有决策调用");
+        assert!(!decide.user.contains("打破僵局"));
+    }
+
+    #[tokio::test]
+    async fn none_stall_hint_keeps_director_prompt_clean() {
+        let (host, specs) = recording_host(happy_script());
+        init_run(host.as_ref(), "run-1", false);
+        let engine = NarrativeEngine::new(host.clone());
+        // round_input 默认 stall_hint: None。
+        let out = engine
+            .run_round(&routes(), &prompts(), round_input("run-1", big_budget()), &CancelFlag::new())
+            .await
+            .unwrap();
+        assert!(out.blocked.is_none());
+        let specs = specs.lock().unwrap();
+        let director = specs.iter().find(|s| s.agent == "director").expect("应有导演调用");
+        assert!(!director.user.contains("僵持未能推进"), "无提示时不应织入：{}", director.user);
+        assert!(!director.user.contains("打破僵局"));
+    }
+
     // ===== LLM 鲁棒性：role_decide 单角色确定性降级（空 content 兜底）=====
 
     /// 初始化含 a/b/c 三角色（无硬节点）的 run。
@@ -2696,6 +2891,7 @@ mod tests {
             world_controlled: Vec::new(),
             locations: BTreeMap::new(),
             now_hint: 0,
+            stall_hint: None,
         }
     }
 

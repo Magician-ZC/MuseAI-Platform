@@ -132,10 +132,12 @@ pub async fn start_narrative_round(app: AppHandle, request: RoundRequestDto) -> 
             max_output_tokens: request.max_output_tokens.unwrap_or(8192),
             budget: request.budget,
             approved_consents: request.approved_consents.unwrap_or_default(),
-            // 桌面壳默认空（引擎文档语义）：无世界固有角色 / 无地点维度 / interval 模式 now_hint=0。
+            // 桌面壳默认空（引擎文档语义）：无世界固有角色 / 无地点维度 / interval 模式 now_hint=0 /
+            // 无僵局提示（stall_hint 仅平台 runtime 按连续 blocked 计数回灌）。
             world_controlled: Vec::new(),
             locations: BTreeMap::new(),
             now_hint: 0,
+            stall_hint: None,
         };
         let result = engine.run_round(&routes, &prompts, input, &flag).await;
         let payload = match &result {

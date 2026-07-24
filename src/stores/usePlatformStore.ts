@@ -88,10 +88,24 @@ export interface WorldCharacterState {
   activity: number;
 }
 
-/** state-summary 端点返回体：权威关系 + 角色状态。 */
+/** 一个地点（public 投影）：拓扑 + 秘境标记；gate 细节由服务端剥离（防剧透），前端拿不到也无需渲染。 */
+export interface WorldLocation {
+  id: string;
+  name: string;
+  /** 可直达地点 id（无向渲染时按此连边）。 */
+  connections: string[];
+  /** 秘境标记：SceneMap 以锁形/虚线环区分。 */
+  isSecretRealm: boolean;
+}
+
+/** state-summary 端点返回体：权威关系 + 角色状态 + 地点投影（Phase 2，均按 principal 过滤）。 */
 export interface WorldStateSummary {
   relations: WorldRelation[];
   characters: WorldCharacterState[];
+  /** 地点图（public 投影，可选：老服务端/空世界无此字段）。 */
+  locations?: WorldLocation[];
+  /** 角色当前位置 {characterId: locationId}（principal 过滤：秘境内位置仅角色主人可见）。 */
+  positions?: Record<string, string>;
 }
 
 export interface CloudCharacter {
@@ -448,7 +462,7 @@ export function provenanceMeta(kind: ProvenanceKind): { label: string; color: st
 
 // ---------- store ----------
 
-export type RoomView = 'stream' | 'cards' | 'graph' | 'map' | 'status' | 'worldline';
+export type RoomView = 'stream' | 'cards' | 'graph' | 'map' | 'scene' | 'status' | 'worldline' | 'timeline';
 
 interface PlatformState {
   // 世界大厅

@@ -607,7 +607,56 @@ async fn world_state_summary(
         })
         .collect();
 
-    Ok(Json(json!({ "relations": relations, "characters": characters })))
+    // 地点投影（Phase 2）：从 assembled_json 的 assembly.locationGraph 读回钉住的地点图。
+    // public 投影——只下发 {id, name, connections, isSecretRealm}，gate 细节（准入门槛/道具）不下发（防剧透）。
+    let wrapper = crate::assembly::load_wrapper(&state.db, &id).await?;
+    let mut secret_realms: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let locations: Vec<Value> = wrapper
+        .get("assembly")
+        .and_then(|a| a.get("locationGraph"))
+        .and_then(|g| g.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|loc| {
+                    let lid = loc.get("id").and_then(|v| v.as_str())?;
+                    let is_secret = loc
+                        .get("isSecretRealm")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if is_secret {
+                        secret_realms.insert(lid.to_string());
+                    }
+                    Some(json!({
+                        "id": lid,
+                        "name": loc.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                        "connections": loc.get("connections").cloned().unwrap_or_else(|| json!([])),
+                        "isSecretRealm": is_secret,
+                    }))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // 角色位置投影：{characterId: locationId}，从 NarrativeState.characters[].location 派生，按 principal 过滤。
+    // 防剧透：秘境（isSecretRealm）内的角色位置仅角色主人可见——观战者/他人看不到「谁进了秘境」，
+    // 非秘境（公共地点）位置对全体资格 viewer 可见。空 location（无地点/全局场景）不下发。
+    let mut positions = serde_json::Map::new();
+    for (cid, cs) in &st.characters {
+        if cs.location.is_empty() {
+            continue;
+        }
+        if secret_realms.contains(&cs.location) && !mine.contains(cid) {
+            continue; // 私密位置不泄露
+        }
+        positions.insert(cid.clone(), Value::String(cs.location.clone()));
+    }
+
+    Ok(Json(json!({
+        "relations": relations,
+        "characters": characters,
+        "locations": locations,
+        "positions": positions,
+    })))
 }
 
 pub fn router() -> Router<AppState> {
@@ -657,6 +706,46 @@ mod tests {
             .execute(db)
             .await
             .unwrap();
+    }
+
+    async fn set_assembled(db: &AnyPool, world: &str, s: &str) {
+        sqlx::query("UPDATE worlds SET assembled_json = ? WHERE id = ?")
+            .bind(s)
+            .bind(world)
+            .execute(db)
+            .await
+            .unwrap();
+    }
+
+    /// 带地点维度的权威状态：c1 在公共前厅、c2 在秘境、c3 无地点。
+    fn state_with_locations_json() -> String {
+        json!({
+            "schemaVersion": 1,
+            "runId": "w1",
+            "revision": 4,
+            "characters": {
+                "c1": { "arcStage": "rising", "goals": ["夺权"], "location": "hall" },
+                "c2": { "arcStage": "setup", "goals": ["自保"], "location": "secret" },
+                "c3": { "arcStage": "", "goals": [], "location": "" }
+            },
+            "relations": []
+        })
+        .to_string()
+    }
+
+    /// 装配包装：钉住地点图（含秘境 gate 细节，投影时应被剥离）。
+    fn assembled_with_locations_json() -> String {
+        json!({
+            "assembly": {
+                "locationGraph": [
+                    { "id": "hall", "name": "前厅", "connections": ["secret"] },
+                    { "id": "secret", "name": "密室", "connections": ["hall"], "isSecretRealm": true,
+                      "gate": { "requiredItemIds": ["jade_key"], "maxPowerTier": 3 } }
+                ]
+            },
+            "chapterState": { "currentNode": 0 }
+        })
+        .to_string()
     }
 
     async fn get_summary(state: &AppState, bearer: Option<&str>, world: &str) -> (StatusCode, Value) {
@@ -742,6 +831,42 @@ mod tests {
         assert_eq!(activity_of(&v1, "c1"), 4, "c1 活跃度 = 目标2 + 计划1 + 情绪1");
         assert_eq!(activity_of(&v1, "c2"), 1, "c2 活跃度 = 目标1");
         assert_eq!(activity_of(&v1, "c3"), 0, "c3 活跃度 = 0");
+    }
+
+    #[tokio::test]
+    async fn state_summary_locations_and_positions_filtered_by_principal() {
+        let state = test_state().await;
+        // official 世界 → 允许观战；u1 持 c1（公共前厅）、u2 持 c2（秘境）、u3 无角色（观战者）。
+        seed_user(&state.db, "u1").await;
+        seed_user(&state.db, "u2").await;
+        seed_user(&state.db, "u3").await;
+        seed_world(&state.db, "w1", 3, "running").await;
+        seed_member(&state.db, "m1", "w1", "u1", "c1", "active").await;
+        seed_member(&state.db, "m2", "w1", "u2", "c2", "active").await;
+        set_state(&state.db, "w1", &state_with_locations_json()).await;
+        set_assembled(&state.db, "w1", &assembled_with_locations_json()).await;
+
+        // 地点图对所有资格 viewer 一致：两地点全下发，但 gate 细节（准入门槛）被剥离（防剧透）。
+        let (s3, v3) = get_summary(&state, Some(&token(&state, "u3")), "w1").await;
+        assert_eq!(s3, StatusCode::OK, "body={v3}");
+        let locs = v3["locations"].as_array().unwrap();
+        assert_eq!(locs.len(), 2, "两地点全下发（拓扑公开）");
+        let secret = locs.iter().find(|l| l["id"] == "secret").unwrap();
+        assert_eq!(secret["isSecretRealm"], json!(true), "秘境标记保留");
+        assert_eq!(secret["name"], json!("密室"));
+        assert!(secret.get("gate").is_none(), "gate 细节不下发（防剧透）");
+
+        // u3（观战者）：只见 public 地点的角色位置（c1@hall），秘境内 c2 位置不泄露；c3 无地点不下发。
+        let positions3 = v3["positions"].as_object().unwrap();
+        assert_eq!(positions3.get("c1"), Some(&json!("hall")), "观众可见公共地点角色位置");
+        assert!(!positions3.contains_key("c2"), "秘境内角色位置对观战者不泄露");
+        assert!(!positions3.contains_key("c3"), "无地点角色不下发位置");
+
+        // u2（持 c2）：秘境是自己的角色 → 可见 c2@secret；同时也见公共 c1@hall。
+        let (_, v2) = get_summary(&state, Some(&token(&state, "u2")), "w1").await;
+        let positions2 = v2["positions"].as_object().unwrap();
+        assert_eq!(positions2.get("c2"), Some(&json!("secret")), "角色主人可见自己在秘境的位置");
+        assert_eq!(positions2.get("c1"), Some(&json!("hall")), "公共地点位置对全体可见");
     }
 
     #[tokio::test]

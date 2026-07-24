@@ -18,12 +18,17 @@ import {
 import { useParams, useNavigate } from 'react-router-dom';
 import ReactECharts from 'echarts-for-react';
 import { cloudFetch, cloudStream } from '../../utils/cloudApi';
+import RelationForceGraph from '../../components/graph/RelationForceGraph';
+import EventTimeline, { toTimelineEvents } from '../../components/graph/EventTimeline';
+import { useWorldStateSummary } from './WorldRoom';
 import {
   describeCloudError,
   arenaPhaseMeta,
   arenaEventKindMeta,
   eventTypeMeta,
   type WorldDetail,
+  type WorldEventItem,
+  type WorldRosterEntry,
   type ArenaReport,
   type ArenaEnvEvent,
   type ArenaReplayEvent,
@@ -160,6 +165,8 @@ const ArenaSpectate: React.FC = () => {
   const [loading, setLoading] = useState(true);
   // 实时赛制事件（arena_elim/winner/gift）：由 cloudStream 合并，去重按 sequence。
   const [liveEvents, setLiveEvents] = useState<ArenaReplayEvent[]>([]);
+  // 权威快照（结盟/敌对关系）：驱动实时关系图谱；端点未就绪 / 非关系房时组件回退事件共现启发式。
+  const { summary, reload: reloadSummary } = useWorldStateSummary(worldId);
 
   const loadReport = async () => {
     if (!worldId) return;
@@ -198,9 +205,11 @@ const ArenaSpectate: React.FC = () => {
     return (id: string) => m.get(id) || id;
   }, [world]);
 
-  // 让流处理闭包始终读到最新 nameOf（world 异步加载后才有名字映射）。
+  // 让流处理闭包始终读到最新 nameOf（world 异步加载后才有名字映射）与快照重拉函数。
   const nameOfRef = useRef(nameOf);
   nameOfRef.current = nameOf;
+  const reloadSummaryRef = useRef(reloadSummary);
+  reloadSummaryRef.current = reloadSummary;
 
   // 实时观战：订阅世界流，只合并赛制系统事件（arena_*）。淘汰/胜者弹 toast；打赏/胜者补拉权威快照。
   useEffect(() => {
@@ -222,6 +231,8 @@ const ArenaSpectate: React.FC = () => {
           if (ev.type === 'arena_winner') message.success(`唯一胜者：${who || '已产生'}`);
           // 打赏/胜者落定后补拉权威快照（环境日志 / eliminations / winner）。
           if (ev.type === 'arena_gift' || ev.type === 'arena_winner') void loadReport();
+          // 淘汰/胜者改变结盟/敌对格局 → 重拉关系快照，让实时关系图谱活起来。
+          if (ev.type === 'arena_elim' || ev.type === 'arena_winner') reloadSummaryRef.current();
         },
         () => {
           // 实时流异常不致命：保留已加载战报，等待 cloudStream 自动重连补偿。
@@ -263,6 +274,47 @@ const ArenaSpectate: React.FC = () => {
   }, [rosterCount, remaining, eliminations.length]);
 
   const hasChartData = rosterCount > 0 || eliminations.length > 0;
+
+  const roster: WorldRosterEntry[] = world?.roster ?? [];
+
+  // 战报回合事件 + 实时赛制事件 → 统一 WorldEventItem[]（供关系图谱共现回退与时间线点亮）。
+  const arenaEventItems: WorldEventItem[] = useMemo(() => {
+    const items: WorldEventItem[] = [];
+    for (const round of report?.rounds ?? []) {
+      for (const ev of round.events) {
+        items.push({
+          id: `round-${ev.sequence}`,
+          worldId: worldId ?? '',
+          tick: round.tick,
+          sequence: ev.sequence,
+          domainEventId: `round-${ev.sequence}`,
+          type: ev.type,
+          actors: ev.actors,
+          visibility: 'public',
+          projection: { summary: ev.summary },
+          occurredAt: round.tick,
+        });
+      }
+    }
+    for (const ev of liveEvents) {
+      const actors = ev.actors.length > 0 ? ev.actors : ev.characterId ? [ev.characterId] : [];
+      items.push({
+        id: ev.id,
+        worldId: worldId ?? '',
+        tick: ev.tick,
+        sequence: ev.sequence,
+        domainEventId: ev.id,
+        type: ev.type,
+        actors,
+        visibility: 'public',
+        projection: { summary: ev.summary },
+        occurredAt: ev.occurredAt,
+      });
+    }
+    return items.sort((a, b) => a.sequence - b.sequence);
+  }, [report, liveEvents, worldId]);
+
+  const timelineEvents = useMemo(() => toTimelineEvents(arenaEventItems), [arenaEventItems]);
 
   if (loading && !report) {
     return (
@@ -387,6 +439,45 @@ const ArenaSpectate: React.FC = () => {
           </Space>
         </Card>
       )}
+
+      {/* 对抗时间轴（实时点亮）：横轴 tick × 角色泳道，同拍多 actor 纵向连线，随 liveEvents 点亮淘汰/对抗节点。 */}
+      <Card
+        title={
+          <Space size={6}>
+            <span>对抗时间轴</span>
+            <Tag color="processing" style={{ marginInlineEnd: 0 }}>
+              LIVE
+            </Tag>
+          </Space>
+        }
+        style={{ marginBottom: 16, borderRadius: 12, border: 'none', boxShadow: '0 1px 3px rgba(0,0,0,0.05)' }}
+        styles={{ body: { padding: 20 } }}
+      >
+        {timelineEvents.length === 0 ? (
+          <Empty description="赛事尚未产生可展示的对抗事件" image={Empty.PRESENTED_IMAGE_SIMPLE} />
+        ) : (
+          <EventTimeline events={timelineEvents} roster={roster} testId="arena-event-timeline" height={320} />
+        )}
+      </Card>
+
+      {/* 实时关系图谱：结盟/敌对格局（有权威快照时按关系维度，否则由观测事件共现回退）。只读展示。 */}
+      <Card
+        title="关系图谱（实时结盟 / 敌对）"
+        style={{ marginBottom: 16, borderRadius: 12, border: 'none', boxShadow: '0 1px 3px rgba(0,0,0,0.05)' }}
+        styles={{ body: { padding: 20 } }}
+      >
+        {roster.length === 0 ? (
+          <Empty description="暂无角色阵容" image={Empty.PRESENTED_IMAGE_SIMPLE} />
+        ) : (
+          <RelationForceGraph
+            roster={roster}
+            events={arenaEventItems}
+            relations={summary?.relations}
+            characters={summary?.characters}
+            testId="arena-relation-graph"
+          />
+        )}
+      </Card>
 
       <div style={{ display: 'flex', gap: 16, alignItems: 'flex-start', flexWrap: 'wrap' }}>
         {/* 战报时间轴 */}

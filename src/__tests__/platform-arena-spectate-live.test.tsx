@@ -22,6 +22,22 @@ vi.mock('echarts-for-react', () => ({
   default: () => <div data-testid="echarts-graph" />,
 }));
 
+// ForceGraph / EventTimeline 用 raw echarts + ref；jsdom 无 canvas，替身化 init/dispose。
+vi.mock('echarts', () => {
+  const chart = {
+    setOption: vi.fn(),
+    resize: vi.fn(),
+    dispose: vi.fn(),
+    on: vi.fn(),
+    off: vi.fn(),
+    dispatchAction: vi.fn(),
+  };
+  return {
+    init: vi.fn(() => chart),
+    getInstanceByDom: vi.fn(() => undefined),
+  };
+});
+
 import { cloudFetch, cloudStream } from '../utils/cloudApi';
 import ArenaSpectate from '../pages/platform/ArenaSpectate';
 

@@ -17,10 +17,21 @@ vi.mock('../utils/cloudApi', () => {
   };
 });
 
-// echarts 力导向图在 jsdom 无 canvas，替身化以隔离渲染。
-vi.mock('echarts-for-react', () => ({
-  default: () => <div data-testid="echarts-graph" />,
-}));
+// echarts 在 jsdom 无 canvas，替身化 init/dispose 以隔离渲染（ForceGraph 用 raw echarts + ref）。
+vi.mock('echarts', () => {
+  const chart = {
+    setOption: vi.fn(),
+    resize: vi.fn(),
+    dispose: vi.fn(),
+    on: vi.fn(),
+    off: vi.fn(),
+    dispatchAction: vi.fn(),
+  };
+  return {
+    init: vi.fn(() => chart),
+    getInstanceByDom: vi.fn(() => undefined),
+  };
+});
 
 import { cloudFetch, cloudStream } from '../utils/cloudApi';
 import WorldRoom from '../pages/platform/WorldRoom';

@@ -13,6 +13,9 @@ export default defineConfig(async () => ({
     setupFiles: "./src/test/setup.ts",
     include: ["src/**/*.{test,spec}.{ts,tsx}"],
     testTimeout: 15000,
+    // 限制并发 worker：满核并发下 jsdom 重渲染测试（Settings/Markdown/Background 等）
+    // 会因 CPU 抢占撞上 15s 超时而 flaky。限到半数核心让每个 worker 有足够 CPU。
+    maxWorkers: "50%",
   },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`

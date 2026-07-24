@@ -152,7 +152,12 @@ export function useWorldStateSummary(worldId: string | undefined): {
     cloudFetch<WorldStateSummary>(`/api/worlds/${worldId}/state-summary`)
       .then((data) => {
         if (cancelled) return;
-        setSummary({ relations: data.relations ?? [], characters: data.characters ?? [] });
+        setSummary({
+          relations: data.relations ?? [],
+          characters: data.characters ?? [],
+          locations: data.locations ?? [],
+          positions: data.positions ?? {},
+        });
         setError(null);
       })
       .catch((e) => {

@@ -409,6 +409,8 @@ pub struct CreateWorldParams {
     pub daily_token_budget: i64,
     pub daily_cny_budget_cents: i64,
     pub status: Option<String>,
+    /// 时间线模式：'interval'（默认）或 'event'（放置房 DES）。落 worlds.timeline_mode 列，供调度分派。
+    pub timeline_mode: String,
     pub engine_version: Option<String>,
     pub prompt_set_version: Option<String>,
     pub model_route_version: Option<String>,
@@ -435,6 +437,7 @@ impl CreateWorldParams {
             daily_token_budget: 200_000,
             daily_cny_budget_cents: 2_000,
             status: None,
+            timeline_mode: "interval".into(),
             engine_version: None,
             prompt_set_version: None,
             model_route_version: None,
@@ -473,12 +476,19 @@ pub async fn create_world(db: &AnyPool, p: CreateWorldParams) -> Result<String, 
     let now = now_ms();
     let id = new_id("wld");
     let status = p.status.unwrap_or_else(|| "open".into());
+    // 防御式归一化：本函数 admin 入口已做枚举校验，但 P4b 房主建房亦复用；非法值兜底为 interval，
+    // 保证落库的 timeline_mode 恒为调度器可分派的合法枚举（interval/event）。
+    let timeline_mode = if matches!(p.timeline_mode.as_str(), "interval" | "event") {
+        p.timeline_mode.as_str()
+    } else {
+        "interval"
+    };
 
     sqlx::query(
         "INSERT INTO worlds (id, template_id, template_version, engine_version, prompt_set_version, \
          model_route_version, room_type, title, status, visibility, host_user_id, member_limit, \
-         tick_per_day, assembled_json, state_revision, narrative_state_json, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+         tick_per_day, timeline_mode, assembled_json, state_revision, narrative_state_json, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&p.template_id)
@@ -493,6 +503,7 @@ pub async fn create_world(db: &AnyPool, p: CreateWorldParams) -> Result<String, 
     .bind(&p.host_user_id)
     .bind(p.member_limit)
     .bind(p.tick_per_day)
+    .bind(timeline_mode)
     .bind(&p.assembled_json)
     .bind(p.initial_state_json.unwrap_or_else(|| "{}".into()))
     .bind(now)

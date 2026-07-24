@@ -1165,6 +1165,31 @@ async fn process_tick_inner(
         return Ok(TickStatus::Skipped("no_model_config"));
     };
 
+    // 5.5) idle 房通用装配（缺口②）：首 tick 前若未装配则一次性装配，随后 reload world。
+    //   与 chapter_start（chapters/mod.rs）同一入口 assemble_instance（房型无关），仅去掉 require_chapter_room
+    //   门控——chapter 房经 start 已在排 tick 前装配，故限定 room_type=="idle" 使 chapter 路径逐字节不变；
+    //   arena 为主播驱动、不自动装配，排除。
+    //   触发条件唯一：assembled_json IS NULL（不加"模板含 worldCharacters/locations"守卫）——assemble_instance
+    //   同时产出 enabledEndings（select_ending/终局依赖）、perCharacterHooks、fatedNodes、sampling.selectedMainline
+    //   （seed_narrative_layer 建 outline 用），纯主线模板若被守卫拦掉将丢结局/钩子/宿命种入；空池天然退化
+    //   （空 hooks/空 NPC）且写入非 NULL wrapper → 自限，不会每 tick 重装。
+    //   幂等：assemble_instance 内 C-7 CAS（assembly/mod.rs `WHERE assembled_json IS NULL`）保证仅首次写入，
+    //   两个并发首 tick reload 得同一 assembled_json；后续 tick world.assembled_json.is_some() 直接短路 → 每房仅一次。
+    //   阵容快照语义：装配在首 tick 触发，阵容指纹 = 首 tick 时的在场成员集，经 CAS 钉住；首 tick 后加入的玩家
+    //   不改已钉装配（与 chapter 房"start 时刻钉住"同语义）。assemble_instance 只 CAS assembled_json，不动
+    //   state_revision，故上方 :1107 陈旧门（world.state_revision != base_revision）判定不受 reload 影响。
+    //   置于 running/superseded/budget/model 各门之后：不为将被 skip 的世界白装配；且必须在下方
+    //   active_cards.len() < 2 门之前——NPC 来自装配的 worldCharacterEntries，装配前注入不了 NPC，否则单人 idle
+    //   + NPC 模板会永远卡在 insufficient_members（本缺口的死锁）。
+    let world = if world.room_type == "idle" && world.assembled_json.is_none() {
+        crate::assembly::assemble_instance(state, world_id).await?;
+        // 重载：使下方 6b 的 worldCharacterEntries/locationGraph 注入、seed_narrative_layer 的
+        // fatedNodes/selectedMainline 种入、select_ending 的 enabledEndings 读取均命中新装配。
+        load_world(db, world_id).await?
+    } else {
+        world
+    };
+
     // 6) 组装成员卡与 principal 投影表。
     let mrows = sqlx::query(
         "SELECT wm.cloud_character_id AS cid, wm.user_id AS uid, cc.card_json AS card \

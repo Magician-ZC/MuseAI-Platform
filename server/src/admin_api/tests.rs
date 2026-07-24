@@ -680,6 +680,63 @@ async fn world_create_pause_resume_and_diagnostics() {
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
 
+// ---------------- 建房 timelineMode（缺口①） ----------------
+
+#[tokio::test]
+async fn world_create_timeline_mode() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+
+    // event 放置房：timelineMode=event + roomType=idle → 落库 event。
+    let (st, body) = post(
+        &app,
+        "/api/admin/worlds",
+        Some(&admin),
+        json!({ "templateId": "tpl1", "templateVersion": 1, "title": "放置世界", "roomType": "idle", "timelineMode": "event" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let wid = body["worldId"].as_str().unwrap().to_string();
+    let tm = sqlx::query("SELECT timeline_mode FROM worlds WHERE id=?")
+        .bind(&wid).fetch_one(&state.db).await.unwrap().try_get::<String, _>("timeline_mode").unwrap();
+    assert_eq!(tm, "event");
+
+    // 省略 timelineMode → 默认 interval（向后兼容）。
+    let (st, body) = post(
+        &app,
+        "/api/admin/worlds",
+        Some(&admin),
+        json!({ "templateId": "tpl1", "templateVersion": 1, "title": "默认世界", "roomType": "idle" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let wid2 = body["worldId"].as_str().unwrap().to_string();
+    let tm2 = sqlx::query("SELECT timeline_mode FROM worlds WHERE id=?")
+        .bind(&wid2).fetch_one(&state.db).await.unwrap().try_get::<String, _>("timeline_mode").unwrap();
+    assert_eq!(tm2, "interval");
+
+    // 非法值 → 400。
+    let (st, _) = post(
+        &app,
+        "/api/admin/worlds",
+        Some(&admin),
+        json!({ "templateId": "tpl1", "templateVersion": 1, "title": "非法", "roomType": "idle", "timelineMode": "foo" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // 跨字段约束：event + 非 idle 房型 → 400。
+    let (st, _) = post(
+        &app,
+        "/api/admin/worlds",
+        Some(&admin),
+        json!({ "templateId": "tpl1", "templateVersion": 1, "title": "event章节房", "roomType": "chapter", "timelineMode": "event" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+}
+
 // ---------------- 数据看板聚合 ----------------
 
 #[tokio::test]

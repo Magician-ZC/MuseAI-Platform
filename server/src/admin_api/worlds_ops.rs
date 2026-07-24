@@ -269,6 +269,9 @@ pub(super) struct CreateWorldReq {
     daily_token_budget: Option<i64>,
     daily_cny_budget_cents: Option<i64>,
     status: Option<String>,
+    /// 时间线模式：'interval'（默认，墙钟固定间隔排 tick）或 'event'（放置房 DES 背靠背推进）。
+    /// 省略 = interval（向后兼容，老行为不变）。
+    timeline_mode: Option<String>,
     /// 平台指派主播：赛事房（arena）必须指定；idle/chapter 可选。
     host_user_id: Option<String>,
 }
@@ -319,6 +322,18 @@ pub(super) async fn create_world(
             return Err(ApiError::BadRequest("status 非法（建房仅允许 open/running）".into()));
         }
         p.status = Some(s);
+    }
+    if let Some(tm) = req.timeline_mode {
+        if !matches!(tm.as_str(), "interval" | "event") {
+            return Err(ApiError::BadRequest("timelineMode 非法（仅 interval/event）".into()));
+        }
+        // 跨字段约束：event（DES/run_event_step）是放置房终局管线的一部分，load_endgame_policy
+        // 亦 idle-gated。event 与 arena/chapter 组合未经引擎验证 → 拒绝，避免建出不可自终局的 event 房。
+        // 顺序：本块须在 room_type 已落 p（上方 roomType 块）之后，才能读到 p.room_type 做跨字段校验。
+        if tm == "event" && p.room_type != "idle" {
+            return Err(ApiError::BadRequest("timelineMode=event 仅支持 idle 放置房".into()));
+        }
+        p.timeline_mode = tm;
     }
     // 平台指派主播：写入 host_user_id。赛事房若无主播，require_host 恒 Forbidden、
     // 主播控制台整条回路（host/tick/eliminate/settle）不可用，故 arena 必填。

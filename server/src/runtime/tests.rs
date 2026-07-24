@@ -1516,6 +1516,223 @@ async fn seed_narrative_layer_filters_outline_to_selected_mainline() {
     assert_eq!(ids, vec!["n1", "n2"], "outline 应仅含被选主线（模板序），n3 被采样裁掉");
 }
 
+// ==================== 缺口②：idle 房通用装配（NPC / 地点 / 装配采样进场） ====================
+
+/// 直接以给定 skeleton 建模板（绕过 admin 的 validate_skeleton_refs，测试可用任意骨架）。
+async fn seed_template_custom(db: &AnyPool, id: &str, room_type: &str, skeleton: serde_json::Value) {
+    sqlx::query(
+        "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, official, version, moderation, created_at) \
+         VALUES (?, '缺口②模板', ?, ?, '{\"mode\":\"open\"}', 1, 1, 'approved', ?)",
+    )
+    .bind(id)
+    .bind(room_type)
+    .bind(skeleton.to_string())
+    .bind(now_ms())
+    .execute(db)
+    .await
+    .unwrap();
+}
+
+/// 建一个 running、idle、指定（已 seed 的）模板、带 n 名成员的世界，assembled_json 初始 NULL（未装配）。
+/// 资源 id 以 `tag` 隔离；用于缺口② idle 通用装配用例。
+async fn running_idle_world_with_members(state: &AppState, tag: &str, tpl: &str, n: usize) -> String {
+    let routes_v = format!("routes-{tag}");
+    seed_model_routes(&state.db, &routes_v).await;
+
+    let mut p = CreateWorldParams::official(tpl.to_string(), 1, "缺口② idle 世界");
+    p.status = Some("running".into());
+    p.room_type = "idle".into();
+    p.model_route_version = Some(routes_v.clone());
+    p.prompt_set_version = Some("test-prompts".into());
+    p.member_limit = 10;
+    p.daily_token_budget = 1_000_000;
+    p.daily_cny_budget_cents = 0;
+    let wid = create_world(&state.db, p).await.unwrap();
+
+    for i in 0..n {
+        let (u, c) = (format!("u{tag}{i}"), format!("c{tag}{i}"));
+        seed_user(&state.db, &u).await;
+        seed_char(&state.db, &c, &u, &format!("玩家{i}")).await;
+        seed_member(&state.db, &wid, &u, &c).await;
+    }
+    wid
+}
+
+/// 装配落地：idle 房模板含 worldCharacters + locations → 首 tick 前通用装配 → assembled_json 从 NULL
+/// 变为含 worldCharacterEntries + locationGraph；装配的 NPC 注入 active_cards（产出 actor 含 npc 的 world_events）。
+#[tokio::test]
+async fn idle_room_assembles_npc_and_locations_on_first_tick() {
+    let state = test_state().await;
+    let npc: serde_json::Value = serde_json::from_str(&sample_card_json("npc-a", "北境守将")).unwrap();
+    let skeleton = json!({
+        "mainlineNodes": [{ "id": "n1", "summary": "相遇", "constraint": "soft" }],
+        "worldCharacters": [
+            { "card": npc, "homeLocation": "north", "carriedItemIds": [], "agendaNodes": [] }
+        ],
+        "locations": [
+            { "id": "hall", "name": "前厅", "connections": ["north"] },
+            { "id": "north", "name": "北境", "connections": ["hall"] }
+        ]
+    });
+    seed_template_custom(&state.db, "tpl-idle-asm", "idle", skeleton).await;
+    let wid = running_idle_world_with_members(&state, "asm", "tpl-idle-asm", 2).await;
+
+    // 建成时未装配：assembled_json 恒 NULL。
+    let before: Option<String> = sqlx::query_scalar("SELECT assembled_json FROM worlds WHERE id=?")
+        .bind(&wid)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert!(before.is_none(), "idle 房建成时未装配，assembled_json 应为 NULL");
+
+    let model: Arc<dyn ModelClient> = Arc::new(MockModel { input_tokens: 10, output_tokens: 20 });
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 0, model).await.unwrap(), TickStatus::Done);
+
+    // 装配落地：assembled_json 非 NULL，含 worldCharacterEntries + locationGraph。
+    let raw = text_one(&state.db, "SELECT assembled_json FROM worlds WHERE id=?", &wid).await;
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let entries = v["assembly"]["worldCharacterEntries"].as_array().expect("装配后应含 worldCharacterEntries");
+    assert_eq!(entries.len(), 1, "1 个世界 NPC 应装配进 worldCharacterEntries");
+    assert_eq!(entries[0]["characterId"], "npc-a");
+    let graph = v["assembly"]["locationGraph"].as_array().expect("装配后应含 locationGraph");
+    assert_eq!(graph.len(), 2, "2 个地点应装配进 locationGraph");
+
+    // NPC 进 active_cards：参与本回合决策 → 产出 actor 含 npc-a 的 world_events。
+    let npc_events = i64_one(
+        &state.db,
+        "SELECT COUNT(*) FROM world_events WHERE world_id=? AND actors_json LIKE '%npc-a%'",
+        &wid,
+    )
+    .await;
+    assert!(npc_events > 0, "装配的 NPC 应注入 active_cards 参与本回合决策");
+}
+
+/// 死锁解除：1 玩家 idle 房 + NPC 模板——装配前 active_cards 只有 1（会命中 insufficient_members），
+/// 首 tick 前通用装配注入 NPC 使 active_cards≥2 → tick 正常推进（Done），不再 insufficient_members。
+#[tokio::test]
+async fn idle_npc_assembly_breaks_insufficient_members_deadlock() {
+    let state = test_state().await;
+    let npc: serde_json::Value = serde_json::from_str(&sample_card_json("npc-d", "黑衣客")).unwrap();
+    let skeleton = json!({
+        "mainlineNodes": [{ "id": "n1", "summary": "独处", "constraint": "soft" }],
+        // 无地点：NPC home 空 → default_start 空（退化单一场景），仍能凑够碰撞。
+        "worldCharacters": [
+            { "card": npc, "homeLocation": "", "carriedItemIds": [], "agendaNodes": [] }
+        ]
+    });
+    seed_template_custom(&state.db, "tpl-idle-dl", "idle", skeleton).await;
+    // 仅 1 名玩家成员：装配前 active_cards.len()==1。
+    let wid = running_idle_world_with_members(&state, "dl", "tpl-idle-dl", 1).await;
+
+    let model: Arc<dyn ModelClient> = Arc::new(MockModel { input_tokens: 10, output_tokens: 20 });
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    let status = process_tick_with_model(&state, &wid, 0, model).await.unwrap();
+
+    assert_ne!(
+        status,
+        TickStatus::Skipped("insufficient_members"),
+        "首 tick 前装配注入 NPC 应打破 active_cards<2 死锁"
+    );
+    assert_eq!(status, TickStatus::Done, "单玩家 idle + NPC 模板：装配后 active_cards==2 → 正常推进");
+
+    // NPC 确已装配进实例（active_cards 的来源）。
+    let raw = text_one(&state.db, "SELECT assembled_json FROM worlds WHERE id=?", &wid).await;
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(v["assembly"]["worldCharacterEntries"].as_array().unwrap().len(), 1, "NPC 应装配进实例");
+}
+
+/// 幂等：idle 房连跑两 tick，装配仅首 tick 发生一次——第二 tick 因 assembled_json.is_some() 短路 +
+/// C-7 CAS（WHERE assembled_json IS NULL），装配段与 assembledAt 逐字节不变（commit_tick 不触碰 assembled_json）。
+#[tokio::test]
+async fn idle_assembly_is_idempotent_across_ticks() {
+    let state = test_state().await;
+    let npc: serde_json::Value = serde_json::from_str(&sample_card_json("npc-i", "守夜人")).unwrap();
+    let skeleton = json!({
+        "mainlineNodes": [{ "id": "n1", "summary": "相处", "constraint": "soft" }],
+        "worldCharacters": [
+            { "card": npc, "homeLocation": "hall", "carriedItemIds": [], "agendaNodes": [] }
+        ],
+        "locations": [ { "id": "hall", "name": "前厅", "connections": [] } ]
+    });
+    seed_template_custom(&state.db, "tpl-idle-idem", "idle", skeleton).await;
+    let wid = running_idle_world_with_members(&state, "idem", "tpl-idle-idem", 2).await;
+    let model: Arc<dyn ModelClient> = Arc::new(MockModel { input_tokens: 10, output_tokens: 20 });
+
+    // tick 0：装配（首次）。
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 0, model.clone()).await.unwrap(), TickStatus::Done);
+    let raw0 = text_one(&state.db, "SELECT assembled_json FROM worlds WHERE id=?", &wid).await;
+    let v0: serde_json::Value = serde_json::from_str(&raw0).unwrap();
+
+    // tick 1：不得重装（is_some 短路）。
+    insert_tick(&state.db, &wid, 1, 1).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 1, model.clone()).await.unwrap(), TickStatus::Done);
+    let raw1 = text_one(&state.db, "SELECT assembled_json FROM worlds WHERE id=?", &wid).await;
+    let v1: serde_json::Value = serde_json::from_str(&raw1).unwrap();
+
+    assert_eq!(v0["assembledAt"], v1["assembledAt"], "第二 tick 不得重装（assembledAt 不变）");
+    assert_eq!(v0["assembly"], v1["assembly"], "装配段跨 tick 逐字节钉住（不重掷、不覆盖）");
+}
+
+/// 装配采样对 idle 生效：超集 idle 模板（isSuperset + storylines + sampling）→ 首 tick 装配走种子采样，
+/// 钉住 /assembly/sampling 审计段；seed_narrative_layer 仅对被选主线建 outline（模板全量 5 → 被选 2，含 fated），
+/// 证明防刷第二环（装配采样）在 idle 房与 chapter 房同口径生效。
+#[tokio::test]
+async fn idle_room_assembly_sampling_narrows_outline() {
+    let state = test_state().await;
+    let npc1: serde_json::Value = serde_json::from_str(&sample_card_json("mnpc-1", "厉无咎")).unwrap();
+    let npc2: serde_json::Value = serde_json::from_str(&sample_card_json("mnpc-2", "沈孤鸿")).unwrap();
+    let npc3: serde_json::Value = serde_json::from_str(&sample_card_json("mnpc-3", "白清欢")).unwrap();
+    let skeleton = json!({
+        "sourceWork": { "sourceId": "src_novel", "title": "测试小说" },
+        "isSuperset": true,
+        "storylines": [
+            { "id": "arc-1", "affinity": "strategist", "mainlineNodeIds": ["mn-fate","mn-x1","mn-x2","mn-y"], "hiddenPoolIds": [], "endingIds": ["end-1"] },
+            { "id": "arc-2", "affinity": "social",     "mainlineNodeIds": ["mn-z"],                            "hiddenPoolIds": [], "endingIds": ["end-2"] }
+        ],
+        "mainlineNodes": [
+            { "id": "mn-fate", "fated": true, "arcTags": ["arc-1","arc-2"] },
+            { "id": "mn-x1", "variantGroup": "vgx", "arcTags": ["arc-1"] },
+            { "id": "mn-x2", "variantGroup": "vgx", "arcTags": ["arc-1"] },
+            { "id": "mn-y", "arcTags": ["arc-1"] },
+            { "id": "mn-z", "arcTags": ["arc-2"] }
+        ],
+        "endingPool": [
+            { "id": "end-1", "affinity": "strategist", "baseWeight": 1.0, "arcTags": ["arc-1"] },
+            { "id": "end-2", "affinity": "social",     "baseWeight": 1.0, "arcTags": ["arc-2"] }
+        ],
+        "worldCharacters": [
+            { "card": npc1, "homeLocation": "", "carriedItemIds": [], "agendaNodes": ["mn-fate"] },
+            { "card": npc2, "homeLocation": "", "carriedItemIds": [], "agendaNodes": [] },
+            { "card": npc3, "homeLocation": "", "carriedItemIds": [], "agendaNodes": [] }
+        ],
+        "sampling": { "instanceStorylineCount": 1, "instanceMainlineCount": 1, "instanceHiddenCount": 1, "instanceNpcCount": 1 }
+    });
+    seed_template_custom(&state.db, "tpl-idle-smp", "idle", skeleton).await;
+    let wid = running_idle_world_with_members(&state, "smp", "tpl-idle-smp", 2).await;
+
+    let model: Arc<dyn ModelClient> = Arc::new(MockModel { input_tokens: 10, output_tokens: 20 });
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 0, model).await.unwrap(), TickStatus::Done);
+
+    // 装配采样审计段钉入（16 位十六进制 seed；被选主线 = fated + 1 = 2，模板全量 5）。
+    let raw = text_one(&state.db, "SELECT assembled_json FROM worlds WHERE id=?", &wid).await;
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let seed = v["assembly"]["sampling"]["seed"].as_str().expect("超集 idle 实例应产出采样审计段（seed）");
+    assert_eq!(seed.len(), 16, "seed 应为 u64 十六进制");
+    let sel = v["assembly"]["sampling"]["selectedMainline"].as_array().expect("应钉住 selectedMainline");
+    assert_eq!(sel.len(), 2, "采样后主线 = fated + 1（模板全量 5）");
+    assert!(sel.iter().any(|x| x == "mn-fate"), "fated 硬节点必留");
+
+    // 下游生效：seed_narrative_layer 仅对被选主线建 outline（idle 房与 chapter 同口径）。
+    let st: NarrativeState =
+        serde_json::from_str(&load_world(&state.db, &wid).await.unwrap().narrative_state_json).unwrap();
+    let ids: Vec<&str> = st.narrative.outline_nodes.iter().map(|n| n.id.as_str()).collect();
+    assert_eq!(ids.len(), 2, "outline 仅含被选主线（装配采样对 idle 生效），全量 5 被裁到 2: {ids:?}");
+    assert!(ids.contains(&"mn-fate"), "outline 应含 fated 主线");
+}
+
 // ---------- 引擎 LLM 鲁棒性：max_output_tokens 从世界钉住的 model_routes 读取 ----------
 
 async fn seed_routes_json(db: &AnyPool, version: &str, routes: serde_json::Value) {

@@ -166,6 +166,61 @@ async fn create_world_pins_versions_and_budget() {
     assert_eq!(budget, 500);
 }
 
+// ---------- timeline_mode 落库（缺口①） ----------
+
+#[tokio::test]
+async fn create_world_defaults_timeline_mode_interval() {
+    let state = test_state().await;
+    // official() 默认 timeline_mode = interval，落库亦为 interval（向后兼容，老行为不变）。
+    let p = CreateWorldParams::official("tpl", 1, "默认世界");
+    assert_eq!(p.timeline_mode, "interval");
+    let wid = create_world(&state.db, p).await.unwrap();
+
+    let tm: String = sqlx::query("SELECT timeline_mode FROM worlds WHERE id=?")
+        .bind(&wid)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+        .try_get("timeline_mode")
+        .unwrap();
+    assert_eq!(tm, "interval");
+}
+
+#[tokio::test]
+async fn create_world_persists_event_timeline_mode() {
+    let state = test_state().await;
+    let mut p = CreateWorldParams::official("tpl", 1, "放置世界");
+    p.timeline_mode = "event".into();
+    let wid = create_world(&state.db, p).await.unwrap();
+
+    let tm: String = sqlx::query("SELECT timeline_mode FROM worlds WHERE id=?")
+        .bind(&wid)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+        .try_get("timeline_mode")
+        .unwrap();
+    assert_eq!(tm, "event");
+}
+
+#[tokio::test]
+async fn create_world_normalizes_bogus_timeline_mode() {
+    let state = test_state().await;
+    // 防御式归一化：inner create_world 对非法值兜底为 interval（P4b 复用面）。
+    let mut p = CreateWorldParams::official("tpl", 1, "非法值世界");
+    p.timeline_mode = "bogus".into();
+    let wid = create_world(&state.db, p).await.unwrap();
+
+    let tm: String = sqlx::query("SELECT timeline_mode FROM worlds WHERE id=?")
+        .bind(&wid)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+        .try_get("timeline_mode")
+        .unwrap();
+    assert_eq!(tm, "interval");
+}
+
 // ---------- join 服务端权威 ----------
 
 #[tokio::test]

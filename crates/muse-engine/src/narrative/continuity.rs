@@ -132,6 +132,7 @@ pub async fn narrative_critic(
     cancel: &CancelFlag,
 ) -> Result<CriticReport, EngineError> {
     let spec = ModelCallSpec {
+        max_retries: None,
         profile: profile.clone(),
         system: prompts.system.clone(),
         user: build_critic_user_prompt(prose, decisions),

@@ -32,6 +32,7 @@ pub async fn scan_world_chapter(
 ) -> Result<WorldChapterDiscovery, EngineError> {
     let user = build_scan_prompt(chapter, chapter_body);
     let spec = ModelCallSpec {
+        max_retries: None,
         profile: profile.clone(),
         system: prompts.scan_system.clone(),
         user,

@@ -71,6 +71,7 @@ rewardItemRef 只引用已存在的道具 id。",
         items = item_ids,
     );
     let spec = ModelCallSpec {
+        max_retries: None,
         profile: profile.clone(),
         system: system.to_string(),
         user,
@@ -126,6 +127,7 @@ pub async fn synthesize_endings(
         list = list,
     );
     let spec = ModelCallSpec {
+        max_retries: None,
         profile: profile.clone(),
         system: system.to_string(),
         user,

@@ -301,6 +301,7 @@ pub async fn model_arbitrate(
     }
 
     let spec = ModelCallSpec {
+        max_retries: None,
         profile: profile.clone(),
         system: prompts.system.clone(),
         user: build_arbiter_user_prompt(state, situation, pending),

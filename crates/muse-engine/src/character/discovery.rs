@@ -31,6 +31,7 @@ pub async fn scan_chapter(
 ) -> Result<ChapterDiscovery, EngineError> {
     let user = build_scan_prompt(chapter, chapter_body);
     let spec = ModelCallSpec {
+        max_retries: None,
         profile: profile.clone(),
         system: prompts.scan_system.clone(),
         user,
@@ -174,13 +175,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parse_failure_retries_once_then_errors() {
-        // 两次都返回非 JSON → json_call 重试一次后报 model_output。
+    async fn parse_failure_retries_then_errors() {
+        // 持续返回非 JSON → json_call 在 DEFAULT_MAX_RETRIES 次尝试内均解析失败后报 model_output。
+        // 喂足与最大尝试次数相等的坏响应，确保走满 parse 失败路径（而非脚本耗尽的传输错误）。
+        let bad: Vec<Result<String, EngineError>> =
+            (0..crate::model::DEFAULT_MAX_RETRIES).map(|_| Ok("非 JSON".to_string())).collect();
         let host = EngineHost {
             fs: Arc::new(MemFs::default()),
             clock: Arc::new(FixedClock(0)),
             events: Arc::new(NullEvents),
-            model: Arc::new(ScriptedModel::new(vec![Ok("非 JSON".into()), Ok("还是非 JSON".into())])),
+            model: Arc::new(ScriptedModel::new(bad)),
         };
         let err = scan_chapter(&host, &profile(), &prompts(), 0.0, 1024, "t", &chapter(), "正文", &CancelFlag::new())
             .await

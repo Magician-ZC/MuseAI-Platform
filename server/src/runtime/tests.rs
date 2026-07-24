@@ -1515,3 +1515,42 @@ async fn seed_narrative_layer_filters_outline_to_selected_mainline() {
     let ids: Vec<&str> = st.narrative.outline_nodes.iter().map(|n| n.id.as_str()).collect();
     assert_eq!(ids, vec!["n1", "n2"], "outline 应仅含被选主线（模板序），n3 被采样裁掉");
 }
+
+// ---------- 引擎 LLM 鲁棒性：max_output_tokens 从世界钉住的 model_routes 读取 ----------
+
+async fn seed_routes_json(db: &AnyPool, version: &str, routes: serde_json::Value) {
+    sqlx::query("INSERT INTO model_routes (id, version, routes_json, active, created_at) VALUES (?, ?, ?, 1, ?)")
+        .bind(new_id("mr"))
+        .bind(version)
+        .bind(routes.to_string())
+        .bind(now_ms())
+        .execute(db)
+        .await
+        .unwrap();
+}
+
+/// 测试点 #8：RoutesConfig 带 maxOutputTokens → 解析出的值等于配置值；缺字段 → 回退默认。
+#[tokio::test]
+async fn resolve_model_routes_reads_max_output_tokens_from_config() {
+    let state = test_state().await;
+    let profile =
+        json!({ "interface": "OpenAI-compatible", "baseUrl": "http://mock", "apiKey": "k", "model": "m" });
+
+    // 带 maxOutputTokens（camelCase）→ 读取配置值。
+    seed_routes_json(&state.db, "v-cfg", json!({ "default": profile, "maxOutputTokens": 4096 })).await;
+    let (_routes, max_cfg) =
+        super::resolve_model_routes(&state.db, "v-cfg").await.unwrap().expect("应解析出路由");
+    assert_eq!(max_cfg, 4096, "应读取世界路由配置的 maxOutputTokens");
+
+    // 缺字段 → 回退 DEFAULT_MAX_OUTPUT_TOKENS（旧世界零改动向后兼容）。
+    seed_routes_json(&state.db, "v-def", json!({ "default": profile })).await;
+    let (_routes2, max_def) =
+        super::resolve_model_routes(&state.db, "v-def").await.unwrap().expect("应解析出路由");
+    assert_eq!(max_def, super::DEFAULT_MAX_OUTPUT_TOKENS, "缺字段应回退默认上限");
+
+    // 显式 0 视为无效 → 回退默认（不允许 0 上限把 max_tokens 直接归零）。
+    seed_routes_json(&state.db, "v-zero", json!({ "default": profile, "maxOutputTokens": 0 })).await;
+    let (_routes3, max_zero) =
+        super::resolve_model_routes(&state.db, "v-zero").await.unwrap().expect("应解析出路由");
+    assert_eq!(max_zero, super::DEFAULT_MAX_OUTPUT_TOKENS, "maxOutputTokens=0 应回退默认");
+}

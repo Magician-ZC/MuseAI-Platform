@@ -141,6 +141,7 @@ pub async fn review_boundaries(
     let candidates: Vec<&RosterEntry> = roster.iter().filter(|e| boundary.contains(&e.key)).collect();
     let user = build_tier_prompt(&candidates);
     let spec = ModelCallSpec {
+        max_retries: None,
         profile: profile.clone(),
         system: prompts.tiering_system.clone(),
         user,

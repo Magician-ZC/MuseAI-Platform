@@ -45,6 +45,7 @@ pub async fn run_swap_test(
 
     let user = build_swap_prompt(card_a, card_b, scenario);
     let spec = ModelCallSpec {
+        max_retries: None,
         profile: profile.clone(),
         system: prompts.swap_system.clone(),
         user,
@@ -75,6 +76,7 @@ pub async fn run_stress_test(
 ) -> Result<StressTestReport, EngineError> {
     let user = build_stress_prompt(card, scenarios);
     let spec = ModelCallSpec {
+        max_retries: None,
         profile: profile.clone(),
         system: prompts.stress_system.clone(),
         user,

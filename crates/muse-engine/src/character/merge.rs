@@ -136,6 +136,7 @@ pub async fn model_merge(
         let allowed: BTreeSet<&str> = batch.iter().map(|s| s.as_str()).collect();
         let user = build_merge_prompt(batch, context_samples);
         let spec = ModelCallSpec {
+            max_retries: None,
             profile: profile.clone(),
             system: prompts.merge_system.clone(),
             user,

@@ -35,6 +35,7 @@ pub async fn distill_from_chunks(
     }
 
     let spec = ModelCallSpec {
+        max_retries: None,
         profile: profile.clone(),
         system,
         user,

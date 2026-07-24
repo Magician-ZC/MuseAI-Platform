@@ -53,6 +53,7 @@ pub async fn synthesize_character(
 
     let user = build_synthesis_prompt(entry, source_title, &evidence_block);
     let spec = ModelCallSpec {
+        max_retries: None,
         profile: profile.clone(),
         system: prompts.synthesis_system.clone(),
         user,
@@ -238,6 +239,7 @@ async fn summarize_evidence(
             chunk = chunk,
         );
         let spec = ModelCallSpec {
+            max_retries: None,
             profile: profile.clone(),
             system: prompts.synthesis_system.clone(),
             user,

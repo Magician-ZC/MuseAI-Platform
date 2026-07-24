@@ -10,6 +10,11 @@ use serde::{Deserialize, Serialize};
 use crate::error::EngineError;
 use crate::host::{CancelFlag, EngineEvent, HostEvents, ModelCallLog};
 
+/// json_call 默认最大尝试次数（含首发）。推理模型（DeepSeek-R1 等）偶发把 max_tokens 全部用于
+/// reasoning 段后返回空 content，以及偶发脏 JSON，都是 temperature=0 下重试常能恢复的瞬态；
+/// 故默认给足次数兜底。可由 `ModelCallSpec.max_retries` 覆盖。
+pub const DEFAULT_MAX_RETRIES: u32 = 4;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ModelInterface {
     #[serde(rename = "OpenAI-compatible")]
@@ -41,6 +46,9 @@ pub struct ModelCallSpec {
     pub prompt_version: String,
     /// 观测与归组用：运行 id（任务 id / 回合 id）
     pub run_id: String,
+    /// 最大尝试次数（含首发）覆盖；`None` → `DEFAULT_MAX_RETRIES`。通用字段：空 content / 脏 JSON /
+    /// 可重试模型错误在此次数内重试。向后兼容——既有构造点填 `None` 即用默认。
+    pub max_retries: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -72,8 +80,13 @@ pub fn extract_json_payload(raw: &str) -> Result<serde_json::Value, EngineError>
     serde_json::from_str(candidate).map_err(|e| EngineError::ModelOutput(format!("JSON 解析失败: {e}")))
 }
 
-/// 严格 JSON 调用：补全 → 解析 → 失败重试一次（重试不改变输入）。
-/// 每次调用通过 `events` 发射 ModelCall 观测日志。
+/// 严格 JSON 调用：补全 → 解析 → 失败重试（重试不改变输入，temperature=0 下重试确定性一致）。
+/// 每次调用通过 `events` 发射 ModelCall 观测日志。尝试次数由 `spec.max_retries` 决定（默认
+/// `DEFAULT_MAX_RETRIES`）。三类失败区分对待：
+/// - **空 content**（推理模型耗尽 max_tokens 的瞬态成功响应）：`error="empty_content"`，重试；
+/// - **非空脏 JSON**（偶发格式抖动）：`error="model_output"`，重试；
+/// - **真实模型错误**：可重试（5xx/429）继续重试，非可重试（4xx，如鉴权失败）早退不浪费次数；
+///   `Cancelled` 立即透传。
 pub async fn json_call<T: DeserializeOwned>(
     client: &dyn ModelClient,
     events: &dyn HostEvents,
@@ -81,13 +94,36 @@ pub async fn json_call<T: DeserializeOwned>(
     cancel: &CancelFlag,
 ) -> Result<T, EngineError> {
     let mut last_err: Option<EngineError> = None;
-    for attempt in 0..2u32 {
+    // 至少一次尝试（防 Some(0) 退化为不调用）。
+    let max_attempts = spec.max_retries.unwrap_or(DEFAULT_MAX_RETRIES).max(1);
+    for attempt in 0..max_attempts {
         cancel.check()?;
         let started = std::time::Instant::now();
         let result = client.complete(spec, cancel).await;
         let latency_ms = started.elapsed().as_millis() as u64;
         match result {
             Ok(output) => {
+                // 空 content：一次成功 HTTP 响应但 content 为空/全空白——推理模型把 max_tokens 全用于
+                // reasoning 段的典型症状。明确归类为可重试瞬态，用专门的 "empty_content" 码发日志，
+                // 与真实脏 JSON（model_output）区分，供观测/告警面板判「瞬态自愈」vs「真实故障」。
+                if output.content.trim().is_empty() {
+                    events.emit(EngineEvent::ModelCall(ModelCallLog {
+                        run_id: spec.run_id.clone(),
+                        agent: spec.agent.clone(),
+                        prompt_version: spec.prompt_version.clone(),
+                        model_id: spec.profile.model.clone(),
+                        input_tokens: output.input_tokens,
+                        // 通常 == max_tokens，佐证被 reasoning 段吃光。
+                        output_tokens: output.output_tokens,
+                        latency_ms,
+                        retries: attempt,
+                        error: Some("empty_content".to_string()),
+                    }));
+                    last_err = Some(EngineError::ModelOutput(
+                        "模型返回空 content（疑似推理耗尽 max_tokens）".into(),
+                    ));
+                    continue;
+                }
                 let parsed = extract_json_payload(&output.content)
                     .and_then(|v| serde_json::from_value::<T>(v).map_err(EngineError::serde));
                 events.emit(EngineEvent::ModelCall(ModelCallLog {
@@ -120,6 +156,12 @@ pub async fn json_call<T: DeserializeOwned>(
                 }));
                 if matches!(e, EngineError::Cancelled) {
                     return Err(e);
+                }
+                // 非可重试的真实模型错误（4xx，如鉴权失败）早退，不浪费剩余次数；
+                // 空 content / 脏 JSON（ModelOutput）与可重试模型错误（5xx/429）恒继续重试。
+                if !e.retryable() && !matches!(e, EngineError::ModelOutput(_)) {
+                    last_err = Some(e);
+                    break;
                 }
                 last_err = Some(e);
             }
@@ -299,5 +341,113 @@ pub mod testing {
     fn extract_json_handles_prefixed_prose() {
         let value = extract_json_payload("好的，结果如下：{\"a\":[1,2]}").unwrap();
         assert_eq!(value["a"][1], 2);
+    }
+
+    fn test_spec() -> ModelCallSpec {
+        ModelCallSpec {
+            profile: ModelProfile {
+                interface: ModelInterface::OpenAiCompatible,
+                base_url: "http://x".into(),
+                api_key: "k".into(),
+                model: "m".into(),
+            },
+            system: "s".into(),
+            user: "u".into(),
+            temperature: 0.0,
+            max_output_tokens: 64,
+            agent: "test".into(),
+            prompt_version: "v1".into(),
+            run_id: "run".into(),
+            max_retries: None,
+        }
+    }
+
+    fn model_call_logs(events: &crate::host::testing::CollectEvents) -> Vec<ModelCallLog> {
+        events
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                EngineEvent::ModelCall(l) => Some(l.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // 测试点 #1：空 content 重试后成功——前两次空、末次有效 JSON → 最终 Ok，日志前两次 empty_content、
+    // 末次 error=None，retries 递增。
+    #[tokio::test]
+    async fn json_call_retries_empty_content_then_succeeds() {
+        let model = ScriptedModel::new(vec![
+            Ok(String::new()),
+            Ok("   ".to_string()),
+            Ok(r#"{"a":1}"#.to_string()),
+        ]);
+        let events = crate::host::testing::CollectEvents::default();
+        let v: serde_json::Value =
+            json_call(&model, &events, &test_spec(), &CancelFlag::new()).await.unwrap();
+        assert_eq!(v["a"], 1);
+        let logs = model_call_logs(&events);
+        assert_eq!(logs.len(), 3);
+        assert_eq!(logs[0].error.as_deref(), Some("empty_content"));
+        assert_eq!(logs[0].retries, 0);
+        assert_eq!(logs[1].error.as_deref(), Some("empty_content"));
+        assert_eq!(logs[1].retries, 1);
+        assert_eq!(logs[2].error, None);
+        assert_eq!(logs[2].retries, 2);
+    }
+
+    // 测试点 #2：空 content 与脏 JSON 分类可区分。
+    #[tokio::test]
+    async fn json_call_distinguishes_empty_from_dirty_json() {
+        // 空 content → empty_content 语义。
+        let empty = ScriptedModel::new(vec![Ok(String::new())]);
+        let ev_empty = crate::host::testing::CollectEvents::default();
+        let mut spec = test_spec();
+        spec.max_retries = Some(1);
+        let err_empty =
+            json_call::<serde_json::Value>(&empty, &ev_empty, &spec, &CancelFlag::new()).await.unwrap_err();
+        assert_eq!(err_empty.code(), "model_output");
+        assert_eq!(model_call_logs(&ev_empty)[0].error.as_deref(), Some("empty_content"));
+
+        // 非空脏 JSON → model_output（走 parse 失败路径），error 码不同于 empty_content。
+        let dirty = ScriptedModel::new(vec![Ok("这不是 JSON".to_string())]);
+        let ev_dirty = crate::host::testing::CollectEvents::default();
+        let err_dirty =
+            json_call::<serde_json::Value>(&dirty, &ev_dirty, &spec, &CancelFlag::new()).await.unwrap_err();
+        assert_eq!(err_dirty.code(), "model_output");
+        let dirty_code = model_call_logs(&ev_dirty)[0].error.clone();
+        assert_eq!(dirty_code.as_deref(), Some("model_output"));
+        assert_ne!(dirty_code.as_deref(), Some("empty_content"));
+    }
+
+    // 测试点 #9：非可重试错误早退——首次即返回，不耗满 DEFAULT_MAX_RETRIES。
+    #[tokio::test]
+    async fn json_call_non_retryable_error_breaks_early() {
+        let model = ScriptedModel::new(vec![
+            Err(EngineError::Model { message: "401 未授权".into(), retryable: false }),
+            Ok(r#"{"a":1}"#.to_string()), // 不应被消费
+        ]);
+        let events = crate::host::testing::CollectEvents::default();
+        let err = json_call::<serde_json::Value>(&model, &events, &test_spec(), &CancelFlag::new())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "model");
+        assert_eq!(model_call_logs(&events).len(), 1, "非可重试错误应在首次尝试后早退");
+    }
+
+    // 可重试模型错误在次数内重试后成功（5xx/429 语义）。
+    #[tokio::test]
+    async fn json_call_retries_retryable_model_error_then_succeeds() {
+        let model = ScriptedModel::new(vec![
+            Err(EngineError::Model { message: "503".into(), retryable: true }),
+            Ok(r#"{"a":2}"#.to_string()),
+        ]);
+        let events = crate::host::testing::CollectEvents::default();
+        let v: serde_json::Value =
+            json_call(&model, &events, &test_spec(), &CancelFlag::new()).await.unwrap();
+        assert_eq!(v["a"], 2);
+        assert_eq!(model_call_logs(&events).len(), 2);
     }
 }

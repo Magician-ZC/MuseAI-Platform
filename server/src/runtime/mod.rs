@@ -39,6 +39,10 @@ const TOPIC: &str = "world_tick";
 
 /// 无预算配置时的兜底剩余 token（daily_token_budget=0 亦按此放行，但官方建房已强制非零，见 B-2）。
 const DEFAULT_REMAINING_TOKENS: u64 = 100_000;
+/// 世界路由未配置 `maxOutputTokens` 时的兜底单次输出上限。给推理模型（DeepSeek-R1 等）留足
+/// reasoning 预算，从根上降低「reasoning 段吃光 max_tokens → 空 content」的概率（取代旧的进程级
+/// MUSE_MAX_OUTPUT_TOKENS env，改由世界钉住的 model_routes 配置读，可按世界调）。
+const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 2048;
 /// token→cny 估算默认单价（分/1K token）；可用 MUSE_TOKEN_CNY_CENTS_PER_1K 覆盖（真实定价是运营配置）。
 const DEFAULT_TOKEN_CNY_CENTS_PER_1K: i64 = 2;
 /// 单个 tick 的总处理次数上限（跨重启，C-9）：超限即终态 failed，不再无限重跑。
@@ -298,7 +302,10 @@ async fn schedule_due_ticks(state: &AppState) -> Result<(), ApiError> {
 
 // ---------- 版本钉住解析 ----------
 
+// rename_all=camelCase：与 ModelProfile（baseUrl/apiKey）及桌面端 agentConfigs 命名一致；
+// 既有单词字段（default/decide/...）不受影响，仅新增字段以 camelCase（maxOutputTokens）出现。
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RoutesConfig {
     default: Option<ModelProfile>,
     decide: Option<ModelProfile>,
@@ -306,10 +313,18 @@ struct RoutesConfig {
     writer: Option<ModelProfile>,
     critic: Option<ModelProfile>,
     director: Option<ModelProfile>,
+    /// 单次输出上限（本回合各环节 request 的 max_tokens）。世界钉住、可按世界调；缺省 → 兜底
+    /// `DEFAULT_MAX_OUTPUT_TOKENS`。`#[serde(default)]` 保证旧 routes_json（无此字段）零改动向后兼容。
+    #[serde(default)]
+    max_output_tokens: Option<u32>,
 }
 
-/// 解析世界钉住的 model_route_version → ModelRoutes；无匹配/缺 default profile → None（dev 跳过信号）。
-async fn resolve_model_routes(db: &AnyPool, version: &str) -> Result<Option<ModelRoutes>, ApiError> {
+/// 解析世界钉住的 model_route_version → (ModelRoutes, max_output_tokens)；无匹配/缺 default profile →
+/// None（dev 跳过信号）。max_output_tokens 取配置值，缺省回退 `DEFAULT_MAX_OUTPUT_TOKENS`（>0 兜底）。
+async fn resolve_model_routes(
+    db: &AnyPool,
+    version: &str,
+) -> Result<Option<(ModelRoutes, u32)>, ApiError> {
     let Some(row) = sqlx::query("SELECT routes_json FROM model_routes WHERE version = ? LIMIT 1")
         .bind(version)
         .fetch_optional(db)
@@ -324,14 +339,19 @@ async fn resolve_model_routes(db: &AnyPool, version: &str) -> Result<Option<Mode
     let Some(default) = cfg.default else {
         return Ok(None);
     };
-    Ok(Some(ModelRoutes {
-        default,
-        decide: cfg.decide,
-        arbiter: cfg.arbiter,
-        writer: cfg.writer,
-        critic: cfg.critic,
-        director: cfg.director,
-    }))
+    let max_output_tokens =
+        cfg.max_output_tokens.filter(|v| *v > 0).unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
+    Ok(Some((
+        ModelRoutes {
+            default,
+            decide: cfg.decide,
+            arbiter: cfg.arbiter,
+            writer: cfg.writer,
+            critic: cfg.critic,
+            director: cfg.director,
+        },
+        max_output_tokens,
+    )))
 }
 
 /// 解析世界钉住的 prompt_set_version（按 version 聚合各 scope 行）→ NarrativePrompts。
@@ -1137,8 +1157,9 @@ async fn process_tick_inner(
         remaining_tokens = if daily > 0 { (daily - spent).max(0) as u64 } else { DEFAULT_REMAINING_TOKENS };
     }
 
-    // 5) 模型配置解析：无配置 → dev 跳过（不 panic）。
-    let Some(routes) = resolve_model_routes(db, &world.model_route_version).await? else {
+    // 5) 模型配置解析：无配置 → dev 跳过（不 panic）。max_output_tokens 随路由一并钉住（按世界可调）。
+    let Some((routes, max_output_tokens)) = resolve_model_routes(db, &world.model_route_version).await?
+    else {
         tracing::warn!(world_id, version = %world.model_route_version, "world 无模型配置，tick 跳过");
         finish_tick_noop(db, world_id, tick_no, Some("no_model_config")).await?;
         return Ok(TickStatus::Skipped("no_model_config"));
@@ -1374,7 +1395,8 @@ async fn process_tick_inner(
             fragments: BTreeMap::new(),
             temperature_decide: 0.0,
             temperature_writer: 0.8,
-            max_output_tokens: 1024,
+            // 世界钉住的路由配置值（缺省已回退 DEFAULT_MAX_OUTPUT_TOKENS）——不再读进程级 env。
+            max_output_tokens,
             budget: RoundBudget { max_total_tokens: remaining_tokens, spent_tokens: 0, max_scenes: 1 },
             // #3b：已获批不可逆同意 subject 回灌；命中者本回合门控放行落定。
             approved_consents: approved_consents.clone(),

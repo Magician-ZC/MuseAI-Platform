@@ -105,6 +105,7 @@ pub async fn model_merge_entities(
         let allowed: BTreeSet<&str> = batch.iter().map(|s| s.as_str()).collect();
         let user = build_merge_prompt(batch);
         let spec = ModelCallSpec {
+            max_retries: None,
             profile: profile.clone(),
             system: merge_system.to_string(),
             user,
@@ -200,6 +201,7 @@ pub async fn synthesize_items(
         cos = KNOWN_COSMOLOGIES,
     );
     let spec = ModelCallSpec {
+        max_retries: None,
         profile: profile.clone(),
         system: system.to_string(),
         user,
@@ -259,6 +261,7 @@ pub async fn synthesize_locations(
         items = item_ids,
     );
     let spec = ModelCallSpec {
+        max_retries: None,
         profile: profile.clone(),
         system: system.to_string(),
         user,

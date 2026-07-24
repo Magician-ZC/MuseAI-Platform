@@ -148,6 +148,7 @@ pub async fn role_decide(
     cancel: &CancelFlag,
 ) -> Result<RoleDecision, EngineError> {
     let spec = ModelCallSpec {
+        max_retries: None,
         profile: profile.clone(),
         system: prompts.system.clone(),
         user: build_decide_user_prompt(character_id, visible_context),

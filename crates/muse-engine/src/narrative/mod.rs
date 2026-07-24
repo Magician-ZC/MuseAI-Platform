@@ -40,7 +40,7 @@ pub const MIN_DURATION: i64 = 1;
 pub const MAX_DURATION: i64 = 1_000_000;
 /// blocked/gated 后 cohort next_time 的兜底推进量（防同一 T 反复重试锁死 → 饿死）。
 pub const RETRY_STEP: i64 = 30;
-use crate::host::{CancelFlag, EngineEvent, EngineHost};
+use crate::host::{CancelFlag, EngineEvent, EngineHost, ModelCallLog};
 use crate::model::{json_call, ModelCallSpec, ModelProfile};
 use crate::EngineError;
 use types::*;
@@ -263,6 +263,7 @@ impl NarrativeEngine {
                 routes.for_stage("director"),
                 &prompts.director_system,
                 &prompts.prompt_version,
+                input.max_output_tokens,
                 &run_id,
                 &current,
                 members,
@@ -306,6 +307,22 @@ impl NarrativeEngine {
         type DecideFut<'a> =
             std::pin::Pin<Box<dyn std::future::Future<Output = Result<RoleDecision, EngineError>> + Send + 'a>>;
         let mut decisions: Vec<RoleDecision> = Vec::with_capacity(active_ids.len());
+        // 单角色决策失败的【确定性降级】（LLM 鲁棒性）：`json_call` 已在内部按 `DEFAULT_MAX_RETRIES`
+        // 重试（空 content / 脏 JSON / 可重试模型错误）；若某角色重试耗尽仍失败，本回合【跳过】该角色
+        // （不进 `decisions`）而非 abort 整个 `run_round`——其余角色照常裁决/写作/原子提交。
+        //
+        // 为何跳过而非注入 benign 决策：空 action 经 `arbiter::rule_arbitrate` 会判 Success（rule:clear），
+        // 从而产生 ActionResolved 事件 + pacingNote + 里程碑强度累积，污染叙事与推进（见规格风险 #3）；
+        // 跳过则零副作用——仲裁/`build_patch`/`build_events` 皆按实际 decisions 迭代，天然兼容缺角色，
+        // 不变量 I2/I3 只校验「事件 actor/target ⊆ active」不要求「active ⊆ 有决策者」，故不受影响。
+        //
+        // 确定性：结果按 `chunk` + `cid` 顺序 zip 收集（`join_all` 保序，与并发完成顺序无关），
+        // 同一失败输入恒跳过同一角色，无随机源；DES `next_time` 对缺席角色兜底 `DEFAULT_DURATION`
+        // 前进（`run_event_step`），不会饿死。
+        // 边界：`Cancelled` 必须原样传播（绝不降级）；非模型类错误（`Serde`/`Io` 等引擎缺陷）fail-hard
+        //       上抛以免掩盖真实 bug；仅「模型类」错误（`ModelOutput` / `Model`）降级。
+        let mut degraded_count: usize = 0;
+        let mut last_degrade_err: Option<EngineError> = None;
         for chunk in active_ids.chunks(DECIDE_CONCURRENCY) {
             let futs: Vec<DecideFut<'_>> = chunk
                 .iter()
@@ -328,9 +345,36 @@ impl NarrativeEngine {
                     }) as DecideFut<'_>
                 })
                 .collect();
-            for r in join_all(futs).await {
-                decisions.push(r?);
+            for (cid, r) in chunk.iter().zip(join_all(futs).await) {
+                match r {
+                    Ok(d) => decisions.push(d),
+                    // 取消必须原样传播，绝不降级为跳过。
+                    Err(EngineError::Cancelled) => return Err(EngineError::Cancelled),
+                    // 模型类错误：确定性降级——跳过该角色，发观测事件（供告警面板区分「瞬态自愈」vs「真实故障」）。
+                    Err(e @ (EngineError::ModelOutput(_) | EngineError::Model { .. })) => {
+                        host.events.emit(EngineEvent::ModelCall(ModelCallLog {
+                            run_id: run_id.clone(),
+                            agent: "roleDecide".to_string(),
+                            prompt_version: prompts.prompt_version.clone(),
+                            model_id: decide_stage.model.clone(),
+                            input_tokens: None,
+                            output_tokens: None,
+                            latency_ms: 0,
+                            retries: 0,
+                            error: Some(format!("character_degraded:{cid}:{}", e.code())),
+                        }));
+                        degraded_count += 1;
+                        last_degrade_err = Some(e);
+                    }
+                    // 非模型类错误（引擎内部缺陷）：fail-hard 上抛，不掩盖。
+                    Err(e) => return Err(e),
+                }
             }
+        }
+        // 全部活跃角色都降级 → 合理失败（不静默提交空回合），交上层 tick 重试/暂停。
+        if !active_ids.is_empty() && degraded_count == active_ids.len() {
+            return Err(last_degrade_err
+                .unwrap_or_else(|| EngineError::ModelOutput("全部角色决策失败".into())));
         }
         decisions.sort_by(|a, b| a.character_id.cmp(&b.character_id));
 
@@ -772,6 +816,7 @@ async fn call_director(
     profile: &ModelProfile,
     system: &str,
     prompt_version: &str,
+    max_output_tokens: u32,
     run_id: &str,
     state: &NarrativeState,
     active_ids: &[String],
@@ -806,11 +851,12 @@ async fn call_director(
         world = serde_json::to_string(&public_world(state)).unwrap_or_default(),
     );
     let spec = ModelCallSpec {
+        max_retries: None,
         profile: profile.clone(),
         system: system.to_string(),
         user,
         temperature: 0.7,
-        max_output_tokens: 1024,
+        max_output_tokens,
         agent: "director".to_string(),
         prompt_version: prompt_version.to_string(),
         run_id: run_id.to_string(),
@@ -863,6 +909,7 @@ async fn call_writer(
         res = serde_json::to_string(&res).unwrap_or_default(),
     );
     let spec = ModelCallSpec {
+        max_retries: None,
         profile: profile.clone(),
         system: system.to_string(),
         user,
@@ -2616,5 +2663,163 @@ mod tests {
         // 全 Failure（progressed=false）：不推进（保留旧语义）。
         let fail = build_patch(s.revision, &decisions, &[outcome_of("li", "d", ArbiterResult::Failure)], &s);
         assert!(!has_status_done(&fail, "n1"), "旧节点无 success 不推进");
+    }
+
+    // ===== LLM 鲁棒性：role_decide 单角色确定性降级（空 content 兜底）=====
+
+    /// 初始化含 a/b/c 三角色（无硬节点）的 run。
+    fn init_run3(host: &EngineHost, run_id: &str) {
+        let mut s = NarrativeState { schema_version: 1, run_id: run_id.into(), ..Default::default() };
+        for c in ["a", "b", "c"] {
+            s.characters.insert(c.into(), CharacterState::default());
+        }
+        NarrativeStore::new(host.fs.clone()).init(&s).unwrap();
+    }
+
+    fn cards3() -> BTreeMap<String, CharacterCardV2> {
+        ["a", "b", "c"].into_iter().map(|n| (n.to_string(), minimal_card(n))).collect()
+    }
+
+    fn round_input3(run_id: &str, budget: RoundBudget) -> RoundInput {
+        RoundInput {
+            run_id: run_id.into(),
+            mode: RunMode::Observe,
+            active_cards: cards3(),
+            other_cards_brief: BTreeMap::new(),
+            whispers: BTreeMap::new(),
+            fragments: BTreeMap::new(),
+            temperature_decide: 0.0,
+            temperature_writer: 0.7,
+            max_output_tokens: 100,
+            budget,
+            approved_consents: Vec::new(),
+            world_controlled: Vec::new(),
+            locations: BTreeMap::new(),
+            now_hint: 0,
+        }
+    }
+
+    /// 单组、三角色时 run_round 的模型脚本：director → decide(a) → decide(b) → decide(c) → writer → critic。
+    /// `b` 的所有 attempt 返回空 content（DEFAULT_MAX_RETRIES 次）；a/c 正常。
+    /// 并发决策在 ScriptedModel 下同步完成（无 yield），故脚本按 a→b→c 顺序确定性消费。
+    fn degrade_middle_script() -> Vec<Result<String, EngineError>> {
+        let mut resp: Vec<Result<String, EngineError>> = vec![
+            Ok(r#"{"situation":"三人对坐，烛火摇曳。"}"#.to_string()), // director
+            Ok(benign_decision()),                                    // decide a
+        ];
+        resp.extend((0..crate::model::DEFAULT_MAX_RETRIES).map(|_| Ok(String::new()))); // decide b：全空
+        resp.push(Ok(benign_decision())); // decide c
+        resp.push(Ok(r#"{"prose":"三人各怀心事，礼数周全。"}"#.to_string())); // writer
+        resp.push(Ok(
+            r#"{"characterConsistencyIssues":[],"causalIssues":[],"revisionSuggestions":[]}"#.to_string(),
+        )); // critic
+        resp
+    }
+
+    // 测试点 #3 + #4：持续空 content → 单角色降级不 abort，整 tick 仍 commit。
+    #[tokio::test]
+    async fn single_role_degradation_skips_and_still_commits() {
+        let (host, ev) = host_with(degrade_middle_script());
+        init_run3(host.as_ref(), "run-1");
+        let engine = NarrativeEngine::new(host.clone());
+        let out = engine
+            .run_round(&routes(), &prompts(), round_input3("run-1", big_budget()), &CancelFlag::new())
+            .await
+            .unwrap();
+
+        // 未 abort：整 tick 正常提交。
+        assert!(out.blocked.is_none(), "单角色降级不应 blocked");
+        assert_eq!(out.new_state.revision, 1, "整 tick 应提交，revision 前进");
+        // 降级角色 b 缺席，仅 a/c 进入 decisions（确定性定序）。
+        let ids: Vec<&str> = out.scene.decisions.iter().map(|d| d.character_id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "c"], "降级角色 b 应缺席，a/c 正常");
+        // 场景与状态落盘。
+        let store = NarrativeStore::new(host.fs.clone());
+        assert_eq!(store.list_scene_ids("run-1").unwrap(), vec!["sc-0".to_string()]);
+        assert_eq!(store.load("run-1").unwrap().revision, 1);
+        // 其余两角色 outcomes/events 正常生成（a/c 各 ActionResolved + DialogueSpoken = 4 事件），b 无事件。
+        let narrative_events = ev
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, EngineEvent::Narrative { .. }))
+            .count();
+        assert_eq!(narrative_events, 4, "仅 a/c 产事件，降级角色 b 不产任何事件");
+        // 发出确定性降级观测事件（含 cid=b）。
+        let degraded = ev.0.lock().unwrap().iter().any(|e| {
+            matches!(e, EngineEvent::ModelCall(l)
+                if l.error.as_deref().map(|s| s.starts_with("character_degraded:b:")).unwrap_or(false))
+        });
+        assert!(degraded, "应发出 b 的确定性降级观测事件");
+    }
+
+    // 测试点：全部角色都失败 → run_round 合理失败（不静默提交空回合）。
+    #[tokio::test]
+    async fn all_roles_degradation_fails_round_without_commit() {
+        let mut resp: Vec<Result<String, EngineError>> =
+            vec![Ok(r#"{"situation":"三人对坐。"}"#.to_string())]; // director
+        for _ in 0..3 {
+            resp.extend((0..crate::model::DEFAULT_MAX_RETRIES).map(|_| Ok(String::new())));
+        }
+        let (host, _ev) = host_with(resp);
+        init_run3(host.as_ref(), "run-1");
+        let engine = NarrativeEngine::new(host.clone());
+        let err = engine
+            .run_round(&routes(), &prompts(), round_input3("run-1", big_budget()), &CancelFlag::new())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "model_output", "全角色降级应上抛模型输出错误");
+        // 未提交任何状态、无场景落盘。
+        let store = NarrativeStore::new(host.fs.clone());
+        assert_eq!(store.load("run-1").unwrap().revision, 0);
+        assert!(store.list_scene_ids("run-1").unwrap().is_empty());
+    }
+
+    // 测试点 #6：确定性——同一脚本（含空 content 序列）两次 run_round 的 scene / new_state 逐字节一致。
+    #[tokio::test]
+    async fn degradation_is_deterministic_across_runs() {
+        let (h1, _) = host_with(degrade_middle_script());
+        init_run3(h1.as_ref(), "run-det");
+        let o1 = NarrativeEngine::new(h1.clone())
+            .run_round(&routes(), &prompts(), round_input3("run-det", big_budget()), &CancelFlag::new())
+            .await
+            .unwrap();
+
+        let (h2, _) = host_with(degrade_middle_script());
+        init_run3(h2.as_ref(), "run-det");
+        let o2 = NarrativeEngine::new(h2.clone())
+            .run_round(&routes(), &prompts(), round_input3("run-det", big_budget()), &CancelFlag::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            serde_json::to_string(&o1.scene).unwrap(),
+            serde_json::to_string(&o2.scene).unwrap(),
+            "scene（decisions/outcomes/StatePatch/events）应逐字节一致"
+        );
+        assert_eq!(
+            serde_json::to_string(&o1.new_state).unwrap(),
+            serde_json::to_string(&o2.new_state).unwrap(),
+            "new_state 应逐字节一致"
+        );
+    }
+
+    // 测试点 #7：Cancelled 不被降级吞掉——决策阶段返回 Cancelled 必须原样传播。
+    #[tokio::test]
+    async fn cancelled_not_swallowed_by_degradation() {
+        let resp = vec![
+            Ok(r#"{"situation":"对坐。"}"#.to_string()), // director
+            Err(EngineError::Cancelled),                 // decide li → Cancelled
+        ];
+        let (host, _ev) = host_with(resp);
+        init_run(host.as_ref(), "run-1", false);
+        let engine = NarrativeEngine::new(host.clone());
+        let err = engine
+            .run_round(&routes(), &prompts(), round_input("run-1", big_budget()), &CancelFlag::new())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "cancelled", "Cancelled 必须透传，不被降级为跳过");
+        assert_eq!(NarrativeStore::new(host.fs.clone()).load("run-1").unwrap().revision, 0);
     }
 }

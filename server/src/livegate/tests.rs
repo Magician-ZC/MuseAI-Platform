@@ -7,6 +7,7 @@ use crate::safety::testkit::{count, seed_member, seed_user, seed_world, test_sta
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
+use sqlx::AnyPool;
 use tower::ServiceExt;
 
 /// test_state + 容错建 arena_env_events（P6a 的 0007 并发期可能未落地；IF NOT EXISTS 落地后自动无操作）。
@@ -319,4 +320,216 @@ async fn spectator_gift_idempotent() {
     );
     // 进流也只一条 arena_gift。
     assert_eq!(count(&state.db, "SELECT COUNT(*) FROM world_events WHERE world_id='w1' AND event_type='arena_gift'").await, 1);
+}
+
+// ---------- P1 打赏扣费：站内 charge（钱包扣费 + 分成 + 平台抽成 + SUM=0）；外部 webhook 仅记账 ----------
+
+/// 充值钱包（镜像 billing 双写）：recharge journal(user_wallet +amount / recharge_source −amount) + billing_balances 物化。
+/// 保证测试起点 user_wallet == billing_balances 恒等。单连接内存库 → 同一 tx 内写两表（不可再借连接）。
+async fn fund_wallet(db: &AnyPool, uid: &str, amount: i64) {
+    let mut tx = db.begin().await.unwrap();
+    crate::ledger::post_journal(
+        &mut tx,
+        "recharge",
+        "order",
+        "seed",
+        None,
+        &[
+            crate::ledger::Posting {
+                account: crate::ledger::AccountRef::UserWallet(uid.to_string()),
+                delta_cents: amount,
+            },
+            crate::ledger::Posting {
+                account: crate::ledger::AccountRef::PlatformRechargeSource,
+                delta_cents: -amount,
+            },
+        ],
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO billing_balances (user_id, balance_cents, updated_at) VALUES (?, ?, ?) \
+         ON CONFLICT(user_id) DO UPDATE SET balance_cents = billing_balances.balance_cents + excluded.balance_cents, updated_at = excluded.updated_at",
+    )
+    .bind(uid)
+    .bind(amount)
+    .bind(crate::db::now_ms())
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+}
+
+/// 造世界模板：owner=Some → 创作者模板（official=0）；bps=None → revenue_share_bps NULL（走全局默认 7000）。
+async fn seed_template(db: &AnyPool, id: &str, owner: Option<&str>, bps: Option<i64>) {
+    let official = if owner.is_some() { 0 } else { 1 };
+    sqlx::query(
+        "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, official, version, moderation, owner_id, revenue_share_bps, created_at) \
+         VALUES (?, 't', 'idle', '{}', '{\"mode\":\"open\"}', ?, 1, 'approved', ?, ?, ?)",
+    )
+    .bind(id)
+    .bind(official)
+    .bind(owner)
+    .bind(bps)
+    .bind(crate::db::now_ms())
+    .execute(db)
+    .await
+    .unwrap();
+}
+
+/// 造世界实例（指向指定模板，visibility=official → 任何登录用户可观战/打赏）。
+async fn seed_world_tpl(db: &AnyPool, world_id: &str, template_id: &str) {
+    sqlx::query(
+        "INSERT INTO worlds (id, template_id, template_version, engine_version, prompt_set_version, \
+         model_route_version, room_type, title, status, visibility, member_limit, tick_per_day, \
+         state_revision, narrative_state_json, created_at, updated_at) \
+         VALUES (?, ?, 1, 'e1', 'p1', 'm1', 'idle', 'w', 'running', 'official', 10, 3, 0, '{}', ?, ?)",
+    )
+    .bind(world_id)
+    .bind(template_id)
+    .bind(crate::db::now_ms())
+    .bind(crate::db::now_ms())
+    .execute(db)
+    .await
+    .unwrap();
+}
+
+/// 给某 SKU 定价（分）；gift 总价 = price_cents × count。
+async fn set_sku_price(db: &AnyPool, sku: &str, price_cents: i64) {
+    sqlx::query("UPDATE gift_sku_map SET price_cents = ? WHERE sku = ?")
+        .bind(price_cents)
+        .bind(sku)
+        .execute(db)
+        .await
+        .unwrap();
+}
+
+async fn acct_balance(db: &AnyPool, account_id: &str) -> i64 {
+    let row: Option<(i64,)> = sqlx::query_as("SELECT balance_cents FROM ledger_accounts WHERE id = ?")
+        .bind(account_id)
+        .fetch_optional(db)
+        .await
+        .unwrap();
+    row.map(|(b,)| b).unwrap_or(0)
+}
+
+async fn billing_balance(db: &AnyPool, uid: &str) -> i64 {
+    let row: Option<(i64,)> = sqlx::query_as("SELECT balance_cents FROM billing_balances WHERE user_id = ?")
+        .bind(uid)
+        .fetch_optional(db)
+        .await
+        .unwrap();
+    row.map(|(b,)| b).unwrap_or(0)
+}
+
+/// 红线不变量：每 journal SUM(postings)==0（有借必有贷）。返回不平衡 journal 数（应为 0）。
+async fn unbalanced_journals(db: &AnyPool) -> i64 {
+    count(
+        db,
+        "SELECT COUNT(*) FROM (SELECT journal_id FROM ledger_postings GROUP BY journal_id HAVING SUM(delta_cents) <> 0) t",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn spectator_gift_charges_wallet_creator_and_platform() {
+    // 站内打赏走钱包扣费：创作者模板（默认 70%）rose 定价 1000，count=1 →
+    // 钱包 −1000、创作者 +700、平台 +300；SUM(postings)==0；gift 副作用照旧。
+    let state = arena_state().await;
+    seed_user(&state.db, "creator").await;
+    seed_user(&state.db, "payer").await;
+    seed_template(&state.db, "tpl_c", Some("creator"), None).await; // 默认 7000 bps
+    seed_world_tpl(&state.db, "wc", "tpl_c").await;
+    set_sku_price(&state.db, "rose", 1000).await;
+    fund_wallet(&state.db, "payer", 2000).await;
+
+    let (s, v) = post_gift(&state, "wc", "payer", json!({ "sku": "rose", "count": 1 }), None).await;
+    assert_eq!(s, StatusCode::OK, "body={v}");
+    assert_eq!(v["mapped"], true);
+
+    // 钱包扣费：payer 2000 − 1000 = 1000；user_wallet == billing_balances 恒等。
+    assert_eq!(billing_balance(&state.db, "payer").await, 1000);
+    assert_eq!(acct_balance(&state.db, "acct_wallet_payer").await, 1000);
+    // 分成入账：创作者 700 + 平台抽成 300。
+    assert_eq!(acct_balance(&state.db, "acct_creator_creator").await, 700);
+    assert_eq!(acct_balance(&state.db, "acct_platform_revenue").await, 300);
+    // 复式恒等（有借必有贷）。
+    assert_eq!(unbalanced_journals(&state.db).await, 0, "每 journal SUM(postings) 必须为 0");
+    // gift 副作用照旧：env 事件 + gift_events(via=in_app) + 进流 arena_gift；红线不写 interventions。
+    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM arena_env_events WHERE world_id='wc' AND kind='gift_boon'").await, 1);
+    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM gift_events WHERE world_id='wc' AND via='in_app'").await, 1);
+    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM world_events WHERE world_id='wc' AND event_type='arena_gift'").await, 1);
+    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM interventions").await, 0);
+    // charge 的 journal ref_id 与 gift_events 主键一致（审计链）。
+    assert_eq!(
+        count(
+            &state.db,
+            "SELECT COUNT(*) FROM ledger_journals j JOIN gift_events g ON j.ref_id = g.id \
+             WHERE j.reason='gift' AND g.world_id='wc'",
+        )
+        .await,
+        1,
+        "gift journal 应与 gift_events 通过 ref_id 对齐"
+    );
+}
+
+#[tokio::test]
+async fn spectator_gift_self_tip_zero_share() {
+    // 自打赏防刷：owner 给自己世界打赏 → 分成归零，全额入平台，creator 账户不产生分成。
+    let state = arena_state().await;
+    seed_user(&state.db, "creator").await;
+    seed_template(&state.db, "tpl_s", Some("creator"), None).await;
+    seed_world_tpl(&state.db, "ws", "tpl_s").await;
+    set_sku_price(&state.db, "rose", 500).await;
+    fund_wallet(&state.db, "creator", 1000).await;
+
+    let (s, v) = post_gift(&state, "ws", "creator", json!({ "sku": "rose", "count": 1 }), None).await;
+    assert_eq!(s, StatusCode::OK, "body={v}");
+
+    // 钱包仍扣（1000 − 500 = 500），但分成归零、全额入平台。
+    assert_eq!(billing_balance(&state.db, "creator").await, 500);
+    assert_eq!(acct_balance(&state.db, "acct_creator_creator").await, 0, "自打赏分成必须归零");
+    assert_eq!(acct_balance(&state.db, "acct_platform_revenue").await, 500);
+    assert_eq!(unbalanced_journals(&state.db).await, 0);
+}
+
+#[tokio::test]
+async fn spectator_gift_insufficient_balance_rejected() {
+    // 余额不足拒付 → 409，且零副作用（无 gift_events / env / journal，钱包不动）。
+    let state = arena_state().await;
+    seed_user(&state.db, "poor").await;
+    seed_world(&state.db, "w1", 0, "running").await; // official → 可观战
+    set_sku_price(&state.db, "rose", 1000).await; // 定价 1000，但 poor 钱包为 0
+
+    let (s, _v) = post_gift(&state, "w1", "poor", json!({ "sku": "rose", "count": 1 }), None).await;
+    assert_eq!(s, StatusCode::CONFLICT, "余额不足应 409");
+
+    // 零副作用：charge 在余额校验处返回，tx 回滚。
+    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM gift_events").await, 0, "余额不足不得记 gift_events");
+    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM arena_env_events").await, 0, "余额不足不得写环境事件");
+    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM ledger_journals WHERE reason='gift'").await, 0, "余额不足不得产 gift journal");
+    assert_eq!(billing_balance(&state.db, "poor").await, 0, "钱包不动");
+    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM world_events WHERE event_type='arena_gift'").await, 0);
+}
+
+#[tokio::test]
+async fn webhook_external_records_no_charge() {
+    // 外部 webhook（观众已在直播平台付费）：仅记账（gift_events via='livegate'），**站内不二次扣钱包**（红线）。
+    // 即便 SKU 已定价，webhook 路径也绝不产生 charge/journal。
+    let state = arena_state().await;
+    seed_world(&state.db, "we", 0, "running").await;
+    set_sku_price(&state.db, "rose", 1000).await;
+
+    let (s, v) =
+        post_webhook(&state, json!({ "worldId": "we", "giftSku": "rose", "count": 1, "fromUser": "ext123" })).await;
+    assert_eq!(s, StatusCode::OK, "body={v}");
+    assert_eq!(v["mapped"], true);
+
+    // 记账：gift_events via='livegate'。
+    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM gift_events WHERE world_id='we' AND via='livegate'").await, 1);
+    // 红线：外部路径不扣钱包、不产任何 journal（复式账本全空）。
+    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM ledger_journals").await, 0, "外部 webhook 不得产 journal（不站内扣费）");
+    assert_eq!(billing_balance(&state.db, "ext123").await, 0, "外部观众钱包无扣费");
+    // gift 副作用照旧（env 事件）。
+    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM arena_env_events WHERE world_id='we' AND kind='gift_boon'").await, 1);
 }

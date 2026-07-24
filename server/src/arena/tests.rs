@@ -480,3 +480,214 @@ async fn gift_does_not_touch_eliminations_or_winner() {
     // 红线：打赏绝不进玩家 interventions 通道。
     assert_eq!(count(&state.db, "SELECT COUNT(*) FROM interventions WHERE world_id='w'").await, 0);
 }
+
+// ---------- P2 复活扣费：平台服务不分成 + 红线（买过程不买结果）+ 余额不足拒付 ----------
+
+/// 造带复活定价的世界模板（owner=Some → 创作者模板 official=0；None → 官方模板）。复活不分成，owner 仅用于对照断言。
+async fn seed_template_revive(db: &AnyPool, id: &str, owner: Option<&str>, revive_price: i64) {
+    let official = if owner.is_some() { 0 } else { 1 };
+    sqlx::query(
+        "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, official, version, moderation, owner_id, revive_price_cents, created_at) \
+         VALUES (?, 't', 'arena', '{}', '{\"mode\":\"open\"}', ?, 1, 'approved', ?, ?, ?)",
+    )
+    .bind(id)
+    .bind(official)
+    .bind(owner)
+    .bind(revive_price)
+    .bind(now_ms())
+    .execute(db)
+    .await
+    .expect("seed template revive");
+}
+
+/// running 赛事世界（指向指定模板，携 host + visibility）。
+async fn seed_arena_world_tpl(db: &AnyPool, id: &str, host: &str, visibility: &str, template_id: &str) {
+    sqlx::query(
+        "INSERT INTO worlds (id, template_id, template_version, engine_version, prompt_set_version, \
+         model_route_version, room_type, title, status, visibility, host_user_id, member_limit, tick_per_day, \
+         state_revision, narrative_state_json, created_at, updated_at) \
+         VALUES (?, ?, 1, 'e1', 'p1', 'm1', 'arena', '赛事世界', 'running', ?, ?, 10, 3, 0, '{}', ?, ?)",
+    )
+    .bind(id)
+    .bind(template_id)
+    .bind(visibility)
+    .bind(host)
+    .bind(now_ms())
+    .bind(now_ms())
+    .execute(db)
+    .await
+    .expect("seed arena world tpl");
+}
+
+/// 充值钱包（镜像 billing 双写）：post_journal + billing_balances 物化，保证 user_wallet == billing_balances。
+async fn fund_wallet(db: &AnyPool, uid: &str, amount: i64) {
+    let mut tx = db.begin().await.unwrap();
+    crate::ledger::post_journal(
+        &mut tx,
+        "recharge",
+        "order",
+        "seed",
+        None,
+        &[
+            crate::ledger::Posting {
+                account: crate::ledger::AccountRef::UserWallet(uid.to_string()),
+                delta_cents: amount,
+            },
+            crate::ledger::Posting {
+                account: crate::ledger::AccountRef::PlatformRechargeSource,
+                delta_cents: -amount,
+            },
+        ],
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO billing_balances (user_id, balance_cents, updated_at) VALUES (?, ?, ?) \
+         ON CONFLICT(user_id) DO UPDATE SET balance_cents = billing_balances.balance_cents + excluded.balance_cents, updated_at = excluded.updated_at",
+    )
+    .bind(uid)
+    .bind(amount)
+    .bind(now_ms())
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+}
+
+async fn acct_balance(db: &AnyPool, account_id: &str) -> i64 {
+    let row: Option<(i64,)> = sqlx::query_as("SELECT balance_cents FROM ledger_accounts WHERE id = ?")
+        .bind(account_id)
+        .fetch_optional(db)
+        .await
+        .unwrap();
+    row.map(|(b,)| b).unwrap_or(0)
+}
+
+async fn billing_balance(db: &AnyPool, uid: &str) -> i64 {
+    let row: Option<(i64,)> = sqlx::query_as("SELECT balance_cents FROM billing_balances WHERE user_id = ?")
+        .bind(uid)
+        .fetch_optional(db)
+        .await
+        .unwrap();
+    row.map(|(b,)| b).unwrap_or(0)
+}
+
+/// 红线不变量：每 journal SUM(postings)==0（有借必有贷）。返回不平衡 journal 数（应为 0）。
+async fn unbalanced_journals(db: &AnyPool) -> i64 {
+    count(
+        db,
+        "SELECT COUNT(*) FROM (SELECT journal_id FROM ledger_postings GROUP BY journal_id HAVING SUM(delta_cents) <> 0) t",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn revive_charge_deducts_all_platform_no_share_and_preserves_verdict() {
+    // 复活扣费：观众为已淘汰角色买复活「资格」→ 扣钱包，**全额入平台不分成**（平台服务，charge world_id=None）；
+    // 红线：charge 成功 ≠ 免死——绝不撤销既有淘汰、绝不改最终判定（买过程不买结果）。
+    let state = test_state().await;
+    seed_user(&state.db, "host").await;
+    seed_user(&state.db, "creator").await;
+    seed_user(&state.db, "u1").await;
+    seed_user(&state.db, "u2").await;
+    seed_user(&state.db, "viewer").await;
+    seed_template_revive(&state.db, "tpl_c", Some("creator"), 300).await; // 创作者模板，复活价 300
+    seed_arena_world_tpl(&state.db, "w", "host", "official", "tpl_c").await;
+    seed_member(&state.db, "m1", "w", "u1", "c1", "active").await;
+    seed_member(&state.db, "m2", "w", "u2", "c2", "active").await;
+    fund_wallet(&state.db, "viewer", 1000).await;
+
+    // 先经同意门控落定淘汰 c1 → 唯一胜者 c2（既有仲裁结果）。
+    let (_, v) = post(&state, "/api/arena/w/eliminate", "host", json!({ "cloudCharacterId": "c1" })).await;
+    let cid = v["consentId"].as_str().unwrap().to_string();
+    respond_consent(&state, "u1", "w", &cid, true).await;
+    let (_, settled) = post(&state, "/api/arena/w/settle", "host", json!({})).await;
+    assert_eq!(settled["winnerCharId"], "c2");
+
+    // 观众为被淘汰角色 c1 付费买复活赛资格。
+    let (s, rv) = post(&state, "/api/arena/w/revive-match", "viewer", json!({ "cloudCharacterId": "c1" })).await;
+    assert_eq!(s, StatusCode::OK, "body={rv}");
+    assert_eq!(rv["status"], "eligible");
+    // 付费边界（诚实标注）：买资格，非免死、不改最终判定。
+    assert_eq!(rv["boundary"]["buys"], "revive_eligibility");
+    assert_eq!(rv["boundary"]["notImmunity"], true);
+    assert_eq!(rv["boundary"]["notFinalVerdict"], true);
+
+    // 扣费：viewer 1000 − 300 = 700；user_wallet == billing_balances 恒等。
+    assert_eq!(billing_balance(&state.db, "viewer").await, 700);
+    assert_eq!(acct_balance(&state.db, "acct_wallet_viewer").await, 700);
+    // 复活是平台服务：全额入平台，**绝不分成给创作者**（即便世界有创作者模板 owner）。
+    assert_eq!(acct_balance(&state.db, "acct_platform_revenue").await, 300);
+    assert_eq!(acct_balance(&state.db, "acct_creator_creator").await, 0, "复活扣费不得分成给创作者");
+    assert_eq!(unbalanced_journals(&state.db).await, 0, "每 journal SUM(postings) 必须为 0");
+    // journal reason=revive，ref_id == 复活凭证 id（审计链）。
+    let rgid = rv["reviveGrantId"].as_str().unwrap().to_string();
+    assert_eq!(
+        count(&state.db, &format!("SELECT COUNT(*) FROM ledger_journals WHERE reason='revive' AND ref_id='{rgid}'")).await,
+        1,
+        "revive journal 应与 grant 通过 ref_id 对齐"
+    );
+
+    // 红线：买过程不买结果——charge 成功绝不撤销淘汰、绝不改最终判定。
+    let (_, rep) = get(&state, "/api/arena/w/report", "host").await;
+    let elim: Vec<String> = serde_json::from_value(rep["match"]["eliminations"].clone()).unwrap();
+    assert_eq!(elim, vec!["c1".to_string()], "复活扣费不得撤销淘汰（不免死）");
+    assert_eq!(rep["match"]["winnerCharId"], "c2", "复活扣费不得改判（买过程不买结果）");
+    // 资格仍只记 eligible（非免死落定）。
+    assert_eq!(
+        count(&state.db, "SELECT COUNT(*) FROM arena_revive_grants WHERE world_id='w' AND status='eligible'").await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn revive_insufficient_balance_rejected_zero_side_effects() {
+    // 余额不足拒付 → 409，且零副作用（无 grant、无 journal，钱包不动）。
+    let state = test_state().await;
+    seed_user(&state.db, "host").await;
+    seed_user(&state.db, "u1").await;
+    seed_user(&state.db, "u2").await;
+    seed_user(&state.db, "poor").await;
+    seed_template_revive(&state.db, "tpl_off", None, 1000).await; // 复活价 1000
+    seed_arena_world_tpl(&state.db, "w", "host", "official", "tpl_off").await;
+    seed_member(&state.db, "m1", "w", "u1", "c1", "active").await;
+    seed_member(&state.db, "m2", "w", "u2", "c2", "active").await;
+    // poor 未充值，钱包为 0 < 1000。
+
+    let (s, _v) = post(&state, "/api/arena/w/revive-match", "poor", json!({ "cloudCharacterId": "c1" })).await;
+    assert_eq!(s, StatusCode::CONFLICT, "余额不足应 409");
+
+    assert_eq!(
+        count(&state.db, "SELECT COUNT(*) FROM arena_revive_grants WHERE world_id='w'").await,
+        0,
+        "余额不足不得写复活资格"
+    );
+    assert_eq!(
+        count(&state.db, "SELECT COUNT(*) FROM ledger_journals WHERE reason='revive'").await,
+        0,
+        "余额不足不得产 revive journal"
+    );
+    assert_eq!(billing_balance(&state.db, "poor").await, 0, "钱包不动");
+}
+
+#[tokio::test]
+async fn revive_free_when_price_zero_no_charge() {
+    // 未定价（模板缺失/revive_price_cents=0）→ charge no-op：免费复活保留，不产 journal、钱包不动。
+    let state = test_state().await;
+    seed_user(&state.db, "host").await;
+    seed_user(&state.db, "u1").await;
+    seed_user(&state.db, "u2").await;
+    seed_user(&state.db, "viewer").await;
+    // seed_arena_world 用 template_id='tpl' 但不建模板行 → revive_price_cents 溯源为 0（免费）。
+    seed_arena_world(&state.db, "w", "host", "official").await;
+    seed_member(&state.db, "m1", "w", "u1", "c1", "active").await;
+    seed_member(&state.db, "m2", "w", "u2", "c2", "active").await;
+
+    let (s, rv) = post(&state, "/api/arena/w/revive-match", "viewer", json!({ "cloudCharacterId": "c1" })).await;
+    assert_eq!(s, StatusCode::OK, "body={rv}");
+    assert_eq!(rv["status"], "eligible");
+    // 免费：无 journal、钱包 0。
+    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM ledger_journals").await, 0, "免费复活不产 journal");
+    assert_eq!(billing_balance(&state.db, "viewer").await, 0);
+    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM arena_revive_grants WHERE world_id='w' AND status='eligible'").await, 1);
+}

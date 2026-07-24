@@ -910,6 +910,105 @@ async fn economy_overview_role_gate_finance_and_admin_only() {
     assert_eq!(get(&app, "/api/admin/economy/overview", None).await.0, StatusCode::UNAUTHORIZED);
 }
 
+// ---------------- 财务对账（P4：GET /admin/ledger/reconcile） ----------------
+// 复式账本表恒存在（0013 迁移不随 feature 门控），故经 raw SQL 播种、直接核验对账 SQL，与 feature 无关。
+
+async fn ins_account(state: &AppState, id: &str, kind: &str, owner: Option<&str>, balance: i64) {
+    sqlx::query(
+        "INSERT INTO ledger_accounts (id, kind, owner_id, scope_id, balance_cents, withdrawable, created_at, updated_at) \
+         VALUES (?, ?, ?, NULL, ?, 0, ?, ?)",
+    )
+    .bind(id).bind(kind).bind(owner).bind(balance).bind(now_ms()).bind(now_ms())
+    .execute(&state.db).await.unwrap();
+}
+
+async fn ins_journal(state: &AppState, id: &str, reason: &str) {
+    sqlx::query("INSERT INTO ledger_journals (id, reason, ref_kind, ref_id, world_id, created_at) VALUES (?, ?, 'x', 'x', NULL, ?)")
+        .bind(id).bind(reason).bind(now_ms()).execute(&state.db).await.unwrap();
+}
+
+async fn ins_posting(state: &AppState, id: &str, journal_id: &str, account_id: &str, delta: i64) {
+    sqlx::query("INSERT INTO ledger_postings (id, journal_id, account_id, delta_cents, created_at) VALUES (?, ?, ?, ?, ?)")
+        .bind(id).bind(journal_id).bind(account_id).bind(delta).bind(now_ms()).execute(&state.db).await.unwrap();
+}
+
+async fn ins_billing(state: &AppState, uid: &str, balance: i64) {
+    sqlx::query("INSERT INTO billing_balances (user_id, balance_cents, updated_at) VALUES (?, ?, ?)")
+        .bind(uid).bind(balance).bind(now_ms()).execute(&state.db).await.unwrap();
+}
+
+/// 播种一组平衡账本：recharge(wallet+2000/source-2000) + gift(wallet-1000/creator+700/platform+300)。
+/// 账户物化余额与 postings 之和一致；user_wallet(u1)=1000 与 billing_balances(u1)=1000 恒等。
+async fn seed_balanced_ledger(state: &AppState) {
+    ins_account(state, "acct_wallet_u1", "user_wallet", Some("u1"), 1000).await; // 2000-1000
+    ins_account(state, "acct_platform_recharge_source", "platform_recharge_source", None, -2000).await;
+    ins_account(state, "acct_creator_c1", "creator_earnings", Some("c1"), 700).await;
+    ins_account(state, "acct_platform_revenue", "platform_revenue", None, 300).await;
+    ins_billing(state, "u1", 1000).await;
+
+    ins_journal(state, "j_recharge", "recharge").await;
+    ins_posting(state, "p1", "j_recharge", "acct_wallet_u1", 2000).await;
+    ins_posting(state, "p2", "j_recharge", "acct_platform_recharge_source", -2000).await;
+
+    ins_journal(state, "j_gift", "gift").await;
+    ins_posting(state, "p3", "j_gift", "acct_wallet_u1", -1000).await;
+    ins_posting(state, "p4", "j_gift", "acct_creator_c1", 700).await;
+    ins_posting(state, "p5", "j_gift", "acct_platform_revenue", 300).await;
+}
+
+#[tokio::test]
+async fn ledger_reconcile_role_gate_finance_and_admin_only() {
+    // finance/admin 放行；operator/reviewer/support/user 越权 403；无 token 401（对齐 economy_overview gate）。
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    assert_eq!(get(&app, "/api/admin/ledger/reconcile", Some(&admin_token(&state))).await.0, StatusCode::OK);
+    assert_eq!(get(&app, "/api/admin/ledger/reconcile", Some(&role_token(&state, "finance"))).await.0, StatusCode::OK);
+    assert_eq!(get(&app, "/api/admin/ledger/reconcile", Some(&role_token(&state, "operator"))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(get(&app, "/api/admin/ledger/reconcile", Some(&role_token(&state, "reviewer"))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(get(&app, "/api/admin/ledger/reconcile", Some(&role_token(&state, "support"))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(get(&app, "/api/admin/ledger/reconcile", Some(&user_token(&state))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(get(&app, "/api/admin/ledger/reconcile", None).await.0, StatusCode::UNAUTHORIZED);
+
+    // 空账本 → 平衡，全账 SUM=0。
+    let (st, body) = get(&app, "/api/admin/ledger/reconcile", Some(&role_token(&state, "finance"))).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body["balanced"], true);
+    assert_eq!(body["globalPostingSumCents"], 0);
+}
+
+#[tokio::test]
+async fn ledger_reconcile_verifies_sum_zero_and_detects_imbalance() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let finance = role_token(&state, "finance");
+
+    // 平衡账本 → balanced=true：全账 SUM=0、无不平 journal、账户物化余额一致、wallet==billing。
+    seed_balanced_ledger(&state).await;
+    let (st, body) = get(&app, "/api/admin/ledger/reconcile", Some(&finance)).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body["balanced"], true, "平衡账本必须判为 balanced，body={body}");
+    assert_eq!(body["globalPostingSumCents"], 0, "全账复式恒等：SUM(postings)=0");
+    assert_eq!(body["journals"]["unbalanced"], 0);
+    assert_eq!(body["accounts"]["mismatched"], 0);
+    assert_eq!(body["walletBillingIdentity"]["mismatched"], 0, "user_wallet==billing_balances 恒等");
+
+    // 注入一条不平 journal（单边 +50，不同步账户余额）→ 破坏两项不变量：
+    //   全账 SUM≠0 且该 journal 不平；wallet 账户余额(1000) ≠ 其 postings 之和(1050)。
+    ins_journal(&state, "j_bad", "gift").await;
+    ins_posting(&state, "p_bad", "j_bad", "acct_wallet_u1", 50).await;
+
+    let (st, body) = get(&app, "/api/admin/ledger/reconcile", Some(&finance)).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body["balanced"], false, "破坏后必须判为不平衡，body={body}");
+    assert_eq!(body["globalPostingSumCents"], 50, "全账 SUM 应暴露 +50 缺口");
+    assert_eq!(body["journals"]["unbalanced"], 1, "应检出 1 条不平 journal");
+    assert!(
+        body["journals"]["unbalancedIds"].as_array().unwrap().iter().any(|v| v == "j_bad"),
+        "不平 journal 应列出 j_bad 供 triage"
+    );
+    assert_eq!(body["accounts"]["mismatched"], 1, "wallet 账户物化余额应与 postings 之和不符");
+}
+
 // ---------------- 风控 + 工单 ----------------
 
 #[tokio::test]

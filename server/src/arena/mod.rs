@@ -16,7 +16,12 @@
 //! 红线（规格 §2.5，写进实现+测试）：买过程不买结果；无免死端点；胜者奖励非强度；淘汰不可逆需同意门控。
 //! seam（诚实标注）：礼物→引擎回合真实影响——arena_env_events 已记录并进战报，注入 LLM RoundInput 需
 //!   runtime 扩展（HA 域），本期不接；arbiter rule_refs 注入 world_events.arbiter_note 亦为 runtime seam，
-//!   report 读取该列作判定依据。复活/礼物实际扣费经 billing（跨 feature）留 TODO。
+//!   report 读取该列作判定依据。
+//!
+//! 复活扣费（P2，feature=arena → ledger 恒在）：复活「资格」价从世界模板 `revive_price_cents` 读
+//!   （题材维度定价；模板缺失/未定价 → 0 → 免费复活，保留旧行为）。经 `ledger::charge` 扣钱包，
+//!   **平台服务不分成**（charge 传 world_id=None → 全额入平台）——买的是「进复活赛的资格（过程）」，
+//!   不是免死/改判（结果）。charge 与写 grant 同一事务原子；余额不足 409 → tx 回滚零副作用（无 grant/journal）。
 
 use std::collections::BTreeMap;
 
@@ -429,6 +434,19 @@ struct ReviveReq {
     cloud_character_id: String,
 }
 
+/// 复活资格定价（分）：溯源 world → template.revive_price_cents。
+/// 模板不存在 / 该列未设 → 0（免费复活，保留旧行为）。价来自模板但复活仍不分成（见 revive_match 红线）。
+async fn revive_price_cents(db: &AnyPool, world_id: &str) -> Result<i64, ApiError> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        "SELECT COALESCE(t.revive_price_cents, 0) FROM worlds w \
+         JOIN world_templates t ON w.template_id = t.id WHERE w.id = ?",
+    )
+    .bind(world_id)
+    .fetch_optional(db)
+    .await?;
+    Ok(row.map(|(p,)| p).unwrap_or(0))
+}
+
 /// 复活赛「资格」：仅记 eligibility。红线（§2.5）——买的是复活赛资格（过程），不是免死、不改最终判定（结果）。
 async fn revive_match(
     State(state): State<AppState>,
@@ -458,9 +476,15 @@ async fn revive_match(
         return Err(ApiError::NotFound);
     }
 
-    // 仅记资格。TODO(seam)：实际扣费经 billing 集成（跨 feature）——billing::charge(user, revive_sku)，本期不接。
-    // 绝不在此设置任何免死/复活落定标志，也不触碰 eliminations / winner。
+    // 复活资格定价：从世界模板 revive_price_cents 读（模板缺失/未定价 → 0 → 免费复活）。读只在 pool 上，先于 tx。
+    let price = revive_price_cents(&state.db, &world_id).await?;
+
+    // 扣费 + 记资格（同一事务原子）。**红线**：复活是平台服务，charge 传 world_id=None → 全额入平台、不分成
+    // （买过程不买结果，避免「付费改判」观感）。charge 成功 ≠ 免死——仅写 status='eligible'，
+    // 绝不设任何免死/复活落定标志、绝不触碰 eliminations / winner。余额不足 → 409，tx 回滚零副作用。
     let grant_id = new_id("rv");
+    let mut tx = state.db.begin().await?;
+    crate::ledger::charge(&mut tx, &user.user_id, price, "revive", "revive_grant", &grant_id, None).await?;
     sqlx::query(
         "INSERT INTO arena_revive_grants (id, world_id, character_id, user_id, status, created_at) \
          VALUES (?, ?, ?, ?, 'eligible', ?)",
@@ -470,8 +494,9 @@ async fn revive_match(
     .bind(&body.cloud_character_id)
     .bind(&user.user_id)
     .bind(now_ms())
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     let resp = json!({
         "reviveGrantId": grant_id,

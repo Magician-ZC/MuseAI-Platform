@@ -104,6 +104,35 @@ pub async fn record_risk(
     Ok(())
 }
 
+/// `record_risk` 的事务内变体：在调用方已开启的 tx 内写 `risk_events`，与业务副作用原子。
+///
+/// 用于扣费口 `ledger::charge` 的可疑交易留痕（未成年 owner 分成挂账 / 自打赏防刷 / 异常大额）——
+/// 这些留痕必须与扣费在同一事务：要么随扣费一起提交，要么随回滚一起消失（绝不产生「记了险但没扣款」
+/// 或反之的错位账）。且单连接池（测试/SQLite）下不可再向池借连接，必须复用 tx，否则死锁 PoolTimedOut。
+///
+/// feature 与 ledger 一致（`any(billing, arena)`）：仅经济模块编译进来时才有调用者。
+#[cfg(any(feature = "billing", feature = "arena"))]
+pub async fn record_risk_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    user_id: Option<&str>,
+    world_id: Option<&str>,
+    kind: &str,
+    detail: serde_json::Value,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        "INSERT INTO risk_events (id, user_id, world_id, kind, detail_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(crate::db::new_id("risk"))
+    .bind(user_id)
+    .bind(world_id)
+    .bind(kind)
+    .bind(detail.to_string())
+    .bind(crate::db::now_ms())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 pub fn verdict_str(v: ModerationVerdict) -> &'static str {
     match v {
         ModerationVerdict::Approved => "approved",

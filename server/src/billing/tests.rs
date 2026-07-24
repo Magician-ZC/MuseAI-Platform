@@ -340,3 +340,59 @@ async fn no_withdraw_or_transfer_endpoints() {
         assert_eq!(gs, StatusCode::NOT_FOUND, "GET {uri} 不应存在（余额不可提现/转账红线）");
     }
 }
+
+// ---------- P0 复式账本双写（新账本 ledger_accounts/journals/postings） ----------
+
+/// 复式账户余额（无行视为 0）。
+async fn acct_balance(db: &sqlx::AnyPool, id: &str) -> i64 {
+    let row: Option<(i64,)> = sqlx::query_as("SELECT balance_cents FROM ledger_accounts WHERE id = ?")
+        .bind(id)
+        .fetch_optional(db)
+        .await
+        .unwrap();
+    row.map(|(b,)| b).unwrap_or(0)
+}
+
+/// 不平衡 journal 数（红线：每 journal SUM(postings)==0，应恒为 0）。
+async fn unbalanced_journals(db: &sqlx::AnyPool) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM (SELECT journal_id FROM ledger_postings GROUP BY journal_id HAVING SUM(delta_cents) <> 0) t",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap()
+}
+
+/// 红线（P0）：充值/退款同事务双写复式账本（user_wallet + platform_recharge_source），
+/// 与 billing_balances / ledger_entries 三账恒等；每 journal SUM(postings)==0。
+#[tokio::test]
+async fn recharge_and_refund_double_write_new_ledger() {
+    let state = test_state().await;
+    seed_user(&state, "dw", 1).await;
+    let app = build_router(state.clone());
+    let tk = token(&state, "dw");
+
+    // 充值 5000：CR user_wallet(+5000) / DR platform_recharge_source(−5000)
+    let (st, body) = post(&app, "/api/billing/orders", &tk, Some("dw-1"), json!({"kind":"recharge","amountCents":5000})).await;
+    assert_eq!(st, StatusCode::OK);
+    let oid = body["orderId"].as_str().unwrap().to_string();
+    assert_eq!(acct_balance(&state.db, "acct_wallet_dw").await, 5000);
+    assert_eq!(acct_balance(&state.db, "acct_platform_recharge_source").await, -5000);
+    // 恒等：user_wallet == billing_balances == SUM(ledger_entries)
+    assert_eq!(balance_row(&state.db, "dw").await, 5000);
+    assert_eq!(ledger_sum(&state.db, "dw").await, 5000);
+    assert_eq!(unbalanced_journals(&state.db).await, 0);
+
+    // 退款：DR user_wallet(−5000) / CR platform_recharge_source(+5000) → 两账归零，不出金
+    let (rst, _) = post(&app, "/api/billing/refunds", &tk, Some("dw-r1"), json!({"orderId": oid})).await;
+    assert_eq!(rst, StatusCode::OK);
+    assert_eq!(acct_balance(&state.db, "acct_wallet_dw").await, 0);
+    assert_eq!(acct_balance(&state.db, "acct_platform_recharge_source").await, 0);
+    assert_eq!(balance_row(&state.db, "dw").await, 0);
+    assert_eq!(ledger_sum(&state.db, "dw").await, 0);
+    assert_eq!(unbalanced_journals(&state.db).await, 0);
+
+    // 每笔业务一个 journal：充值 + 退款 = 2
+    let jc: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ledger_journals").fetch_one(&state.db).await.unwrap();
+    assert_eq!(jc, 2);
+}

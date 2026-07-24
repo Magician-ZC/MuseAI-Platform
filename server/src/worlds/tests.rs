@@ -496,3 +496,274 @@ async fn events_query_enforces_audience_isolation() {
     assert_eq!(b_events.len(), 1, "B 只应见 public");
     assert_eq!(b_events[0]["visibility"], "public");
 }
+
+// ---------- P2 房主建房 POST /worlds + 开房费 charge（feature=billing/arena 才装配该端点） ----------
+
+#[cfg(any(feature = "billing", feature = "arena"))]
+mod room_open {
+    //! 房主建房 + 开房费扣费：分成认 template.owner（创作者），自建自房归零，余额不足零副作用，免费房保留。
+    use super::*;
+    use sqlx::AnyPool;
+
+    async fn seed_user_age(db: &AnyPool, id: &str, age: i64) {
+        sqlx::query(
+            "INSERT INTO users (id, nickname, age_declared, status, created_at, updated_at) VALUES (?, '', ?, 'active', ?, ?)",
+        )
+        .bind(id)
+        .bind(age)
+        .bind(now_ms())
+        .bind(now_ms())
+        .execute(db)
+        .await
+        .unwrap();
+    }
+
+    /// 造模板：owner=Some → 创作者模板（official=0）；None → 官方（official=1, owner NULL）。设开房费 + 可选分成率。
+    /// moderation='approved'、withdrawn=0（可建房）。
+    async fn seed_template(db: &AnyPool, id: &str, owner: Option<&str>, room_open_price: i64, bps: Option<i64>) {
+        let official = if owner.is_some() { 0 } else { 1 };
+        sqlx::query(
+            "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, official, version, moderation, owner_id, revenue_share_bps, room_open_price_cents, withdrawn, created_at) \
+             VALUES (?, '模板房', 'idle', '{}', '{\"mode\":\"open\"}', ?, 1, 'approved', ?, ?, ?, 0, ?)",
+        )
+        .bind(id)
+        .bind(official)
+        .bind(owner)
+        .bind(bps)
+        .bind(room_open_price)
+        .bind(now_ms())
+        .execute(db)
+        .await
+        .unwrap();
+    }
+
+    /// 充值钱包（镜像 billing 双写），保证起点 user_wallet == billing_balances。
+    async fn fund_wallet(db: &AnyPool, uid: &str, amount: i64) {
+        let mut tx = db.begin().await.unwrap();
+        crate::ledger::post_journal(
+            &mut tx,
+            "recharge",
+            "order",
+            "seed",
+            None,
+            &[
+                crate::ledger::Posting {
+                    account: crate::ledger::AccountRef::UserWallet(uid.to_string()),
+                    delta_cents: amount,
+                },
+                crate::ledger::Posting {
+                    account: crate::ledger::AccountRef::PlatformRechargeSource,
+                    delta_cents: -amount,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO billing_balances (user_id, balance_cents, updated_at) VALUES (?, ?, ?) \
+             ON CONFLICT(user_id) DO UPDATE SET balance_cents = billing_balances.balance_cents + excluded.balance_cents, updated_at = excluded.updated_at",
+        )
+        .bind(uid)
+        .bind(amount)
+        .bind(now_ms())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    async fn acct_balance(db: &AnyPool, account_id: &str) -> i64 {
+        let row: Option<(i64,)> = sqlx::query_as("SELECT balance_cents FROM ledger_accounts WHERE id = ?")
+            .bind(account_id)
+            .fetch_optional(db)
+            .await
+            .unwrap();
+        row.map(|(b,)| b).unwrap_or(0)
+    }
+
+    async fn billing_balance(db: &AnyPool, uid: &str) -> i64 {
+        let row: Option<(i64,)> = sqlx::query_as("SELECT balance_cents FROM billing_balances WHERE user_id = ?")
+            .bind(uid)
+            .fetch_optional(db)
+            .await
+            .unwrap();
+        row.map(|(b,)| b).unwrap_or(0)
+    }
+
+    async fn count_sql(db: &AnyPool, sql: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>(sql).fetch_one(db).await.unwrap()
+    }
+
+    /// 红线不变量：每 journal SUM(postings)==0。返回不平衡 journal 数（应为 0）。
+    async fn unbalanced_journals(db: &AnyPool) -> i64 {
+        count_sql(
+            db,
+            "SELECT COUNT(*) FROM (SELECT journal_id FROM ledger_postings GROUP BY journal_id HAVING SUM(delta_cents) <> 0) t",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn create_room_charges_open_fee_and_shares_to_owner() {
+        // 房主用创作者模板建房：开房费 1000，默认分成 70% → 创作者 700 + 平台 300；世界落库归属房主。
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_user_age(&state.db, "creator", 1).await;
+        seed_user_age(&state.db, "host", 1).await;
+        seed_template(&state.db, "tpl", Some("creator"), 1000, None).await;
+        fund_wallet(&state.db, "host", 2000).await;
+
+        let th = token(&state, "host");
+        let (s, v) = post_json(
+            &app,
+            "/api/worlds",
+            &th,
+            Some("k-room"),
+            json!({ "templateId": "tpl", "title": "我的房", "visibility": "public" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "body={v}");
+        let wid = v["worldId"].as_str().unwrap().to_string();
+        assert_eq!(v["roomOpenPriceCents"], 1000);
+        assert_eq!(v["charge"]["chargedCents"], 1000);
+        assert_eq!(v["charge"]["creatorEarningsCents"], 700);
+        assert_eq!(v["charge"]["platformRevenueCents"], 300);
+
+        // 世界落库：归属房主、指向模板、可见性 public、room_type 取自模板。
+        let w = load_world(&state.db, &wid).await.unwrap();
+        assert_eq!(w.host_user_id.as_deref(), Some("host"));
+        assert_eq!(w.template_id, "tpl");
+        assert_eq!(w.visibility, "public");
+        assert_eq!(w.room_type, "idle");
+        assert_eq!(count_sql(&state.db, &format!("SELECT COUNT(*) FROM world_budgets WHERE world_id='{wid}'")).await, 1);
+
+        // 扣费 + 分成：host 2000 − 1000 = 1000；creator 700；平台 300。分成认 template.owner（非房主）。
+        assert_eq!(billing_balance(&state.db, "host").await, 1000);
+        assert_eq!(acct_balance(&state.db, "acct_wallet_host").await, 1000);
+        assert_eq!(acct_balance(&state.db, "acct_creator_creator").await, 700);
+        assert_eq!(acct_balance(&state.db, "acct_platform_revenue").await, 300);
+        assert_eq!(unbalanced_journals(&state.db).await, 0);
+        // journal reason=room_open，ref_id/world_id 均为新世界（审计溯源）。
+        assert_eq!(
+            count_sql(
+                &state.db,
+                &format!("SELECT COUNT(*) FROM ledger_journals WHERE reason='room_open' AND ref_id='{wid}' AND world_id='{wid}'")
+            )
+            .await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn create_room_self_owned_template_no_share() {
+        // 自建自房防刷：host == 模板 owner → 分成归零，全额入平台。
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_user_age(&state.db, "host", 1).await;
+        seed_template(&state.db, "tpl_self", Some("host"), 1000, None).await;
+        fund_wallet(&state.db, "host", 2000).await;
+
+        let th = token(&state, "host");
+        let (s, v) = post_json(&app, "/api/worlds", &th, None, json!({ "templateId": "tpl_self" })).await;
+        assert_eq!(s, StatusCode::OK, "body={v}");
+        assert_eq!(v["charge"]["creatorEarningsCents"], 0, "自建自房分成必须归零");
+        assert_eq!(v["charge"]["platformRevenueCents"], 1000);
+        assert_eq!(acct_balance(&state.db, "acct_creator_host").await, 0, "自建自房不得给自己产分成");
+        assert_eq!(acct_balance(&state.db, "acct_platform_revenue").await, 1000);
+        assert_eq!(billing_balance(&state.db, "host").await, 1000);
+        assert_eq!(unbalanced_journals(&state.db).await, 0);
+    }
+
+    #[tokio::test]
+    async fn create_room_free_when_price_zero() {
+        // 免费房：开房费 0 → charge no-op（不产 journal），保留免费开房能力；默认可见性 private。
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_user_age(&state.db, "host", 1).await;
+        seed_template(&state.db, "tpl_free", None, 0, None).await; // 官方模板 owner NULL，开房费 0
+
+        let th = token(&state, "host");
+        let (s, v) = post_json(&app, "/api/worlds", &th, None, json!({ "templateId": "tpl_free" })).await;
+        assert_eq!(s, StatusCode::OK, "body={v}");
+        let wid = v["worldId"].as_str().unwrap().to_string();
+        assert_eq!(v["charge"]["chargedCents"], 0);
+        assert_eq!(v["visibility"], "private", "未传可见性默认 private");
+        assert_eq!(count_sql(&state.db, "SELECT COUNT(*) FROM ledger_journals WHERE reason='room_open'").await, 0, "免费开房不产 journal");
+        assert_eq!(billing_balance(&state.db, "host").await, 0);
+        assert!(load_world(&state.db, &wid).await.is_ok(), "免费房仍建成");
+    }
+
+    #[tokio::test]
+    async fn create_room_insufficient_balance_rejected_zero_side_effects() {
+        // 余额不足拒付 → 409，零副作用（无 world/budget/journal，钱包不动）。
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_user_age(&state.db, "creator", 1).await;
+        seed_user_age(&state.db, "host", 1).await;
+        seed_template(&state.db, "tpl", Some("creator"), 1000, None).await;
+        fund_wallet(&state.db, "host", 500).await; // < 1000
+
+        let th = token(&state, "host");
+        let (s, _v) = post_json(&app, "/api/worlds", &th, None, json!({ "templateId": "tpl" })).await;
+        assert_eq!(s, StatusCode::CONFLICT, "余额不足应 409");
+
+        assert_eq!(count_sql(&state.db, "SELECT COUNT(*) FROM worlds WHERE host_user_id='host'").await, 0, "余额不足不得建房");
+        assert_eq!(count_sql(&state.db, "SELECT COUNT(*) FROM ledger_journals WHERE reason='room_open'").await, 0, "余额不足不得产 journal");
+        assert_eq!(billing_balance(&state.db, "host").await, 500, "钱包不动");
+    }
+
+    #[tokio::test]
+    async fn create_room_rejects_missing_or_unavailable_template() {
+        // 模板不存在 → 404；未审核/已撤回 → 409（均在扣费前，零账务副作用）。
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_user_age(&state.db, "host", 1).await;
+        let th = token(&state, "host");
+
+        let (s, _) = post_json(&app, "/api/worlds", &th, None, json!({ "templateId": "ghost" })).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+
+        sqlx::query(
+            "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, official, version, moderation, owner_id, room_open_price_cents, withdrawn, created_at) \
+             VALUES ('tpl_pending','t','idle','{}','{\"mode\":\"open\"}',0,1,'pending','host',0,0,?)",
+        )
+        .bind(now_ms())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let (s2, _) = post_json(&app, "/api/worlds", &th, None, json!({ "templateId": "tpl_pending" })).await;
+        assert_eq!(s2, StatusCode::CONFLICT, "未审核模板不得建房");
+
+        sqlx::query(
+            "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, official, version, moderation, owner_id, room_open_price_cents, withdrawn, created_at) \
+             VALUES ('tpl_wd','t','idle','{}','{\"mode\":\"open\"}',0,1,'approved','host',0,1,?)",
+        )
+        .bind(now_ms())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let (s3, _) = post_json(&app, "/api/worlds", &th, None, json!({ "templateId": "tpl_wd" })).await;
+        assert_eq!(s3, StatusCode::CONFLICT, "已撤回模板不得建房");
+    }
+
+    #[tokio::test]
+    async fn create_room_idempotent_no_double_charge() {
+        // 幂等：同 Idempotency-Key 重投 → 缓存返回，不双扣、不重复建房。
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_user_age(&state.db, "creator", 1).await;
+        seed_user_age(&state.db, "host", 1).await;
+        seed_template(&state.db, "tpl", Some("creator"), 1000, None).await;
+        fund_wallet(&state.db, "host", 2000).await;
+        let th = token(&state, "host");
+
+        let (s1, v1) = post_json(&app, "/api/worlds", &th, Some("k-1"), json!({ "templateId": "tpl", "visibility": "public" })).await;
+        assert_eq!(s1, StatusCode::OK, "body={v1}");
+        let (s2, v2) = post_json(&app, "/api/worlds", &th, Some("k-1"), json!({ "templateId": "tpl", "visibility": "public" })).await;
+        assert_eq!(s2, StatusCode::OK, "body={v2}");
+        assert_eq!(v1["worldId"], v2["worldId"], "同 key 重投返回同一世界");
+        assert_eq!(billing_balance(&state.db, "host").await, 1000, "幂等重投不得双扣");
+        assert_eq!(count_sql(&state.db, "SELECT COUNT(*) FROM ledger_journals WHERE reason='room_open'").await, 1, "幂等重投只产一笔 journal");
+        assert_eq!(count_sql(&state.db, "SELECT COUNT(*) FROM worlds WHERE host_user_id='host'").await, 1, "幂等重投只建一个世界");
+    }
+}

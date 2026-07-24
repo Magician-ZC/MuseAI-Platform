@@ -8,6 +8,7 @@
 //!   世界运营：GET /admin/worlds?status=、GET /admin/worlds/{id}/diagnostics（脱敏诊断）、
 //!            POST /admin/worlds/{id}/pause|resume、POST /admin/worlds（官方建房）、GET/POST /admin/world-templates
 //!   经济运营：GET /admin/economy/overview（真实只读聚合：充值/退款/余额/礼物/订单状态，不建结算）
+//!            GET /admin/ledger/reconcile（P4：全账复式恒等 SUM=0 + 账户物化余额对账，finance 只读，无提现）
 //!   数据看板：GET /admin/metrics/overview（SQL 聚合）
 //!   治理：    GET/POST /admin/prompts、POST /admin/prompts/{id}/activate|canary、
 //!            GET/POST /admin/model-routes、POST /admin/model-routes/{id}/activate（一键回滚=激活旧版本）
@@ -30,6 +31,7 @@ mod audit;
 mod dashboards;
 mod governance;
 mod ops;
+mod reconcile;
 mod users;
 mod worlds_ops;
 
@@ -67,6 +69,8 @@ pub fn router() -> Router<AppState> {
         )
         // 经济运营（真实只读聚合）
         .route("/admin/economy/overview", get(dashboards::economy_overview))
+        // 财务对账（P4 合规增强）：全账复式恒等 + 账户物化余额对账（finance/admin 只读，无提现）
+        .route("/admin/ledger/reconcile", get(reconcile::ledger_reconcile))
         // 数据看板
         .route("/admin/metrics/overview", get(dashboards::metrics_overview))
         // 模型与 Prompt 治理

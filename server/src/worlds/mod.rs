@@ -16,7 +16,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sqlx::{AnyPool, Row};
+use sqlx::{Any, AnyPool, Row, Transaction};
 
 use crate::app::AppState;
 use crate::auth::AuthUser;
@@ -448,35 +448,37 @@ impl CreateWorldParams {
 }
 
 #[allow(dead_code)]
-async fn active_version(db: &AnyPool, table: &str) -> Result<Option<String>, ApiError> {
+async fn active_version_tx(tx: &mut Transaction<'_, Any>, table: &str) -> Result<Option<String>, ApiError> {
     let sql = format!("SELECT version FROM {table} WHERE active = 1 ORDER BY created_at DESC LIMIT 1");
-    let row = sqlx::query(&sql).fetch_optional(db).await?;
+    let row = sqlx::query(&sql).fetch_optional(&mut **tx).await?;
     Ok(match row {
         Some(r) => Some(r.try_get("version")?),
         None => None,
     })
 }
 
-/// 建房：钉住引擎/prompt/模型/模板版本，写 worlds + world_budgets。返回 world_id。
-/// 官方建房由 admin S6 调用；房主建房（P4b）亦复用本函数。
+/// 建房（事务版）：钉住引擎/prompt/模型/模板版本，写 worlds + world_budgets，返回 world_id。
+/// **在调用方已开启的事务内执行**——P4b 房主建房把它与开房费 `ledger::charge` 组进同一 tx，
+/// charge 失败即随 tx 回滚（零副作用，无 world/budget/journal 残留）；charge 的 resolve_share 需 world 已在 tx 内落库，
+/// 故建房必须先于 charge。官方建房经下面的 `create_world` 薄封装（自开自提交 tx）。
 #[allow(dead_code)]
-pub async fn create_world(db: &AnyPool, p: CreateWorldParams) -> Result<String, ApiError> {
+pub async fn create_world_tx(tx: &mut Transaction<'_, Any>, p: CreateWorldParams) -> Result<String, ApiError> {
     let engine_version = match p.engine_version {
         Some(v) => v,
         None => muse_engine::ENGINE_VERSION.to_string(),
     };
     let prompt_set_version = match p.prompt_set_version {
         Some(v) => v,
-        None => active_version(db, "prompt_versions").await?.unwrap_or_else(|| "dev-none".into()),
+        None => active_version_tx(tx, "prompt_versions").await?.unwrap_or_else(|| "dev-none".into()),
     };
     let model_route_version = match p.model_route_version {
         Some(v) => v,
-        None => active_version(db, "model_routes").await?.unwrap_or_else(|| "dev-none".into()),
+        None => active_version_tx(tx, "model_routes").await?.unwrap_or_else(|| "dev-none".into()),
     };
     let now = now_ms();
     let id = new_id("wld");
     let status = p.status.unwrap_or_else(|| "open".into());
-    // 防御式归一化：本函数 admin 入口已做枚举校验，但 P4b 房主建房亦复用；非法值兜底为 interval，
+    // 防御式归一化：admin 入口已做枚举校验，但 P4b 房主建房亦复用；非法值兜底为 interval，
     // 保证落库的 timeline_mode 恒为调度器可分派的合法枚举（interval/event）。
     let timeline_mode = if matches!(p.timeline_mode.as_str(), "interval" | "event") {
         p.timeline_mode.as_str()
@@ -508,7 +510,7 @@ pub async fn create_world(db: &AnyPool, p: CreateWorldParams) -> Result<String, 
     .bind(p.initial_state_json.unwrap_or_else(|| "{}".into()))
     .bind(now)
     .bind(now)
-    .execute(db)
+    .execute(&mut **tx)
     .await?;
 
     sqlx::query(
@@ -519,16 +521,168 @@ pub async fn create_world(db: &AnyPool, p: CreateWorldParams) -> Result<String, 
     .bind(p.daily_token_budget)
     .bind(p.daily_cny_budget_cents)
     .bind(now)
-    .execute(db)
+    .execute(&mut **tx)
     .await?;
 
     Ok(id)
 }
 
+/// 建房（薄封装）：自开自提交事务调 `create_world_tx`。官方建房（admin S6）及 test 复用本签名。
+/// 房主建房走 `POST /worlds` 的 `create_room`（把建房 + 开房费 charge 组进同一 tx，不走此封装）。
+#[allow(dead_code)]
+pub async fn create_world(db: &AnyPool, p: CreateWorldParams) -> Result<String, ApiError> {
+    let mut tx = db.begin().await?;
+    let id = create_world_tx(&mut tx, p).await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
 pub fn router() -> Router<AppState> {
+    // 房主建房 POST /worlds 携开房费 charge（P4b），依赖 `ledger`（feature=billing/arena 才装配）；
+    // 无经济 feature 时不暴露该端点（GET /worlds 大厅列表恒在）。feature 一致，见 app.rs / ledger 门控。
+    #[cfg(any(feature = "billing", feature = "arena"))]
+    let worlds_route = get(list_worlds).post(create_room);
+    #[cfg(not(any(feature = "billing", feature = "arena")))]
+    let worlds_route = get(list_worlds);
+
     Router::new()
-        .route("/worlds", get(list_worlds))
+        .route("/worlds", worlds_route)
         .route("/worlds/{id}", get(world_detail))
         .route("/worlds/{id}/join", post(join_world))
         .route("/worlds/{id}/leave", post(leave_world))
+}
+
+// ---------- 房主建房（POST /worlds）+ 开房费 charge（P4b/P2，feature=billing/arena） ----------
+
+/// 房主建房请求。`templateId` 必填（用哪个模板建房，决定 room_type/版本/开房费/分成对手方）；
+/// `visibility` 仅 public/private（official 是运营专属，房主不可自建官方房）；其余留空取默认。
+#[cfg(any(feature = "billing", feature = "arena"))]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateRoomReq {
+    template_id: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    visibility: Option<String>,
+    #[serde(default)]
+    member_limit: Option<i64>,
+    #[serde(default)]
+    tick_per_day: Option<i64>,
+}
+
+/// POST /worlds：房主建房 + 开房费扣费（单事务，账本红线集中在 ledger::charge）。
+///
+/// 流程：模板校验（存在 + approved + 未撤回，读 owner/room_type/版本/开房费）→ 幂等 guard →
+///   开事务 → `create_world_tx`（先建房，charge 分成溯源需 world 已落库）→
+///   `ledger::charge(host, 开房费, "room_open", world_id=Some(新世界))`（分成给模板 owner；
+///   自打赏防刷/未成年 owner 挂平台/取整余数归平台/SUM=0 全在 charge 内守；余额不足 409 → tx 回滚零副作用）→ 提交。
+///
+/// 红线：
+/// - 建房**不设年龄硬门**（建房 ≠ 充值；但消费余额只能来自已 age-gate 的充值 → 未成年余额恒 0 →
+///   开房费 > 0 时必然余额不足 409；免费房 room_open_price==0 走 charge no-op 仍可建）。
+/// - 分成认 **template.owner_id**（创作者），非 worlds.host_user_id（房主）；官方模板 owner NULL → 全额平台。
+/// - 免费房（开房费 0）保留：charge no-op 不产 journal。
+#[cfg(any(feature = "billing", feature = "arena"))]
+async fn create_room(
+    State(state): State<AppState>,
+    user: AuthUser,
+    headers: HeaderMap,
+    Json(body): Json<CreateRoomReq>,
+) -> Result<Json<Value>, ApiError> {
+    // 模板校验（读只在 pool 上，先于 tx；释放连接后再 begin，单连接池不自锁）。
+    let tpl = sqlx::query(
+        "SELECT title, room_type, version, moderation, COALESCE(withdrawn, 0) AS withdrawn, \
+         COALESCE(room_open_price_cents, 0) AS price FROM world_templates WHERE id = ?",
+    )
+    .bind(&body.template_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or(ApiError::NotFound)?;
+    let moderation: String = tpl.try_get("moderation")?;
+    let withdrawn: i64 = tpl.try_get("withdrawn")?;
+    if moderation != "approved" {
+        return Err(ApiError::Conflict("template_not_approved".into()));
+    }
+    if withdrawn != 0 {
+        return Err(ApiError::Conflict("template_withdrawn".into()));
+    }
+    let tpl_title: String = tpl.try_get("title")?;
+    let room_type: String = tpl.try_get("room_type")?;
+    let template_version: i64 = tpl.try_get("version")?;
+    let room_open_price: i64 = tpl.try_get("price")?;
+
+    // 房主建房可见性仅 public/private（official 运营专属）。缺省 private。
+    let visibility = match body.visibility.as_deref() {
+        Some("public") => "public",
+        None | Some("private") => "private",
+        Some(_) => return Err(ApiError::BadRequest("visibility 仅支持 public/private".into())),
+    };
+    let title = match &body.title {
+        Some(t) if !t.trim().is_empty() => t.clone(),
+        _ => tpl_title,
+    };
+    let member_limit = body.member_limit.unwrap_or(10).clamp(1, 100);
+    let tick_per_day = body.tick_per_day.unwrap_or(3).clamp(1, 100);
+
+    // 幂等：同 key 同载荷 → 缓存返回（不双扣不双建）。
+    let idem_key = headers.get("Idempotency-Key").and_then(|v| v.to_str().ok());
+    let payload_hash = idempotency::hash_payload(&serde_json::to_vec(&body).unwrap_or_default());
+    let guard = idempotency::guard(&state.db, &user.user_id, "worlds.create", idem_key, &payload_hash).await?;
+    if let Some(cached) = &guard.cached_response {
+        return Ok(Json(serde_json::from_str(cached).unwrap_or(json!({}))));
+    }
+
+    let params = CreateWorldParams {
+        template_id: body.template_id.clone(),
+        template_version,
+        room_type: room_type.clone(),
+        title,
+        visibility: visibility.into(),
+        host_user_id: Some(user.user_id.clone()),
+        member_limit,
+        tick_per_day,
+        // 房主房沿用保守默认预算（B-2：非零 token/cny 上限，避免成本失控）。
+        daily_token_budget: 200_000,
+        daily_cny_budget_cents: 2_000,
+        status: None,
+        timeline_mode: "interval".into(),
+        engine_version: None,
+        prompt_set_version: None,
+        model_route_version: None,
+        assembled_json: None,
+        initial_state_json: None,
+    };
+
+    // 单事务：建房 + 开房费 charge 原子。先建房（charge 溯源分成需 world 已在 tx 内），再 charge。
+    let mut tx = state.db.begin().await?;
+    let world_id = create_world_tx(&mut tx, params).await?;
+    let receipt = crate::ledger::charge(
+        &mut tx,
+        &user.user_id,
+        room_open_price,
+        "room_open",
+        "world",
+        &world_id,
+        Some(&world_id),
+    )
+    .await?;
+    tx.commit().await?;
+
+    let resp = json!({
+        "worldId": world_id,
+        "templateId": body.template_id,
+        "roomType": room_type,
+        "visibility": visibility,
+        "hostUserId": user.user_id,
+        "roomOpenPriceCents": room_open_price,
+        // 开房费分账明细（诚实标注）：创作者分成 + 平台抽成（自打赏/官方模板/未成年 owner → 创作者 0）。
+        "charge": {
+            "chargedCents": receipt.charged_cents,
+            "creatorEarningsCents": receipt.creator_earnings_cents,
+            "platformRevenueCents": receipt.platform_revenue_cents,
+        },
+    });
+    guard.store_response(&state.db, &resp.to_string()).await?;
+    Ok(Json(resp))
 }

@@ -188,6 +188,26 @@ async fn create_order(
     .bind(now)
     .execute(&mut *tx)
     .await?;
+    // 复式账本双写（P0）：充值 = CR user_wallet(+amount) / DR platform_recharge_source(−amount)，同 journal SUM=0。
+    // user_wallet 账户余额与上面的 billing_balances 恒等（物化视图），对账测试守。
+    crate::ledger::post_journal(
+        &mut tx,
+        "recharge",
+        "order",
+        &order_id,
+        None,
+        &[
+            crate::ledger::Posting {
+                account: crate::ledger::AccountRef::UserWallet(user.user_id.clone()),
+                delta_cents: req.amount_cents,
+            },
+            crate::ledger::Posting {
+                account: crate::ledger::AccountRef::PlatformRechargeSource,
+                delta_cents: -req.amount_cents,
+            },
+        ],
+    )
+    .await?;
     sqlx::query("UPDATE orders SET status = 'fulfilled', updated_at = ? WHERE id = ?")
         .bind(now)
         .bind(&order_id)
@@ -274,6 +294,26 @@ async fn create_refund(
                 .bind(&user.user_id)
                 .execute(&mut *tx)
                 .await?;
+            // 复式账本双写（P0）：退款逆向 = DR user_wallet(−amount) / CR platform_recharge_source(+amount)，SUM=0。
+            // 退款只回退钱包、不出金（对齐红线：无提现出口）；三账（新账本/billing_balances/ledger_entries）恒等。
+            crate::ledger::post_journal(
+                &mut tx,
+                "refund",
+                "order",
+                &order_id,
+                None,
+                &[
+                    crate::ledger::Posting {
+                        account: crate::ledger::AccountRef::UserWallet(user.user_id.clone()),
+                        delta_cents: -amount,
+                    },
+                    crate::ledger::Posting {
+                        account: crate::ledger::AccountRef::PlatformRechargeSource,
+                        delta_cents: amount,
+                    },
+                ],
+            )
+            .await?;
             sqlx::query("UPDATE orders SET status = 'refunded', updated_at = ? WHERE id = ?")
                 .bind(now)
                 .bind(&order_id)

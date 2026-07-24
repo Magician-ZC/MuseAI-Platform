@@ -56,6 +56,10 @@ pub fn build_router(state: AppState) -> Router {
     #[cfg(feature = "billing")]
     let api = api.merge(crate::billing::router());
 
+    // P3 平台售卖（云成长 / 平台道具售卖 / 创作者收益查询）：依赖复式账本，与 ledger 同 feature 门控。
+    #[cfg(any(feature = "billing", feature = "arena"))]
+    let api = api.merge(crate::shop::router());
+
     Router::new()
         .nest("/api", api)
         .layer(tower_http::trace::TraceLayer::new_for_http())

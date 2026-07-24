@@ -31,6 +31,12 @@ mod clips;
 mod livegate;
 #[cfg(feature = "billing")]
 mod billing;
+// 复式账本（P0）：billing 充值/退款双写 + 各付费点统一扣费口。feature 与经济模块（billing/arena）一致。
+#[cfg(any(feature = "billing", feature = "arena"))]
+mod ledger;
+// P3 平台售卖：云成长服务位 + 平台道具单向售卖 + 创作者收益查询。依赖 ledger，feature 一致。
+#[cfg(any(feature = "billing", feature = "arena"))]
+mod shop;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

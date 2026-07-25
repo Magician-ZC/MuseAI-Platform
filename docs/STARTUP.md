@@ -178,9 +178,11 @@ curl -sX POST 127.0.0.1:8787/api/auth/challenge -H 'Content-Type: application/js
 
 ## 10. 文档索引
 
-- `docs/character-asset-p0-p2-product-dev-spec.md` — P0-P2 引擎产品/开发规格
-- `docs/platform-world-p3-p6-product-dev-spec.md` — P3-P6 平台产品/开发规格
-- `docs/build/BUILD-STATUS.md` — 全栈构建台账(含工程约定、git 禁令)
-- `docs/build/P4a-HARDENING.md` — P4a/P5 整体重审 triage 与加固记录
-- `docs/build/P4b-P6-BUILD.md` — P4b 计费 + P6 赛事房开发契约与验证
+- `PRODUCT.md` — 产品定位一页纸(指向总规格)
+- `docs/build/spec-world-ecosystem.md` — **世界生态总规格 v2**(24 条拍板,产品宪法+系统设计+衔接表+路线图,唯一权威产品文档)
+- `docs/build/rules-anti-farming.md` — 防刷/反重复收益规则(有效规则)
+- `docs/build/spec-subplot-cards.md` — 自定义房装配技术附录(命名空间/四段式种子/缝合;其 UGC 假设已被总规格取代)
+- `docs/build/example-idle-skeleton.md` — 软主线 skeleton 创作示例(内容制作参考)
 - `CLAUDE.md` — 仓库结构与惯例(给 AI 协作者)
+
+> 历史阶段文档(P0-P6 各期规格/台账/验收/试玩记录)已于 2026-07-25 清理,需要时查 git 历史(提交 `8bdea60` 之前)。

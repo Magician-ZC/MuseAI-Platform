@@ -9,7 +9,8 @@
 - **核心原则**：平权吃鸡（无主角、无数值强弱，戏份靠玩出来）、买过程不买结果、
   公共事实不可改、死亡 = 传记封卷而非资产清零。
 
-**唯一权威产品文档**：[`docs/build/spec-world-ecosystem.md`](docs/build/spec-world-ecosystem.md)
-（世界生态总规格 v2 —— 产品宪法 7 条 + 24 条拍板设计 + 已上线系统衔接表 + R1-R3 路线图）。
+**双轨策略**：开发按完整规格（[`docs/build/spec-world-ecosystem.md`](docs/build/spec-world-ecosystem.md)，
+红线 + 24 条默认策略 + 衔接表 + 路线图）继续；**发布按阶段验证**（[`docs/VALIDATION.md`](docs/VALIDATION.md)，
+T0-T5 商业假设逐层开闸）。**开发完成度决定"能不能打开"，用户数据决定"该不该打开"。**
 
 开发与启动：[`docs/STARTUP.md`](docs/STARTUP.md) · 仓库惯例：[`CLAUDE.md`](CLAUDE.md)

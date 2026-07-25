@@ -9,6 +9,10 @@ MuseAI is a local-first AI app for immersive character interaction. You can crea
 
 It is not just a chatbot, and it is not only a writing tool. MuseAI is a local AI interaction world that keeps your characters, settings, memories, and relationships in one place.
 
+> **Dual-track note**: this repository contains two forms.
+> **① Local mode (everything in this README)**: unchanged promises — all data stays on your own computer, the app itself is free, models are called with your own API key.
+> **② Platform Worlds (in development, not publicly released)**: an optional cloud multiplayer mode where you **actively publish** a character into shared story worlds. Strictly opt-in: nothing leaves your machine unless you publish; publishing offers **field-level consent** (you see exactly which fields are uploaded); governed by separate terms and billing. See [`PRODUCT.md`](PRODUCT.md) and [`docs/VALIDATION.md`](docs/VALIDATION.md).
+
 ![MuseAI home screen: local AI companions, text adventures, story-world isekai, bonds, and creative tools](assets/首页.png)
 
 ---
@@ -199,7 +203,7 @@ You can configure different models and parameters for companion chat, adventures
 
 ## Local Data Storage
 
-MuseAI stores your data locally and does not upload it to external servers except when you explicitly call your configured AI provider.
+In **local mode**, MuseAI stores your data locally and does not upload it to external servers except when you explicitly call your configured AI provider. (The future optional Platform Worlds mode uploads only what you explicitly publish, with field-level consent — see the dual-track note above.)
 
 User data is stored under `~/Documents/MuseAI/`:
 

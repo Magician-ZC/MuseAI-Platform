@@ -4,7 +4,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概览
 
-MuseAI 是一个 Tauri 2 桌面应用：本地 AI 伴侣 / 角色扮演 / 文字冒险 / 穿书互动 + 小说辅助创作工具。前端 React 19 + TypeScript + Vite + Ant Design v6 + Zustand（`src/`），后端 Rust（`src-tauri/src/`，lib 名为 `tauri_app_lib`）。所有数据以 JSON/文件形式存在本地 `~/Documents/MuseAI/`（无数据库），LLM 通过用户自己的 API Key 调用（OpenAI 兼容或 Anthropic 兼容接口）。
+MuseAI-Platform 是 MuseAI 的**双轨仓库**：
+- **本地轨**：Tauri 2 桌面应用——本地 AI 伴侣 / 角色扮演 / 文字冒险 / 穿书互动 + 小说辅助创作。前端 React 19 + TypeScript + Vite + antd v6 + Zustand（`src/`），桌面后端 Rust（`src-tauri/`，lib 名 `tauri_app_lib`）。本地数据存 `~/Documents/MuseAI/`，LLM 用用户自己的 API Key。
+- **平台轨**：多人世界平台——`crates/muse-engine`（宿主无关叙事引擎，trait 注入 ModelClient/fs/clock）+ `server/`（axum + sqlx AnyPool，SQLite dev / Postgres prod，迁移 `server/migrations/0001-0020` 启动自动执行）+ `admin/`（运营后台 React）+ `src/pages/platform/`（玩家端）。产品总规格 `docs/build/spec-world-ecosystem.md`，验证节奏 `docs/VALIDATION.md`，启动文档 `docs/STARTUP.md`。
+
+平台轨常用命令：
+```bash
+cd server && cargo run --features billing,arena                 # 起平台 server(:8787)
+cargo test --manifest-path server/Cargo.toml --features billing,arena
+cargo test --manifest-path crates/muse-engine/Cargo.toml
+cd admin && npm run build                                       # admin 类型检查+构建
+```
 
 ## 常用命令
 
@@ -74,3 +84,10 @@ CI（`.github/workflows/test.yml`）在 push/PR 时跑 `npm run test`、`npm run
 - UI 文案和后端错误信息均为简体中文。
 - 面向用户的功能文档在 `README.md`（中文）/`README_EN.md`，数据目录结构以 README「数据存储说明」为准。
 - Vite dev 端口固定 1420（strictPort），被占用会直接失败。
+
+## 平台轨工程三约束（绑定所有平台开发，详见 docs/VALIDATION.md）
+
+1. **未验证功能默认关闭**：新功能经 feature flag / 运营开关 / 数据配置启用，不随代码合并自动对用户开放。
+2. **产品规则参数化**：托梦配额、死亡规则、奖励系数、成员规模、tick 节奏等一律可配置，禁止写死。
+3. **状态语言七档**：`Concept → Specified → Implemented → Integrated → Production-ready → Validated → Enabled`；"测试全绿/已实现"不得表述为"可上线/已验证"。Dev 桩（短信/审核/实名/TTS/支付）不可上线。
+4. 平台红线（不卖胜负与数值平权 / 资产单一写入 / 公共事实不可回滚 / 未成年保护 / 无提现 / AI 标识）锁进测试，任何改动需显式评审。

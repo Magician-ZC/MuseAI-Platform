@@ -58,7 +58,11 @@ cd server && cargo run --features billing,arena # 含 P4b 计费 + P6 赛事房
 ```
 
 - 默认 dev 态:SQLite 内存库 + 内存队列 + Dev providers,**无需任何外部依赖**,监听 `127.0.0.1:8787`。
-- 迁移(`server/migrations/0001-0008`)启动时自动执行。
+- 迁移(`server/migrations/0001-0020`)启动时自动执行。
+- **状态诚实声明**:短信、内容审核(含图审)、实名、TTS、支付当前均为 **Dev 桩**(直过/回显),
+  按七档状态语言属 `Implemented`,**不是 `Production-ready`**——上线需接真实 Provider、
+  补实名闭环(当前接口存在请求方直提 verified 的 dev 口子)并完成"生成式 AI 服务 + 游戏监管"双轨合规评估。
+  发布节奏与门槛见 `docs/VALIDATION.md`。
 - **feature-gated**:`billing`(计费)、`arena`(赛事房)默认关闭,不进默认构建(合规阶段门未过)。
 
 ### 3.3 管理后台
@@ -179,6 +183,7 @@ curl -sX POST 127.0.0.1:8787/api/auth/challenge -H 'Content-Type: application/js
 ## 10. 文档索引
 
 - `PRODUCT.md` — 产品定位一页纸(指向总规格)
+- `docs/VALIDATION.md` — **商业验证分阶段计划**(T0-T5、双坐标功能台账、工程三约束、七档状态语言)
 - `docs/build/spec-world-ecosystem.md` — **世界生态总规格 v2**(24 条拍板,产品宪法+系统设计+衔接表+路线图,唯一权威产品文档)
 - `docs/build/rules-anti-farming.md` — 防刷/反重复收益规则(有效规则)
 - `docs/build/spec-subplot-cards.md` — 自定义房装配技术附录(命名空间/四段式种子/缝合;其 UGC 假设已被总规格取代)

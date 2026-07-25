@@ -1,7 +1,8 @@
 # prod-like 本地环境（平台规格 §7）：PostgreSQL + Redis。
 # dev 默认用 SQLite 内存库 + 内存队列，无需此文件；需要贴近生产时：
 #   docker compose up -d
-#   MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo run -p muse-server
+#   cd server && MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo run
+# 注意：仓库根没有 workspace Cargo.toml，必须先 cd server（或带 --manifest-path server/Cargo.toml）。
 services:
   postgres:
     image: postgres:16-alpine

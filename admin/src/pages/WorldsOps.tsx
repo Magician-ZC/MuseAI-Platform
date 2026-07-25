@@ -18,8 +18,10 @@ import {
   Typography,
 } from 'antd';
 import type { TableColumnsType } from 'antd';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { adminFetch, AdminApiError } from '../api';
 import { ErrorAlert, formatNumber, formatTime, friendlyError, ReasonModal, usePagedList } from '../components/shared';
+import WorldsMonitorConsole from './WorldsMonitorConsole';
 
 // ---------------- 类型 ----------------
 
@@ -749,16 +751,32 @@ function Templates() {
 // ================= 主页面 =================
 
 export default function WorldsOps() {
+  const location = useLocation();
+  const navigate = useNavigate();
+  const requestedView = new URLSearchParams(location.search).get('view') === 'templates' ? 'templates' : 'monitor';
+  const [activeView, setActiveView] = useState<'monitor' | 'templates'>(requestedView);
+
+  useEffect(() => setActiveView(requestedView), [requestedView]);
+
+  if (activeView === 'monitor') {
+    return <WorldsMonitorConsole />;
+  }
+
+  const backToMonitor = () => {
+    const query = new URLSearchParams(location.search);
+    query.delete('view');
+    const suffix = query.toString();
+    navigate(`/worlds${suffix ? `?${suffix}` : ''}`);
+    setActiveView('monitor');
+  };
+
   return (
-    <div>
-      <Typography.Title level={4}>世界运营</Typography.Title>
-      <Tabs
-        defaultActiveKey="monitor"
-        items={[
-          { key: 'monitor', label: '世界监控', children: <WorldsMonitor /> },
-          { key: 'templates', label: '世界模板', children: <Templates /> },
-        ]}
-      />
+    <div style={{ padding: 24 }}>
+      <Space style={{ marginBottom: 16 }}>
+        <Button onClick={backToMonitor}>返回世界监控</Button>
+        <Typography.Title level={4} style={{ margin: 0 }}>世界模板</Typography.Title>
+      </Space>
+      <Templates />
     </div>
   );
 }

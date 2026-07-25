@@ -78,9 +78,13 @@ cd admin && npm run dev        # 端口 1430
 
 ```bash
 docker compose up -d      # PostgreSQL(5433) + Redis(6380)
-# 然后用 PG 连接串启动后端:
-MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo run -p muse-server --features billing,arena
+# 然后用 PG 连接串启动后端(注意:仓库无根 workspace,必须先 cd server):
+cd server && MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo run --features billing,arena
 ```
+
+> 各 Rust crate 独立成包(`server`、`crates/muse-engine`、`src-tauri` 各有自己的 `Cargo.toml`,
+> **仓库根没有 workspace `Cargo.toml`**)——所有 cargo 命令必须 `cd` 进对应目录或带 `--manifest-path`,
+> `cargo run -p muse-server` 在仓库根会直接报 `could not find Cargo.toml`。
 
 ---
 
@@ -102,6 +106,9 @@ MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo run -p muse-ser
 | `MUSE_TICK_INTERVAL_MS` / `MUSE_TICK_POLL_MS` | 内置 | tick 调度间隔 / 轮询间隔 |
 | `MUSE_OUTBOX_RESCAN_MS` | `60000` | 通知 outbox 恢复重扫间隔 |
 | `MUSE_LIVEGATE_SECRET` | 未配置=fail-closed | 赛事房礼物 webhook 验签(生产必配) |
+| `MUSE_TOKEN_CNY_CENTS_PER_1K` | 内置(`runtime/mod.rs:66`) | 每 1K token 折算人民币分。**成本仪表定价基准**(总规格 §17),`world_ticks.cost_tokens` 逐拍记账按此换算 |
+
+> 上表即全部 `MUSE_*` 变量(校验命令:`grep -rhoE '"MUSE_[A-Z0-9_]+"' server/src crates | sort -u`)。
 
 > 生产最小改动:`MUSE_DEV=0`、`MUSE_JWT_SECRET=<强随机>`、`MUSE_DATABASE_URL=<postgres>`、`MUSE_LIVEGATE_SECRET=<密钥>`(若开 arena)。
 
@@ -109,10 +116,32 @@ MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo run -p muse-ser
 
 ## 5. 数据库与迁移
 
-- 迁移文件 `server/migrations/0001-0008.sql`,启动自动按版本号顺序执行(sqlx migrate)。
+- 迁移文件 `server/migrations/0001-0020`(共 20 个),启动自动按版本号顺序执行(sqlx migrate)。
 - 可移植 SQL 子集(TEXT id / BIGINT 毫秒 / TEXT JSON / INTEGER 布尔),SQLite 与 Postgres 双跑。
-- `0001` 初始全表;`0002-0005` P4a/P5 加固(tick/同意独立表/通知去重/章节);`0006` 计费索引;`0007` 赛事房;`0008` 礼物/切片。
 - dev 内存库每次启动重建;需要持久化 dev 数据用文件库 `sqlite://muse-dev.db`(已 gitignore)。
+
+| 迁移 | 内容 |
+|---|---|
+| `0001_init` | 初始全表(账号/资产/世界/成员/事件/干预/同意/通知/审计/风控/治理) |
+| `0002_tick_hardening` | tick 加固(并发领取/幂等) |
+| `0003_consent_responses` | 同意响应独立表 |
+| `0004_notification_dedupe_index` | 通知去重索引 |
+| `0005_chapter_hardening` | 章节房加固 |
+| `0006_billing` | 计费索引(feature `billing`) |
+| `0007_arena` | 赛事房(feature `arena`) |
+| `0008_gift_clips` | 礼物 / 高光切片 |
+| `0009_character_manifest` | 角色卡清单与版本钉住 |
+| `0010_timeline` | 世界线时间轴 |
+| `0011_world_asset_templates` | 创作者世界模板资产 |
+| `0012_arena_spectate` | 赛事观战 |
+| `0013_creator_economy` | 创作者收益(平台内权益,无提现) |
+| `0014_room_revive_pricing` | 开房 / 复活定价参数 |
+| `0015_p3_cloud_growth_item_shop` | 云成长与平台道具售卖 |
+| `0016_character_avatar` | 角色立绘 |
+| `0017_world_discovery` | 世界发现 / 热门 |
+| `0018_moderation_appeals` | 审核申诉复审链 |
+| `0019_progression` | **历练与卡位**(总规格 §11 底座) |
+| `0020_template_star` | **模板星级 curation**(3-5★ 仅运营晋升) |
 
 ---
 
@@ -126,17 +155,23 @@ MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo run -p muse-ser
 
 ## 7. 冒烟验证
 
+全绿基线(**校验于 2026-07-25**,数字随开发增长——对不上先确认是新增测试还是漏跑):
+
 ```bash
-# 引擎 + 后端 + 桌面壳(全绿基线)
-cargo test --manifest-path crates/muse-engine/Cargo.toml          # 136
-(cd server && cargo test)                                          # 125(default)
-(cd server && cargo test --features billing,arena)                 # 150
-cargo check --manifest-path src-tauri/Cargo.toml                   # 编译
+# 引擎 + 后端 + 桌面壳
+cargo test --manifest-path crates/muse-engine/Cargo.toml          # 226 passed
+(cd server && cargo test)                                          # 273 passed(default)
+(cd server && cargo test --features billing,arena)                 # 349 passed
+cargo test --manifest-path src-tauri/Cargo.toml                    # 208 passed
 # 前端 + 后台
-npm run test -- --maxWorkers=2                                     # 421
+npm run test                                                       # 477 passed / 79 files
 npx tsc --noEmit                                                   # 0 错误
-(cd admin && npm run build)                                        # 产出 dist
+(cd admin && npx tsc --noEmit && npm run build)                    # 0 错误 + 产出 dist
 ```
+
+> CI(`.github/workflows/test.yml`)三个 job 覆盖上述全部:`frontend-test`(前端 test + build)、
+> `rust-test`(桌面轨 `src-tauri`)、`platform-test`(引擎 + server 双 feature 组合 + admin 构建)。
+> **`billing`/`arena` 虽默认不进构建,但 CI 单独跑一遍其测试**——feature-gated 代码不进 CI 会在无人察觉中腐化。
 
 后端进程端到端冒烟(dev):
 
@@ -183,6 +218,8 @@ curl -sX POST 127.0.0.1:8787/api/auth/challenge -H 'Content-Type: application/js
 ## 10. 文档索引
 
 - `PRODUCT.md` — 产品定位一页纸(指向总规格)
+- `docs/API.md` — **平台后端 API 清单**(84 条路由、鉴权级别、feature 门控、admin 角色矩阵)
+- `docs/design/README.md` — **客户端与管理后台界面设计索引**(设计决策、页面规格、实现映射、验收图)
 - `docs/VALIDATION.md` — **商业验证分阶段计划**(T0-T5、双坐标功能台账、工程三约束、七档状态语言)
 - `docs/build/spec-world-ecosystem.md` — **世界生态总规格 v2**(24 条拍板,产品宪法+系统设计+衔接表+路线图,唯一权威产品文档)
 - `docs/build/rules-anti-farming.md` — 防刷/反重复收益规则(有效规则)

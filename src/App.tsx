@@ -43,25 +43,26 @@ import { useSettingsStore } from './stores/useSettingsStore';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useEffect } from 'react';
-import { isMobile } from './utils/runtime';
+import { isMobile, isTauriHost } from './utils/runtime';
 import { applyPartnerStoreContent } from './utils/partnerStoreSync';
 import './App.css';
 
 function App() {
   const setWorksDirectory = useSettingsStore((s) => s.setWorksDirectory);
   const mobileEnv = isMobile();
+  const tauriHost = isTauriHost();
 
   useEffect(() => {
     // Only invoke desktop setup commands on desktop
-    if (!mobileEnv) {
+    if (!mobileEnv && tauriHost) {
       invoke<string>('get_workspace_dir', { dirType: 'articles' })
         .then((dir) => setWorksDirectory(dir))
         .catch((err) => console.error('Failed to initialize workspace directory:', err));
     }
-  }, [mobileEnv, setWorksDirectory]);
+  }, [mobileEnv, setWorksDirectory, tauriHost]);
 
   useEffect(() => {
-    if (mobileEnv) return;
+    if (mobileEnv || !tauriHost) return;
 
     let unlistenFn: (() => void) | undefined;
     listen('partner-store-updated', async () => {
@@ -78,7 +79,7 @@ function App() {
     return () => {
       if (unlistenFn) unlistenFn();
     };
-  }, [mobileEnv]);
+  }, [mobileEnv, tauriHost]);
 
   return (
     <Router>

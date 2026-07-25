@@ -146,7 +146,7 @@ If a piece of writing feels too machine-generated, MuseAI can first detect AI-li
 
 ### 1. Download and Install
 
-Go to the [Releases page](https://github.com/yejiming/MuseAI/releases) and download the latest installer (`.dmg` or `.exe`), then launch the app after installation.
+Go to the [Releases page](https://github.com/Magician-ZC/MuseAI-Platform/releases) and download the latest installer (`.dmg` or `.exe`), then launch the app after installation.
 
 **Windows users**: if antivirus software blocks the installer, temporarily disable tools such as 360, Tencent PC Manager, Huorong, or Windows Defender during installation, then re-enable them afterward.
 
@@ -344,6 +344,18 @@ A: MuseAI itself is free. AI usage costs are billed by the provider you configur
 - [taichuy/1flowbase](https://github.com/taichuy/1flowbase): An open-source project for quickly building AI app and workflow foundations.
 - [zhu1090093659/deepseek-pp](https://github.com/zhu1090093659/deepseek-pp): An open-source project focused on improving and extending the DeepSeek experience.
 - [FrontAgent/FrontAgent](https://github.com/FrontAgent/FrontAgent): An open-source AI agent project for frontend development workflows.
+
+---
+
+## License and Copyright
+
+**Copyright © 2026 MuseAI. All Rights Reserved.**
+
+This repository is **not** currently released under any open-source license. This means:
+
+- **The application is free for personal use** — download it, run it, and keep your data and API keys entirely on your own machine. That does not change.
+- However, no license is granted to copy, modify, distribute, fork, or use the source code commercially. The repository contains unreleased platform-track code (`server/`, `admin/`, `crates/`); the licensing policy will be decided once the commercial model is settled.
+- For commercial licensing, derivative work, or partnership inquiries, please reach out via Issues.
 
 ---
 

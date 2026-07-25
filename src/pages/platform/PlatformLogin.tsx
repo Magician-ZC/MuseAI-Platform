@@ -131,7 +131,7 @@ const PlatformLogin: React.FC = () => {
         style={{ width: 420, borderRadius: 14, border: 'none', boxShadow: '0 4px 24px rgba(0,0,0,0.06)' }}
         styles={{ body: { padding: 32 } }}
       >
-        <Space direction="vertical" size={4} style={{ width: '100%', marginBottom: 20 }}>
+        <Space orientation="vertical" size={4} style={{ width: '100%', marginBottom: 20 }}>
           <GlobalOutlined style={{ fontSize: 28, color: '#d97757' }} />
           <Title level={3} style={{ margin: 0, color: '#33312e' }}>
             登录平台世界

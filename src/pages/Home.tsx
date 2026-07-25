@@ -15,6 +15,7 @@ import {
 } from '@ant-design/icons';
 import { invoke } from '@tauri-apps/api/core';
 import { warmMinimalistTheme } from '../theme';
+import { isTauriHost } from '../utils/runtime';
 
 const { Title, Text } = Typography;
 
@@ -103,6 +104,11 @@ const Home: React.FC = () => {
   const [stats, setStats] = useState<InteractionStats | null>(null);
   const [loading, setLoading] = useState(true);
   useEffect(() => {
+    if (!isTauriHost()) {
+      setLoading(false);
+      return;
+    }
+
     const loadStats = async () => {
       try {
         const result: InteractionStats = await invoke('get_interaction_stats');
@@ -168,7 +174,7 @@ const Home: React.FC = () => {
             border: 'none',
             boxShadow: '0 1px 3px rgba(0,0,0,0.04)',
           }}
-          bodyStyle={{ padding: '24px 28px' }}
+          styles={{ body: { padding: '24px 28px' } }}
         >
           {loading ? (
             <div style={{ textAlign: 'center', padding: 40 }}>
@@ -267,7 +273,7 @@ const Home: React.FC = () => {
               <Card
                 hoverable
                 onClick={() => navigate(mod.key)}
-                bodyStyle={{ padding: '20px 16px', textAlign: 'center' }}
+                styles={{ body: { padding: '20px 16px', textAlign: 'center' } }}
                 style={{
                   borderRadius: 12,
                   border: 'none',
@@ -301,7 +307,7 @@ const Home: React.FC = () => {
               <Card
                 hoverable
                 onClick={() => navigate(mod.key)}
-                bodyStyle={{ padding: '20px 16px', textAlign: 'center' }}
+                styles={{ body: { padding: '20px 16px', textAlign: 'center' } }}
                 style={{
                   borderRadius: 12,
                   border: 'none',

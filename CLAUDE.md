@@ -8,13 +8,16 @@ MuseAI-Platform 是 MuseAI 的**双轨仓库**：
 - **本地轨**：Tauri 2 桌面应用——本地 AI 伴侣 / 角色扮演 / 文字冒险 / 穿书互动 + 小说辅助创作。前端 React 19 + TypeScript + Vite + antd v6 + Zustand（`src/`），桌面后端 Rust（`src-tauri/`，lib 名 `tauri_app_lib`）。本地数据存 `~/Documents/MuseAI/`，LLM 用用户自己的 API Key。
 - **平台轨**：多人世界平台——`crates/muse-engine`（宿主无关叙事引擎，trait 注入 ModelClient/fs/clock）+ `server/`（axum + sqlx AnyPool，SQLite dev / Postgres prod，迁移 `server/migrations/0001-0020` 启动自动执行）+ `admin/`（运营后台 React）+ `src/pages/platform/`（玩家端）。产品总规格 `docs/build/spec-world-ecosystem.md`，验证节奏 `docs/VALIDATION.md`，启动文档 `docs/STARTUP.md`。
 
-平台轨常用命令：
+平台轨常用命令（**仓库根没有 workspace `Cargo.toml`**，每个 crate 独立成包，cargo 命令必须 `cd` 进目录或带 `--manifest-path`）：
 ```bash
 cd server && cargo run --features billing,arena                 # 起平台 server(:8787)
-cargo test --manifest-path server/Cargo.toml --features billing,arena
-cargo test --manifest-path crates/muse-engine/Cargo.toml
-cd admin && npm run build                                       # admin 类型检查+构建
+cargo test --manifest-path server/Cargo.toml                    # 273 passed（default）
+cargo test --manifest-path server/Cargo.toml --features billing,arena   # 349 passed
+cargo test --manifest-path crates/muse-engine/Cargo.toml        # 226 passed
+cd admin && npm run build                                       # admin 类型检查+构建（端口 1430）
 ```
+
+接口清单见 `docs/API.md`（84 条路由 / 鉴权级别 / feature 门控 / admin 角色矩阵）。
 
 ## 常用命令
 
@@ -29,7 +32,9 @@ npm run build            # tsc 类型检查 + vite build（没有配置 ESLint�
 npm run tauri build      # 打生产安装包
 ```
 
-CI（`.github/workflows/test.yml`）在 push/PR 时跑 `npm run test`、`npm run build` 和 cargo test，改动前本地先过这三样。
+CI（`.github/workflows/test.yml`）在 push/PR 时跑三个 job：`frontend-test`（`npm run test` + `npm run build`）、
+`rust-test`（桌面轨 `src-tauri` cargo test）、`platform-test`（`muse-engine` + `server` 双 feature 组合 + `admin` 构建）。
+改动前本地先过对应那几样。基线数字见 `docs/STARTUP.md` §7。
 
 发布：推 `v*` tag 触发 `release.yml` 三平台打包。发版需同步改三处版本号：`package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`（提交习惯为 `release: vX.Y.Z`）。
 
@@ -84,6 +89,29 @@ CI（`.github/workflows/test.yml`）在 push/PR 时跑 `npm run test`、`npm run
 - UI 文案和后端错误信息均为简体中文。
 - 面向用户的功能文档在 `README.md`（中文）/`README_EN.md`，数据目录结构以 README「数据存储说明」为准。
 - Vite dev 端口固定 1420（strictPort），被占用会直接失败。
+
+### 源码注释里的「规格 §x.y」指向哪里（重要）
+
+源码有约 80 处 `规格 §x.y` / `本地规格 §x.y` / `平台规格 §x.y` 注释（engine 35、`src/` 27、server 19）。
+**这些编号属于两份已在 `d7b2f5b`（2026-07-25 清理历史文档）删除的规格**，与现存
+`docs/build/spec-world-ecosystem.md` 的 §0-§20 是**不同的编号体系，不可互相对照**：
+
+| 注释前缀 / 所在位置 | 指向 | 内容 |
+|---|---|---|
+| `本地规格 §x.y`；`crates/muse-engine/`、`src/` 本地轨文件 | `docs/character-asset-p0-p2-product-dev-spec.md`（**已删除**） | P0-P2 角色资产与自主叙事引擎（§8.2 = 工程约定，§10 = P0 技术方案） |
+| `平台规格 §x.y`；`server/`、`src/pages/platform/`、`src/stores/useWalletStore.ts` 等平台轨文件 | `docs/platform-world-p3-p6-product-dev-spec.md`（**已删除**） | P3-P6 平台世界（§2.5 = 三房型，§9.x = 后端服务设计，§10 = 后台管理） |
+
+取回方式（文件已删，内容在 git 历史里完好）：
+
+```bash
+git show d7b2f5b^:docs/character-asset-p0-p2-product-dev-spec.md   # P0-P2（759 行）
+git show d7b2f5b^:docs/platform-world-p3-p6-product-dev-spec.md    # P3-P6（467 行）
+git show d7b2f5b --stat                                            # 全部 19 份被删文档清单
+```
+
+**这些是历史依据，不是现行产品规则。** 产品规则一律以 `docs/build/spec-world-ecosystem.md`
+（唯一权威）+ `docs/VALIDATION.md`（发布节奏）为准；两者冲突时以现行文档为准，旧规格只用于
+理解「这段代码当初为什么这么写」。新写代码请勿再引用旧编号。
 
 ## 平台轨工程三约束（绑定所有平台开发，详见 docs/VALIDATION.md）
 

@@ -29,7 +29,7 @@ jobs:
         run: npm run build
 
   rust-test:
-    name: Rust Tests
+    name: Rust Tests (桌面轨 src-tauri)
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
@@ -50,3 +50,46 @@ jobs:
 
       - name: Run Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
+
+  # 平台轨（muse-engine + server + admin）。桌面轨的系统依赖（webkit 等）在此不需要，
+  # 两个 crate 均为纯 Rust，且各自独立成包——仓库根没有 workspace Cargo.toml。
+  platform-test:
+    name: Platform Tests (引擎 + 后端 + 后台)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            crates/muse-engine
+            server
+
+      - name: Engine tests
+        run: cargo test --manifest-path crates/muse-engine/Cargo.toml
+
+      - name: Server tests (default features)
+        run: cargo test --manifest-path server/Cargo.toml
+
+      # billing/arena 默认不进构建（合规阶段门未过），但测试必须跑——
+      # 否则 feature-gated 代码会在无人察觉中腐化。
+      - name: Server tests (billing + arena)
+        run: cargo test --manifest-path server/Cargo.toml --features billing,arena
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: admin/package-lock.json
+
+      - name: Admin build (tsc + vite)
+        working-directory: admin
+        run: |
+          npm ci
+          npm run build

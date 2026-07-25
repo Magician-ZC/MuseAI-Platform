@@ -1,0 +1,40 @@
+.local-client-shell__sider .ant-layout-sider-children {
+  overflow: hidden;
+}
+
+.local-client-shell__menu {
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.local-client-shell__menu .ant-menu-item-divider {
+  margin: 8px 10px;
+  border-color: #ede8e1;
+}
+
+.local-client-shell__content {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: #fff;
+}
+
+.local-client-shell__permission-command {
+  padding: 12px;
+  border-radius: 6px;
+  background: #f5f5f5;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+@media (max-height: 760px) {
+  .local-client-shell__menu .ant-menu-item {
+    height: 36px;
+    line-height: 36px;
+  }
+
+  .local-client-shell__menu .ant-menu-item-divider {
+    margin-block: 4px;
+  }
+}

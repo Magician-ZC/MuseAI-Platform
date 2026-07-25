@@ -146,7 +146,7 @@ MuseAI 支持手动创建世界书和角色卡，也可以上传小说原文或�
 
 ### 1. 下载与安装
 
-前往 [Releases 页面](https://github.com/yejiming/MuseAI/releases) 下载最新版本的安装包（`.dmg`/`.exe`），双击安装后即可启动。
+前往 [Releases 页面](https://github.com/Magician-ZC/MuseAI-Platform/releases) 下载最新版本的安装包（`.dmg`/`.exe`），双击安装后即可启动。
 
 **Windows 用户**：安装前请关闭杀毒软件（如 360、腾讯电脑管家、火绒、Windows Defender 等），否则安装程序可能被误拦截导致安装失败或运行异常。安装完成后可重新开启。
 
@@ -344,6 +344,18 @@ A：MuseAI 本身完全免费，AI 功能的费用由你使用的 API 服务商�
 - [taichuy/1flowbase](https://github.com/taichuy/1flowbase)：一个适合快速搭建 AI 应用与工作流基础能力的开源项目。
 - [zhu1090093659/deepseek-pp](https://github.com/zhu1090093659/deepseek-pp)：围绕 DeepSeek 使用体验与能力扩展的开源项目。
 - [FrontAgent/FrontAgent](https://github.com/FrontAgent/FrontAgent)：面向前端开发场景的 AI Agent 开源项目。
+
+---
+
+## 许可与版权
+
+**Copyright © 2026 MuseAI. 保留所有权利（All Rights Reserved）。**
+
+本仓库目前**未采用任何开源许可证**。这意味着：
+
+- **应用本身对个人用户免费**，可自由下载安装使用，你的数据和 API Key 都在自己手里——这一点不变。
+- 但源代码**未授予**复制、修改、分发、二次开发或商业使用的许可。仓库内含尚未公开发布的平台轨代码（`server/`、`admin/`、`crates/`），许可策略待商业模式定型后再行确定。
+- 需要商用授权、二次开发或合作，请通过 Issue 联系。
 
 ---
 

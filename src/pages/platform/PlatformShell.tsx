@@ -1,146 +1,210 @@
-// 平台模式外壳（C1）：独立路由组 /platform/* 的布局与鉴权门。
-// Local-first 红线：平台是独立壳，不复用本地 AppShell，不给任何本地页面加登录门；
-// 未登录访问受保护平台页 → 友好引导登录（不劫持、不强制跳转本地）。
-import React from 'react';
-import { Layout, Menu, ConfigProvider, Typography, Space, Tag, Button, Dropdown } from 'antd';
+// 平台空间外壳：与本地工作室共享同一客户端身份，但保持独立的信息架构。
+import React, { useEffect, useState } from 'react';
 import {
-  GlobalOutlined,
-  CloudUploadOutlined,
+  Avatar,
+  Button,
+  ConfigProvider,
+  Dropdown,
+  Input,
+  Layout,
+  Menu,
+  Tooltip,
+} from 'antd';
+import {
   AppstoreOutlined,
-  ReadOutlined,
-  WalletOutlined,
-  UserOutlined,
-  LogoutOutlined,
-  RollbackOutlined,
-  TeamOutlined,
-  ShoppingOutlined,
+  BellOutlined,
+  BookOutlined,
+  DownOutlined,
+  GlobalOutlined,
   HeartOutlined,
+  HomeOutlined,
+  LogoutOutlined,
+  ReadOutlined,
+  SearchOutlined,
+  SettingOutlined,
+  ShoppingOutlined,
+  TrophyOutlined,
+  WalletOutlined,
 } from '@ant-design/icons';
-import { Outlet, useNavigate, useLocation, Navigate } from 'react-router-dom';
+import { Navigate, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { warmMinimalistTheme } from '../../theme';
 import { useAuthStore } from '../../stores/useAuthStore';
+import { usePlatformStore } from '../../stores/usePlatformStore';
 import { cloudFetch } from '../../utils/cloudApi';
+import './PlatformShell.css';
 
-const { Header, Content } = Layout;
-const { Text } = Typography;
+const { Header, Sider, Content } = Layout;
 
-const NAV_ITEMS = [
+const PRIMARY_NAV_ITEMS = [
   { key: '/platform', icon: <GlobalOutlined />, label: '世界大厅' },
-  { key: '/platform/publish', icon: <CloudUploadOutlined />, label: '发布角色' },
-  { key: '/platform/worlds/publish', icon: <GlobalOutlined />, label: '发布世界' },
-  { key: '/platform/my', icon: <AppstoreOutlined />, label: '我的世界' },
-  { key: '/platform/characters', icon: <TeamOutlined />, label: '我的角色' },
+  { key: '/platform/my', icon: <BookOutlined />, label: '我的房间' },
+  { key: '/platform/worlds/publish', icon: <AppstoreOutlined />, label: '我的发布' },
   { key: '/platform/backpack', icon: <ShoppingOutlined />, label: '背包' },
   { key: '/platform/bonds', icon: <HeartOutlined />, label: '羁绊' },
-  { key: '/platform/reports', icon: <ReadOutlined />, label: '日报' },
+  {
+    key: 'arena',
+    icon: <TrophyOutlined />,
+    label: <Tooltip title="进入支持赛事的世界后开启">竞技场</Tooltip>,
+    disabled: true,
+  },
+];
+
+const SECONDARY_NAV_ITEMS = [
+  { key: '/platform/reports', icon: <ReadOutlined />, label: '世界日报' },
   { key: '/platform/wallet', icon: <WalletOutlined />, label: '钱包' },
 ];
 
 /** 当前高亮的导航项：取匹配的最长前缀。 */
 function activeNavKey(pathname: string): string {
-  const matched = NAV_ITEMS.map((i) => i.key)
+  const keys = [...PRIMARY_NAV_ITEMS, ...SECONDARY_NAV_ITEMS]
+    .map((item) => item.key)
+    .filter((key) => key.startsWith('/'));
+  const matched = keys
     .filter((key) => pathname === key || pathname.startsWith(`${key}/`))
     .sort((a, b) => b.length - a.length);
+  if (pathname.startsWith('/platform/worlds/') && pathname !== '/platform/worlds/publish') return '/platform';
   return matched[0] ?? '/platform';
 }
 
 export const PlatformShell: React.FC = () => {
   const navigate = useNavigate();
   const location = useLocation();
-  const user = useAuthStore((s) => s.user);
-  const isAuthed = useAuthStore((s) => s.isAuthed());
-  const logout = useAuthStore((s) => s.logout);
+  const user = useAuthStore((state) => state.user);
+  const isAuthed = useAuthStore((state) => state.isAuthed());
+  const logout = useAuthStore((state) => state.logout);
+  const worldsQuery = usePlatformStore((state) => state.worldsQuery);
+  const setWorldsQuery = usePlatformStore((state) => state.setWorldsQuery);
+  const [searchText, setSearchText] = useState(worldsQuery);
+  const isLogin = location.pathname === '/platform/login';
+  const designPreview = import.meta.env.DEV && new URLSearchParams(location.search).get('design') === 'preview';
+  const showProfile = isAuthed || designPreview;
+
+  useEffect(() => setSearchText(worldsQuery), [worldsQuery]);
 
   const handleLogout = async () => {
     try {
-      // 服务端吊销 refresh（best-effort，失败也要本地登出）。
       await cloudFetch('/api/auth/logout', { method: 'POST', idempotent: true });
     } catch {
-      // 忽略：本地登出必须成功
+      // 服务端不可用时也必须允许退出本地会话。
     }
     logout();
     navigate('/platform/login');
   };
 
+  const submitSearch = async (value: string) => {
+    navigate('/platform');
+    await setWorldsQuery(value.trim());
+  };
+
   return (
     <ConfigProvider theme={warmMinimalistTheme}>
-      <Layout style={{ minHeight: '100vh', background: '#faf9f5' }}>
-        <Header
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: 24,
-            background: '#faf9f5',
-            borderBottom: '1px solid #eae6df',
-            paddingInline: 24,
-          }}
-        >
-          <Space size={10} style={{ flex: '0 0 auto' }}>
-            <GlobalOutlined style={{ fontSize: 20, color: '#d97757' }} />
-            <Text strong style={{ fontSize: 16, color: '#33312e' }}>
-              平台世界
-            </Text>
-            <Tag color="orange" style={{ marginInlineStart: 4 }}>
-              AI 生成内容
-            </Tag>
-          </Space>
+      <Layout className="platform-shell">
+        <Header className="platform-shell__header">
+          <button className="platform-brand" type="button" onClick={() => navigate('/platform')} aria-label="MuseAI 平台世界首页">
+            <img src="/icon.png" alt="" />
+            <span>MuseAI</span>
+          </button>
 
-          <Menu
-            mode="horizontal"
-            selectedKeys={[activeNavKey(location.pathname)]}
-            onClick={({ key }) => navigate(key)}
-            items={NAV_ITEMS}
-            style={{ flex: 1, background: 'transparent', borderBottom: 'none', minWidth: 0 }}
-          />
+          {!isLogin && (
+            <Input
+              className="platform-global-search"
+              value={searchText}
+              onChange={(event) => setSearchText(event.target.value)}
+              onPressEnter={() => void submitSearch(searchText)}
+              onClear={() => void submitSearch('')}
+              allowClear
+              prefix={<SearchOutlined />}
+              suffix={<span className="platform-global-search__hint">⌘ K</span>}
+              placeholder="搜索世界、角色、房间、发布…"
+              aria-label="搜索平台世界"
+            />
+          )}
 
-          <Space size={12} style={{ flex: '0 0 auto' }}>
-            <Button
-              type="text"
-              size="small"
-              icon={<RollbackOutlined />}
-              onClick={() => navigate('/')}
-              style={{ color: '#8c857b' }}
-            >
-              返回本地模式
-            </Button>
-            {isAuthed ? (
+          <div className="platform-account">
+            {!isLogin && showProfile && (
+              <Button className="platform-icon-button" type="text" aria-label="通知" icon={<BellOutlined />} />
+            )}
+            {showProfile ? (
               <Dropdown
+                trigger={['click']}
                 menu={{
                   items: [
+                    { key: 'settings', icon: <SettingOutlined />, label: '账户设置', onClick: () => navigate('/settings') },
+                    { type: 'divider' },
                     { key: 'logout', icon: <LogoutOutlined />, label: '退出登录', onClick: handleLogout },
                   ],
                 }}
               >
-                <Button type="text" icon={<UserOutlined />} style={{ color: '#33312e' }}>
-                  {user?.nickname || user?.phone || '已登录'}
+                <Button className="platform-profile-button" type="text">
+                  <Avatar size={30} src="/assets/characters/kane-night-oath-portrait.png" />
+                  <span>{user?.nickname || user?.phone || (designPreview ? '林逸' : '已登录')}</span>
+                  <DownOutlined />
                 </Button>
               </Dropdown>
             ) : (
-              <Button type="primary" size="small" onClick={() => navigate('/platform/login')}>
-                登录
-              </Button>
+              <Button type="primary" onClick={() => navigate('/platform/login')}>登录</Button>
             )}
-          </Space>
+          </div>
         </Header>
 
-        <Content style={{ background: '#faf9f5', overflow: 'auto' }}>
-          <Outlet />
-        </Content>
+        {isLogin ? (
+          <Content className="platform-shell__login-content">
+            <Outlet />
+          </Content>
+        ) : (
+          <Layout className="platform-shell__body">
+            <Sider width={220} theme="light" className="platform-shell__sider">
+              <div className="platform-space-panel" aria-label="客户端空间切换">
+                <span className="platform-space-panel__label">空间</span>
+                <div className="platform-space-switcher">
+                  <button type="button" onClick={() => navigate('/')}>
+                    <HomeOutlined />
+                    <strong>我的工作室</strong>
+                  </button>
+                  <button type="button" className="is-active" aria-current="page" onClick={() => navigate('/platform')}>
+                    <GlobalOutlined />
+                    <strong>平台世界</strong>
+                  </button>
+                </div>
+              </div>
+              <Menu
+                mode="inline"
+                selectedKeys={[activeNavKey(location.pathname)]}
+                onClick={({ key }) => key.startsWith('/') && navigate(key)}
+                items={PRIMARY_NAV_ITEMS}
+                className="platform-shell__menu"
+              />
+              <div className="platform-shell__sider-footer">
+                <Menu
+                  mode="inline"
+                  selectedKeys={[activeNavKey(location.pathname)]}
+                  onClick={({ key }) => navigate(key)}
+                  items={SECONDARY_NAV_ITEMS}
+                  className="platform-shell__menu"
+                />
+                <Button type="text" icon={<SettingOutlined />} onClick={() => navigate('/settings')}>设置</Button>
+                <button className="platform-collapse-hint" type="button" aria-label="收起侧栏">
+                  <span>‹</span> 收起侧栏
+                </button>
+              </div>
+            </Sider>
+            <Content className="platform-shell__content">
+              <Outlet />
+            </Content>
+          </Layout>
+        )}
       </Layout>
     </ConfigProvider>
   );
 };
 
-/**
- * 受保护平台页的鉴权门：未登录时展示引导（而非静默重定向），
- * 明确告知本地能力无需登录（Local-first）。
- */
+/** 未登录访问平台页时，仅跳到平台登录；本地工作室始终保持可用。 */
 export const RequireAuth: React.FC<{ children: React.ReactElement }> = ({ children }) => {
-  const isAuthed = useAuthStore((s) => s.isAuthed());
+  const isAuthed = useAuthStore((state) => state.isAuthed());
   const location = useLocation();
-  if (!isAuthed) {
-    return <Navigate to="/platform/login" replace state={{ from: location.pathname }} />;
-  }
+  const designPreview = import.meta.env.DEV && new URLSearchParams(location.search).get('design') === 'preview';
+  if (designPreview) return children;
+  if (!isAuthed) return <Navigate to="/platform/login" replace state={{ from: location.pathname }} />;
   return children;
 };
 

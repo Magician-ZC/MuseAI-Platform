@@ -1,9 +1,18 @@
 # 放置房软主线示例 skeleton（Idle-Room Soft Mainline Example）
 
-> P1 放置房终局配套样例。演示一条 6 里程碑的软主线：**推进 = 事件强度累积到 `threshold` ∧ 关系强度谓词 `advanceWhen` 命中**；**终局 = 主线全里程碑 Done ∨ 世界时间到上限 ∨ 关键角色退场**。
+> **有效性地图（防误用）**：
+> - ✅ **技术内容全部有效**：本文 JSON 与 `server/src/runtime/tests.rs:1244` `example_idle_skeleton()`
+>   镜像同一份，由测试 `example_idle_skeleton_seeds_valid_milestones` 守护「可加载 + 结构合法」，防样例腐化。
+>   字段语义（`threshold` / `advanceWhen` / `endgame`）与当前引擎实现一致。
+> - ⚠️ **术语已过时**：文中「放置房」「P1」是旧词汇。总规格
+>   [`spec-world-ecosystem.md`](./spec-world-ecosystem.md) §1 已把 `idle/chapter/arena`
+>   **降级为引擎运行模式、退出产品词汇表**——现在的产品词汇是节奏三档（直播场 / 连载场 / **慢炖场**）。
+>   `room_type='idle'` 仍是数据库与代码里的真实取值，读代码时按「慢节奏预设的实现」理解即可，
+>   代码零删改（总规格 §1）。P0-P6 阶段编号已随历史文档于 2026-07-25 清理。
 >
-> 本文档 JSON 与 `server/src/runtime/tests.rs::example_idle_skeleton()` 镜像同一份，并由测试
-> `example_idle_skeleton_seeds_valid_milestones` 守护「可加载 + 结构合法」，防样例腐化。
+> 本文定位：**内容制作参考**（软主线怎么写），不是产品规格。
+
+> 演示一条 6 里程碑的软主线：**推进 = 事件强度累积到 `threshold` ∧ 关系强度谓词 `advanceWhen` 命中**；**终局 = 主线全里程碑 Done ∨ 世界时间到上限 ∨ 关键角色退场**。
 
 ## 用法
 

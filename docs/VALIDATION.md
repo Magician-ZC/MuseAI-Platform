@@ -97,6 +97,25 @@
 | 真人社交解锁 | Specified（R3） | T4+ 待测 | 关闭 |
 | 内容中台工业线 | Concept | — | — |
 
+### 3.1 R1 批次台账（总规格 §19 地基批，**校验于 2026-07-25**）
+
+上表按产品能力分组，漏掉了 R1 的多数工程项。以下按路线图批次补齐——**每项都标了代码锚点，
+状态可当场复核**（"未见锚点"= 全仓库 grep 零命中，即尚未动工）：
+
+| R1 项 | 开发状态 | 代码锚点 / 复核命令 | 默认开关 |
+|---|---|---|---|
+| 同源卡同世界唯一（提取源指纹 + join 校验） | **Specified**（未动工） | 现有的是"同用户一卡"防自刷（`server/src/worlds/mod.rs:468`），非同源指纹；`grep -r source_fingerprint server/src` 零命中 | 未开发 |
+| 托梦配额（每卡每阶段 N 条） | Implemented（通道）/ **Specified**（配额） | 托梦通道在 `server/src/interventions/`；`grep -r dream_quota server/src` 零命中 | 灰度 |
+| 生死契约三档（join 签署 + 引擎分派） | **Specified**（未动工） | `grep -r lethality server/src server/migrations` 零命中；现有的是同意制（`consents/`） | 关闭（默认庇护/同意制） |
+| 身份池进采样域 | **Specified**（未动工） | 采样基座 `assembly/mod.rs` `plan_sampling` 已在；`grep -r identityPool` 零命中 | 未开发 |
+| 确定性产出表 + ③世界线层贡献归因 | **Specified**（未动工） | 结算事务与产出封顶（星级）已在；产出表配置与贡献分公式未见 | 未开发 |
+| 成本仪表 | **Implemented**（每世界）/ **Specified**（每玩家·每局） | 逐拍记账 `runtime/mod.rs:1687`；按世界聚合已进看板 `admin_api/dashboards.rs:71`（`tokenCostByWorld`）；单价 `MUSE_TOKEN_CNY_CENTS_PER_1K`。**每玩家/每局维度与错峰·Batch 调度未做** | 恒开（只读） |
+| 运行时敏感词库 + 语义分类钩 | **Specified**（接口就绪，实现是桩） | `ModerationProvider::check_text` 接口在（`providers/mod.rs:39`），但 `DevModeration` 仅一个硬编码关键词（:57）——五层漏斗的第 2、3 层均未落地 | 审核链恒开（能力为桩） |
+| Saga 归组字段（saga_id + stage_no） | **Specified**（未动工） | `grep -r "saga_id\|stage_no" server/migrations server/src` 零命中 | 未开发 |
+
+> **纪律提醒**：本节存在的意义是 §4.3 那条"发布评审以台账为准，禁止口头'已完成'"。
+> 台账漏项 = 评审失去依据，与状态写错同等严重。改 R1 相关代码时同步改本表。
+
 ## 4. 验证基建三件套（优先于新增功能）
 
 1. **黄金世界回归**：一个公版/原创标准样板（固定角色卡 + 世界模板 + 20-30 个关键剧情测试点，

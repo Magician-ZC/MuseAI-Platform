@@ -1,13 +1,30 @@
-// 管理后台外壳：#9 RBAC 路由 + 按 role 收敛的八模块菜单。
-// 登录后保存 dev-login 返回的 role；菜单与路由按 role 收敛可见模块，越权模块显示「无权限」页。
-// 后端 require_role 仍是唯一权威，此处为纵深防御 + UX。
-import type { ComponentType } from 'react';
+// 管理后台外壳：角色收敛菜单 + 与客户端一致的 MuseAI 暖色视觉系统。
+import { useState, type ComponentType, type ReactNode } from 'react';
 import { BrowserRouter, Routes, Route, Navigate, Link, useLocation, useNavigate } from 'react-router-dom';
-import { Button, Layout, Menu, Result, Space, Tag, Typography } from 'antd';
+import {
+  AppstoreOutlined,
+  AuditOutlined,
+  BarChartOutlined,
+  BellOutlined,
+  CustomerServiceOutlined,
+  DatabaseOutlined,
+  DeploymentUnitOutlined,
+  DownOutlined,
+  FileTextOutlined,
+  GlobalOutlined,
+  LogoutOutlined,
+  MenuFoldOutlined,
+  MenuUnfoldOutlined,
+  SafetyCertificateOutlined,
+  SearchOutlined,
+  SettingOutlined,
+  UserOutlined,
+  WalletOutlined,
+} from '@ant-design/icons';
+import { Avatar, Badge, Button, Dropdown, Input, Layout, Menu, Result } from 'antd';
 import { clearSession, getRole, getToken } from './api';
 import { canAccess, firstModuleKey, MODULES, roleLabel, visibleModules } from './rbac';
 
-// 八模块真实页面。
 import Login from './pages/Login';
 import Users from './pages/Users';
 import Audit from './pages/Audit';
@@ -18,7 +35,6 @@ import Governance from './pages/Governance';
 import Risk from './pages/Risk';
 import Tickets from './pages/Tickets';
 
-// 路由键 → 页面组件。
 const PAGES: Record<string, ComponentType> = {
   users: Users,
   audit: Audit,
@@ -30,7 +46,28 @@ const PAGES: Record<string, ComponentType> = {
   tickets: Tickets,
 };
 
-/** 越权模块的占位页：不渲染真实页面，给出明确的无权限提示。 */
+const MODULE_ICON: Record<string, ReactNode> = {
+  users: <UserOutlined />,
+  audit: <AuditOutlined />,
+  worlds: <GlobalOutlined />,
+  economy: <WalletOutlined />,
+  metrics: <BarChartOutlined />,
+  prompts: <DeploymentUnitOutlined />,
+  risk: <SafetyCertificateOutlined />,
+  tickets: <CustomerServiceOutlined />,
+};
+
+const PAGE_TITLE: Record<string, string> = {
+  users: '用户管理',
+  audit: '内容审核',
+  worlds: '世界运行监控',
+  economy: '经济运营',
+  metrics: '数据看板',
+  prompts: '模型与 Prompt',
+  risk: '风控',
+  tickets: '客服与工单',
+};
+
 function Forbidden({ moduleLabel }: { moduleLabel?: string }) {
   return (
     <Result
@@ -41,7 +78,6 @@ function Forbidden({ moduleLabel }: { moduleLabel?: string }) {
   );
 }
 
-/** 角色未分配任何后台模块时的兜底页。 */
 function NoModules() {
   const navigate = useNavigate();
   return (
@@ -67,12 +103,15 @@ function NoModules() {
 function Shell() {
   const location = useLocation();
   const navigate = useNavigate();
-  if (!getToken()) return <Navigate to="/login" replace />;
+  const [collapsed, setCollapsed] = useState(false);
+  const designPreview = (import.meta as any).env?.DEV && new URLSearchParams(location.search).get('design') === 'preview';
+  if (!getToken() && !designPreview) return <Navigate to="/login" replace />;
 
-  const role = getRole();
+  const role = designPreview ? 'operator' : getRole();
   const visible = visibleModules(role);
   const landing = firstModuleKey(role);
   const active = location.pathname.split('/')[1] || landing || '';
+  const withPreview = (path: string) => `${path}${designPreview ? '?design=preview' : ''}`;
 
   const logout = () => {
     clearSession();
@@ -80,39 +119,122 @@ function Shell() {
   };
 
   return (
-    <Layout style={{ minHeight: '100vh' }}>
-      <Layout.Sider theme="light">
-        <div style={{ padding: 16, fontWeight: 600 }}>MuseAI 后台</div>
-        <div style={{ padding: '0 16px 12px' }}>
-          <Space size={4} wrap>
-            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-              当前角色
-            </Typography.Text>
-            <Tag color={role === 'admin' ? 'gold' : 'blue'}>{roleLabel(role)}</Tag>
-          </Space>
-        </div>
+    <Layout className="admin-shell">
+      <Layout.Sider
+        width={220}
+        collapsedWidth={72}
+        collapsed={collapsed}
+        theme="light"
+        className="admin-shell__sider"
+      >
+        <button className="admin-brand" type="button" onClick={() => navigate(withPreview('/worlds'))}>
+          <img src="/icon.png" alt="" />
+          {!collapsed && <strong>MuseAI 后台</strong>}
+        </button>
+
+        <Dropdown
+          trigger={['click']}
+          menu={{
+            items: [
+              { key: 'role', label: `当前权限：${roleLabel(role)}`, disabled: true },
+              { type: 'divider' },
+              { key: 'logout', icon: <LogoutOutlined />, label: '退出登录', onClick: logout },
+            ],
+          }}
+        >
+          <Button className="admin-role-button" type="text" block>
+            <span className="admin-role-button__dot" />
+            {!collapsed && <span>{roleLabel(role)}</span>}
+            {!collapsed && <DownOutlined />}
+          </Button>
+        </Dropdown>
+
         <Menu
           mode="inline"
+          inlineCollapsed={collapsed}
           selectedKeys={[active]}
-          items={visible.map((m) => ({ key: m.key, label: <Link to={`/${m.key}`}>{m.label}</Link> }))}
+          className="admin-shell__menu"
+          items={visible.map((m) => ({
+            key: m.key,
+            icon: MODULE_ICON[m.key],
+            label: <Link to={withPreview(`/${m.key}`)}>{m.label}</Link>,
+          }))}
         />
-        <div style={{ padding: 16 }}>
-          <Button size="small" block onClick={logout}>
-            退出登录
+
+        {!collapsed && role !== 'admin' && (
+          <Dropdown
+            trigger={['click']}
+            menu={{
+              items: [
+                {
+                  key: 'templates',
+                  icon: <DatabaseOutlined />,
+                  label: '世界模板',
+                  onClick: () => navigate(`/worlds?${designPreview ? 'design=preview&' : ''}view=templates`),
+                },
+                { type: 'divider' },
+                { key: 'hint', label: '其他模块随角色权限显示', disabled: true },
+              ],
+            }}
+          >
+            <button className="admin-more-modules" type="button">
+              <AppstoreOutlined />
+              <span>更多模块</span>
+              <DownOutlined />
+            </button>
+          </Dropdown>
+        )}
+
+        <div className="admin-shell__sider-footer">
+          <Button type="text" icon={<SettingOutlined />} block>{!collapsed && '设置'}</Button>
+          <Button type="text" icon={<FileTextOutlined />} block>{!collapsed && '文档中心'}</Button>
+          <Button
+            type="text"
+            icon={collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
+            block
+            onClick={() => setCollapsed((value) => !value)}
+          >
+            {!collapsed && '收起'}
           </Button>
         </div>
       </Layout.Sider>
-      <Layout>
-        <Layout.Content style={{ padding: 24 }}>
+
+      <Layout className="admin-shell__workspace">
+        <Layout.Header className="admin-shell__header">
+          <div className="admin-shell__page-title">{PAGE_TITLE[active] ?? '管理后台'}</div>
+          <Input
+            className="admin-shell__search"
+            prefix={<SearchOutlined />}
+            suffix={<span>⌘ K</span>}
+            placeholder="搜索世界、房间、角色、事件ID…"
+            allowClear
+            aria-label="搜索后台数据"
+          />
+          <div className="admin-shell__account">
+            <Button className="admin-environment" type="text">
+              <span className="admin-environment__dot" />
+              生产环境
+              <DownOutlined />
+            </Button>
+            <Badge count={12} size="small">
+              <Button type="text" className="admin-notification" icon={<BellOutlined />} aria-label="通知" />
+            </Badge>
+            <Button type="text" className="admin-profile">
+              <Avatar size={34} src="/assets/worlds/mist-sea-world.png" />
+              <span>
+                <strong>林逸</strong>
+                <small>{roleLabel(role)}</small>
+              </span>
+              <DownOutlined />
+            </Button>
+          </div>
+        </Layout.Header>
+
+        <Layout.Content className="admin-shell__content">
           <Routes>
-            {/* 根路径与未知路径落到角色的首个可见模块；无可见模块则兜底页。 */}
-            <Route
-              index
-              element={landing ? <Navigate to={`/${landing}`} replace /> : <NoModules />}
-            />
+            <Route index element={landing ? <Navigate to={withPreview(`/${landing}`)} replace /> : <NoModules />} />
             {MODULES.map((m) => {
               const Page = PAGES[m.key];
-              // 越权模块不渲染真实页面（不发越权请求），显示 403 占位页。
               return (
                 <Route
                   key={m.key}
@@ -121,10 +243,7 @@ function Shell() {
                 />
               );
             })}
-            <Route
-              path="*"
-              element={landing ? <Navigate to={`/${landing}`} replace /> : <NoModules />}
-            />
+            <Route path="*" element={landing ? <Navigate to={withPreview(`/${landing}`)} replace /> : <NoModules />} />
           </Routes>
         </Layout.Content>
       </Layout>

@@ -66,3 +66,6 @@ prompts/
 .workbuddy/memory/
 .opencode
 .codex-audit/
+# 一次性视觉验收草稿（证据为本机 .codex 绝对路径，不可随仓库分发）。
+# 入库的设计文档在 docs/design/，截图已复制进 docs/design/assets/。
+design-qa.md

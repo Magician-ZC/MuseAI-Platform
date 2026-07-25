@@ -90,7 +90,24 @@ pub struct ProjectedEvent {
     pub audience_user_ids: Vec<String>,
     pub summary: String,
     pub arbiter_note: Option<String>,
+    /// 审核态（approved / pending / rejected）。投影时一律 `approved`，由 §15 第 2 层
+    /// `safety::moderate_runtime_projection` 在**落库前**改写为非 approved；
+    /// 非 approved 的行在全部读取面被过滤，且不进 WS 广播。
+    pub moderation: String,
 }
+
+/// 投影初始审核态：未过闸前默认放行，闸在落库前收紧（§0.3 落库即最终事实，不做事后改写）。
+pub const MODERATION_APPROVED: &str = "approved";
+
+/// 读取面统一 SQL（三重门）：世界 + 游标 + **双硬隔离**（public 或 audience 命中）+ **审核门**。
+/// `list_events` 与 `stream_loop` 断线补偿共用同一口径——两处各写一份 SQL 必然漂移，
+/// 漏掉任一处的 `moderation = 'approved'` 就等于整层拦截失效。
+const VISIBLE_EVENTS_SQL: &str = "SELECT * FROM world_events \
+     WHERE world_id = ? AND sequence > ? AND (visibility = 'public' OR audience_json LIKE ?) \
+     AND moderation = 'approved' ORDER BY sequence ASC LIMIT ?";
+
+/// WS 断线重连补偿的单次上限（原为 SQL 内联字面量 500，抽出以复用 VISIBLE_EVENTS_SQL）。
+const STREAM_BACKFILL_LIMIT: i64 = 500;
 
 /// 落库后的一条 WorldEvent（携带客户端可见载荷与推送受众；sequence 已内嵌 payload）。
 #[derive(Debug, Clone)]
@@ -143,6 +160,7 @@ pub fn project_domain_events(events: &[DomainEvent], members: &[ProjectionMember
                     audience_user_ids: Vec::new(),
                     summary,
                     arbiter_note: None,
+                    moderation: MODERATION_APPROVED.into(),
                 },
                 EventVisibility::Private { audience_character_ids } => {
                     // 受众角色 → principal（owner）并集，排序去重（确定性）。
@@ -162,6 +180,7 @@ pub fn project_domain_events(events: &[DomainEvent], members: &[ProjectionMember
                         audience_user_ids: principals,
                         summary,
                         arbiter_note: None,
+                        moderation: MODERATION_APPROVED.into(),
                     }
                 }
             }
@@ -194,6 +213,11 @@ fn build_payload(
 }
 
 /// 在事务内落库投影事件（分配 per-world 单调 sequence），返回落库结果供 ws 广播。
+///
+/// `moderation` 从 `ProjectedEvent` 取（原先硬编码字面量 `'approved'`，等于运行时产出零审核）；
+/// `ai_label` 保持硬编码 1——AI 生成标识是平台红线（总规格 §0.6 / §16），**不可参数化、不可绕过**。
+/// 返回值只含 `moderation='approved'` 的事件：非 approved 的行落库留痕但**不进 WS 广播**，
+/// 与读取面的 `VISIBLE_EVENTS_SQL` 一起构成推送/查询双层过滤。
 pub async fn insert_events_tx(
     tx: &mut Transaction<'_, Any>,
     world_id: &str,
@@ -222,7 +246,7 @@ pub async fn insert_events_tx(
             "INSERT INTO world_events (id, world_id, tick_no, sequence, domain_event_id, event_type, \
              actors_json, visibility, audience_json, public_projection_json, private_projections_json, \
              arbiter_note, moderation, ai_label, occurred_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'approved', 1, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
         )
         .bind(&id)
         .bind(world_id)
@@ -236,10 +260,15 @@ pub async fn insert_events_tx(
         .bind(&public_proj)
         .bind(&private_proj)
         .bind(&pe.arbiter_note)
+        .bind(&pe.moderation)
         .bind(now)
         .execute(&mut **tx)
         .await?;
 
+        // 未过审事件不进推送层：落库留痕（供人审/申诉），但不广播给任何连接。
+        if pe.moderation != MODERATION_APPROVED {
+            continue;
+        }
         out.push(StoredEvent {
             audience_user_ids: if pe.visibility == "public" {
                 None
@@ -375,7 +404,15 @@ struct EventsQuery {
 }
 
 /// 把一行 world_events 组装为当前 principal 可见的展示对象；不可见返回 None（查询层硬隔离复核）。
+///
+/// 两道复核：**审核门**（moderation 必须 approved）+ **principal 硬隔离**（private 须在 audience 内）。
+/// 审核门在 Rust 侧再判一次，与 `VISIBLE_EVENTS_SQL` 的 SQL 过滤构成双层——将来新增读取面若忘了带
+/// SQL 条件，这里仍然拦得住（口径与 avatar_moderation 的「读取面双过滤」一致）。
 fn row_to_event(row: &sqlx::any::AnyRow, principal: &str) -> Result<Option<Value>, ApiError> {
+    let moderation: String = row.try_get("moderation")?;
+    if moderation != MODERATION_APPROVED {
+        return Ok(None); // 未过审（§15 第 2/3 层拦下）→ 不下发
+    }
     let visibility: String = row.try_get("visibility")?;
     let sequence: i64 = row.try_get("sequence")?;
     let id: String = row.try_get("id")?;
@@ -432,19 +469,15 @@ async fn list_events(
     }
     let cursor = q.cursor.unwrap_or(-1);
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
-    // SQL 先用 LIKE 粗过滤（public + audience 命中），Rust 再精确复核（双层硬隔离）。
+    // SQL 先粗过滤（public + audience 命中 + 审核门），Rust 再精确复核（双层硬隔离 + 审核复核）。
     let like = format!("%\"{}\"%", user.user_id);
-    let rows = sqlx::query(
-        "SELECT * FROM world_events \
-         WHERE world_id = ? AND sequence > ? AND (visibility = 'public' OR audience_json LIKE ?) \
-         ORDER BY sequence ASC LIMIT ?",
-    )
-    .bind(&id)
-    .bind(cursor)
-    .bind(&like)
-    .bind(limit)
-    .fetch_all(&state.db)
-    .await?;
+    let rows = sqlx::query(VISIBLE_EVENTS_SQL)
+        .bind(&id)
+        .bind(cursor)
+        .bind(&like)
+        .bind(limit)
+        .fetch_all(&state.db)
+        .await?;
 
     let mut events = Vec::new();
     let mut next_cursor: Option<i64> = None;
@@ -493,19 +526,17 @@ async fn stream_loop(
     // 订阅先于补偿，避免补偿与实时之间丢事件（客户端按 sequence 去重）。
     let mut rx = state.ws_hub.sender(&world_id).subscribe();
 
-    // 断线重连补偿：下发 lastEventId 之后、当前 principal 可见的历史事件。
+    // 断线重连补偿：下发 lastEventId 之后、当前 principal 可见**且已过审**的历史事件
+    // （与 list_events 共用 VISIBLE_EVENTS_SQL，避免两处口径漂移）。
     if last_event_id >= 0 {
         let like = format!("%\"{principal}\"%");
-        if let Ok(rows) = sqlx::query(
-            "SELECT * FROM world_events \
-             WHERE world_id = ? AND sequence > ? AND (visibility = 'public' OR audience_json LIKE ?) \
-             ORDER BY sequence ASC LIMIT 500",
-        )
-        .bind(&world_id)
-        .bind(last_event_id)
-        .bind(&like)
-        .fetch_all(&state.db)
-        .await
+        if let Ok(rows) = sqlx::query(VISIBLE_EVENTS_SQL)
+            .bind(&world_id)
+            .bind(last_event_id)
+            .bind(&like)
+            .bind(STREAM_BACKFILL_LIMIT)
+            .fetch_all(&state.db)
+            .await
         {
             for row in &rows {
                 if let Ok(Some(item)) = row_to_event(row, &principal) {
@@ -903,6 +934,126 @@ mod tests {
         // 非成员 u2 → 403（成员/观战资格守卫）。
         let (s2, _) = get_summary(&state, Some(&token(&state, "u2")), "w1").await;
         assert_eq!(s2, StatusCode::FORBIDDEN);
+    }
+
+    // ---------- §15 第 2/3 层：未过审事件在全部读取面被过滤 ----------
+
+    fn projected(domain_id: &str, summary: &str, moderation: &str, audience: &[&str]) -> ProjectedEvent {
+        let private = !audience.is_empty();
+        ProjectedEvent {
+            domain_event_id: domain_id.into(),
+            event_type: "dialogue".into(),
+            actor_ids: vec!["c1".into()],
+            visibility: if private { "private".into() } else { "public".into() },
+            audience_user_ids: audience.iter().map(|s| s.to_string()).collect(),
+            summary: summary.into(),
+            arbiter_note: None,
+            moderation: moderation.into(),
+        }
+    }
+
+    async fn get_events(state: &AppState, bearer: &str, world: &str) -> (StatusCode, Value) {
+        let app = crate::app::build_router(state.clone());
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/worlds/{world}/events"))
+            .header("authorization", format!("Bearer {bearer}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let s = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (s, serde_json::from_slice(&bytes).unwrap_or(json!(null)))
+    }
+
+    fn domain_ids(items: &[Value]) -> Vec<String> {
+        items.iter().map(|e| e["domainEventId"].as_str().unwrap_or_default().to_string()).collect()
+    }
+
+    /// 拦截只有在**全部**读取面生效才算数：查询层 / 推送层实时广播 / 推送层断线补偿 / 逐行复核。
+    #[tokio::test]
+    async fn blocked_events_are_filtered_from_every_read_face() {
+        let state = test_state().await;
+        seed_user(&state.db, "u1").await;
+        seed_world(&state.db, "w1", 0, "running").await;
+        seed_member(&state.db, "m1", "w1", "u1", "c1", "active").await;
+
+        let stored = persist_events(
+            &state.db,
+            "w1",
+            0,
+            &[
+                projected("de-ok", "正常公开事实", MODERATION_APPROVED, &[]),
+                projected("de-bad", "被拦下的公开事实", "pending", &[]),
+                projected("de-priv-bad", "被拦下的私有视角", "pending", &["u1"]),
+                projected("de-priv-ok", "正常私有视角", MODERATION_APPROVED, &["u1"]),
+            ],
+        )
+        .await
+        .unwrap();
+
+        // ① 推送层（实时广播）：未过审事件不产生 StoredEvent，压根不进 ws_hub。
+        assert_eq!(stored.len(), 2, "只有过审事件进 WS 广播");
+        assert!(stored.iter().all(|s| !s.payload_json.contains("被拦下")), "广播载荷不得含未过审文本");
+
+        // 但四条都已落库留痕（供人审/申诉；§0.3 落库即事实，不做事后删改）。
+        let all = sqlx::query("SELECT * FROM world_events WHERE world_id='w1' ORDER BY sequence ASC")
+            .fetch_all(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 4, "未过审事件仍落库留痕，只是不外发");
+
+        // ② 查询层 GET /worlds/{id}/events。
+        let (code, body) = get_events(&state, &token(&state, "u1"), "w1").await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        assert_eq!(
+            domain_ids(body["events"].as_array().unwrap()),
+            vec!["de-ok", "de-priv-ok"],
+            "未过审事件不得出现在事件列表"
+        );
+
+        // ③ 推送层断线补偿：与 list_events 共用 VISIBLE_EVENTS_SQL（同一口径，不会漂移）。
+        let rows = sqlx::query(VISIBLE_EVENTS_SQL)
+            .bind("w1")
+            .bind(-1i64)
+            .bind("%\"u1\"%")
+            .bind(STREAM_BACKFILL_LIMIT)
+            .fetch_all(&state.db)
+            .await
+            .unwrap();
+        let backfilled: Vec<Value> =
+            rows.iter().filter_map(|r| row_to_event(r, "u1").unwrap()).collect();
+        assert_eq!(domain_ids(&backfilled), vec!["de-ok", "de-priv-ok"], "断线补偿不得回放未过审事件");
+
+        // ④ 逐行复核：即便某个新读取面忘了带 SQL 审核门，row_to_event 仍然拦得住（双层）。
+        let visible: Vec<Value> = all.iter().filter_map(|r| row_to_event(r, "u1").unwrap()).collect();
+        assert_eq!(domain_ids(&visible), vec!["de-ok", "de-priv-ok"], "row_to_event 必须独立拦截未过审行");
+    }
+
+    /// AI 标识是红线（总规格 §0.6）：审核态改写不得连带把 ai_label 改掉。
+    #[tokio::test]
+    async fn ai_label_stays_on_for_every_projected_event() {
+        let state = test_state().await;
+        seed_user(&state.db, "u1").await;
+        seed_world(&state.db, "w1", 0, "running").await;
+        persist_events(
+            &state.db,
+            "w1",
+            0,
+            &[
+                projected("de-ok", "正常公开事实", MODERATION_APPROVED, &[]),
+                projected("de-bad", "被拦下的公开事实", "pending", &[]),
+            ],
+        )
+        .await
+        .unwrap();
+        let off = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM world_events WHERE ai_label <> 1")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(off, 0, "ai_label 必须恒为 1，不可被审核路径改写或绕过");
+        let (_, body) = get_events(&state, &token(&state, "u1"), "w1").await;
+        assert_eq!(body["events"][0]["aiLabel"]["visible"], json!(true));
     }
 
     #[tokio::test]

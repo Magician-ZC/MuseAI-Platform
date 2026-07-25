@@ -197,6 +197,26 @@ fn build_manifest(card: &serde_json::Value, rights: &str, version: i64) -> serde
     })
 }
 
+/// 提取「同源指纹 + 原味卡」两列（R1 同源卡同世界唯一，规格 §7）。
+///
+/// - 指纹 = `identity.sourceWork.sourceId`，即提取源文件的全字节哈希（muse-engine
+///   `character::synthesis` 合成时写入）。纯原创卡没有该字段 → `None`，天然不参与同源判定。
+/// - 原味卡 = 合成产物出厂态未被改动：`lifecycle == "draft"` 且 `revision == 0`
+///   （`synthesis::assemble_card` 的产物）。任一被改动即视为「玩家自己的版本」，join 一律放行。
+///
+/// 服务端权威（§9.6 铁律）：只从 card_json 推导，绝不接受客户端另传的指纹/原味声明。
+fn source_identity(card: &serde_json::Value) -> (Option<String>, bool) {
+    let fingerprint = card
+        .pointer("/identity/sourceWork/sourceId")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let pristine = card.get("lifecycle").and_then(|v| v.as_str()) == Some("draft")
+        && card.get("revision").and_then(|v| v.as_i64()) == Some(0);
+    (fingerprint, pristine)
+}
+
 /// 机审裁决 → cloud_characters.moderation（服务端权威，不信客户端声明）。
 /// 裁决由 safety::moderate_and_queue 统一给出：注入命中即便 provider 直过也已折叠为 Pending
 /// （保守阈值，§14 最高优先级威胁），此处只做字符串映射，不重复判定/落库。
@@ -283,8 +303,12 @@ async fn publish(
     let manifest = build_manifest(&req.card_json, &req.rights_declaration, version);
     let manifest_text = manifest.to_string();
 
+    // 同源指纹 + 原味卡标记（R1，规格 §7）：发布时一次性物化成列，join 热路径直接读，
+    // 免去每次投放都反序列化整张卡。判据只来自服务端解析的 card_json。
+    let (source_fingerprint, pristine) = source_identity(&req.card_json);
+
     sqlx::query(
-        "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, rights_declaration, moderation, withdrawn, manifest_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+        "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, rights_declaration, moderation, withdrawn, manifest_json, source_fingerprint, pristine, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&user.user_id)
@@ -294,6 +318,8 @@ async fn publish(
     .bind(&req.rights_declaration)
     .bind(moderation)
     .bind(&manifest_text)
+    .bind(source_fingerprint.as_deref())
+    .bind(i64::from(pristine))
     .bind(now)
     .execute(&state.db)
     .await?;

@@ -1,14 +1,14 @@
 // 平台世界大厅：首屏先呈现一个“正在发生”的世界，搜索与目录退居次级。
+// 布局遵循 docs/design/client-ui-design.md §6：主视觉世界 / 世界动态 / 世界目录 + 右侧辅助栏（发布状态、相关世界、账号提示）。
+// 诚实化原则：所有条目只渲染接口真实字段；接口没有的字段一律不显示（空态或整块隐藏），不做按下标硬编码的伪造文案。
 import React, { useEffect, useMemo, useState } from 'react';
 import { Alert, Button, Empty, Input, Segmented, Spin, Tag } from 'antd';
 import {
   BookOutlined,
   CheckCircleOutlined,
-  ClockCircleOutlined,
   EyeOutlined,
   FireOutlined,
   HeartOutlined,
-  MessageOutlined,
   RightOutlined,
   TeamOutlined,
   ThunderboltOutlined,
@@ -16,9 +16,11 @@ import {
 import { useNavigate } from 'react-router-dom';
 import { cloudFetch } from '../../utils/cloudApi';
 import {
+  eventTypeMeta,
+  moderationMeta,
   roomTypeLabel,
   usePlatformStore,
-  type MyWorldEntry,
+  type Membership,
   type RoomTypeFilter,
   type WorldEventItem,
   type WorldSummary,
@@ -26,10 +28,12 @@ import {
 } from '../../stores/usePlatformStore';
 import './PlatformHall.css';
 
-const HERO_IMAGE = '/assets/platform/mist-sea-world.png';
 const KANE_IMAGE = '/assets/characters/kane-night-oath-portrait.png';
-const ELENA_IMAGE = '/assets/characters/elena-windwhisper-portrait.png';
 const TAVERN_IMAGE = '/assets/platform/ember-tavern.png';
+
+/** 世界封面位图池（真实位图资产，设计文档 §6 禁止占位框/Emoji/CSS 绘图）。
+ * world.coverUrl 缺席时按 world.id 做确定性兜底：同一世界永远同一张封面，不随机、不随渲染次数变化。 */
+const WORLD_COVER_POOL = ['/assets/platform/mist-sea-world.png', '/assets/platform/ember-tavern.png'];
 
 const ROOM_OPTIONS = [
   { label: '放置房', value: 'idle' as RoomTypeFilter },
@@ -41,6 +45,16 @@ const SORT_OPTIONS = [
   { label: '最新', value: 'new' as WorldsSort },
   { label: '热门', value: 'hot' as WorldsSort },
 ];
+
+/** server WorldTemplateView（GET /assets/worlds/mine）：大厅「发布状态」的权威数据源。 */
+interface PublishedWorld {
+  id: string;
+  title: string;
+  version: number;
+  moderation: string;
+  withdrawn: boolean;
+  createdAt: number;
+}
 
 const DEMO_WORLDS: WorldSummary[] = [
   {
@@ -55,6 +69,7 @@ const DEMO_WORLDS: WorldSummary[] = [
     aiLabel: { visible: true },
     hotScore: 982,
     starRating: 4,
+    coverUrl: '/assets/platform/mist-sea-world.png',
   },
   {
     id: 'magic-continent',
@@ -67,6 +82,7 @@ const DEMO_WORLDS: WorldSummary[] = [
     tickPerDay: 4,
     aiLabel: { visible: true },
     starRating: 3,
+    coverUrl: '/assets/platform/ember-tavern.png',
   },
   {
     id: 'silent-mountain',
@@ -79,6 +95,7 @@ const DEMO_WORLDS: WorldSummary[] = [
     tickPerDay: 3,
     aiLabel: { visible: true },
     starRating: 2,
+    coverUrl: '/assets/platform/mist-sea-world.png',
   },
 ];
 
@@ -121,14 +138,16 @@ const DEMO_EVENTS: WorldEventItem[] = [
   },
 ];
 
-const DEMO_MY_WORLD: MyWorldEntry = {
-  worldId: 'magic-continent',
-  characterIds: ['kane-night-oath'],
-  unreadCount: 0,
-  totalReports: 12,
-  latestReportId: 'report-demo',
-  latestReportDay: '2026-07-24',
-};
+const DEMO_PUBLISHED: PublishedWorld[] = [
+  {
+    id: 'magic-continent',
+    title: '魔法大陆设定集',
+    version: 3,
+    moderation: 'approved',
+    withdrawn: false,
+    createdAt: Date.UTC(2026, 6, 24, 14, 18),
+  },
+];
 
 const statusMeta = (status: string): { label: string; className: string } => {
   switch (status) {
@@ -151,40 +170,76 @@ const formatCount = (value: number) => new Intl.NumberFormat('zh-CN').format(val
 const formatEventTime = (timestamp: number) =>
   new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(timestamp));
 
-const nextWorldTickLabel = () => {
-  const now = new Date();
-  return `${now.getFullYear()}年${now.getMonth() + 1}月${now.getDate()}日 20:00`;
+const formatDay = (timestamp: number) => {
+  const date = new Date(timestamp);
+  return `${date.getFullYear()}年${date.getMonth() + 1}月${date.getDate()}日`;
 };
 
-const eventTitle = (event: WorldEventItem, index: number) => {
-  if (index === 0) return '北境风暴平息，商路重启';
-  if (index === 1) return `${event.actors[0] || '新角色'}加入了「银鸦商团」`;
-  return '静止山脉东麓的古道被发现';
+/** 相对时间：完全由事件真实 occurredAt 推导，不按列表下标编造。 */
+const relativeTime = (timestamp: number, now: number = Date.now()): string => {
+  const diff = now - timestamp;
+  if (!Number.isFinite(diff) || diff < 60_000) return '刚刚';
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}分钟前`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}小时前`;
+  const days = Math.floor(diff / 86_400_000);
+  return days === 1 ? '昨天' : `${days}天前`;
 };
 
-const eventImage = (index: number) => (index === 0 ? KANE_IMAGE : index === 1 ? ELENA_IMAGE : HERO_IMAGE);
+/** 确定性字符串哈希：仅用于在没有 coverUrl 时稳定挑选一张真实位图封面。 */
+const hashString = (value: string): number => {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash * 31 + value.charCodeAt(index)) | 0;
+  }
+  return Math.abs(hash);
+};
+
+const worldCover = (world: WorldSummary): string =>
+  world.coverUrl?.trim() || WORLD_COVER_POOL[hashString(world.id) % WORLD_COVER_POOL.length];
+
+/** 事件标题：只取投影里的真实文本（summary 优先，其次 narrative）。 */
+const eventHeadline = (event: WorldEventItem): string =>
+  event.projection?.summary?.trim() || event.projection?.narrative?.trim() || '';
+
+/** 事件补充描述：narrative 与 summary 不同才展示，避免同一句话重复两遍。 */
+const eventDetail = (event: WorldEventItem): string => {
+  const summary = event.projection?.summary?.trim() || '';
+  const narrative = event.projection?.narrative?.trim() || '';
+  return narrative && narrative !== summary ? narrative : '';
+};
+
+/** 事件元信息行：事件类型 + 参与角色 + 拍数，全部来自接口字段。 */
+const eventMetaLine = (event: WorldEventItem): string => {
+  const parts = [eventTypeMeta(event.type).label];
+  if (event.actors?.length) parts.push(event.actors.join('、'));
+  if (Number.isFinite(event.tick)) parts.push(`第 ${event.tick} 拍`);
+  return parts.join(' · ');
+};
 
 const WorldCatalogCard: React.FC<{ world: WorldSummary; onEnter: () => void; onSpectate: () => void }> = ({ world, onEnter, onSpectate }) => {
   const status = statusMeta(world.status);
   return (
     <article className="world-catalog-card">
-      <div className="world-catalog-card__head">
-        <strong>{world.title}</strong>
-        <span className={`world-status ${status.className}`}>{status.label}</span>
-      </div>
-      <div className="world-catalog-card__tags">
-        <Tag color="orange">{roomTypeLabel(world.roomType)}</Tag>
-        {typeof world.starRating === 'number' && <Tag color="gold">{world.starRating}★</Tag>}
-        {world.aiLabel?.visible !== false && <Tag>AI 生成</Tag>}
-        {typeof world.hotScore === 'number' && <Tag color="volcano"><FireOutlined /> 热度 {world.hotScore}</Tag>}
-      </div>
-      <div className="world-catalog-card__meta">
-        <span><TeamOutlined /> {world.memberCount}/{world.memberLimit} 角色</span>
-        <span><ThunderboltOutlined /> 每日 {world.tickPerDay} 拍</span>
-      </div>
-      <div className="world-catalog-card__actions">
-        <Button type="primary" size="small" onClick={onEnter}>进入世界</Button>
-        <Button size="small" icon={<EyeOutlined />} onClick={onSpectate}>观战</Button>
+      <img className="world-catalog-card__cover" src={worldCover(world)} alt={`${world.title}的世界封面`} />
+      <div className="world-catalog-card__body">
+        <div className="world-catalog-card__head">
+          <strong>{world.title}</strong>
+          <span className={`world-status ${status.className}`}>{status.label}</span>
+        </div>
+        <div className="world-catalog-card__tags">
+          <Tag color="orange">{roomTypeLabel(world.roomType)}</Tag>
+          {typeof world.starRating === 'number' && <Tag color="gold">{world.starRating}★</Tag>}
+          {world.aiLabel?.visible !== false && <Tag>AI 生成</Tag>}
+          {typeof world.hotScore === 'number' && <Tag color="volcano"><FireOutlined /> 热度 {world.hotScore}</Tag>}
+        </div>
+        <div className="world-catalog-card__meta">
+          <span><TeamOutlined /> {world.memberCount}/{world.memberLimit} 角色</span>
+          <span><ThunderboltOutlined /> 每日 {world.tickPerDay} 拍</span>
+        </div>
+        <div className="world-catalog-card__actions">
+          <Button type="primary" size="small" onClick={onEnter}>进入世界</Button>
+          <Button size="small" icon={<EyeOutlined />} onClick={onSpectate}>观战</Button>
+        </div>
       </div>
     </article>
   );
@@ -201,25 +256,41 @@ const PlatformHall: React.FC = () => {
     worldsLoading,
     worldsError,
     worldsHasMore,
-    myWorlds,
-    worldTitles,
     memberships,
     setRoomTypeFilter,
     setWorldsQuery,
     setWorldsSort,
     loadWorlds,
-    loadReports,
     loadMemberships,
   } = usePlatformStore();
   const [searchText, setSearchText] = useState(worldsQuery);
   const [events, setEvents] = useState<WorldEventItem[]>([]);
+  const [publishedWorlds, setPublishedWorlds] = useState<PublishedWorld[]>([]);
 
   useEffect(() => {
     if (previewMode) return;
     void loadWorlds(true);
-    void loadReports();
     void loadMemberships();
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [previewMode]);
+
+  // 发布状态：读 /assets/worlds/mine（我提交的世界模板），失败或为空一律走空态，不编造已发布记录。
+  useEffect(() => {
+    if (previewMode) {
+      setPublishedWorlds(DEMO_PUBLISHED);
+      return;
+    }
+    let cancelled = false;
+    cloudFetch<PublishedWorld[]>('/api/assets/worlds/mine')
+      .then((data) => {
+        if (!cancelled) setPublishedWorlds(Array.isArray(data) ? data : []);
+      })
+      .catch(() => {
+        if (!cancelled) setPublishedWorlds([]);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [previewMode]);
 
   const visibleWorlds = previewMode ? DEMO_WORLDS : worlds;
@@ -244,12 +315,23 @@ const PlatformHall: React.FC = () => {
   }, [featuredWorld?.id, previewMode]);
 
   const recentEvents = previewMode ? DEMO_EVENTS : events;
-  const myWorld = previewMode ? DEMO_MY_WORLD : myWorlds[0];
-  const myWorldTitle = previewMode ? '魔法大陆设定集' : myWorld ? worldTitles[myWorld.worldId] || myWorld.worldId : '';
-  const bondedCharacter = previewMode ? '凯恩·夜誓' : memberships[0]?.characterName;
   const featuredStatus = statusMeta(featuredWorld?.status || 'open');
+  // 主视觉「最近活动」：直接引用该世界最新一条公开事件的真实摘要；没有事件就不显示这一行。
+  const featuredRecap = recentEvents[0] ? eventHeadline(recentEvents[0]) : '';
+  const activeMembership: Membership | undefined = previewMode
+    ? undefined
+    : memberships.find((item) => item.membershipStatus === 'active') ?? memberships[0];
+  const latestPublished = useMemo(
+    () => publishedWorlds.filter((item) => !item.withdrawn).sort((a, b) => b.createdAt - a.createdAt)[0],
+    [publishedWorlds],
+  );
 
   const catalogWorlds = useMemo(() => visibleWorlds.slice(1), [visibleWorlds]);
+  // 相关世界：复用已加载的世界列表，取与主视觉世界同房型的其它世界（无则空态，不造数据）。
+  const relatedWorlds = useMemo(() => {
+    if (!featuredWorld) return [];
+    return visibleWorlds.filter((item) => item.id !== featuredWorld.id && item.roomType === featuredWorld.roomType).slice(0, 3);
+  }, [visibleWorlds, featuredWorld]);
 
   if (!previewMode && worldsError && worlds.length === 0) {
     return (
@@ -283,7 +365,7 @@ const PlatformHall: React.FC = () => {
       <div className="platform-hall__layout">
         <main className="platform-hall__main">
           <section className="featured-world" aria-labelledby="featured-world-title">
-            <img src={HERO_IMAGE} alt="雾海中矗立的奇幻城堡与山脉" />
+            <img src={worldCover(featuredWorld)} alt={`${featuredWorld.title}的世界封面`} />
             <div className="featured-world__content">
               <h2 id="featured-world-title">{featuredWorld.title}</h2>
               <div className="featured-world__status-row">
@@ -296,18 +378,18 @@ const PlatformHall: React.FC = () => {
               <dl>
                 <div>
                   <dt><TeamOutlined /> 参与人数</dt>
-                  <dd>{formatCount(featuredWorld.memberCount)}</dd>
+                  <dd>{formatCount(featuredWorld.memberCount)} / {formatCount(featuredWorld.memberLimit)}</dd>
                 </div>
                 <div>
-                  <dt><ClockCircleOutlined /> 下次世界时刻</dt>
-                  <dd>{nextWorldTickLabel()}</dd>
+                  <dt><ThunderboltOutlined /> 世界节奏</dt>
+                  <dd>每日 {featuredWorld.tickPerDay} 拍</dd>
                 </div>
               </dl>
-              <p>你离开后，北境的风暴平息，商团重新打通了雷德港的航线。</p>
+              {featuredRecap && <p>{featuredRecap}</p>}
               <div className="featured-world__actions">
                 <Button type="primary" onClick={() => navigate(`/platform/worlds/${featuredWorld.id}`)}>进入世界</Button>
-                <Button onClick={() => navigate('/background')}>继续编辑</Button>
-                <Button onClick={() => navigate('/platform/my')}>查看我的发布</Button>
+                <Button onClick={() => navigate(`/platform/worlds/${featuredWorld.id}/spectate`)}>观战</Button>
+                <Button onClick={() => navigate('/platform/my')}>我的房间</Button>
               </div>
             </div>
           </section>
@@ -321,43 +403,22 @@ const PlatformHall: React.FC = () => {
               <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="世界尚未产生公开事件" />
             ) : (
               <div className="world-activity__list">
-                {recentEvents.slice(0, 3).map((event, index) => (
-                  <button key={event.id} type="button" className="world-event" onClick={() => navigate(`/platform/worlds/${featuredWorld.id}/spectate`)}>
-                    <img src={eventImage(index)} alt="" />
-                    <span className="world-event__copy">
-                      <strong>{eventTitle(event, index)}</strong>
-                      <span>{event.projection?.summary || event.projection?.narrative || '世界发生了新的变化。'}</span>
-                      <small>{index === 0 ? '世界事件 · 雷德港 · 商团' : index === 1 ? '角色动态 · 风语者' : '探索发现 · 静止山脉'}</small>
-                    </span>
-                    <time dateTime={new Date(event.occurredAt).toISOString()}>
-                      {index === 0 ? '1小时前' : index === 1 ? '3小时前' : '6小时前'}
-                      <span>{formatEventTime(event.occurredAt)}</span>
-                    </time>
-                  </button>
-                ))}
-              </div>
-            )}
-          </section>
-
-          <section className="publish-status" aria-labelledby="publish-status-title">
-            <h2 id="publish-status-title">你的发布状态</h2>
-            {myWorld ? (
-              <div className="publish-status__row">
-                <span className="publish-status__icon"><BookOutlined /></span>
-                <span className="publish-status__title">
-                  <strong>{myWorldTitle}</strong>
-                  <small>世界书 · 来源于你的工作室</small>
-                </span>
-                <span className="publish-status__state"><CheckCircleOutlined /> 已发布<small>公开可见</small></span>
-                <span className="publish-status__metric"><small>浏览</small>{previewMode ? 327 : myWorld.totalReports}</span>
-                <span className="publish-status__metric"><small>收藏</small>{previewMode ? 68 : myWorld.characterIds.length}</span>
-                <span className="publish-status__updated">更新于 2026年7月24日 22:18</span>
-                <Button onClick={() => navigate('/background')}>继续编辑</Button>
-              </div>
-            ) : (
-              <div className="publish-status__empty">
-                <span>还没有发布世界，把本地设定整理好后再来。</span>
-                <Button type="primary" onClick={() => navigate('/platform/worlds/publish')}>发布世界</Button>
+                {recentEvents.slice(0, 3).map((event) => {
+                  const detail = eventDetail(event);
+                  return (
+                    <button key={event.id} type="button" className="world-event" onClick={() => navigate(`/platform/worlds/${featuredWorld.id}/spectate`)}>
+                      <span className="world-event__copy">
+                        <strong>{eventHeadline(event) || eventTypeMeta(event.type).label}</strong>
+                        {detail && <span>{detail}</span>}
+                        <small>{eventMetaLine(event)}</small>
+                      </span>
+                      <time dateTime={new Date(event.occurredAt).toISOString()}>
+                        {relativeTime(event.occurredAt)}
+                        <span>{formatEventTime(event.occurredAt)}</span>
+                      </time>
+                    </button>
+                  );
+                })}
               </div>
             )}
           </section>
@@ -402,16 +463,72 @@ const PlatformHall: React.FC = () => {
 
         <aside className="related-rail" aria-labelledby="related-title">
           <h2 id="related-title">与你有关</h2>
+
+          <section className="related-section related-section--publish">
+            <h3>发布状态</h3>
+            {latestPublished ? (
+              <div className="publish-entry">
+                <span className="publish-entry__icon"><BookOutlined /></span>
+                <div className="publish-entry__body">
+                  <strong>{latestPublished.title}</strong>
+                  <small>世界书 · 来源于你的工作室</small>
+                  <span className={`publish-entry__state is-${moderationMeta(latestPublished.moderation).color}`}>
+                    {latestPublished.moderation === 'approved' && <CheckCircleOutlined />}
+                    {moderationMeta(latestPublished.moderation).label} · 第 {latestPublished.version} 版
+                  </span>
+                  <small>提交于 {formatDay(latestPublished.createdAt)}</small>
+                </div>
+                <Button size="small" onClick={() => navigate('/platform/worlds/publish')}>管理发布</Button>
+              </div>
+            ) : (
+              <div className="publish-entry__empty">
+                <p className="related-empty">还没有发布世界，把本地设定整理好后再来。</p>
+                <Button type="primary" size="small" onClick={() => navigate('/platform/worlds/publish')}>发布世界</Button>
+              </div>
+            )}
+          </section>
+
+          <section className="related-section">
+            <h3>相关世界</h3>
+            {relatedWorlds.length > 0 ? (
+              <ul className="related-worlds">
+                {relatedWorlds.map((world) => (
+                  <li key={world.id}>
+                    <button type="button" onClick={() => navigate(`/platform/worlds/${world.id}`)}>
+                      {/* 缩略封面为装饰性图像：按钮可访问名已含世界标题，故 alt 留空避免读屏重复。 */}
+                      <img src={worldCover(world)} alt="" />
+                      <span>
+                        <strong>{world.title}</strong>
+                        <small>{roomTypeLabel(world.roomType)} · {formatCount(world.memberCount)} 名角色</small>
+                      </span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="related-empty">暂时没有与之同类型的其它世界。</p>
+            )}
+          </section>
+
           <section className="related-section">
             <h3>你的羁绊角色</h3>
-            {bondedCharacter ? (
+            {previewMode ? (
               <div className="bonded-character">
-                <img src={KANE_IMAGE} alt={`${bondedCharacter}的角色头像`} />
+                <img src={KANE_IMAGE} alt="凯恩·夜誓的角色头像" />
                 <div>
-                  <strong>{bondedCharacter}</strong>
-                  <span><HeartOutlined /> 羁绊值 {previewMode ? 68 : '—'}</span>
-                  <small>上次互动：今天 14:32</small>
-                  <Button onClick={() => navigate('/chat')}>继续对话</Button>
+                  <strong>凯恩·夜誓</strong>
+                  <span><HeartOutlined /> 羁绊值 68</span>
+                  <small>所在世界：魔法大陆设定集</small>
+                  <Button onClick={() => navigate('/platform/bonds')}>查看羁绊</Button>
+                </div>
+              </div>
+            ) : activeMembership ? (
+              <div className="bonded-character bonded-character--compact">
+                <div>
+                  <strong>{activeMembership.characterName}</strong>
+                  <span>{activeMembership.worldTitle || activeMembership.worldId}</span>
+                  <small>加入于 {formatDay(activeMembership.joinedAt)}</small>
+                  <Button onClick={() => navigate('/platform/bonds')}>查看羁绊</Button>
                 </div>
               </div>
             ) : (
@@ -439,15 +556,6 @@ const PlatformHall: React.FC = () => {
             ) : (
               <p className="related-empty">暂无新的房间邀请。</p>
             )}
-          </section>
-
-          <section className="related-section related-section--activity">
-            <h3>最新互动</h3>
-            <ul>
-              <li><MessageOutlined /><span>有人在你的房间留言</span><time>2小时前</time></li>
-              <li><HeartOutlined /><span>艾琳娜·风语者关注了你</span><time>5小时前</time></li>
-              <li><BookOutlined /><span>你的发布获得 {previewMode ? 327 : myWorld?.totalReports || 0} 次浏览</span><time>昨日</time></li>
-            </ul>
           </section>
         </aside>
       </div>

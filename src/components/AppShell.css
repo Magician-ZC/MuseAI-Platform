@@ -16,7 +16,8 @@
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  background: #fff;
+  /* 设计文档 §5：页面底色统一 #fbfaf7 暖白（与平台空间一致），卡片才用 #ffffff。 */
+  background: #fbfaf7;
 }
 
 .local-client-shell__permission-command {

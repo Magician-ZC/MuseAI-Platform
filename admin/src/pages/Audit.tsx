@@ -343,7 +343,7 @@ export default function Audit() {
                 type="info"
                 showIcon
                 style={{ marginTop: 20 }}
-                message="卡片全文需后端支持"
+                title="卡片全文需后端支持"
                 description="审核详情端点（卡片全文 + 同作者历史）尚未就绪，当前仅展示机审命中与主体引用。端点上线后此处将自动呈现完整内容（§10）。"
               />
             )}

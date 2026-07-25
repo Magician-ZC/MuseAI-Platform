@@ -42,7 +42,7 @@ export default function Login() {
           type="info"
           showIcon
           style={{ marginBottom: 16 }}
-          message="Dev 引导登录"
+          title="Dev 引导登录"
           description="dev 态用约定 secret 换取管理员令牌。生产环境此入口停用，改由正式管理员登录。"
         />
         <Form onFinish={onFinish} layout="vertical" initialValues={{ secret: DEFAULT_SECRET }}>

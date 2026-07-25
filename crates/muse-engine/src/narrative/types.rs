@@ -430,6 +430,37 @@ pub enum RunMode {
     ChapterDraft,
 }
 
+/// 生死契约档（世界生态总规格 §11【拍板 24】）：与星级正交的**世界级参数**，
+/// 随 `RoundInput` 每回合由调用方传入（后端无状态约定：引擎不持有世界配置）。
+///
+/// 三档语义：
+/// - `Sanctuary`（庇护世界）：**死亡不可能**——致死行动在【场景写作之前】被降级为重伤，
+///   正文与公共事实同口径（见 `narrative::apply_lethality`）。
+/// - `Consent`（同意制世界，**默认**）：现行机制——不可逆事件由当事人临场同意，超时保守门控。
+/// - `Deathmatch`（生死状世界）：入场即签生死状，事后不再临场征询；**死亡判定仍受仲裁
+///   叙事合理性硬约束**（`rule_arbitrate` R5 硬节点保护 / `model_arbitrate` 的 Invalid/Blocked
+///   原样生效）——取消的只是被杀者的否决权，不是裁判。
+///
+/// **默认必须是 `Consent`**：调用方（server/桌面壳）不传时行为与历史完全一致。
+/// 未成年禁入生死状是 server 侧 join 的责任，引擎不做任何年龄相关假设。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum Lethality {
+    /// 庇护世界：致死行动降级为重伤，任何角色都不会死。
+    Sanctuary,
+    /// 同意制世界（默认）：不可逆事件当事人临场同意，超时保守。
+    Consent,
+    /// 生死状世界：入场即签，事后不再临场征询；仲裁硬约束不变。
+    Deathmatch,
+}
+
+impl Default for Lethality {
+    /// 默认 = 同意制（现行机制）：新增字段对既有调用方零行为变化。
+    fn default() -> Self {
+        Self::Consent
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SceneRecord {

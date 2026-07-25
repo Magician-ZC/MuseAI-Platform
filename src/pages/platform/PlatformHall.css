@@ -181,7 +181,6 @@
 }
 
 .world-activity,
-.publish-status,
 .world-catalog,
 .related-rail {
   border: 1px solid #ebe5de;
@@ -203,7 +202,6 @@
 }
 
 .section-heading h2,
-.publish-status > h2,
 .related-rail > h2,
 .related-section h3 {
   margin: 0;
@@ -224,7 +222,7 @@
 
 .world-event {
   display: grid;
-  grid-template-columns: 76px minmax(0, 1fr) 70px;
+  grid-template-columns: minmax(0, 1fr) 70px;
   align-items: center;
   gap: 14px;
   width: 100%;
@@ -250,13 +248,6 @@
 .world-event:focus-visible {
   outline: 2px solid #d97757;
   outline-offset: 2px;
-}
-
-.world-event > img {
-  width: 76px;
-  height: 76px;
-  border-radius: 7px;
-  object-fit: cover;
 }
 
 .world-event__copy {
@@ -303,29 +294,18 @@
   color: #5f5953;
 }
 
-.publish-status {
-  margin-top: 14px;
-  overflow: hidden;
-  border-radius: 8px;
-}
-
-.publish-status > h2 {
-  padding: 17px 20px 10px;
-}
-
-.publish-status__row {
+/* 发布状态：设计文档 §6 归属右侧辅助栏，随 .related-section 一起排布。 */
+.publish-entry {
   display: grid;
-  grid-template-columns: 42px minmax(160px, 1.2fr) 82px 54px 54px minmax(150px, 1fr) auto;
-  align-items: center;
-  gap: 12px;
-  margin: 0 20px 16px;
-  padding: 12px 14px;
+  grid-template-columns: 36px minmax(0, 1fr);
+  gap: 10px;
+  padding: 12px;
   border: 1px solid #ece6df;
   border-radius: 7px;
   background: #fdfcf9;
 }
 
-.publish-status__icon {
+.publish-entry__icon {
   display: grid;
   width: 36px;
   height: 36px;
@@ -336,47 +316,118 @@
   font-size: 18px;
 }
 
-.publish-status__title,
-.publish-status__state,
-.publish-status__metric {
+.publish-entry__body {
   display: flex;
+  min-width: 0;
   flex-direction: column;
+  gap: 3px;
 }
 
-.publish-status__title strong {
+.publish-entry__body strong {
+  overflow: hidden;
   color: #4b4641;
   font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.publish-status__title small,
-.publish-status__state small,
-.publish-status__metric small,
-.publish-status__updated {
+.publish-entry__body small {
   color: #a19990;
   font-size: 11px;
 }
 
-.publish-status__state {
-  color: #56805d;
-  font-size: 12px;
-}
-
-.publish-status__state .anticon {
-  margin-right: 4px;
-}
-
-.publish-status__metric {
+.publish-entry__state {
   color: #5d5751;
   font-size: 12px;
 }
 
-.publish-status__empty {
+.publish-entry__state.is-green {
+  color: #56805d;
+}
+
+.publish-entry__state.is-gold {
+  color: #8a6d33;
+}
+
+.publish-entry__state.is-red,
+.publish-entry__state.is-volcano {
+  color: #b0523c;
+}
+
+.publish-entry__state .anticon {
+  margin-right: 4px;
+}
+
+.publish-entry > .ant-btn {
+  grid-column: 1 / -1;
+  margin-top: 4px;
+}
+
+.publish-entry__empty {
   display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+/* 相关世界：复用已加载的世界列表，封面同样使用真实位图。 */
+.related-worlds {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.related-worlds button {
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr);
   align-items: center;
-  justify-content: space-between;
-  padding: 8px 20px 18px;
-  color: #817970;
+  gap: 10px;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.related-worlds button:hover strong {
+  color: #c66f4d;
+}
+
+.related-worlds button:focus-visible {
+  outline: 2px solid #d97757;
+  outline-offset: 2px;
+}
+
+.related-worlds img {
+  width: 52px;
+  height: 52px;
+  border-radius: 7px;
+  object-fit: cover;
+}
+
+.related-worlds span {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.related-worlds strong {
+  overflow: hidden;
+  color: #3b3834;
   font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.related-worlds small {
+  color: #918980;
+  font-size: 11px;
 }
 
 .related-rail {
@@ -409,6 +460,11 @@
   display: grid;
   grid-template-columns: 112px minmax(0, 1fr);
   gap: 14px;
+}
+
+/* 无头像数据源时的紧凑变体（接口暂未下发成员头像，不放占位图）。 */
+.bonded-character--compact {
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .bonded-character > img {
@@ -501,28 +557,6 @@
   margin-top: 12px;
 }
 
-.related-section--activity ul {
-  display: grid;
-  gap: 13px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.related-section--activity li {
-  display: grid;
-  grid-template-columns: 16px minmax(0, 1fr) auto;
-  align-items: start;
-  gap: 7px;
-  color: #625c55;
-  font-size: 11px;
-}
-
-.related-section--activity li time {
-  color: #aaa299;
-  white-space: nowrap;
-}
-
 .related-empty {
   margin: 0;
   color: #918980;
@@ -565,10 +599,25 @@
 }
 
 .world-catalog-card {
-  padding: 16px;
+  display: grid;
+  grid-template-columns: 104px minmax(0, 1fr);
+  gap: 14px;
+  padding: 14px;
   border: 1px solid #ebe5de;
   border-radius: 8px;
   background: #fdfcf9;
+}
+
+/* 真实位图封面（world.coverUrl 缺席时按 id 哈希确定性兜底）。 */
+.world-catalog-card__cover {
+  width: 104px;
+  height: 104px;
+  border-radius: 7px;
+  object-fit: cover;
+}
+
+.world-catalog-card__body {
+  min-width: 0;
 }
 
 .world-catalog-card__head,
@@ -584,9 +633,16 @@
   gap: 8px;
 }
 
+.world-catalog-card__head strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .world-catalog-card__tags {
   flex-wrap: wrap;
-  margin: 10px 0;
+  gap: 4px 0;
+  margin: 8px 0;
 }
 
 .world-catalog-card__meta {
@@ -609,8 +665,13 @@
     width: 68%;
   }
 
-  .publish-status__updated {
-    display: none;
+  .world-catalog-card {
+    grid-template-columns: 84px minmax(0, 1fr);
+  }
+
+  .world-catalog-card__cover {
+    width: 84px;
+    height: 84px;
   }
 }
 
@@ -621,7 +682,7 @@
 
   .related-rail {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .related-rail > h2 {
@@ -642,13 +703,8 @@
     height: 100px;
   }
 
-  .publish-status__row {
-    grid-template-columns: 42px minmax(160px, 1fr) 82px auto;
-  }
-
-  .publish-status__metric,
-  .publish-status__updated {
-    display: none;
+  .world-catalog__grid {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .world-catalog__heading {

@@ -11,6 +11,7 @@
 //! POST /worlds/{id}/join                 投放角色：AuthUser + Idempotency-Key + cloudCharacterId + boundary
 //!   服务端权威校验（§9.6）：角色 approved 且未 withdrawn 且属于本人；人数上限；写 world_members；
 //!   防自刷：同一世界每位用户仅可投放一张 active 角色卡（退出后可换卡再进）；
+//!   同源唯一（R1）：同一提取源的未编辑原味卡同世界仅可在场一张（编辑过的卡/无指纹卡放行）；
 //!   历练准入（波次 3）：模板 star≥3 时投放卡 mileage 须达门槛（3★=300/4★=1000/5★=3000），1-2★ 免检
 //! POST /worlds/{id}/leave                离场：置成员 left（离场事件交由下个 tick 叙事化）
 //!
@@ -397,6 +398,24 @@ fn star_mileage_gate(star: i64) -> Option<i64> {
     }
 }
 
+/// 同源冲突拒绝文案里的角色名（`card_json.identity.name`）。
+/// 只在拒绝路径调用——正常 join 不反序列化整张卡（同源判定读的是物化列）。
+/// 取不到名字（卡结构异常/无名）时兜底为「该角色」，文案仍可读，绝不因取名失败改变判定。
+async fn character_display_name(db: &AnyPool, character_id: &str) -> String {
+    let card: Option<String> =
+        sqlx::query_scalar("SELECT card_json FROM cloud_characters WHERE id = ?")
+            .bind(character_id)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+    card.as_deref()
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .and_then(|v| v.pointer("/identity/name").and_then(|n| n.as_str()).map(str::to_string))
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "该角色".to_string())
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct JoinRequest {
@@ -427,9 +446,10 @@ async fn join_world(
         return Err(ApiError::Conflict("world_not_joinable".into()));
     }
 
-    // 角色服务端权威校验：属本人 + approved + 未撤回（mileage 同查读出，供下方星级历练准入）。
+    // 角色服务端权威校验：属本人 + approved + 未撤回（mileage 供下方星级历练准入，
+    // source_fingerprint/pristine 供下方同源唯一校验——同一次查询读出，不新增数据库往返）。
     let ch = sqlx::query(
-        "SELECT owner_id, moderation, withdrawn, mileage FROM cloud_characters WHERE id = ?",
+        "SELECT owner_id, moderation, withdrawn, mileage, source_fingerprint, pristine FROM cloud_characters WHERE id = ?",
     )
     .bind(&body.cloud_character_id)
     .fetch_optional(&state.db)
@@ -439,6 +459,8 @@ async fn join_world(
     let moderation: String = ch.try_get("moderation")?;
     let withdrawn: i64 = ch.try_get("withdrawn")?;
     let mileage: i64 = ch.try_get("mileage")?;
+    let source_fingerprint: Option<String> = ch.try_get("source_fingerprint")?;
+    let pristine: i64 = ch.try_get("pristine")?;
     if owner_id != user.user_id {
         return Err(ApiError::Forbidden);
     }
@@ -462,6 +484,46 @@ async fn join_world(
             return Err(ApiError::Conflict(format!(
                 "该世界为 {star} 星副本，需角色历练 ≥{required}（当前 {mileage}）"
             )));
+        }
+    }
+
+    // 同源卡同世界唯一（R1，规格 §7「这个世界只有一个唐三」，与上方星级准入同为投放资格类校验）：
+    // 同一世界内，同一提取源的**未编辑原味卡**只允许在场一张；撞卡的玩家被引导去编辑出自己的
+    // 版本，或换一个世界实例（叙事合理 + 撞卡压力转化为编辑创作激励 + 热门卡分流多实例）。
+    //
+    // 两条放行硬约束（不得收紧）：
+    // - 只拦 pristine=1。玩家编辑过的卡（lifecycle/revision 任一变动）一律放行——「编辑出你自己的
+    //   版本」就是本规则的出口，拦掉编辑过的卡等于毁掉这个设计。
+    // - 指纹为 NULL 一律放行：纯原创卡本无提取源，迁移前的老卡也没有物化指纹，不得因缺字段拒绝入世。
+    //
+    // 排除本卡自身 → 同卡重复 join / 复活仍走下方幂等与复活分支，现有行为不回退。
+    //
+    // 取舍说明（为何不加条件唯一索引，体例同下方防自刷）：「pristine 卡按 fingerprint 唯一」需要
+    // 带 WHERE 的部分唯一索引，不在 SQLite/Postgres 双库可移植子集内（0021 迁移只建普通索引）。
+    // 应用层校验覆盖正常路径；并发窗口下两张同源原味卡理论上可各落一行 active，但撞进两行也无资损
+    // ——同源唯一是叙事体验约束而非结算口径，多出的行不影响结算、可事后治理。
+    if pristine == 1 {
+        if let Some(fingerprint) = source_fingerprint.as_deref() {
+            let same_source: i64 = sqlx::query(
+                "SELECT COUNT(*) AS n FROM world_members wm \
+                 JOIN cloud_characters cc ON cc.id = wm.cloud_character_id \
+                 WHERE wm.world_id = ? AND wm.status = 'active' \
+                 AND cc.source_fingerprint = ? AND cc.pristine = 1 \
+                 AND wm.cloud_character_id != ?",
+            )
+            .bind(&id)
+            .bind(fingerprint)
+            .bind(&body.cloud_character_id)
+            .fetch_one(&state.db)
+            .await?
+            .try_get("n")?;
+            if same_source > 0 {
+                // 引导型拒绝（面向玩家）→ 用中文长句文案派，与机器码 world_not_joinable 一类区分。
+                let name = character_display_name(&state.db, &body.cloud_character_id).await;
+                return Err(ApiError::Conflict(format!(
+                    "这个世界已经有一个「{name}」了。编辑出你自己的版本，或换一个世界实例"
+                )));
+            }
         }
     }
 

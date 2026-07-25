@@ -107,6 +107,10 @@ cd server && MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo ru
 | `MUSE_OUTBOX_RESCAN_MS` | `60000` | 通知 outbox 恢复重扫间隔 |
 | `MUSE_LIVEGATE_SECRET` | 未配置=fail-closed | 赛事房礼物 webhook 验签(生产必配) |
 | `MUSE_TOKEN_CNY_CENTS_PER_1K` | 内置(`runtime/mod.rs:66`) | 每 1K token 折算人民币分。**成本仪表定价基准**(总规格 §17),`world_ticks.cost_tokens` 逐拍记账按此换算 |
+| `MUSE_DREAM_QUOTA_PER_STAGE` | `3` | 托梦配额:每卡每阶段条数(总规格 §8)。非正整数/垃圾值一律回落默认——防运营误配把托梦通道锁死 |
+| `MUSE_SAFETY_LEXICON` | **开启** | 运行时敏感词库总开关(§15 第 2 层)。**默认开启且应保持开启**——内容安全是合规主体责任下的恒开设施,此开关定位是误伤应急阀,不是灰度位 |
+| `MUSE_SAFETY_LEXICON_EXTRA` | 空 | 运营补充敏感词(逗号/分号/换行分隔),归类 `custom`、低危 |
+| `MUSE_SAFETY_RUNTIME_AUDIT` | `high` | 运行时命中入人审队列的策略:`high`(仅高危)/`all`/`none`。**命中一律记 risk_events**,本开关只管是否额外入 `audit_queue`(每 tick 每事件都入队会淹掉人审)。配错值回落 `high`,不静默放宽或收紧 |
 
 > 上表即全部 `MUSE_*` 变量(校验命令:`grep -rhoE '"MUSE_[A-Z0-9_]+"' server/src crates | sort -u`)。
 
@@ -116,9 +120,12 @@ cd server && MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo ru
 
 ## 5. 数据库与迁移
 
-- 迁移文件 `server/migrations/0001-0020`(共 20 个),启动自动按版本号顺序执行(sqlx migrate)。
+- 迁移文件 `server/migrations/0001-0025`,启动自动按版本号顺序执行(sqlx migrate)。
 - 可移植 SQL 子集(TEXT id / BIGINT 毫秒 / TEXT JSON / INTEGER 布尔),SQLite 与 Postgres 双跑。
 - dev 内存库每次启动重建;需要持久化 dev 数据用文件库 `sqlite://muse-dev.db`(已 gitignore)。
+- ⚠️ **`0023` 号已跳过,不要补**。R1 并行开发时预留给「运行时内容安全」,但该项复用了 `0001` 就有的
+  `world_events.moderation` 列、无需建表。sqlx 只要求版本号唯一递增、不要求连续,跳号本身无害;
+  但**事后往回插入一个比已应用版本更小的号会让已迁移的库报错**——需要新迁移一律往后取号。
 
 | 迁移 | 内容 |
 |---|---|
@@ -142,6 +149,10 @@ cd server && MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo ru
 | `0018_moderation_appeals` | 审核申诉复审链 |
 | `0019_progression` | **历练与卡位**(总规格 §11 底座) |
 | `0020_template_star` | **模板星级 curation**(3-5★ 仅运营晋升) |
+| `0021_source_fingerprint` | **同源卡同世界唯一**(§7):`cloud_characters` 加提取源指纹 + 原味卡标记 |
+| `0022_dream_quota_index` | **托梦配额**(§8)按卡计数索引 `(world_id, character_id, status)` |
+| `0024_saga_stage` | **Saga 归组**(§3):`world_templates` 加 `saga_id` + `stage_no`(0023 见上方跳号说明) |
+| `0025_worldline_contribution` | **三层结算③世界线层**(§9):贡献归因表(独立于 `narrative_state_json`,绝不回灌引擎) |
 
 ---
 

@@ -1,9 +1,11 @@
 # 放置房软主线示例 skeleton（Idle-Room Soft Mainline Example）
 
 > **有效性地图（防误用）**：
-> - ✅ **技术内容全部有效**：本文 JSON 与 `server/src/runtime/tests.rs:1244` `example_idle_skeleton()`
->   镜像同一份，由测试 `example_idle_skeleton_seeds_valid_milestones` 守护「可加载 + 结构合法」，防样例腐化。
->   字段语义（`threshold` / `advanceWhen` / `endgame`）与当前引擎实现一致。
+> - ✅ **技术内容全部有效**：本文主 JSON（`mainlineNodes` + `endgame`）与 `server/src/runtime/tests.rs:1244`
+>   `example_idle_skeleton()` 镜像同一份，由测试 `example_idle_skeleton_seeds_valid_milestones` 守护
+>   「可加载 + 结构合法」，防样例腐化。字段语义（`threshold` / `advanceWhen` / `endgame`）与当前引擎实现一致。
+> - ✅ **`identityPool` 段（见文末）是装配层维度**，不进 idle 镜像测试，由
+>   `server/src/assembly/mod.rs` 的 `identity_*` / `validate_*_identity_*` 单测守护。
 > - ⚠️ **术语已过时**：文中「放置房」「P1」是旧词汇。总规格
 >   [`spec-world-ecosystem.md`](./spec-world-ecosystem.md) §1 已把 `idle/chapter/arena`
 >   **降级为引擎运行模式、退出产品词汇表**——现在的产品词汇是节奏三档（直播场 / 连载场 / **慢炖场**）。
@@ -85,3 +87,46 @@ relations[<from>-><to>].<field> <op> <num>
 命中任一（且过 `minWorldTicks` 地板、`room_type=='idle'`）→ 世界 `status='ended'` 停机；同事务写终局审计，
 从装配层 `enabledEndings` 选定结局（`select_ending`，`weight_endings` 保底 ≥1），落成**荣誉奖励**
 （走 arena 红线：只记荣誉、非战力、无买判定），并复用 `reports::generate_report` 产出终局日报。
+
+---
+
+## 可选维度：`identityPool`（身份池，总规格 §5【拍板 4、5】）
+
+模板可以在同一份 `skeleton_json` 里再声明一个**身份池**——阶段模板列出这个世界有哪些**开局站位**
+（官员×N、商贾×N、江湖客×N、"被退婚主位"×1~2……），装配时由 `server/src/assembly/mod.rs` 的
+`assign_identities` 按「**内核匹配 + 种子随机**」分给全体入场卡。缺省不写 = 无身份维度，老模板零影响。
+
+```jsonc
+{
+  "identityPool": [
+    { "id": "official", "label": "户部主事",     "quota": 3, "themes": ["朝堂", "文书", "官阶"], "hookAffinity": ["arc-court"] },
+    { "id": "merchant", "label": "漕帮商贾",     "quota": 3, "themes": ["行商", "银钱"] },
+    { "id": "wanderer", "label": "江湖客",       "quota": 4, "themes": ["刀口", "浪迹"] },
+    { "id": "jilted",   "label": "被退婚的嫡女", "quota": 1, "themes": ["退婚", "门第"], "isLead": true, "hookAffinity": ["hook-broken-betrothal"] }
+  ]
+}
+```
+
+| 字段 | 类型 | 含义 |
+|---|---|---|
+| `id` | string | 身份 id。**非空 + 全池唯一**，是分配结果与审计的稳定键（建模板期校验）。 |
+| `label` | string | 叙事展示名。空则展示层回落 `id`。 |
+| `quota` | int(≥1，默认 1) | **上限，不是保底**：这个位最多几个人站。实际站几个由实例种子决定。 |
+| `themes` | string[] | 主题词，与角色卡执念（恐惧 / 被否认的欲望 / 核心矛盾 / 隐藏需求 / 剧情种子 / 拒绝规则）做重叠匹配——**内核匹配**的依据。 |
+| `hookAffinity` | string[] | 专属钩子引力：指向 `storylines[].id` / `hiddenContentPool[].id` / `sideHookPool[].id`。命中本实例在演的内容 → 抽取权重上调。**建模板期校验悬空引用。** |
+| `isLead` | bool | 戏眼主位标记（"被退婚主位"这类站位）：仅上调抽取权重，不保证必被占用。 |
+
+### 分配语义
+
+- **实例种子驱动**：种子 = `H(world_id ‖ 阵容指纹 ‖ template_version)`，与剧情采样同源但走独立子流域，
+  所以**同一模板的 1 号世界可能有 10 个官员，2 号世界只有 1 个**。这同时是**第二重防刷**——
+  外部攻略连身份分布都对不上盘。
+- **确定性**：同一 `(world_id, 阵容, template_version)` 恒得同一份分配；与入场先后无关（阵容按 cid 升序分配）。
+  结果随实例钉进 `worlds.assembled_json` 的 `/assembly/identityAssignments`（`[[cid, identityId], …]`）。
+- **配额边界**：人多于 `Σquota` → 配额用尽后余下角色**无身份**（无预设站位，入场导演在叙事层自由安排）；
+  人少于 `Σquota` → 多余槽位空置。**绝不超发。**
+- **生效范围**：身份池是独立维度，超集模板（`isSuperset` + `storylines` + `sampling`）与普通模板都生效。
+
+> **🔴 平权红线（§0.1 平权宪法，锁进测试）**：**身份 = 开局站位，不是主角光环。**
+> 任何身份都**不携带**数值差异、准入门槛、产出加成、难度优待或叙事特权——分配结果只进叙事层。
+> 严禁任何下游据身份改判定 / 改发奖 / 开权限 / 调难度。戏份靠玩出来。

@@ -1,6 +1,6 @@
 //! 数据看板（总览 + 按天趋势）+ 经济运营。均为只读 SQL 聚合/取数，不产生副作用、不建结算。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use axum::extract::{Query, State};
 use axum::Json;
@@ -29,11 +29,76 @@ fn rate(numer: i64, denom: i64) -> f64 {
     }
 }
 
+// ---------------- 成本仪表口径（总规格 §17【拍板 16】） ----------------
+
+/// token→人民币单价默认值（分 / 千 token）。
+///
+/// **与 runtime 侧同源**：`runtime::token_cny_cents_per_1k` 用同一个 env 名、同一个默认值、
+/// 同一个换算公式。runtime 侧那个函数是模块私有的（服务于逐拍预算熔断），本模块不便跨模块调用，
+/// 故在此复刻**同一口径**而不是另立一套单价——看板金额与熔断金额必须是同一个数，
+/// 否则会出现「后台看着没超预算、世界却被熔断」。
+/// 调价只需改 env `MUSE_TOKEN_CNY_CENTS_PER_1K`，两侧同时生效（VALIDATION §0.2 参数化，禁写死）。
+const DEFAULT_TOKEN_CNY_CENTS_PER_1K: i64 = 2;
+
+/// 读取 token 单价（分/千 token）。env 覆盖 + 默认常量，范式同 `runtime::token_cny_cents_per_1k`。
+pub(super) fn token_cny_cents_per_1k() -> i64 {
+    std::env::var("MUSE_TOKEN_CNY_CENTS_PER_1K")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v: &i64| *v > 0)
+        .unwrap_or(DEFAULT_TOKEN_CNY_CENTS_PER_1K)
+}
+
+/// tokens → 人民币分。公式与 runtime 预算熔断里的 `est_cny` 逐字一致（整数除法、向下取整）。
+pub(super) fn tokens_to_cents(tokens: i64) -> i64 {
+    tokens.saturating_mul(token_cny_cents_per_1k()) / 1000
+}
+
+/// 分 → 元（纯展示派生值）。账面口径一律整数分；元只为前端直接渲染省一次换算。
+pub(super) fn cents_to_cny(cents: i64) -> f64 {
+    cents as f64 / 100.0
+}
+
+/// 每玩家成本分摊：**按该世界 active 成员人均等分**（世界累计成本 ÷ active 成员数）。
+///
+/// 为什么选等分而不是「按参与拍数」：
+/// ① `world_ticks.cost_tokens` 是**整拍**口径——一次 tick 的导演/仲裁/写作调用产出的是
+///    全世界共享的一段叙事，账上根本没有 per-member 的 token 分解，「按参与拍数分摊」
+///    在当前数据下无法计算（world_ticks 不记录本拍参与了哪些成员）；
+/// ② 退而用 `world_events.actors_json` 近似「谁参与了」是**产出侧戏份**而非**成本侧投入**，
+///    会把「戏多」错当成「费钱」，比等分更失真且更难解释；
+/// ③ 等分正面回答定价要问的那个问题——「这个世界再多进一个玩家，摊薄后每人多少钱」。
+/// 局限（须随数一起看）：等分假设玩家对成本贡献均等；戏份极不均的世界会低估重度玩家的真实成本。
+///
+/// 成员数为 0（无人在场/全员退出）→ None：无成员的世界没有「每玩家成本」这个量，不除零、不编 0。
+fn per_player(value: i64, members: i64) -> Option<f64> {
+    if members > 0 {
+        Some(value as f64 / members as f64)
+    } else {
+        None
+    }
+}
+
+/// 成本榜单长度（每局成本卡片只展示头部世界；平台合计仍按全量世界算）。
+const COST_TOP_N: usize = 10;
+
+/// 成本趋势默认窗口（天）。看板健康条要的是「最近一周走势」；可经 `?costDays=` 覆盖。
+const DEFAULT_COST_TREND_DAYS: i64 = 7;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct OverviewQuery {
+    /// 成本趋势窗口天数，clamp 到 [1,60]（与 trends 同），默认 7。
+    cost_days: Option<i64>,
+}
+
 /// GET /admin/metrics/overview：核心运营指标聚合。
-/// 注册数、日报打开率、tick 成功率、按世界 token 成本、审核积压、活跃/熔断世界、风控计数。
+/// 注册数、日报打开率、tick 成功率、按世界 token 成本、审核积压、活跃/熔断世界、风控计数，
+/// 以及**成本仪表**（§17【拍板 16】）：今日成本 + 近 N 日趋势 + 每局成本 + 每玩家分摊。
 pub(super) async fn metrics_overview(
     State(state): State<AppState>,
     admin: AdminUser,
+    Query(q): Query<OverviewQuery>,
 ) -> Result<Json<Value>, ApiError> {
     require_role(&admin, &["operator", "finance"])?;
     let db = &state.db;
@@ -67,20 +132,98 @@ pub(super) async fn metrics_overview(
     let ticks_done: i64 = tk.try_get("done")?;
     let ticks_failed: i64 = tk.try_get("failed")?;
 
-    // 按世界 token 成本（Top 10）。
+    // ==================== 成本仪表（§17【拍板 16】「成本仪表」） ====================
+    // 三个维度共三条只读聚合查询，**无 N+1**（绝不按世界逐个发 SQL——本端点是后台轮询调用的）：
+    //   ① 每局成本：world_ticks 按 world_id 一次 GROUP BY 累计 token；
+    //   ② 每玩家成本：world_members 按 world_id 一次 GROUP BY 数 active 成员，Rust 侧等分分摊；
+    //   ③ 今日成本 + 近 N 日趋势：一条窗口范围查询取回 (cost_tokens, created_at)，Rust 侧分桶到天。
+    // 日界：沿用本文件 `utc_day_start_ms`/`DAY_MS`（UTC 日界，与 metrics_trends 同一套口径），
+    // SQL 只做 BIGINT 毫秒范围过滤，**不用 strftime/date_trunc**（方言特有、SQLite/PG 不可移植）。
+    let cents_per_1k = token_cny_cents_per_1k();
+
+    // ① 每局（每个世界实例）累计 token。去掉了历史上的 `LIMIT 10`：平台合计与每玩家均值必须覆盖
+    //    全部世界才有定价意义；GROUP BY 本就要扫全表，多回传几行世界级聚合的代价可忽略，
+    //    榜单仍只取头部 COST_TOP_N 条。
     let cost_rows = sqlx::query(
-        "SELECT world_id, COALESCE(SUM(cost_tokens), 0) AS tokens FROM world_ticks \
-         GROUP BY world_id ORDER BY tokens DESC LIMIT 10",
+        "SELECT world_id, CAST(COALESCE(SUM(cost_tokens), 0) AS BIGINT) AS tokens FROM world_ticks \
+         GROUP BY world_id ORDER BY tokens DESC",
     )
     .fetch_all(db)
     .await?;
+
+    // ② 各世界 active 成员数（分摊分母）。
+    let member_rows = sqlx::query(
+        "SELECT world_id, COUNT(*) AS n FROM world_members WHERE status = 'active' GROUP BY world_id",
+    )
+    .fetch_all(db)
+    .await?;
+    let mut active_members: HashMap<String, i64> = HashMap::with_capacity(member_rows.len());
+    for r in &member_rows {
+        active_members.insert(r.try_get::<String, _>("world_id")?, r.try_get::<i64, _>("n")?);
+    }
+
+    // ①+② 组装：榜单取头部；合计覆盖全量世界。
+    // 合计的成员分母只累加**有 tick 记账的世界**——从未跑过的世界成本恒为 0，把它的成员计进分母
+    // 会把平台均值稀释成一个没人能解释的数。
     let mut token_cost_by_world = Vec::new();
+    let mut cost_by_world = Vec::new();
+    let mut total_tokens = 0i64;
+    let mut total_members = 0i64;
     for r in &cost_rows {
-        token_cost_by_world.push(json!({
-            "worldId": r.try_get::<String, _>("world_id")?,
-            "tokens": r.try_get::<i64, _>("tokens")?,
+        let world_id: String = r.try_get("world_id")?;
+        let tokens: i64 = r.try_get("tokens")?;
+        let members = active_members.get(&world_id).copied().unwrap_or(0);
+        total_tokens += tokens;
+        total_members += members;
+        if cost_by_world.len() < COST_TOP_N {
+            let cents = tokens_to_cents(tokens);
+            // 兼容既有看板字段（旧 Metrics 页读的就是它），值与 cost.byWorld 同源同序。
+            token_cost_by_world.push(json!({ "worldId": world_id.clone(), "tokens": tokens }));
+            cost_by_world.push(json!({
+                "worldId": world_id,
+                "tokens": tokens,
+                "cents": cents,
+                "cny": cents_to_cny(cents),
+                "activeMembers": members,
+                "tokensPerPlayer": per_player(tokens, members),
+                "centsPerPlayer": per_player(cents, members),
+            }));
+        }
+    }
+    let total_cents = tokens_to_cents(total_tokens);
+
+    // ③ 今日成本 + 近 N 日趋势（UTC 日界，空天补零，末桶即"今天"）。
+    let cost_days = q.cost_days.unwrap_or(DEFAULT_COST_TREND_DAYS).clamp(1, 60);
+    let today_start = utc_day_start_ms(now_ms());
+    let cost_start = today_start - (cost_days - 1) * DAY_MS;
+    let cost_end = today_start + DAY_MS; // 右开区间，含今天整天
+    let mut day_tokens = vec![0i64; cost_days as usize];
+    let rows = sqlx::query(
+        "SELECT cost_tokens, created_at FROM world_ticks WHERE created_at >= ? AND created_at < ?",
+    )
+    .bind(cost_start)
+    .bind(cost_end)
+    .fetch_all(db)
+    .await?;
+    for r in &rows {
+        let ts: i64 = r.try_get("created_at")?;
+        // 窗口起点即 UTC 0 点，(ts-start)/天宽 整除即天序号；SQL 已过滤，越界防御性跳过。
+        if ts >= cost_start && ts < cost_end {
+            day_tokens[((ts - cost_start) / DAY_MS) as usize] += r.try_get::<i64, _>("cost_tokens")?;
+        }
+    }
+    let mut cost_trend = Vec::with_capacity(day_tokens.len());
+    for (i, tokens) in day_tokens.iter().enumerate() {
+        let cents = tokens_to_cents(*tokens);
+        cost_trend.push(json!({
+            "day": crate::runtime::day_string(cost_start + i as i64 * DAY_MS),
+            "tokens": tokens,
+            "cents": cents,
+            "cny": cents_to_cny(cents),
         }));
     }
+    let today_tokens = *day_tokens.last().unwrap_or(&0);
+    let today_cents = tokens_to_cents(today_tokens);
 
     // 审核积压 / 活跃世界 / 熔断世界 / 风控事件。
     let audit_backlog =
@@ -110,6 +253,38 @@ pub(super) async fn metrics_overview(
             "successRate": rate(ticks_done, ticks_total),
         },
         "tokenCostByWorld": token_cost_by_world,
+        // 成本仪表（§17【拍板 16】）。金额一律**整数分**（cents）为账面口径，cny 仅为展示派生；
+        // perPlayer 系列是派生均值（浮点），不是账面金额。
+        "cost": {
+            "centsPer1kTokens": cents_per_1k,
+            "today": {
+                "day": crate::runtime::day_string(today_start),
+                "tokens": today_tokens,
+                "cents": today_cents,
+                "cny": cents_to_cny(today_cents),
+            },
+            "trendDays": cost_days,
+            "trend": cost_trend,
+            "byWorld": cost_by_world,
+            "total": {
+                "worlds": cost_rows.len() as i64,
+                "tokens": total_tokens,
+                "cents": total_cents,
+                "cny": cents_to_cny(total_cents),
+                "activeMembers": total_members,
+                "tokensPerPlayer": per_player(total_tokens, total_members),
+                "centsPerPlayer": per_player(total_cents, total_members),
+            },
+            "allocation": "per_member_equal_split",
+            "notes": [
+                "单价口径：MUSE_TOKEN_CNY_CENTS_PER_1K（分/千 token），与 runtime 预算熔断同一个参数与公式。",
+                "每玩家成本 = 世界累计成本 ÷ 该世界 world_members 中 status='active' 的成员数（人均等分）。",
+                "选等分的理由：cost_tokens 是整拍口径，账上没有 per-member 分解，「按参与拍数分摊」当前无数据可算；等分正面回答定价问题（多进一人摊薄多少）。",
+                "局限：等分假设玩家对成本贡献均等，戏份极不均的世界会低估重度玩家的真实成本。",
+                "平台合计的成员分母只含有 tick 记账的世界；无 active 成员的世界 perPlayer 为 null（不除零）。",
+                "日界为 UTC（与 metrics/trends、world_budgets.budget_day 同口径）；趋势末桶即今天。",
+            ],
+        },
         "auditBacklog": audit_backlog,
         "worlds": { "active": worlds_active, "fused": worlds_fused },
         "riskEvents": risk_total,
@@ -119,7 +294,7 @@ pub(super) async fn metrics_overview(
 
 // ---------------- 按天趋势 ----------------
 
-const DAY_MS: i64 = 86_400_000;
+pub(super) const DAY_MS: i64 = 86_400_000;
 
 #[derive(Debug, Deserialize)]
 pub(super) struct TrendsQuery {
@@ -129,7 +304,7 @@ pub(super) struct TrendsQuery {
 /// ms 时间戳 → 所在天的 UTC 0 点 ms。
 /// 时区口径与 `reports::day_bounds` / `runtime::day_string` 一致：**UTC 日界**，
 /// 桶恒为 `[UTC 0 点, +86_400_000)`（全仓禁 SQL 日期函数，SQL 只做 BIGINT ms 范围过滤）。
-fn utc_day_start_ms(ms: i64) -> i64 {
+pub(super) fn utc_day_start_ms(ms: i64) -> i64 {
     use chrono::NaiveTime;
     chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
         .map(|d| d.date_naive().and_time(NaiveTime::MIN).and_utc().timestamp_millis())

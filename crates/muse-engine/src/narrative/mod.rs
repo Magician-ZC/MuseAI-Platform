@@ -115,6 +115,17 @@ pub struct RoundInput {
     /// 促使导演主动改变局势打破僵局。`None` = 无提示（默认，向后兼容；桌面壳恒 None）。
     /// **不动「Blocked 不提交」不变量**——仅影响导演 prompt 文本，不触碰裁决/提交路径。
     pub stall_hint: Option<String>,
+    /// 生死契约档（规格 §11【拍板 24】）：世界级参数，与星级正交，随每回合传入（引擎不持有世界配置）。
+    /// - `Consent`（**默认**）= 现行同意制，行为与历史完全一致；调用方不传即此档。
+    /// - `Sanctuary` = 庇护世界：致死行动在写作前降级为重伤（`apply_lethality`），正文与事件同口径。
+    /// - `Deathmatch` = 生死状世界：入场即签，`gate_consents` 不再临场征询；仲裁硬约束原样保留。
+    ///
+    /// 平台由 runtime 从 worlds.lethality 回灌（server 侧下一阶段接线）；桌面壳恒默认档。
+    ///
+    /// 注：`RoundInput` 本身不派生 serde（纯进程内入参，无 `#[serde(default)]` 可用），
+    /// 「不传即默认」由 `Default for RoundInput` + `Default for Lethality` 保证；
+    /// 跨进程边界（server DTO / Tauri 命令入参）的 `#[serde(default)]` 由各自的请求结构负责。
+    pub lethality: Lethality,
 }
 
 impl Default for RoundInput {
@@ -135,6 +146,8 @@ impl Default for RoundInput {
             locations: BTreeMap::new(),
             now_hint: 0,
             stall_hint: None,
+            // 生死契约默认档 = 同意制（现行机制）：不传 = 行为与历史零差异。
+            lethality: Lethality::default(),
         }
     }
 }
@@ -435,6 +448,13 @@ impl NarrativeEngine {
             });
         }
 
+        // 3c) 生死契约档降级（规格 §11【拍板 24】·庇护世界）——**必须在场景写作(4) 之前**：
+        // 写作吃的是 `group_outcomes`，若只在门控(4.5) 处拦截死亡，就会出现「正文写着他被杀死了、
+        // 公共事实却是退场/未落定」的矛盾（违反 §0.3 公共事实不可回滚的推论：正文即公共事实）。
+        // 故在此把致死结果就地降级为重伤，让 prose / ActionResolved.fact / pacingNotes 全部按降级后
+        // 的口径生成。非庇护档（含默认 Consent）此步为 no-op，行为零变化。
+        apply_lethality(&mut outcomes, &decisions, input.lethality);
+
         // 4) 逐组场景写作（Phase 2）：每组各写一段，合并为单 SceneRecord.prose（tick=revision 仍单值，
         //    单 patch/单 revision 原子提交契约不变）。单组时即一次写作调用，退化路径不变。
         let outcome_by_cid: BTreeMap<&str, &ArbiterOutcome> =
@@ -472,8 +492,14 @@ impl NarrativeEngine {
         // 分类不可逆结果（角色死亡/永久退场/永久关系变更，由 ArbiterResult 成功 + 行动语义判定）；
         // subject 全部命中 approved_consents → 正常落定并清除对应 pending；否则门控——
         // 产 ConsentRequested、剔出落定集（不落定该不可逆结果）、记 narrative.pending_consents。
-        let (committing_outcomes, consent_requests, newly_pending, approved_landed) =
-            gate_consents(&decisions, &outcomes, &input.approved_consents, &input.world_controlled);
+        // 生死状档（Deathmatch）在此放行全部 subject（入场即签，事后不再临场征询）。
+        let (committing_outcomes, consent_requests, newly_pending, approved_landed) = gate_consents(
+            &decisions,
+            &outcomes,
+            &input.approved_consents,
+            &input.world_controlled,
+            input.lethality,
+        );
 
         // 5) reducer 生成 StatePatch + DomainEvent（事件引用 patch.id，供 I3 校验）。
         // 落定集已剔除被门控的不可逆结果 → 其后果不进入 StatePatch/ActionResolved。
@@ -1161,6 +1187,56 @@ fn build_events(
     events
 }
 
+// ---------- 生死契约档降级（规格 §11【拍板 24】·庇护世界） ----------
+
+/// 庇护档降级后写入 `ArbiterOutcome.rule_refs` 的规则标记（透明战报可见「为什么没死」）。
+const SANCTUARY_RULE_REF: &str = "lethality:sanctuaryDowngrade";
+
+/// 庇护档降级后的 `consequence` 文案（**参数化集中点**，VALIDATION §0.2：产品规则不散落硬编码）。
+///
+/// 该文本同时是**给写作环节的指令**——`call_writer` 把 `consequence` 原样喂给写手，故必须
+/// 显式否定死亡，否则写手会顺着决策原文（仍含「杀死」）把人写死，造成正文与公共事实矛盾。
+/// 该文本同时会进入公共事实（`ActionResolved.fact.consequence` 与 `pacingNotes`），故写成可直读的
+/// 中文陈述句，不夹排版记号。
+const SANCTUARY_DOWNGRADE_CONSEQUENCE: &str =
+    "致命一击未能取人性命：对方重伤倒地、失去行动力，但仍然活着\
+（本世界为庇护世界，任何角色都不会死亡——正文不得写出任何角色的死亡）";
+
+/// 按生死契约档对仲裁结果做**写作前**的确定性降级（纯函数式变换，无随机源、无 map 迭代序依赖：
+/// 只按 `outcomes` 既有顺序原地改写，同输入恒同输出，满足 replay 契约）。
+///
+/// 目前仅 `Sanctuary` 有降级动作：致死结果（`is_lethal`）→ `PartialSuccess` + 重伤语义 consequence
+/// + 规则标记。`Consent`/`Deathmatch` 为 no-op（默认档行为零变化）。
+///
+/// **调用位置铁律**：必须在场景写作之前（`run_round` 步骤 3c），因为写作吃的就是这些 outcomes；
+/// 降级后 prose / `ActionResolved.fact.consequence` / `pacingNotes` 三者同源，公共事实自洽。
+fn apply_lethality(
+    outcomes: &mut [ArbiterOutcome],
+    decisions: &[RoleDecision],
+    lethality: Lethality,
+) {
+    if lethality != Lethality::Sanctuary {
+        return;
+    }
+    let rules = IrreversibleRules::new();
+    let dmap: BTreeMap<&str, &RoleDecision> =
+        decisions.iter().map(|d| (d.decision_id.as_str(), d)).collect();
+    for o in outcomes.iter_mut() {
+        let Some(d) = dmap.get(o.decision_id.as_str()).copied() else {
+            continue;
+        };
+        if !rules.is_lethal(o, d) {
+            continue;
+        }
+        // 降级：成功致死 → 部分成功（打中了，但没打死）。
+        o.result = ArbiterResult::PartialSuccess;
+        o.consequence = SANCTUARY_DOWNGRADE_CONSEQUENCE.to_string();
+        if !o.rule_refs.iter().any(|r| r == SANCTUARY_RULE_REF) {
+            o.rule_refs.push(SANCTUARY_RULE_REF.to_string());
+        }
+    }
+}
+
 // ---------- 不可逆结果同意门控（REMEDIATION #3 / 规格 §2.4） ----------
 
 /// 一个待授权的不可逆结果（用于生成 ConsentRequested 域事件）。
@@ -1179,12 +1255,22 @@ struct ConsentRequest {
 /// world_controlled 世界固有角色——无主人可授权，自动放行）→ 留在落定集并记入待清除 pending；
 /// 否则剔出落定集、生成 ConsentRequest、记入新增 pending。非不可逆结果原样落定。
 /// world_controlled subject 从不进 pending_consents（无 owner），故既不记待清除也不记新增。
+///
+/// **生死契约档（规格 §11【拍板 24】）在此分派**：
+/// - `Consent`（默认）：如上，行为与历史完全一致。
+/// - `Deathmatch`：入场即签生死状、**事后不再临场征询**——全部 subject 视为可放行
+///   （等价于把玩家 subject 当 world_controlled 看待）。因 `all_landable` 恒真，
+///   `ConsentRequest` 分支不可达 → 该档天然不产 ConsentRequested、不写 newly_pending。
+/// - `Sanctuary`：不改门控，改的是上游 `apply_lethality` + `classify`（致死已降级为重伤，不再是
+///   不可逆事件）；其余不可逆事件（永久退场/永久关系变更）仍走本函数的同意制流程。
+///
 /// 返回 (落定用 outcomes, 待生成 ConsentRequested, 新增 pending, 已落定待清除 pending)。
 fn gate_consents(
     decisions: &[RoleDecision],
     outcomes: &[ArbiterOutcome],
     approved_consents: &[String],
     world_controlled: &[String],
+    lethality: Lethality,
 ) -> (Vec<ArbiterOutcome>, Vec<ConsentRequest>, Vec<PendingConsent>, Vec<PendingConsent>) {
     let rules = IrreversibleRules::new();
     let approved: std::collections::BTreeSet<&str> =
@@ -1192,6 +1278,8 @@ fn gate_consents(
     // 世界固有角色：无主人可授权，其作为 subject 的不可逆结果一律自动放行（NPC/反派死亡等）。
     let world: std::collections::BTreeSet<&str> =
         world_controlled.iter().map(|s| s.as_str()).collect();
+    // 生死状档：join 时已知情同意，本回合无须再问任何人。
+    let signed = lethality == Lethality::Deathmatch;
     let dmap: BTreeMap<&str, &RoleDecision> =
         decisions.iter().map(|d| (d.decision_id.as_str(), d)).collect();
 
@@ -1201,17 +1289,25 @@ fn gate_consents(
     let mut approved_landed: Vec<PendingConsent> = Vec::new();
 
     for o in outcomes {
-        match dmap.get(o.decision_id.as_str()).and_then(|d| rules.classify(o, d)) {
+        match dmap.get(o.decision_id.as_str()).and_then(|d| rules.classify(o, d, lethality)) {
             None => committing.push(o.clone()), // 非不可逆：正常落定
             Some((event_kind, subjects)) => {
-                // 每个当事角色须「可放行」：world_controlled（自动放行）或已获批。全部可放行 → 落定。
-                let landable = |s: &str| world.contains(s) || approved.contains(s);
+                // 每个当事角色须「可放行」：生死状档（全员）/ world_controlled（自动放行）/ 已获批。
+                // 全部可放行 → 落定。**注意**：能走到这里说明仲裁已判 Success/PartialSuccess——
+                // 被判 Invalid/Blocked 的致死行动根本不进 classify（红线：取消的是否决权，不是裁判）。
+                let landable = |s: &str| signed || world.contains(s) || approved.contains(s);
                 let all_landable =
                     !subjects.is_empty() && subjects.iter().all(|s| landable(s.as_str()));
                 if all_landable {
                     committing.push(o.clone());
                     for s in &subjects {
                         // world_controlled subject 从不入 pending，无需记入待清除；仅玩家 subject 记 approved_landed。
+                        //
+                        // 生死状档同样记 approved_landed（**取舍**）：该档本就不产 pending，正常情况下
+                        // `persist_pending_consents` 的 retain 是空操作；但世界的契约档是**可配置参数**
+                        // （VALIDATION §0.2），存在 Consent → Deathmatch 中途改档的合法路径，届时旧档遗留的
+                        // pending 若不清除，就会在死亡已经落定之后留下一条永远悬空的「请求你同意自己的死亡」。
+                        // 记账（幂等、确定性）换取改档自愈，代价仅是含不可逆结果的少数回合多一次同内容重写。
                         if !world.contains(s.as_str()) {
                             approved_landed.push(PendingConsent {
                                 subject: s.clone(),
@@ -1324,16 +1420,40 @@ impl IrreversibleRules {
         }
     }
 
+    /// 致死行动判定：**`apply_lethality` 降级 与 `classify` 死亡分类 的唯一共同口径**。
+    /// 二者必须命中同一集合，否则会出现「正文写死了、事件却是退场/未落定」的公共事实矛盾（§0.3）。
+    /// 前置条件与 `classify` 完全一致：仅「实际发生」（Success/PartialSuccess）才算致死。
+    /// **红线**：`Invalid`/`Blocked`（仲裁判定行动不成立/危及硬节点）在此恒为 false —— 任何契约档
+    /// 都不会让被裁判否掉的致死行动落定。
+    fn is_lethal(&self, o: &ArbiterOutcome, d: &RoleDecision) -> bool {
+        matches!(o.result, ArbiterResult::Success | ArbiterResult::PartialSuccess)
+            && self.death.is_match(&d.action)
+    }
+
     /// 仅「实际发生」（Success/PartialSuccess）的结果才产生不可逆后果。
     /// 返回 (eventKind, subjectCharacterIds)，非不可逆返回 None。死亡优先级最高。
-    fn classify(&self, o: &ArbiterOutcome, d: &RoleDecision) -> Option<(String, Vec<String>)> {
+    /// `lethality`：庇护档下致死行动已被 `apply_lethality` 降级为重伤，此处**不再产出 death**——
+    /// 两处共用 `is_lethal` 判据，口径天然一致。
+    fn classify(
+        &self,
+        o: &ArbiterOutcome,
+        d: &RoleDecision,
+        lethality: Lethality,
+    ) -> Option<(String, Vec<String>)> {
         if !matches!(o.result, ArbiterResult::Success | ArbiterResult::PartialSuccess) {
             return None;
         }
         let action = d.action.as_str();
         let actor = d.character_id.as_str();
 
-        if self.death.is_match(action) {
+        if self.is_lethal(o, d) {
+            // 庇护档：本条 outcome 已在写作前被降级为「重伤」（可恢复 → 不是不可逆事实），
+            // 故整条 return None——既不产 death，也**不再落到 exit/relation 分支**（原行动语义已被
+            // 降级覆盖，若改判永久退场就会与正文的「重伤但活着」再次矛盾）。
+            // 与 `apply_lethality` 的降级集合逐条对应（同一个 `is_lethal`）。
+            if lethality == Lethality::Sanctuary {
+                return None;
+            }
             let mut subjects = d.targets.clone();
             // 自尽/同归于尽：行动者本人亦为当事；无目标时同样归为行动者。
             if subjects.is_empty() || self.self_death.is_match(action) {
@@ -1508,6 +1628,8 @@ mod tests {
             locations: BTreeMap::new(),
             now_hint: 0,
             stall_hint: None,
+            // 默认档 = 同意制：既有全部用例走的都是历史路径（回归保护）。
+            lethality: Lethality::default(),
         }
     }
 
@@ -2061,6 +2183,8 @@ mod tests {
             locations: BTreeMap::new(),
             now_hint: 0,
             stall_hint: None,
+            // 默认档 = 同意制：既有全部用例走的都是历史路径（回归保护）。
+            lethality: Lethality::default(),
         }
     }
 
@@ -2892,6 +3016,8 @@ mod tests {
             locations: BTreeMap::new(),
             now_hint: 0,
             stall_hint: None,
+            // 默认档 = 同意制：既有全部用例走的都是历史路径（回归保护）。
+            lethality: Lethality::default(),
         }
     }
 
@@ -3017,5 +3143,370 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code(), "cancelled", "Cancelled 必须透传，不被降级为跳过");
         assert_eq!(NarrativeStore::new(host.fs.clone()).load("run-1").unwrap().revision, 0);
+    }
+
+    // ===== 生死契约三档（规格 §11【拍板 24】）=====
+
+    /// 致死行动脚本（与 `kill_decision` 同源，另给一个可指定行动文本的版本）。
+    fn exile_decision(target: &str) -> String {
+        format!(
+            r#"{{"intent":"永绝后患","action":"将其流放到千里之外的荒岛","speak":{{"willSpeak":false,"purpose":""}},"targets":["{target}"],"acceptableCosts":[],"predictions":[]}}"#
+        )
+    }
+
+    /// 致死回合脚本：director → decide(li 杀 wang) → decide(wang) → writer → critic（无硬节点 → 无仲裁模型调用）。
+    fn kill_script() -> Vec<Result<String, EngineError>> {
+        vec![
+            Ok(r#"{"situation":"对峙时刻"}"#.to_string()),
+            Ok(kill_decision("wang")),
+            Ok(benign_decision()),
+            Ok(r#"{"prose":"刀光一闪。"}"#.to_string()),
+            Ok(r#"{"characterConsistencyIssues":[],"causalIssues":[],"revisionSuggestions":[]}"#.to_string()),
+        ]
+    }
+
+    fn count_consent_requested(out: &RoundOutcome) -> usize {
+        out.scene
+            .events
+            .iter()
+            .filter(|e| e.event_type == DomainEventType::ConsentRequested)
+            .count()
+    }
+
+    /// 某角色的 ActionResolved 事件（不含被门控/被剔除者）。
+    fn action_resolved_of<'a>(out: &'a RoundOutcome, cid: &str) -> Option<&'a DomainEvent> {
+        out.scene.events.iter().find(|e| {
+            e.event_type == DomainEventType::ActionResolved && e.actor_ids.iter().any(|a| a == cid)
+        })
+    }
+
+    // --- 回归保护：默认档 = 同意制，行为与历史零差异 ---
+
+    #[test]
+    fn default_lethality_is_consent() {
+        // 本任务最重要的兼容性约束：调用方不传 → 同意制（现行机制）。
+        assert_eq!(Lethality::default(), Lethality::Consent);
+        assert_eq!(RoundInput::default().lethality, Lethality::Consent);
+        assert_eq!(round_input("run-1", big_budget()).lethality, Lethality::Consent);
+    }
+
+    #[tokio::test]
+    async fn consent_default_and_explicit_are_byte_identical() {
+        // 显式传 Consent 与不传（默认）必须产出逐字节一致的 scene/state——默认档不走任何新分支。
+        let (h1, _) = host_with(kill_script());
+        init_run(h1.as_ref(), "run-1", false);
+        let o1 = NarrativeEngine::new(h1.clone())
+            .run_round(&routes(), &prompts(), round_input("run-1", big_budget()), &CancelFlag::new())
+            .await
+            .unwrap();
+
+        let (h2, _) = host_with(kill_script());
+        init_run(h2.as_ref(), "run-1", false);
+        let mut input = round_input("run-1", big_budget());
+        input.lethality = Lethality::Consent;
+        let o2 =
+            NarrativeEngine::new(h2.clone()).run_round(&routes(), &prompts(), input, &CancelFlag::new()).await.unwrap();
+
+        assert_eq!(
+            serde_json::to_string(&o1.scene).unwrap(),
+            serde_json::to_string(&o2.scene).unwrap(),
+            "默认档与显式 Consent 的 scene 必须逐字节一致"
+        );
+        assert_eq!(
+            serde_json::to_string(&o1.new_state).unwrap(),
+            serde_json::to_string(&o2.new_state).unwrap(),
+        );
+        // 且仍是历史行为：死亡被门控，产 ConsentRequested + pending_consents。
+        assert_eq!(count_consent_requested(&o1), 1, "同意制下死亡仍须临场征询");
+        assert!(o1.new_state.narrative.pending_consents.iter().any(|p| p.subject == "wang"));
+    }
+
+    // --- 生死状档（Deathmatch）：不再临场征询，但裁判仍在 ---
+
+    #[tokio::test]
+    async fn deathmatch_lands_death_without_consent_request() {
+        let (host, ev) = host_with(kill_script());
+        init_run(host.as_ref(), "run-1", false);
+        let engine = NarrativeEngine::new(host.clone());
+        let mut input = round_input("run-1", big_budget());
+        input.lethality = Lethality::Deathmatch;
+        // approved_consents / world_controlled 皆空——放行只能来自契约档本身。
+        let out = engine.run_round(&routes(), &prompts(), input, &CancelFlag::new()).await.unwrap();
+
+        assert!(out.blocked.is_none());
+        assert_eq!(out.new_state.revision, 1);
+        // ① 死亡直接落定：li 的结果进 StatePatch（节拍记录）与 ActionResolved 事件。
+        assert!(
+            out.new_state.narrative.pacing_notes.iter().any(|n| n.starts_with("li｜")),
+            "生死状档下致死结果应直接落定"
+        );
+        let ar = action_resolved_of(&out, "li").expect("li 应有 ActionResolved");
+        assert_eq!(ar.fact["result"], "Success", "结果未被降级（生死状档不降级）");
+        // ② 不产生 ConsentRequest。
+        assert_eq!(count_consent_requested(&out), 0, "入场即签生死状 → 事后不再临场征询");
+        // ③ 不写 pending_consents。
+        assert!(
+            out.new_state.narrative.pending_consents.is_empty(),
+            "生死状档不产生待审批同意"
+        );
+        // ④ 领域事件通道也不发 consent_requested。
+        let emitted = ev
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, EngineEvent::Narrative { payload, .. }
+                if payload.get("type").and_then(|v| v.as_str()) == Some("consent_requested")))
+            .count();
+        assert_eq!(emitted, 0);
+    }
+
+    #[tokio::test]
+    async fn deathmatch_clears_stale_pending_from_previous_contract() {
+        // 改档自愈（approved_landed 取舍的依据）：Consent 档遗留的 pending 在死亡落定后被清除，
+        // 不留「请求你同意自己的死亡」的悬空请求。
+        let (host, _ev) = host_with(kill_script());
+        let mut s = NarrativeState { schema_version: 1, run_id: "run-1".into(), ..Default::default() };
+        s.characters.insert("li".into(), CharacterState::default());
+        s.characters.insert("wang".into(), CharacterState::default());
+        s.narrative
+            .pending_consents
+            .push(PendingConsent { subject: "wang".into(), event_kind: "death".into() });
+        NarrativeStore::new(host.fs.clone()).init(&s).unwrap();
+
+        let mut input = round_input("run-1", big_budget());
+        input.lethality = Lethality::Deathmatch;
+        let out = NarrativeEngine::new(host.clone())
+            .run_round(&routes(), &prompts(), input, &CancelFlag::new())
+            .await
+            .unwrap();
+
+        assert!(out.new_state.narrative.pending_consents.is_empty(), "旧档遗留 pending 应被清除");
+    }
+
+    #[tokio::test]
+    async fn deathmatch_does_not_override_arbiter_invalid() {
+        // 【规格红线】取消的是被杀者否决权，不是裁判：仲裁判 Invalid 的致死行动，
+        // 生死状档同样不得落定（`classify` 的 Success|PartialSuccess 前置条件原样保留）。
+        let responses = vec![
+            Ok(r#"{"situation":"对峙一触即发"}"#.to_string()),
+            Ok(kill_decision("wang")), // decide li：致死 + 存在 pending 硬节点 → R5 交模型裁决
+            Ok(benign_decision()),     // decide wang
+            Ok(r#"{"outcomes":[{"decisionId":"dec:run-1:0:li","result":"invalid","consequence":"叙事上不成立：他手中并无兵刃"}]}"#.to_string()),
+            Ok(r#"{"prose":"杀意未及出手便已落空。"}"#.to_string()),
+            Ok(r#"{"characterConsistencyIssues":[],"causalIssues":[],"revisionSuggestions":[]}"#.to_string()),
+        ];
+        let (host, _ev) = host_with(responses);
+        init_run(host.as_ref(), "run-1", true); // 含 pending 硬节点 → 致死行动进模型仲裁
+        let mut input = round_input("run-1", big_budget());
+        input.lethality = Lethality::Deathmatch;
+        let out = NarrativeEngine::new(host.clone())
+            .run_round(&routes(), &prompts(), input, &CancelFlag::new())
+            .await
+            .unwrap();
+
+        assert!(out.blocked.is_none(), "Invalid 不阻断整回合，只是该行动不成立");
+        // 裁决确已生效（模型漏判会回退 Success，故此断言同时守住脚本 decision_id 的正确性）。
+        let o = out.scene.outcomes.iter().find(|o| o.character_id == "li").expect("li 应有 outcome");
+        assert_eq!(o.result, ArbiterResult::Invalid);
+        // 被判 Invalid → 无 ActionResolved、无节拍记录：死亡未落定。
+        assert!(action_resolved_of(&out, "li").is_none(), "Invalid 的致死行动不得产生 ActionResolved");
+        assert!(
+            !out.new_state.narrative.pacing_notes.iter().any(|n| n.starts_with("li｜")),
+            "Invalid 的致死行动不得进入 StatePatch"
+        );
+        assert_eq!(count_consent_requested(&out), 0);
+    }
+
+    #[tokio::test]
+    async fn deathmatch_does_not_override_arbiter_blocked() {
+        // 同上：判 Blocked（危及硬节点，arbiter R5 硬节点保护）→ 整回合阻断、零提交，与契约档无关。
+        let responses = vec![
+            Ok(r#"{"situation":"对峙一触即发"}"#.to_string()),
+            Ok(kill_decision("wang")),
+            Ok(benign_decision()),
+            Ok(r#"{"outcomes":[{"decisionId":"dec:run-1:0:li","result":"blocked","consequence":"该行动会使硬节点无法达成"}]}"#.to_string()),
+        ];
+        let (host, _ev) = host_with(responses);
+        init_run(host.as_ref(), "run-1", true);
+        let mut input = round_input("run-1", big_budget());
+        input.lethality = Lethality::Deathmatch;
+        let out = NarrativeEngine::new(host.clone())
+            .run_round(&routes(), &prompts(), input, &CancelFlag::new())
+            .await
+            .unwrap();
+
+        assert!(out.blocked.is_some(), "Blocked 仍阻断整回合");
+        assert_eq!(out.new_state.revision, 0, "生死状档不得绕过硬节点保护而提交");
+        assert!(NarrativeStore::new(host.fs.clone()).list_scene_ids("run-1").unwrap().is_empty());
+    }
+
+    // --- 庇护档（Sanctuary）：写作前降级，正文与公共事实同口径 ---
+
+    #[tokio::test]
+    async fn sanctuary_downgrades_lethal_action_and_keeps_prose_in_sync() {
+        // 用 RecordingModel 抓写作环节实际收到的 outcomes：**写作输入必须已是降级后的口径**，
+        // 否则会出现「正文写死了、事件却是重伤/退场」的公共事实矛盾（§0.3）。
+        let (host, specs) = recording_host(kill_script());
+        init_run(host.as_ref(), "run-1", false);
+        let mut input = round_input("run-1", big_budget());
+        input.lethality = Lethality::Sanctuary;
+        let out = NarrativeEngine::new(host.clone())
+            .run_round(&routes(), &prompts(), input, &CancelFlag::new())
+            .await
+            .unwrap();
+
+        assert!(out.blocked.is_none());
+        assert_eq!(out.new_state.revision, 1);
+
+        // ① 写作输入已降级：写手看到 PartialSuccess + 重伤语义 consequence（且被明确告知不得写死亡）。
+        let writer = {
+            let specs = specs.lock().unwrap();
+            specs.iter().find(|s| s.agent == "writer").expect("应有写作调用").user.clone()
+        };
+        assert!(
+            writer.contains(SANCTUARY_DOWNGRADE_CONSEQUENCE),
+            "写作 prompt 应含降级后的 consequence：{writer}"
+        );
+        assert!(writer.contains("PartialSuccess"), "写作 prompt 中 result 应已降级：{writer}");
+
+        // ② 仲裁结果就地降级 + 规则标记（透明战报可解释「为什么没死」）。
+        let o = out.scene.outcomes.iter().find(|o| o.character_id == "li").expect("li 应有 outcome");
+        assert_eq!(o.result, ArbiterResult::PartialSuccess);
+        assert_eq!(o.consequence, SANCTUARY_DOWNGRADE_CONSEQUENCE);
+        assert!(o.rule_refs.iter().any(|r| r == SANCTUARY_RULE_REF));
+
+        // ③ 口径一致：公共事实（ActionResolved.fact）与写作输入同源同字。
+        let ar = action_resolved_of(&out, "li").expect("降级后的结果应正常落定");
+        assert_eq!(ar.fact["result"], "PartialSuccess");
+        assert_eq!(ar.fact["consequence"], SANCTUARY_DOWNGRADE_CONSEQUENCE);
+        assert!(out
+            .new_state
+            .narrative
+            .pacing_notes
+            .iter()
+            .any(|n| n.starts_with("li｜PartialSuccess｜") && n.contains("仍然活着")));
+
+        // ④ 庇护世界不存在死亡这件事 → 无死亡门控、无 pending。
+        assert_eq!(count_consent_requested(&out), 0, "已降级为重伤（可恢复）→ 无不可逆事件可征询");
+        assert!(out.new_state.narrative.pending_consents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sanctuary_keeps_consent_gate_for_non_lethal_irreversible() {
+        // 庇护档只管死亡：永久退场（流放）仍走原有同意制流程，一字未改。
+        let responses = vec![
+            Ok(r#"{"situation":"朝堂问罪"}"#.to_string()),
+            Ok(exile_decision("wang")), // li：流放 wang（不可逆·永久退场）
+            Ok(benign_decision()),      // wang
+            Ok(r#"{"prose":"判词落下。"}"#.to_string()),
+            Ok(r#"{"characterConsistencyIssues":[],"causalIssues":[],"revisionSuggestions":[]}"#.to_string()),
+        ];
+        let (host, _ev) = host_with(responses);
+        init_run(host.as_ref(), "run-1", false);
+        let mut input = round_input("run-1", big_budget());
+        input.lethality = Lethality::Sanctuary;
+        let out = NarrativeEngine::new(host.clone())
+            .run_round(&routes(), &prompts(), input, &CancelFlag::new())
+            .await
+            .unwrap();
+
+        assert!(out.blocked.is_none());
+        // 未被降级（不是致死行动）。
+        let o = out.scene.outcomes.iter().find(|o| o.character_id == "li").expect("li 应有 outcome");
+        assert_eq!(o.result, ArbiterResult::Success);
+        assert!(!o.rule_refs.iter().any(|r| r == SANCTUARY_RULE_REF), "非致死行动不应被降级标记");
+        // 仍走同意制门控：产 ConsentRequested(permanent_exit) + pending，且不落定。
+        let cr: Vec<&DomainEvent> = out
+            .scene
+            .events
+            .iter()
+            .filter(|e| e.event_type == DomainEventType::ConsentRequested)
+            .collect();
+        assert_eq!(cr.len(), 1, "永久退场在庇护档下仍须临场同意");
+        assert_eq!(cr[0].fact["eventKind"], "permanent_exit");
+        assert!(out
+            .new_state
+            .narrative
+            .pending_consents
+            .iter()
+            .any(|p| p.subject == "wang" && p.event_kind == "permanent_exit"));
+        assert!(
+            !out.new_state.narrative.pacing_notes.iter().any(|n| n.starts_with("li｜")),
+            "未获批的永久退场不得落定"
+        );
+    }
+
+    // --- apply_lethality 纯函数层：确定性 + 非庇护档 no-op ---
+
+    fn lethal_decision_of(cid: &str, decision_id: &str) -> RoleDecision {
+        let mut d = silent_decision(cid, decision_id);
+        d.action = "拔剑杀死叛徒".into();
+        d.targets = vec!["wang".into()];
+        d
+    }
+
+    #[test]
+    fn apply_lethality_is_noop_for_consent_and_deathmatch() {
+        let decisions = vec![lethal_decision_of("li", "d1")];
+        for arch in [Lethality::Consent, Lethality::Deathmatch] {
+            let mut outcomes = vec![outcome_of("li", "d1", ArbiterResult::Success)];
+            let before = outcomes.clone();
+            apply_lethality(&mut outcomes, &decisions, arch);
+            assert_eq!(outcomes[0].result, before[0].result, "{arch:?} 不应降级");
+            assert_eq!(outcomes[0].consequence, before[0].consequence);
+            assert!(outcomes[0].rule_refs.is_empty());
+        }
+    }
+
+    #[test]
+    fn apply_lethality_only_touches_landed_lethal_outcomes() {
+        // 降级集合 = `is_lethal`：仅 Success/PartialSuccess 的致死行动；Invalid/Blocked/非致死一律不动。
+        // 这同时是 `classify` 在庇护档下「不产出 death」的同一判据（两处口径一致的机械证明）。
+        let decisions = vec![
+            lethal_decision_of("a", "d-a"), // 致死 + Success → 降级
+            lethal_decision_of("b", "d-b"), // 致死 + Invalid → 不动
+            silent_decision("c", "d-c"),    // 非致死 + Success → 不动
+        ];
+        let mut outcomes = vec![
+            outcome_of("a", "d-a", ArbiterResult::Success),
+            outcome_of("b", "d-b", ArbiterResult::Invalid),
+            outcome_of("c", "d-c", ArbiterResult::Success),
+        ];
+        apply_lethality(&mut outcomes, &decisions, Lethality::Sanctuary);
+
+        assert_eq!(outcomes[0].result, ArbiterResult::PartialSuccess);
+        assert_eq!(outcomes[0].consequence, SANCTUARY_DOWNGRADE_CONSEQUENCE);
+        assert_eq!(outcomes[1].result, ArbiterResult::Invalid, "被裁判否掉的致死行动不参与降级");
+        assert_eq!(outcomes[1].consequence, "后果");
+        assert_eq!(outcomes[2].result, ArbiterResult::Success);
+        assert_eq!(outcomes[2].consequence, "后果");
+
+        // 幂等（确定性 replay）：再跑一次结果不变，规则标记不重复累积。
+        let snapshot = serde_json::to_string(&outcomes).unwrap();
+        apply_lethality(&mut outcomes, &decisions, Lethality::Sanctuary);
+        assert_eq!(serde_json::to_string(&outcomes).unwrap(), snapshot);
+        assert_eq!(outcomes[0].rule_refs.iter().filter(|r| *r == SANCTUARY_RULE_REF).count(), 1);
+    }
+
+    #[test]
+    fn classify_and_apply_lethality_share_one_verdict() {
+        // 两处口径一致的直接断言：庇护档下 `apply_lethality` 降级的那一条，
+        // `classify` 必须同时停止产出 death（否则正文写重伤、事件写死亡）。
+        let rules = IrreversibleRules::new();
+        let d = lethal_decision_of("li", "d1");
+        let mut o = outcome_of("li", "d1", ArbiterResult::Success);
+
+        assert!(rules.is_lethal(&o, &d));
+        // 同意制/生死状：仍分类为 death（仅门控放行策略不同）。
+        assert_eq!(rules.classify(&o, &d, Lethality::Consent).unwrap().0, "death");
+        assert_eq!(rules.classify(&o, &d, Lethality::Deathmatch).unwrap().0, "death");
+        // 庇护：不产出 death，且不改判为 permanent_exit/relation（与降级后的「重伤仍活着」同口径）。
+        assert!(rules.classify(&o, &d, Lethality::Sanctuary).is_none());
+
+        // 降级后（PartialSuccess）判据不变，仍在同一集合内。
+        apply_lethality(std::slice::from_mut(&mut o), std::slice::from_ref(&d), Lethality::Sanctuary);
+        assert!(rules.is_lethal(&o, &d));
+        assert!(rules.classify(&o, &d, Lethality::Sanctuary).is_none());
     }
 }

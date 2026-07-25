@@ -31,7 +31,11 @@ pub struct InjectionHit {
 // ==================== 归一化 ====================
 
 /// 零宽与不可见格式控制符：去除后再匹配（防零宽插入切断关键短语）。
-const INVISIBLE: &[char] = &[
+///
+/// `pub(super)`：本文件的归一化管线（INVISIBLE / fold_char / normalize / is_separator /
+/// compact_needle）是 safety 模块的**唯一**归一化口径，第 2 层敏感词库（`lexicon.rs`）必须复用，
+/// 否则零宽字符/同形字/全角折叠这些绕过手法会在新词表上整套复活。
+pub(super) const INVISIBLE: &[char] = &[
     '\u{200B}', '\u{200C}', '\u{200D}', // ZWSP / ZWNJ / ZWJ
     '\u{2060}', '\u{FEFF}', '\u{00AD}', // WORD JOINER / ZWNBSP(BOM) / SOFT HYPHEN
     '\u{180E}', '\u{200E}', '\u{200F}', // MONGOLIAN VOWEL SEP / LRM / RLM
@@ -60,7 +64,7 @@ fn map_homoglyph(c: char) -> char {
 }
 
 /// 单字符折叠：全角 ASCII（！..～ = U+FF01..U+FF5E）→ 半角，其余走同形字映射。
-fn fold_char(c: char) -> char {
+pub(super) fn fold_char(c: char) -> char {
     let u = c as u32;
     if (0xFF01..=0xFF5E).contains(&u) {
         return char::from_u32(u - 0xFEE0).unwrap_or(c);
@@ -70,7 +74,7 @@ fn fold_char(c: char) -> char {
 
 /// 归一化：折叠全角/同形字 → 去不可见符 → 小写 → 折叠连续空白为单空格。
 /// 保留断句标点与单空格（供句式判别与可读摘要）；紧凑匹配另在此之上去分隔。
-fn normalize(raw: &str) -> String {
+pub(super) fn normalize(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut prev_ws = false;
     for ch in raw.chars() {
@@ -94,7 +98,7 @@ fn normalize(raw: &str) -> String {
 }
 
 /// 装饰性分隔符：紧凑匹配时忽略（攻击者用来打断关键短语；也是断句符的超集）。
-fn is_separator(c: char) -> bool {
+pub(super) fn is_separator(c: char) -> bool {
     c.is_whitespace()
         || matches!(
             c,
@@ -119,7 +123,7 @@ fn strip_seps(s: &str) -> String {
 }
 
 /// 短语按同一归一化+去分隔预处理为字符序列（与 haystack 紧凑串对齐后匹配）。
-fn compact_needle(s: &str) -> Vec<char> {
+pub(super) fn compact_needle(s: &str) -> Vec<char> {
     normalize(s).chars().filter(|c| !is_separator(*c)).collect()
 }
 

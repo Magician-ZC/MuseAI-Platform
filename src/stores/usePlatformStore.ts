@@ -29,6 +29,8 @@ export interface WorldSummary {
   hotScore?: number;
   /** 星级（1-5）：世界准入门槛展示；星级≥3 的世界要求投放角色历练达标（老服务端缺席则不展示徽标）。 */
   starRating?: number;
+  /** 世界封面位图 URL：当前服务端未下发（前向兼容字段）。缺席时大厅按 world.id 哈希确定性挑选一张内置真实位图。 */
+  coverUrl?: string;
 }
 
 /** 大厅排序：new=最新（cursor 分页）| hot=热度快照榜（不分页）。 */

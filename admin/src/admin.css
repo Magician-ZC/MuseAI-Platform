@@ -10,6 +10,10 @@
   box-sizing: border-box;
 }
 
+/* 最小支持宽度 1100px（设计文档 §4）。
+   完整设计几何为 侧栏 220 + 页面内边距 32 + 主区 680 + 间距 16 + 诊断栏 390 = 1338px，
+   1100–1360px 区间由 WorldsMonitorConsole.css 的 1360px 断点放开主区最小宽度承接，
+   诊断栏 390px 不变，超宽内容在面板内部横向滚动，页面不被撑宽。 */
 html,
 body,
 #root {
@@ -94,7 +98,12 @@ textarea {
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: #6b9756;
+  background: #749b63;
+}
+
+/* 非生产环境或环境未判定：琥珀色提醒运营核对，不用"正常绿"掩盖不确定性。 */
+.admin-environment__dot.is-unverified {
+  background: #d99535;
 }
 
 .admin-shell__menu {
@@ -117,7 +126,7 @@ textarea {
 }
 
 .admin-shell__menu .ant-menu-item-selected {
-  border-color: #dc8a69;
+  border-color: #d37a57;
   background: #fffaf7 !important;
   color: #c96845 !important;
   font-weight: 600;
@@ -137,7 +146,7 @@ textarea {
   margin-top: 8px;
   padding: 0 15px;
   border: 0;
-  border-top: 1px solid #ebe6df;
+  border-top: 1px solid #e7e1da;
   background: transparent;
   color: #4d4843;
   cursor: pointer;
@@ -154,7 +163,7 @@ textarea {
   gap: 2px;
   margin-top: auto;
   padding-top: 12px;
-  border-top: 1px solid #e9e4dd;
+  border-top: 1px solid #e7e1da;
 }
 
 .admin-shell__sider-footer .ant-btn {
@@ -190,7 +199,7 @@ textarea {
 
 .admin-shell__search {
   height: 40px;
-  border-color: #e3ddd6;
+  border-color: #e4ded6;
   border-radius: 8px;
   background: #fff;
   box-shadow: none;
@@ -213,7 +222,7 @@ textarea {
   align-items: center;
   gap: 8px;
   height: 38px;
-  border: 1px solid #e1dbd4;
+  border: 1px solid #e4ded6;
   border-radius: 8px;
   color: #46413d;
 }

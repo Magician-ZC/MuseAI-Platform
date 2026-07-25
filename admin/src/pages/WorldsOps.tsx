@@ -305,7 +305,7 @@ function WorldsMonitor() {
         {diagError && <ErrorAlert message={diagError} onRetry={() => diagId && loadDiagnostics(diagId)} />}
         {diag && (
           <>
-            <Alert type="warning" showIcon style={{ marginBottom: 16 }} message={diag.redactionNote} />
+            <Alert type="warning" showIcon style={{ marginBottom: 16 }} title={diag.redactionNote} />
             <Descriptions
               title="世界元数据"
               column={2}
@@ -651,7 +651,7 @@ function Templates() {
         cancelText="取消"
         width={640}
       >
-        <Alert type="info" showIcon style={{ marginBottom: 12 }} message="新模板进入待审核态，登记到审核队列，由审核工作台裁决。" />
+        <Alert type="info" showIcon style={{ marginBottom: 12 }} title="新模板进入待审核态，登记到审核队列，由审核工作台裁决。" />
         <Form form={form} layout="vertical" initialValues={{ roomType: 'idle', admissionJson: '{ "mode": "open" }' }}>
           <Form.Item name="title" label="模板标题" rules={[{ required: true, message: '请输入标题' }]}>
             <Input />
@@ -691,7 +691,7 @@ function Templates() {
           type="info"
           showIcon
           style={{ marginBottom: 12 }}
-          message="人工定档后来源标记为「人工定档」，覆盖自动评估结果；理由将写入审计日志。"
+          title="人工定档后来源标记为「人工定档」，覆盖自动评估结果；理由将写入审计日志。"
         />
         <Form form={starForm} layout="vertical">
           <Form.Item name="star" label="目标星级" rules={[{ required: true, message: '请选择星级' }]}>

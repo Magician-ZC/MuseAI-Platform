@@ -2007,3 +2007,306 @@ async fn idle_world_ending_grants_growth_to_present_cards_once() {
     assert_eq!(i64_one(&state.db, "SELECT mileage FROM cloud_characters WHERE id=?", "cmlgA").await, 60);
     assert_eq!(i64_one(&state.db, "SELECT mileage FROM cloud_characters WHERE id=?", "cmlgB").await, 60);
 }
+
+// ==================== R1 三层结算 ③ 世界线层：贡献归因 → 公示产出表 → 确定发放 ====================
+
+/// 模板：主线里程碑 + endgame + **公示产出表**（骨架内声明，装配时钉进 assembled_json）+ 模板星级。
+/// 走 skeleton → assemble_instance → assembled_json 全链路，验证产出表不是测试凭空塞进去的。
+async fn seed_template_worldline(
+    db: &AnyPool,
+    id: &str,
+    mainline: serde_json::Value,
+    endgame: serde_json::Value,
+    payout: serde_json::Value,
+    star_rating: i64,
+) {
+    let skeleton = json!({
+        "mainlineNodes": mainline,
+        "forbiddenPredicates": [],
+        "endgame": endgame,
+        "payoutTable": payout,
+    });
+    sqlx::query(
+        "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, official, \
+         version, moderation, star_rating, created_at) \
+         VALUES (?, '产出表模板', 'idle', ?, '{\"mode\":\"open\"}', 1, 1, 'approved', ?, ?)",
+    )
+    .bind(id)
+    .bind(skeleton.to_string())
+    .bind(star_rating)
+    .bind(now_ms())
+    .execute(db)
+    .await
+    .unwrap();
+}
+
+/// 两档公示产出表：见证（≥1.0 → 20 历练）/ 推动（≥3.0 → 80 历练 + powerTier 2 的世界线结晶）。
+fn two_tier_payout(template_id: &str) -> serde_json::Value {
+    json!({
+        "worldlineTiers": [
+            { "label": "见证", "minScore": 1.0, "mileage": 20 },
+            { "label": "推动", "minScore": 3.0, "mileage": 80,
+              "item": { "id": "wl_relic", "narrative": "世界线结晶", "effectTags": ["memento:worldline"],
+                        "origin": { "worldTemplateId": template_id, "cosmology": ["myth"], "powerTier": 2 } } },
+        ]
+    })
+}
+
+/// (score_milli, milestone_score_milli, settled_at)
+async fn contribution_of(db: &AnyPool, wid: &str, cid: &str) -> (i64, i64, i64) {
+    sqlx::query_as::<_, (i64, i64, i64)>(
+        "SELECT score_milli, milestone_score_milli, settled_at FROM world_contributions \
+         WHERE world_id=? AND character_id=?",
+    )
+    .bind(wid)
+    .bind(cid)
+    .fetch_optional(db)
+    .await
+    .unwrap()
+    .unwrap_or((0, 0, 0))
+}
+
+async fn backpack_hook_count(db: &AnyPool, user: &str, hook_key: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM backpacks WHERE user_id=? AND reward_hook_key=?")
+        .bind(user)
+        .bind(hook_key)
+        .fetch_one(db)
+        .await
+        .unwrap()
+}
+
+/// ③ 世界线层主链路：每 tick 逐角色贡献分入独立账本 world_contributions（**不进 narrative_state_json**）
+/// → 终局时按贡献分查**公示产出表**确定发放（历练 + 稀有产出，零随机数）→ 留全链审计。
+/// 同贡献分的两张卡必得完全相同的产出（确定性）。
+#[tokio::test]
+async fn worldline_settlement_pays_by_public_payout_table() {
+    let state = test_state().await;
+    seed_template_worldline(
+        &state.db,
+        "tpl-wl",
+        // 高阈值里程碑：永远推不完 → 引擎不判 MainlineDone，世界跑到 maxWorldTicks 收束；
+        // 但每 tick 的强度都被喂进 milestoneProgress → 在场者即"里程碑推动者"。
+        json!([{ "id": "m1", "summary": "共谋", "constraint": "soft", "threshold": 100.0 }]),
+        json!({ "minWorldTicks": 0, "maxWorldTicks": 2 }),
+        two_tier_payout("tpl-wl"),
+        3,
+    )
+    .await;
+    let wid = running_world_for_endgame(&state, "wl", "tpl-wl", "event", "idle").await;
+    let model: Arc<dyn ModelClient> = Arc::new(MockModel { input_tokens: 10, output_tokens: 20 });
+
+    // tick 0：每角色 Success(1.0) + willSpeak(0.25) = 1.25，且喂进里程碑 → 两列同步累积。
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 0, model.clone()).await.unwrap(), TickStatus::Done);
+    assert_eq!(
+        contribution_of(&state.db, &wid, "cwlA").await,
+        (1250, 1250, 0),
+        "tick 0 应记 1.25 分（×1000 定点），里程碑列同步，未结算"
+    );
+
+    // 产出表随实例钉住（skeleton → assemble_instance → assembled_json），不是运行期临时拼的。
+    let raw: String = sqlx::query_scalar("SELECT assembled_json FROM worlds WHERE id=?")
+        .bind(&wid)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    let wrapper: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(
+        wrapper["assembly"]["payoutTable"]["worldlineTiers"].as_array().unwrap().len(),
+        2,
+        "公示产出表应随实例钉进 assembled_json"
+    );
+    assert_eq!(wrapper["starRating"], json!(3));
+
+    // 贡献分绝不进引擎状态（平权红线）：narrative_state_json 里不得出现贡献账本痕迹。
+    let ns: String = sqlx::query_scalar("SELECT narrative_state_json FROM worlds WHERE id=?")
+        .bind(&wid)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert!(
+        !ns.contains("contribution") && !ns.contains("payout"),
+        "贡献分/产出绝不能写进会回灌引擎的 narrative_state_json（§0.1 平权红线）"
+    );
+
+    // tick 1：累积到 2.5。
+    insert_tick(&state.db, &wid, 1, 1).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 1, model.clone()).await.unwrap(), TickStatus::Done);
+    assert_eq!(contribution_of(&state.db, &wid, "cwlA").await.1, 2500);
+
+    // tick 2：到 maxWorldTicks → 正常收束（非崩塌）。本拍的贡献先入账（3.75）再结算 → 命中"推动"档。
+    insert_tick(&state.db, &wid, 2, 2).await.unwrap();
+    assert_eq!(
+        process_tick_with_model(&state, &wid, 2, model.clone()).await.unwrap(),
+        TickStatus::Concluded
+    );
+    assert_eq!(world_status(&state.db, &wid).await, "ended");
+
+    for (cid, uid) in [("cwlA", "uwlA"), ("cwlB", "uwlB")] {
+        let (score, milestone, settled) = contribution_of(&state.db, &wid, cid).await;
+        assert_eq!(milestone, 3750, "{cid} 三拍各 1.25 分，终局那拍必须计入");
+        assert_eq!(score, milestone, "本例每拍都喂了里程碑，全量与里程碑口径应一致");
+        assert!(settled > 0, "{cid} 结算后应打上 settled_at 幂等标记");
+        // ① 保底 60 + ③ 推动档 80。
+        assert_eq!(
+            i64_one(&state.db, "SELECT mileage FROM cloud_characters WHERE id=?", cid).await,
+            140,
+            "{cid} 应得 ① 出席 60 + ③ 世界线「推动」档 80"
+        );
+        assert_eq!(
+            backpack_hook_count(&state.db, uid, &format!("{wid}:{cid}:worldline")).await,
+            1,
+            "{uid} 应收到该档的世界线产出（发给卡的主人）"
+        );
+    }
+
+    // 全链审计留痕（§0.2）。
+    assert_eq!(
+        i64_one(
+            &state.db,
+            "SELECT COUNT(*) FROM audit_logs WHERE action='world.worldline_settled' AND subject=?",
+            &wid
+        )
+        .await,
+        1,
+        "③ 层结算应留一条可溯审计"
+    );
+
+    // 无抽卡：产出既不经计费也无任何随机来源——两张同分卡拿到逐字段一致的产出。
+    assert_eq!(
+        i64_one(&state.db, "SELECT COUNT(*) FROM ledger_entries", "").await,
+        0,
+        "确定性产出不经任何计费/账本路径"
+    );
+}
+
+/// 世界线崩塌（关键角色退场）：③ 归零 · ① 减半 · ② 已锁定产出原样保留。
+#[tokio::test]
+async fn worldline_collapse_zeroes_tier3_halves_baseline_and_keeps_locked_items() {
+    let state = test_state().await;
+    seed_template_worldline(
+        &state.db,
+        "tpl-col",
+        json!([{ "id": "m1", "summary": "共谋", "constraint": "soft", "threshold": 100.0 }]),
+        // 关键角色 ccolA 退场即崩塌；maxWorldTicks 极大，排除时间上限干扰。
+        json!({ "minWorldTicks": 0, "maxWorldTicks": 100000, "keyCharacterIds": ["ccolA"] }),
+        two_tier_payout("tpl-col"),
+        3,
+    )
+    .await;
+    let wid = running_world_for_endgame(&state, "col", "tpl-col", "event", "idle").await;
+    let model: Arc<dyn ModelClient> = Arc::new(MockModel { input_tokens: 10, output_tokens: 20 });
+
+    // ② 成就层：崩塌前已「完成即锁定」的钩子产出（与本层无关的既有发货路径）。
+    let locked = crate::admission::ItemDefinition {
+        id: "locked_hook_item".into(),
+        narrative: "已锁定的钩子信物".into(),
+        effect_tags: vec!["memento:hook".into()],
+        origin: crate::admission::ItemOrigin {
+            world_template_id: "tpl-col".into(),
+            cosmology: vec!["myth".into()],
+            power_tier: 1,
+        },
+    };
+    crate::backpack::grant_item(&state.db, "ucolB", &locked, &wid).await.unwrap();
+
+    // tick 0：正常推进，两角色各累积 1.25 分（≥ 见证档 1.0 门槛，正常收束下本可得 ③ 产出）。
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 0, model.clone()).await.unwrap(), TickStatus::Done);
+    assert_eq!(contribution_of(&state.db, &wid, "ccolB").await.1, 1250);
+
+    // 关键角色 ccolA 永久退场 → 世界线崩塌。
+    sqlx::query("UPDATE world_members SET status='left' WHERE world_id=? AND cloud_character_id=?")
+        .bind(&wid)
+        .bind("ccolA")
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    insert_tick(&state.db, &wid, 1, 1).await.unwrap();
+    assert_eq!(
+        process_tick_with_model(&state, &wid, 1, model.clone()).await.unwrap(),
+        TickStatus::Concluded
+    );
+    assert_eq!(world_status(&state.db, &wid).await, "ended");
+
+    // ① 减半：出席产出 60 → 30（不是 0，也不是 60，更不含任何 ③ 层加成）。
+    assert_eq!(
+        i64_one(&state.db, "SELECT mileage FROM cloud_characters WHERE id=?", "ccolB").await,
+        30,
+        "崩塌 → ① 保底层减半（60×0.5），且 ③ 归零（否则会是 30+20 或 60+20）"
+    );
+    // ③ 归零：不发任何世界线产出，但结算占位已落（不留重复结算空子）。
+    assert_eq!(
+        backpack_hook_count(&state.db, "ucolB", &format!("{wid}:ccolB:worldline")).await,
+        0,
+        "崩塌 → ③ 世界线层不发放任何产出"
+    );
+    assert!(contribution_of(&state.db, &wid, "ccolB").await.2 > 0, "崩塌也要打幂等标记");
+    assert_eq!(
+        i64_one(
+            &state.db,
+            "SELECT COUNT(*) FROM audit_logs WHERE action='world.worldline_settled' AND subject=?",
+            &wid
+        )
+        .await,
+        0,
+        "③ 归零时无产出可审计"
+    );
+    // ② 保留：崩塌不回收任何已锁定产出（锁定语义正为此设计——本层根本不参与崩塌折算）。
+    let locked_kept: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM backpacks WHERE user_id=? AND item_id=?")
+            .bind("ucolB")
+            .bind("locked_hook_item")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(locked_kept, 1, "崩塌 → ② 已锁定的钩子产出原样保留，一件不回收");
+}
+
+/// 产出封顶不可绕过：产出表声明的道具 powerTier > 实例星级 → 剔除（不降级、不替换），历练照发。
+#[tokio::test]
+async fn worldline_payout_never_exceeds_star_rating_power_tier_cap() {
+    let state = test_state().await;
+    seed_template_worldline(
+        &state.db,
+        "tpl-cap3",
+        json!([{ "id": "m1", "summary": "共谋", "constraint": "soft", "threshold": 100.0 }]),
+        json!({ "minWorldTicks": 0, "maxWorldTicks": 1 }),
+        json!({
+            "worldlineTiers": [
+                { "label": "越顶档", "minScore": 1.0, "mileage": 50,
+                  "item": { "id": "over_tier_relic", "narrative": "超规格神兵", "effectTags": ["advantage:combat"],
+                            "origin": { "worldTemplateId": "tpl-cap3", "cosmology": ["myth"], "powerTier": 4 } } },
+            ]
+        }),
+        1, // 1★ 实例：powerTier 4 的产出必须被剔除
+    )
+    .await;
+    let wid = running_world_for_endgame(&state, "cap3", "tpl-cap3", "event", "idle").await;
+    let model: Arc<dyn ModelClient> = Arc::new(MockModel { input_tokens: 10, output_tokens: 20 });
+
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 0, model.clone()).await.unwrap(), TickStatus::Done);
+    insert_tick(&state.db, &wid, 1, 1).await.unwrap();
+    assert_eq!(
+        process_tick_with_model(&state, &wid, 1, model.clone()).await.unwrap(),
+        TickStatus::Concluded
+    );
+
+    // 历练照发（① 60 + ③ 50），但超顶道具一件都没进包。
+    assert_eq!(
+        i64_one(&state.db, "SELECT mileage FROM cloud_characters WHERE id=?", "ccap3A").await,
+        110
+    );
+    assert_eq!(
+        backpack_hook_count(&state.db, "ucap3A", &format!("{wid}:ccap3A:worldline")).await,
+        0,
+        "powerTier 4 > 1★ → 产出封顶剔除，绝不绕过"
+    );
+    assert_eq!(
+        i64_one(&state.db, "SELECT COUNT(*) FROM items WHERE id=?", "over_tier_relic").await,
+        0,
+        "超顶道具连定义都不该落库（grant_item_tx 根本没被调用）"
+    );
+}

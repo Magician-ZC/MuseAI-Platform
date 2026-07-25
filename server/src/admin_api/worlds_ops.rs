@@ -1,10 +1,12 @@
 //! 世界运营：活跃世界监控、脱敏卡死诊断、暂停/恢复、官方建房、模板库。
 
+use std::collections::HashMap;
+
 use axum::extract::{Path, Query, State};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sqlx::Row;
+use sqlx::{AnyPool, Row};
 
 use crate::app::AppState;
 use crate::auth::{AdminUser, AuthUser};
@@ -12,6 +14,7 @@ use crate::db::{new_id, now_ms};
 use crate::error::ApiError;
 use crate::worlds::{create_world as create_world_inner, load_world, CreateWorldParams};
 
+use super::dashboards::{cents_to_cny, tokens_to_cents, utc_day_start_ms, DAY_MS};
 use super::{audit, clamp_limit, parse_cursor, require_role, ActionQuery};
 
 // ---------------- 世界监控列表 ----------------
@@ -23,7 +26,74 @@ pub(super) struct WorldListQuery {
     limit: Option<i64>,
 }
 
+/// 页内世界的在场人数：`world_members` 里 status='active' 的成员数。
+/// 一次 GROUP BY + IN(页内 id) 取回整页——**绝不逐世界发 SQL**（本端点被后台轮询，N+1 会随页大小放大 QPS）。
+async fn active_member_counts(db: &AnyPool, ids: &[String]) -> Result<HashMap<String, i64>, ApiError> {
+    let mut out = HashMap::new();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    let placeholders = vec!["?"; ids.len()].join(",");
+    let sql = format!(
+        "SELECT world_id, COUNT(*) AS n FROM world_members \
+         WHERE status = 'active' AND world_id IN ({placeholders}) GROUP BY world_id"
+    );
+    let mut query = sqlx::query(&sql);
+    for id in ids {
+        query = query.bind(id.as_str());
+    }
+    for r in query.fetch_all(db).await? {
+        out.insert(r.try_get::<String, _>("world_id")?, r.try_get::<i64, _>("n")?);
+    }
+    Ok(out)
+}
+
+/// 页内世界的 tick 聚合：`(今日 token, done 数, failed 数)`，一次 GROUP BY + IN 取整页。
+///
+/// 今日窗口 `[day_start, day_end)` 由**调用方在 Rust 侧算好毫秒区间**再绑参，SQL 只做 BIGINT 范围比较——
+/// `strftime`/`date_trunc` 是方言特有的，SQLite/Postgres 双跑必须避开（db.rs 可移植 SQL 子集约定）。
+/// 日界取 UTC，与 `dashboards::metrics_trends`、`world_budgets.budget_day` 完全同一套口径。
+/// SUM 一律 CAST(... AS BIGINT)：PG 下 SUM(bigint) 返回 numeric，不 CAST 解码会炸。
+async fn tick_stats_by_world(
+    db: &AnyPool,
+    ids: &[String],
+    day_start: i64,
+    day_end: i64,
+) -> Result<HashMap<String, (i64, i64, i64)>, ApiError> {
+    let mut out = HashMap::new();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    let placeholders = vec!["?"; ids.len()].join(",");
+    let sql = format!(
+        "SELECT world_id, \
+         CAST(COALESCE(SUM(CASE WHEN created_at >= ? AND created_at < ? THEN cost_tokens ELSE 0 END), 0) AS BIGINT) AS today_tokens, \
+         CAST(COALESCE(SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END), 0) AS BIGINT) AS done_n, \
+         CAST(COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS BIGINT) AS failed_n \
+         FROM world_ticks WHERE world_id IN ({placeholders}) GROUP BY world_id"
+    );
+    let mut query = sqlx::query(&sql).bind(day_start).bind(day_end);
+    for id in ids {
+        query = query.bind(id.as_str());
+    }
+    for r in query.fetch_all(db).await? {
+        out.insert(
+            r.try_get::<String, _>("world_id")?,
+            (
+                r.try_get::<i64, _>("today_tokens")?,
+                r.try_get::<i64, _>("done_n")?,
+                r.try_get::<i64, _>("failed_n")?,
+            ),
+        );
+    }
+    Ok(out)
+}
+
 /// GET /admin/worlds?status=&cursor=：全量世界监控（含预算/熔断态；不限可见性）。
+///
+/// 除世界主表字段外，另给运营表格三列派生数据（R1 成本仪表，§17【拍板 16】）：
+/// `participantCount` 在场人数 / `successRate` tick 成功率 / `todayCostCents|todayCostCny` 今日成本。
+/// 三列各来自一条页内 GROUP BY 聚合，总查询数恒为 3（列表 1 + 聚合 2），与页大小无关。
 pub(super) async fn list_worlds(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -60,15 +130,35 @@ pub(super) async fn list_worlds(
 
     let rows = query.fetch_all(&state.db).await?;
     let has_more = rows.len() as i64 > page;
+    let page_n = (rows.len() as i64).min(page).max(0) as usize;
+
+    // 页内 id → 两条补充聚合（在场人数 / tick 统计），先取 id 再一次性聚合，避免 N+1。
+    let mut ids: Vec<String> = Vec::with_capacity(page_n);
+    for row in rows.iter().take(page_n) {
+        ids.push(row.try_get::<String, _>("id")?);
+    }
+    let day_start = utc_day_start_ms(now_ms());
+    let participants = active_member_counts(&state.db, &ids).await?;
+    let tick_stats = tick_stats_by_world(&state.db, &ids, day_start, day_start + DAY_MS).await?;
+
     let mut items = Vec::new();
     let mut next_cursor: Option<String> = None;
-    for (i, row) in rows.iter().enumerate() {
-        if i as i64 >= page {
-            break;
-        }
+    for row in rows.iter().take(page_n) {
         let id: String = row.try_get("id")?;
         let created_at: i64 = row.try_get("created_at")?;
         next_cursor = Some(format!("{created_at}:{id}"));
+        // 在场人数：无成员行的世界即 0（0 是真实答案，不是缺数据）。
+        let participant_count = participants.get(&id).copied().unwrap_or(0);
+        let (today_tokens, done_n, failed_n) =
+            tick_stats.get(&id).copied().unwrap_or((0, 0, 0));
+        let today_cents = tokens_to_cents(today_tokens);
+        // 成功率口径：**已终结 tick** 中 done 的占比，即 done/(done+failed)，取值 0..1（不是百分数）。
+        // pending/running 不进分母——它们还没有结果，计入会把「排队中」误报成「失败」。
+        // 注意与 /admin/metrics/overview 的全局 ticks.successRate 不同：那个分母是全部 tick 行。
+        // 尚无已终结 tick（新房/只排了队）→ null，表示「暂无数据」，前端显示 —，不得当 0% 渲染。
+        let terminal = done_n + failed_n;
+        let success_rate: Option<f64> =
+            if terminal > 0 { Some(done_n as f64 / terminal as f64) } else { None };
         items.push(json!({
             "id": id,
             "title": row.try_get::<String, _>("title")?,
@@ -87,6 +177,19 @@ pub(super) async fn list_worlds(
             "dailyTokenBudget": row.try_get::<i64, _>("daily_token_budget")?,
             "fused": row.try_get::<i64, _>("fused")? != 0,
             "createdAt": created_at,
+            // ---- R1 成本仪表补充列（§17【拍板 16】）----
+            "participantCount": participant_count,
+            "successRate": success_rate,
+            "todayTokens": today_tokens,
+            "todayCostCents": today_cents,
+            "todayCostCny": cents_to_cny(today_cents),
+            // TODO(数据源缺失): moderationLatency —— 需要**每次机审调用的耗时**（provider 请求毫秒数），
+            // 全仓无任何一处记录它：ModerationProvider 调用不打点、risk_events/world_events 无耗时列、
+            // audit_queue 只有 created_at/reviewed_at（那是**人审周转**，量级为小时/天，与前端按秒渲染、
+            // >3s 报警的语义完全不是一回事，拿来充数会得到一个假指标）。
+            // 补齐路径：safety 侧在 moderate_* 调用两端取时钟差 → 落一张 moderation_calls(world_id, latency_ms,…)
+            // 或复用 risk_events.detail_json 增列，再在此按 world_id 聚合 avg/p95。属 safety 模块职责，不在本项范围。
+            // 在此之前**不下发该字段**（前端 null 判定 → 显示 —），诚实空缺胜过假数字（VALIDATION §0.3）。
         }));
     }
     if !has_more {
@@ -129,7 +232,8 @@ pub(super) async fn diagnostics(
         }));
     }
 
-    // 预算/熔断态。
+    // 预算/熔断态。除原始列外补齐**金额换算与用量比**，让诊断栏的预算条不必在前端硬编码金额/百分比。
+    // 换算单价与公式与 runtime 熔断同源（dashboards::tokens_to_cents ← MUSE_TOKEN_CNY_CENTS_PER_1K）。
     let budget = sqlx::query(
         "SELECT daily_token_budget, daily_cny_budget_cents, spent_tokens_today, budget_day, fused \
          FROM world_budgets WHERE world_id = ?",
@@ -138,13 +242,45 @@ pub(super) async fn diagnostics(
     .fetch_optional(&state.db)
     .await?;
     let budget_json = match budget {
-        Some(b) => json!({
-            "dailyTokenBudget": b.try_get::<i64, _>("daily_token_budget")?,
-            "dailyCnyBudgetCents": b.try_get::<i64, _>("daily_cny_budget_cents")?,
-            "spentTokensToday": b.try_get::<i64, _>("spent_tokens_today")?,
-            "budgetDay": b.try_get::<String, _>("budget_day")?,
-            "fused": b.try_get::<i64, _>("fused")? != 0,
-        }),
+        Some(b) => {
+            let daily_tokens: i64 = b.try_get("daily_token_budget")?;
+            let daily_cents: i64 = b.try_get("daily_cny_budget_cents")?;
+            let spent_tokens: i64 = b.try_get("spent_tokens_today")?;
+            let budget_day: String = b.try_get("budget_day")?;
+            // budget_day 是 runtime 写的 UTC 日标签；跨日后计数器要等下一拍才归零，
+            // 所以陈旧日期下的 spent_* 属于**过去某天**，前端不得当"今日"展示。
+            let day_is_today = budget_day == crate::runtime::day_string(now_ms());
+            // 有效今日消耗：日标签非今天 → 0（与 runtime 下一拍的重置口径一致）。
+            let effective_tokens = if day_is_today { spent_tokens } else { 0 };
+            let spent_cents = tokens_to_cents(effective_tokens);
+            // 用量比 0..1：预算未设（<=0）→ null（没有上限就没有"用了百分之多少"）。
+            let token_ratio: Option<f64> = (daily_tokens > 0)
+                .then(|| effective_tokens as f64 / daily_tokens as f64);
+            let cny_ratio: Option<f64> =
+                (daily_cents > 0).then(|| spent_cents as f64 / daily_cents as f64);
+            // 真正决定熔断的是两条线里先到的那条，故合并用量比取二者较大值。
+            let usage_ratio: Option<f64> = match (token_ratio, cny_ratio) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (Some(a), None) => Some(a),
+                (None, b) => b,
+            };
+            json!({
+                "dailyTokenBudget": daily_tokens,
+                "dailyCnyBudgetCents": daily_cents,
+                "dailyCnyBudget": cents_to_cny(daily_cents),
+                "spentTokensToday": spent_tokens,
+                "spentTokensTodayEffective": effective_tokens,
+                "spentCnyCents": spent_cents,
+                "spentCny": cents_to_cny(spent_cents),
+                "centsPer1kTokens": super::dashboards::token_cny_cents_per_1k(),
+                "budgetDay": budget_day,
+                "budgetDayIsToday": day_is_today,
+                "tokenUsageRatio": token_ratio,
+                "cnyUsageRatio": cny_ratio,
+                "usageRatio": usage_ratio,
+                "fused": b.try_get::<i64, _>("fused")? != 0,
+            })
+        }
         None => Value::Null,
     };
 
@@ -370,13 +506,19 @@ pub(super) async fn create_world(
 // ---------------- 世界模板库 ----------------
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct TemplateListQuery {
     moderation: Option<String>,
     cursor: Option<String>,
     limit: Option<i64>,
+    /// R1 Saga 归组（总规格 §3）：按世界系列筛选。传空串等价于不筛（不做「筛出独立模板」用途）。
+    saga_id: Option<String>,
 }
 
-/// GET /admin/world-templates?moderation=&cursor=
+/// GET /admin/world-templates?moderation=&cursor=&sagaId=
+///
+/// 传 sagaId 时切换为**阶段列表**语义：只返回该 Saga 的模板，并按 stage_no 升序（剧情顺序）
+/// 而非 created_at 降序——阶段的自然序是剧情推进顺序，不是录入时间。
 pub(super) async fn list_templates(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -384,25 +526,40 @@ pub(super) async fn list_templates(
 ) -> Result<Json<Value>, ApiError> {
     require_role(&admin, &["operator", "reviewer"])?;
     let page = clamp_limit(q.limit);
+    let saga_filter = q.saga_id.as_deref().filter(|s| !s.trim().is_empty());
     let mut sql = String::from(
         "SELECT id, title, room_type, skeleton_json, admission_json, official, version, \
-         moderation, star_rating, star_source, created_at FROM world_templates WHERE 1=1",
+         moderation, star_rating, star_source, saga_id, stage_no, created_at \
+         FROM world_templates WHERE 1=1",
     );
     if q.moderation.is_some() {
         sql.push_str(" AND moderation = ?");
     }
+    if saga_filter.is_some() {
+        sql.push_str(" AND saga_id = ?");
+    }
+    // 阶段列表按剧情顺序；普通列表沿用既有游标分页（created_at DESC + id DESC）。
     let cursor = q.cursor.as_deref().and_then(parse_cursor);
-    if cursor.is_some() {
+    if saga_filter.is_none() && cursor.is_some() {
         sql.push_str(" AND (created_at < ? OR (created_at = ? AND id < ?))");
     }
-    sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ?");
+    if saga_filter.is_some() {
+        sql.push_str(" ORDER BY stage_no ASC, id ASC LIMIT ?");
+    } else {
+        sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ?");
+    }
 
     let mut query = sqlx::query(&sql);
     if let Some(m) = &q.moderation {
         query = query.bind(m);
     }
-    if let Some((ts, id)) = &cursor {
-        query = query.bind(*ts).bind(*ts).bind(id);
+    if let Some(s) = saga_filter {
+        query = query.bind(s);
+    }
+    if saga_filter.is_none() {
+        if let Some((ts, id)) = &cursor {
+            query = query.bind(*ts).bind(*ts).bind(id);
+        }
     }
     query = query.bind(page + 1);
 
@@ -430,10 +587,14 @@ pub(super) async fn list_templates(
             "moderation": row.try_get::<String, _>("moderation")?,
             "starRating": row.try_get::<i64, _>("star_rating")?,
             "starSource": row.try_get::<String, _>("star_source")?,
+            "sagaId": row.try_get::<String, _>("saga_id")?,
+            "stageNo": row.try_get::<i64, _>("stage_no")?,
             "createdAt": created_at,
         }));
     }
-    if !has_more {
+    // 阶段列表按 stage_no 排序，created_at 游标对它无意义（会跳阶段）——单个 Saga 的阶段数
+    // 由剧情结构决定（量级十几个），一页即可，故不提供游标。
+    if !has_more || saga_filter.is_some() {
         next_cursor = None;
     }
     Ok(Json(json!({ "templates": items, "nextCursor": next_cursor })))
@@ -494,7 +655,15 @@ pub(super) struct CreateTemplateReq {
     room_type: String,
     skeleton_json: Value,
     admission_json: Option<Value>,
+    /// R1 Saga 归组（总规格 §3）。留空 = 独立模板（默认，行为与本字段落地前完全一致）。
+    saga_id: Option<String>,
+    /// 阶段序号，仅在 saga_id 非空时有意义（1 起）。
+    stage_no: Option<i64>,
 }
+
+/// 单个 Saga 的阶段序号上限。剧情结构决定阶段数（分卷检测 + 运营校准），量级十几个；
+/// 设上限是防运营误填（如把字数当阶段号），不是产品规则。
+const STAGE_NO_MAX: i64 = 999;
 
 /// POST /admin/world-templates：新建模板（skeleton_json 结构校验 + 进入审核态/审核队列）。
 pub(super) async fn create_template(
@@ -523,19 +692,36 @@ pub(super) async fn create_template(
     if !admission.is_object() {
         return Err(ApiError::BadRequest("admissionJson 必须是 JSON 对象".into()));
     }
+    // Saga 归组（总规格 §3）：saga_id 与 stage_no 必须成对——只给其一是运营录入错误，
+    // 静默接受会产出「有系列无阶段」或「有阶段无系列」的孤儿模板，阶段列表页无法归组。
+    let saga_id = req.saga_id.as_deref().map(str::trim).unwrap_or("");
+    let stage_no = req.stage_no.unwrap_or(0);
+    if saga_id.is_empty() && stage_no != 0 {
+        return Err(ApiError::BadRequest(
+            "stageNo 需与 sagaId 同时提供：阶段序号只在世界系列内有意义".into(),
+        ));
+    }
+    if !saga_id.is_empty() && !(1..=STAGE_NO_MAX).contains(&stage_no) {
+        return Err(ApiError::BadRequest(format!(
+            "stageNo 非法：属于世界系列的模板须提供 1-{STAGE_NO_MAX} 的阶段序号"
+        )));
+    }
 
     let id = new_id("tpl");
     let now = now_ms();
     // 新模板进入待审核态（官方模板亦走审核工作台）。
     sqlx::query(
         "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, \
-         official, version, moderation, created_at) VALUES (?, ?, ?, ?, ?, 1, 1, 'pending', ?)",
+         official, version, moderation, saga_id, stage_no, created_at) \
+         VALUES (?, ?, ?, ?, ?, 1, 1, 'pending', ?, ?, ?)",
     )
     .bind(&id)
     .bind(req.title.trim())
     .bind(&req.room_type)
     .bind(req.skeleton_json.to_string())
     .bind(admission.to_string())
+    .bind(saga_id)
+    .bind(stage_no)
     .bind(now)
     .execute(&state.db)
     .await?;

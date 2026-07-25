@@ -8,8 +8,9 @@ describe('warmMinimalistTheme', () => {
     expect(warmMinimalistTheme.components).toBeDefined();
   });
 
+  // 设计文档 docs/design/client-ui-design.md §5：页面底色 #fbfaf7 暖白，卡片底色 #ffffff。
   it('should have warm background colors', () => {
-    expect(warmMinimalistTheme.token?.colorBgBase).toBe('#faf9f5');
+    expect(warmMinimalistTheme.token?.colorBgBase).toBe('#fbfaf7');
     expect(warmMinimalistTheme.token?.colorBgContainer).toBe('#ffffff');
   });
 
@@ -32,16 +33,24 @@ describe('warmMinimalistTheme', () => {
   it('should configure Layout component colors', () => {
     const layout = warmMinimalistTheme.components?.Layout;
     expect(layout).toBeDefined();
-    expect(layout?.siderBg).toBe('#faf9f5');
-    expect(layout?.headerBg).toBe('#faf9f5');
-    expect(layout?.bodyBg).toBe('#ffffff');
+    expect(layout?.siderBg).toBe('#fbfaf7');
+    expect(layout?.headerBg).toBe('#fbfaf7');
+    expect(layout?.bodyBg).toBe('#fbfaf7');
   });
 
   it('should configure Menu component colors', () => {
     const menu = warmMinimalistTheme.components?.Menu;
     expect(menu).toBeDefined();
-    expect(menu?.itemBg).toBe('#faf9f5');
+    expect(menu?.itemBg).toBe('#fbfaf7');
     expect(menu?.itemSelectedBg).toBe('#f2e8dc');
     expect(menu?.itemSelectedColor).toBe('#d97757');
+  });
+
+  // 设计文档 §5：中文字体栈必须兼容 PingFang SC / Hiragino Sans GB / Microsoft YaHei。
+  it('should declare a CJK-capable font stack', () => {
+    const fontFamily = warmMinimalistTheme.token?.fontFamily ?? '';
+    expect(fontFamily).toContain('PingFang SC');
+    expect(fontFamily).toContain('Hiragino Sans GB');
+    expect(fontFamily).toContain('Microsoft YaHei');
   });
 });

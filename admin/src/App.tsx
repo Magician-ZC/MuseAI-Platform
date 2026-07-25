@@ -22,7 +22,7 @@ import {
   WalletOutlined,
 } from '@ant-design/icons';
 import { Avatar, Badge, Button, Dropdown, Input, Layout, Menu, Result } from 'antd';
-import { clearSession, getRole, getToken } from './api';
+import { clearSession, getRole, getToken, resolveEnvironment } from './api';
 import { canAccess, firstModuleKey, MODULES, roleLabel, visibleModules } from './rbac';
 
 import Login from './pages/Login';
@@ -108,6 +108,8 @@ function Shell() {
   if (!getToken() && !designPreview) return <Navigate to="/login" replace />;
 
   const role = designPreview ? 'operator' : getRole();
+  // 设计文档 §8：环境标识必须来自真实来源（构建注入 / 接口基址），判不出来显示「环境未知」。
+  const environment = resolveEnvironment();
   const visible = visibleModules(role);
   const landing = firstModuleKey(role);
   const active = location.pathname.split('/')[1] || landing || '';
@@ -211,19 +213,41 @@ function Shell() {
             aria-label="搜索后台数据"
           />
           <div className="admin-shell__account">
-            <Button className="admin-environment" type="text">
-              <span className="admin-environment__dot" />
-              生产环境
-              <DownOutlined />
-            </Button>
-            <Badge count={12} size="small">
+            <Dropdown
+              trigger={['click']}
+              menu={{
+                items: [
+                  { key: 'env', label: `环境：${environment.label}`, disabled: true },
+                  { key: 'base', label: `接口地址：${environment.apiBase}`, disabled: true },
+                  { key: 'mode', label: `构建模式：${environment.buildMode}`, disabled: true },
+                  {
+                    key: 'hint',
+                    label: environment.key === 'unknown'
+                      ? '未注入 VITE_ADMIN_ENV，无法判定环境'
+                      : '环境标识仅供核对，服务端仍会二次校验权限',
+                    disabled: true,
+                  },
+                ],
+              }}
+            >
+              <Button className="admin-environment" type="text" aria-label={`当前环境：${environment.label}`}>
+                <span className={`admin-environment__dot${environment.key === 'production' ? '' : ' is-unverified'}`} />
+                {environment.label}
+                <DownOutlined />
+              </Button>
+            </Dropdown>
+            {/* TODO(接口缺字段): 未读通知数 —— 后台无通知计数接口，正式模式不展示伪造的红点数字。 */}
+            <Badge count={designPreview ? 12 : 0} size="small">
               <Button type="text" className="admin-notification" icon={<BellOutlined />} aria-label="通知" />
             </Badge>
+            {/* TODO(接口缺字段): GET /admin/me（displayName / avatarUrl）—— 正式模式只显示已知的登录角色。 */}
             <Button type="text" className="admin-profile">
-              <Avatar size={34} src="/assets/worlds/mist-sea-world.png" />
+              {designPreview
+                ? <Avatar size={34} src="/assets/worlds/mist-sea-world.png" />
+                : <Avatar size={34} icon={<UserOutlined />} />}
               <span>
-                <strong>林逸</strong>
-                <small>{roleLabel(role)}</small>
+                <strong>{designPreview ? '林逸' : roleLabel(role)}</strong>
+                <small>{designPreview ? roleLabel(role) : '当前登录角色'}</small>
               </span>
               <DownOutlined />
             </Button>

@@ -52,7 +52,7 @@ const companionModules = [
 const HOME_STAT_ICON_STYLE: React.CSSProperties = {
   width: 44,
   height: 44,
-  borderRadius: 10,
+  borderRadius: 7,
   background: '#f2e8dc',
   display: 'flex',
   alignItems: 'center',
@@ -170,7 +170,7 @@ const Home: React.FC = () => {
         </Text>
         <Card
           style={{
-            borderRadius: 12,
+            borderRadius: 8,
             border: 'none',
             boxShadow: '0 1px 3px rgba(0,0,0,0.04)',
           }}
@@ -275,7 +275,7 @@ const Home: React.FC = () => {
                 onClick={() => navigate(mod.key)}
                 styles={{ body: { padding: '20px 16px', textAlign: 'center' } }}
                 style={{
-                  borderRadius: 12,
+                  borderRadius: 8,
                   border: 'none',
                   boxShadow: '0 1px 3px rgba(0,0,0,0.04)',
                   transition: 'box-shadow 0.25s ease, transform 0.25s ease, border-color 0.25s ease',
@@ -309,7 +309,7 @@ const Home: React.FC = () => {
                 onClick={() => navigate(mod.key)}
                 styles={{ body: { padding: '20px 16px', textAlign: 'center' } }}
                 style={{
-                  borderRadius: 12,
+                  borderRadius: 8,
                   border: 'none',
                   boxShadow: '0 1px 3px rgba(0,0,0,0.04)',
                   transition: 'box-shadow 0.25s ease, transform 0.25s ease, border-color 0.25s ease',

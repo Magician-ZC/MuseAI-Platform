@@ -1649,3 +1649,466 @@ async fn appeals_rbac_reviewer_and_admin_only() {
         .fetch_one(&state.db).await.unwrap().try_get::<String, _>("moderation").unwrap();
     assert_eq!(m, "approved");
 }
+
+// ---------------- R1：Saga 归组字段（总规格 §3） ----------------
+
+/// 建模板时的 Saga 归组校验：saga_id 与 stage_no 必须成对，且阶段序号有范围。
+/// 不传两者 = 独立模板（默认路径），必须与本字段落地前行为完全一致。
+#[tokio::test]
+async fn create_template_saga_pairing_rules() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+
+    let create = |body: Value| {
+        let app = app.clone();
+        let admin = admin.clone();
+        async move { post(&app, "/api/admin/world-templates", Some(&admin), body).await }
+    };
+    let skeleton = json!({ "mainlineNodes": [] });
+
+    // 1) 完全不传 saga 字段 → 独立模板，落库为 ''/0（向后兼容，老调用方零改动）。
+    let (st, body) = create(json!({
+        "title": "独立模板", "roomType": "chapter", "skeletonJson": skeleton
+    })).await;
+    assert_eq!(st, StatusCode::OK, "不传 saga 字段应通过: {body}");
+    let tpl_id = body["templateId"].as_str().unwrap().to_string();
+    let row = sqlx::query("SELECT saga_id, stage_no FROM world_templates WHERE id = ?")
+        .bind(&tpl_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(row.try_get::<String, _>("saga_id").unwrap(), "");
+    assert_eq!(row.try_get::<i64, _>("stage_no").unwrap(), 0);
+
+    // 2) 只给 stageNo 不给 sagaId → 400（孤儿阶段，阶段列表页无法归组）。
+    let (st, _) = create(json!({
+        "title": "孤儿阶段", "roomType": "chapter", "skeletonJson": skeleton, "stageNo": 3
+    })).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "只给 stageNo 应拒绝");
+
+    // 3) 给 sagaId 但 stageNo 缺省（0）→ 400（有系列无阶段）。
+    let (st, _) = create(json!({
+        "title": "无阶段号", "roomType": "chapter", "skeletonJson": skeleton, "sagaId": "saga_dp"
+    })).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "有 sagaId 无 stageNo 应拒绝");
+
+    // 4) stageNo 越界 → 400（防运营把字数误填成阶段号）。
+    let (st, _) = create(json!({
+        "title": "越界阶段", "roomType": "chapter", "skeletonJson": skeleton,
+        "sagaId": "saga_dp", "stageNo": 1000
+    })).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "stageNo 超上限应拒绝");
+
+    // 5) 成对且合法 → 通过。
+    let (st, body) = create(json!({
+        "title": "斗罗·史莱克篇", "roomType": "chapter", "skeletonJson": skeleton,
+        "sagaId": "saga_dp", "stageNo": 2
+    })).await;
+    assert_eq!(st, StatusCode::OK, "成对合法应通过: {body}");
+}
+
+/// 阶段列表：按 sagaId 筛选时只返回该系列，且按 stage_no 升序（剧情顺序，不是录入时间）。
+#[tokio::test]
+async fn list_templates_by_saga_orders_by_stage() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+
+    let create = |body: Value| {
+        let app = app.clone();
+        let admin = admin.clone();
+        async move { post(&app, "/api/admin/world-templates", Some(&admin), body).await }
+    };
+    let skeleton = json!({ "mainlineNodes": [] });
+
+    // 故意逆序录入（阶段 3 先建、阶段 1 后建），验证排序不是按 created_at。
+    for (title, stage) in [("第三篇", 3), ("第一篇", 1), ("第二篇", 2)] {
+        let (st, _) = create(json!({
+            "title": title, "roomType": "chapter", "skeletonJson": skeleton,
+            "sagaId": "saga_a", "stageNo": stage
+        })).await;
+        assert_eq!(st, StatusCode::OK);
+    }
+    // 另一个系列 + 一个独立模板，验证筛选隔离。
+    let (st, _) = create(json!({
+        "title": "别的系列", "roomType": "chapter", "skeletonJson": skeleton,
+        "sagaId": "saga_b", "stageNo": 1
+    })).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = create(json!({
+        "title": "独立的", "roomType": "chapter", "skeletonJson": skeleton
+    })).await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, body) = get(&app, "/api/admin/world-templates?sagaId=saga_a", Some(&admin)).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let items = body["templates"].as_array().unwrap();
+    assert_eq!(items.len(), 3, "只应返回 saga_a 的三个阶段: {body}");
+    let stages: Vec<i64> = items.iter().map(|t| t["stageNo"].as_i64().unwrap()).collect();
+    assert_eq!(stages, vec![1, 2, 3], "阶段应按剧情顺序升序");
+    let titles: Vec<&str> = items.iter().map(|t| t["title"].as_str().unwrap()).collect();
+    assert_eq!(titles, vec!["第一篇", "第二篇", "第三篇"]);
+    for t in items {
+        assert_eq!(t["sagaId"], "saga_a");
+    }
+    // 阶段列表不分页（阶段数由剧情结构决定，量级十几个）。
+    assert!(body["nextCursor"].is_null(), "阶段列表不应给游标");
+
+    // 不传 sagaId → 全量列表，仍含独立模板与两个系列，且投影带上新字段。
+    let (st, body) = get(&app, "/api/admin/world-templates", Some(&admin)).await;
+    assert_eq!(st, StatusCode::OK);
+    let all = body["templates"].as_array().unwrap();
+    assert_eq!(all.len(), 5, "全量应含 5 个模板");
+    assert!(all.iter().any(|t| t["sagaId"] == "" && t["stageNo"] == 0), "独立模板应在全量列表里");
+}
+
+// ================= R1 成本仪表（总规格 §17【拍板 16】） =================
+// 日界口径与后端一致：UTC 日界 + 固定 86_400_000ms 桶宽；种子取 now / now-1天 / now-2天，
+// 恒落在窗口对应桶，无跨日抖动（同 metrics_trends 测试的做法）。
+
+/// 建一个最小可列出的世界行（只填 NOT NULL 且无默认值的列，其余走建表默认）。
+async fn ins_world(state: &AppState, id: &str, status: &str, created_at: i64) {
+    sqlx::query(
+        "INSERT INTO worlds (id, template_id, template_version, engine_version, prompt_set_version, \
+         model_route_version, room_type, title, status, created_at, updated_at) \
+         VALUES (?, 'tpl_cost', 1, 'e1', 'p1', 'm1', 'idle', '成本世界', ?, ?, ?)",
+    )
+    .bind(id)
+    .bind(status)
+    .bind(created_at)
+    .bind(created_at)
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+/// 带状态的 tick（成功率口径需要 done/failed/pending 三种）。
+async fn ins_tick_st(
+    state: &AppState,
+    id: &str,
+    world: &str,
+    tick_no: i64,
+    tokens: i64,
+    status: &str,
+    created_at: i64,
+) {
+    sqlx::query(
+        "INSERT INTO world_ticks (id, world_id, tick_no, base_revision, status, cost_tokens, created_at) \
+         VALUES (?, ?, ?, 0, ?, ?, ?)",
+    )
+    .bind(id)
+    .bind(world)
+    .bind(tick_no)
+    .bind(status)
+    .bind(tokens)
+    .bind(created_at)
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+async fn ins_member(state: &AppState, id: &str, world: &str, user: &str, status: &str) {
+    sqlx::query(
+        "INSERT INTO world_members (id, world_id, user_id, cloud_character_id, status, joined_at) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(id)
+    .bind(world)
+    .bind(user)
+    .bind(format!("cc_{id}"))
+    .bind(status)
+    .bind(now_ms())
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+/// 今日成本 + 近 N 日趋势：UTC 日界分桶、空天补零、跨日界不串账。
+#[tokio::test]
+async fn cost_meter_today_and_trend_respect_utc_day_boundary() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+
+    let now = now_ms();
+    let day_a = now - 2 * DAY_MS; // 前天
+                                  // 昨天故意不播种：验证空天补零
+
+    // 前天：w_cost_a 花 1000；今天：w_cost_a 花 300 + w_cost_b 花 700。
+    ins_tick_st(&state, "tc_a1", "w_cost_a", 0, 1000, "done", day_a).await;
+    ins_tick_st(&state, "tc_a2", "w_cost_a", 1, 300, "done", now).await;
+    ins_tick_st(&state, "tc_b1", "w_cost_b", 0, 700, "done", now).await;
+
+    let (st, m) = get(&app, "/api/admin/metrics/overview?costDays=3", Some(&admin)).await;
+    assert_eq!(st, StatusCode::OK, "{m}");
+    let cost = &m["cost"];
+
+    // 单价：与 runtime 熔断同源的 env 参数；未设 env 时为默认 2 分/千 token。
+    let price = cost["centsPer1kTokens"].as_i64().unwrap();
+    assert!(price > 0, "单价必须为正");
+    if std::env::var_os("MUSE_TOKEN_CNY_CENTS_PER_1K").is_none() {
+        assert_eq!(price, 2, "默认单价须与 runtime::DEFAULT_TOKEN_CNY_CENTS_PER_1K 同值");
+    }
+
+    // 今日成本：只含今天两笔（300+700），前天的 1000 不得串进来。
+    assert_eq!(cost["today"]["day"], utc_day(now));
+    assert_eq!(cost["today"]["tokens"], 1000);
+    assert_eq!(cost["today"]["cents"], 1000 * price / 1000);
+
+    // 趋势：3 天升序 [前天, 昨天(补零), 今天]。
+    let trend = cost["trend"].as_array().unwrap();
+    assert_eq!(trend.len(), 3, "costDays=3 应给 3 天");
+    assert_eq!(cost["trendDays"], 3);
+    assert_eq!(trend[0]["day"], utc_day(day_a));
+    assert_eq!(trend[0]["tokens"], 1000);
+    assert_eq!(trend[1]["tokens"], 0, "无数据的天须补零");
+    assert_eq!(trend[2]["day"], utc_day(now));
+    assert_eq!(trend[2]["tokens"], 1000);
+    assert_eq!(trend[0]["cents"], 1000 * price / 1000);
+
+    // 全量累计（不受趋势窗口影响）。
+    assert_eq!(cost["total"]["tokens"], 2000);
+    assert_eq!(cost["total"]["cents"], 2000 * price / 1000);
+    assert_eq!(cost["total"]["worlds"], 2);
+
+    // costDays 缺省 → 7 天；clamp 上下界。
+    let (_, m) = get(&app, "/api/admin/metrics/overview", Some(&admin)).await;
+    assert_eq!(m["cost"]["trendDays"], 7, "默认窗口 7 天");
+    assert_eq!(m["cost"]["trend"].as_array().unwrap().len(), 7);
+    let (_, m) = get(&app, "/api/admin/metrics/overview?costDays=999", Some(&admin)).await;
+    assert_eq!(m["cost"]["trendDays"], 60, "上界 clamp 到 60");
+    let (_, m) = get(&app, "/api/admin/metrics/overview?costDays=0", Some(&admin)).await;
+    assert_eq!(m["cost"]["trendDays"], 1, "下界 clamp 到 1");
+}
+
+/// 每局成本 + 每玩家分摊：按 active 成员人均等分；无成员世界不除零（perPlayer 为 null）。
+#[tokio::test]
+async fn cost_meter_per_player_equal_split_and_no_divide_by_zero() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+
+    let now = now_ms();
+    // w_pp_a：2_000_000 token，4 名 active + 1 名 left（left 不进分母）。
+    ins_tick_st(&state, "tp_a1", "w_pp_a", 0, 1_500_000, "done", now).await;
+    ins_tick_st(&state, "tp_a2", "w_pp_a", 1, 500_000, "done", now).await;
+    for i in 0..4 {
+        ins_member(&state, &format!("mem_a{i}"), "w_pp_a", &format!("u_a{i}"), "active").await;
+    }
+    ins_member(&state, "mem_a_left", "w_pp_a", "u_a_left", "left").await;
+    // w_pp_b：1_000_000 token，0 名成员（全员退出/尚未有人加入）。
+    ins_tick_st(&state, "tp_b1", "w_pp_b", 0, 1_000_000, "done", now).await;
+    // w_pp_c：有成员但从未跑过 tick → 不进成本榜，其成员也不得稀释平台均值分母。
+    ins_member(&state, "mem_c0", "w_pp_c", "u_c0", "active").await;
+
+    let (st, m) = get(&app, "/api/admin/metrics/overview", Some(&admin)).await;
+    assert_eq!(st, StatusCode::OK, "{m}");
+    let cost = &m["cost"];
+    let price = cost["centsPer1kTokens"].as_i64().unwrap();
+    assert_eq!(cost["allocation"], "per_member_equal_split", "分摊口径须自述");
+
+    // 榜单按累计 token 降序：a(2M) 在 b(1M) 前；从未跑过的 c 不在榜。
+    let by_world = cost["byWorld"].as_array().unwrap();
+    assert_eq!(by_world.len(), 2, "只有产生过 tick 的世界进成本榜: {cost}");
+    assert_eq!(by_world[0]["worldId"], "w_pp_a");
+    assert_eq!(by_world[1]["worldId"], "w_pp_b");
+
+    // 每局成本 + 每玩家等分：2_000_000 / 4 = 500_000 token/人。
+    let a_cents = 2_000_000 * price / 1000;
+    assert_eq!(by_world[0]["tokens"], 2_000_000);
+    assert_eq!(by_world[0]["cents"], a_cents);
+    assert_eq!(by_world[0]["cny"].as_f64().unwrap(), a_cents as f64 / 100.0);
+    assert_eq!(by_world[0]["activeMembers"], 4, "left 成员不计入在场");
+    assert_eq!(by_world[0]["tokensPerPlayer"].as_f64().unwrap(), 500_000.0);
+    assert_eq!(by_world[0]["centsPerPlayer"].as_f64().unwrap(), a_cents as f64 / 4.0);
+
+    // 无成员世界：不除零、不编 0，perPlayer 为 null。
+    assert_eq!(by_world[1]["activeMembers"], 0);
+    assert!(by_world[1]["tokensPerPlayer"].is_null(), "0 成员不得除零");
+    assert!(by_world[1]["centsPerPlayer"].is_null(), "0 成员不得除零");
+    assert_eq!(by_world[1]["tokens"], 1_000_000, "成本本身照常统计");
+
+    // 平台合计：分母只含有 tick 记账的世界（w_pp_c 的成员不进分母）。
+    let total = &cost["total"];
+    assert_eq!(total["tokens"], 3_000_000);
+    assert_eq!(total["activeMembers"], 4, "从未跑过 tick 的世界成员不得稀释均值分母");
+    assert_eq!(total["tokensPerPlayer"].as_f64().unwrap(), 750_000.0);
+    let total_cents = 3_000_000 * price / 1000;
+    assert_eq!(total["cents"], total_cents);
+    assert_eq!(total["centsPerPlayer"].as_f64().unwrap(), total_cents as f64 / 4.0);
+
+    // 兼容字段仍在，且与新字段同源。
+    assert_eq!(m["tokenCostByWorld"][0]["worldId"], "w_pp_a");
+    assert_eq!(m["tokenCostByWorld"][0]["tokens"], 2_000_000);
+}
+
+/// 世界监控列表补充列：在场人数 / 成功率 / 今日成本；moderationLatency 无数据源故不下发。
+#[tokio::test]
+async fn worlds_list_participant_success_rate_and_today_cost() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+
+    let now = now_ms();
+    let yesterday = now - DAY_MS;
+    ins_world(&state, "w_ops_1", "running", now).await;
+    ins_world(&state, "w_ops_2", "open", now - 1000).await;
+
+    // w_ops_1：3 active + 1 left；今天 3 done(各 200_000) + 1 failed(0) + 1 pending(0)，昨天 1 done(900_000)。
+    for i in 0..3 {
+        ins_member(&state, &format!("mem_o{i}"), "w_ops_1", &format!("u_o{i}"), "active").await;
+    }
+    ins_member(&state, "mem_o_left", "w_ops_1", "u_o_left", "left").await;
+    ins_tick_st(&state, "to_1", "w_ops_1", 1, 200_000, "done", now).await;
+    ins_tick_st(&state, "to_2", "w_ops_1", 2, 200_000, "done", now).await;
+    ins_tick_st(&state, "to_3", "w_ops_1", 3, 200_000, "done", now).await;
+    ins_tick_st(&state, "to_4", "w_ops_1", 4, 0, "failed", now).await;
+    ins_tick_st(&state, "to_5", "w_ops_1", 5, 0, "pending", now).await;
+    ins_tick_st(&state, "to_0", "w_ops_1", 0, 900_000, "done", yesterday).await;
+    // w_ops_2：无成员、无 tick。
+
+    let (st, body) = get(&app, "/api/admin/worlds", Some(&admin)).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let worlds = body["worlds"].as_array().unwrap();
+    let w1 = worlds.iter().find(|w| w["id"] == "w_ops_1").unwrap();
+    let w2 = worlds.iter().find(|w| w["id"] == "w_ops_2").unwrap();
+
+    // 在场人数：只数 active。
+    assert_eq!(w1["participantCount"], 3);
+    assert_eq!(w2["participantCount"], 0, "无成员即 0（0 是真实答案，不是缺数据）");
+
+    // 成功率：已终结 tick 中 done 占比 = 4/(4+1) = 0.8，取值 0..1；pending 不进分母。
+    assert_eq!(w1["successRate"].as_f64().unwrap(), 0.8);
+    assert!(w2["successRate"].is_null(), "无已终结 tick → null（暂无数据），不得当 0% 渲染");
+
+    // 今日成本：只含今天 3 笔（600_000），昨天的 900_000 不得串进来。
+    assert_eq!(w1["todayTokens"], 600_000);
+    let (_, m) = get(&app, "/api/admin/metrics/overview", Some(&admin)).await;
+    let price = m["cost"]["centsPer1kTokens"].as_i64().unwrap();
+    let cents = 600_000 * price / 1000;
+    assert_eq!(w1["todayCostCents"], cents, "今日成本须与 token 单价口径一致");
+    assert_eq!(w1["todayCostCny"].as_f64().unwrap(), cents as f64 / 100.0);
+    assert_eq!(w2["todayTokens"], 0);
+    assert_eq!(w2["todayCostCents"], 0);
+
+    // 风控延迟无数据源：不编造字段（前端 null 判定 → 显示 —）。
+    assert!(w1.get("moderationLatency").is_none(), "无数据源的字段不得下发假值");
+}
+
+/// 补充列不改 RBAC：/admin/worlds 仍限 operator（+admin），/admin/metrics/* 仍限 operator/finance。
+#[tokio::test]
+async fn cost_meter_endpoints_keep_existing_rbac() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    ins_world(&state, "w_rbac", "running", now_ms()).await;
+
+    let admin = admin_token(&state);
+    let operator = role_token(&state, "operator");
+    let finance = role_token(&state, "finance");
+    let reviewer = role_token(&state, "reviewer");
+    let support = role_token(&state, "support");
+    let user = user_token(&state);
+
+    // 世界监控（含新增成本列）：operator/admin 可读，其余后台角色 403，普通用户 403。
+    assert_eq!(get(&app, "/api/admin/worlds", Some(&operator)).await.0, StatusCode::OK);
+    assert_eq!(get(&app, "/api/admin/worlds", Some(&admin)).await.0, StatusCode::OK);
+    assert_eq!(get(&app, "/api/admin/worlds", Some(&finance)).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(get(&app, "/api/admin/worlds", Some(&reviewer)).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(get(&app, "/api/admin/worlds", Some(&support)).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(get(&app, "/api/admin/worlds", Some(&user)).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(get(&app, "/api/admin/worlds", None).await.0, StatusCode::UNAUTHORIZED);
+
+    // 诊断（含预算金额）：同上，operator/admin only。
+    let diag = "/api/admin/worlds/w_rbac/diagnostics";
+    assert_eq!(get(&app, diag, Some(&operator)).await.0, StatusCode::OK);
+    assert_eq!(get(&app, diag, Some(&finance)).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(get(&app, diag, Some(&reviewer)).await.0, StatusCode::FORBIDDEN);
+
+    // 成本仪表在 metrics/overview 上：operator/finance/admin 可读，reviewer/support 403。
+    let ov = "/api/admin/metrics/overview";
+    assert_eq!(get(&app, ov, Some(&operator)).await.0, StatusCode::OK);
+    assert_eq!(get(&app, ov, Some(&finance)).await.0, StatusCode::OK);
+    assert_eq!(get(&app, ov, Some(&admin)).await.0, StatusCode::OK);
+    assert_eq!(get(&app, ov, Some(&reviewer)).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(get(&app, ov, Some(&support)).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(get(&app, ov, None).await.0, StatusCode::UNAUTHORIZED);
+}
+
+/// 诊断栏预算：金额换算 + 用量比下发（前端据此去掉硬编码的 ¥/百分比）；跨日陈旧计数器不当"今日"。
+#[tokio::test]
+async fn diagnostics_budget_exposes_cny_and_usage_ratio() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+
+    let (st, body) = post(
+        &app,
+        "/api/admin/worlds",
+        Some(&admin),
+        json!({ "templateId": "tpl_b", "templateVersion": 1, "title": "预算世界", "roomType": "idle",
+                "dailyTokenBudget": 1_000_000, "dailyCnyBudgetCents": 4000 }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let wid = body["worldId"].as_str().unwrap().to_string();
+
+    // 熔断计数器停在今天：花掉 400_000 token。
+    let today = crate::runtime::day_string(now_ms());
+    sqlx::query("UPDATE world_budgets SET spent_tokens_today = 400000, budget_day = ? WHERE world_id = ?")
+        .bind(&today)
+        .bind(&wid)
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    let (st, diag) = get(&app, &format!("/api/admin/worlds/{wid}/diagnostics"), Some(&admin)).await;
+    assert_eq!(st, StatusCode::OK);
+    let b = &diag["budget"];
+    let price = b["centsPer1kTokens"].as_i64().unwrap();
+    assert!(price > 0);
+    let spent_cents = 400_000 * price / 1000;
+
+    assert_eq!(b["dailyTokenBudget"], 1_000_000);
+    assert_eq!(b["dailyCnyBudgetCents"], 4000);
+    assert_eq!(b["dailyCnyBudget"].as_f64().unwrap(), 40.0);
+    assert_eq!(b["spentTokensToday"], 400_000);
+    assert_eq!(b["spentTokensTodayEffective"], 400_000);
+    assert_eq!(b["spentCnyCents"], spent_cents);
+    assert_eq!(b["spentCny"].as_f64().unwrap(), spent_cents as f64 / 100.0);
+    assert_eq!(b["budgetDayIsToday"], true);
+    // 用量比 0..1：token 40%，cny = spent_cents/4000；合并取较大者（先撞线的那条决定熔断）。
+    assert_eq!(b["tokenUsageRatio"].as_f64().unwrap(), 0.4);
+    let cny_ratio = spent_cents as f64 / 4000.0;
+    assert_eq!(b["cnyUsageRatio"].as_f64().unwrap(), cny_ratio);
+    assert_eq!(b["usageRatio"].as_f64().unwrap(), 0.4_f64.max(cny_ratio));
+
+    // 计数器停留在过去某天 → 不得当"今日"：有效消耗归零，用量比归零。
+    sqlx::query("UPDATE world_budgets SET budget_day = '1970-01-01' WHERE world_id = ?")
+        .bind(&wid)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let (_, diag) = get(&app, &format!("/api/admin/worlds/{wid}/diagnostics"), Some(&admin)).await;
+    let b = &diag["budget"];
+    assert_eq!(b["budgetDayIsToday"], false);
+    assert_eq!(b["spentTokensToday"], 400_000, "原始列照实回显");
+    assert_eq!(b["spentTokensTodayEffective"], 0, "跨日后计数器属于过去某天，不算今日");
+    assert_eq!(b["spentCnyCents"], 0);
+    assert_eq!(b["usageRatio"].as_f64().unwrap(), 0.0);
+
+    // 未设 cny 上限的世界：cnyUsageRatio 为 null（没有上限就没有"用了百分之多少"）。
+    let (st, body) = post(
+        &app,
+        "/api/admin/worlds",
+        Some(&admin),
+        json!({ "templateId": "tpl_b", "templateVersion": 1, "title": "无 cny 上限", "roomType": "idle",
+                "dailyTokenBudget": 1000, "dailyCnyBudgetCents": 0 }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let wid2 = body["worldId"].as_str().unwrap();
+    let (_, diag) = get(&app, &format!("/api/admin/worlds/{wid2}/diagnostics"), Some(&admin)).await;
+    assert!(diag["budget"]["cnyUsageRatio"].is_null(), "无 cny 上限 → 用量比 null");
+    assert_eq!(diag["budget"]["tokenUsageRatio"].as_f64().unwrap(), 0.0);
+}

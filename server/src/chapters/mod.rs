@@ -302,16 +302,21 @@ async fn chapter_finish(
             }
         }
 
-        // 通关历练（波次 2）：仅「未通关 → 通关」转变沿那一次，给**每张参与卡**（结算时该世界
-        // active 成员的云端角色）+100，与通关结算（CAS 写 chapterState + 道具发货）同一事务。
+        // ① 保底层 + ③ 世界线层（波次 2 + R1 三层结算，总规格 §9）：仅「未通关 → 通关」转变沿那一次。
+        // 成员查询一并取出 user_id——③ 层的产出道具要发给**卡的主人**（grant_item_tx 按 user_id 归属），
+        // 只有 cloud_character_id 是发不出去的。
+        let mut worldline_payouts: Vec<Value> = Vec::new();
         if cleared && !was_cleared {
-            let participants: Vec<(String,)> = sqlx::query_as(
-                "SELECT cloud_character_id FROM world_members WHERE world_id = ? AND status = 'active'",
+            let participants: Vec<(String, String)> = sqlx::query_as(
+                "SELECT cloud_character_id, user_id FROM world_members \
+                 WHERE world_id = ? AND status = 'active'",
             )
             .bind(&world_id)
             .fetch_all(&mut *tx)
             .await?;
-            for (member_cid,) in &participants {
+            // ① 保底层（出席制，不看行动率）：每张参与卡 +100，与通关结算（CAS 写 chapterState +
+            // 道具发货）同一事务。
+            for (member_cid, _) in &participants {
                 crate::progression::grant_mileage_tx(
                     &mut tx,
                     member_cid,
@@ -320,6 +325,13 @@ async fn chapter_finish(
                 )
                 .await?;
             }
+            // ③ 世界线层：里程碑推动者按 world_contributions 里的确定性贡献分查**公示产出表**
+            // （随实例钉在 assembled_json 内）确定发放——无 RNG、无爆率（§10【拍板 17】）。
+            // 章节房正常通关不构成世界线崩塌（崩塌是关键角色退场类终局，见 progression 常量区），
+            // 故 collapsed=false；未声明产出表 / 无里程碑贡献者 → 返回空，不发放也不报错。
+            worldline_payouts =
+                crate::progression::settle_worldline_tx(&mut tx, &world_id, &participants, false)
+                    .await?;
         }
         tx.commit().await?;
 
@@ -330,6 +342,7 @@ async fn chapter_finish(
             "totalNodes": total_nodes,
             "cleared": cleared,
             "grantedItems": granted_items,
+            "worldlinePayouts": worldline_payouts,
             "offlineStarted": true,
         });
     };

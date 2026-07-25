@@ -7,10 +7,12 @@
 //!   - whisper：≤100 字、非空，过 moderation（Approved 才 accepted，否则 rejected/moderation）；
 //!   - item：物品真在 backpacks(owned/carried，carried 须匹配本世界)，否则 risk_event("forged_state")+RiskBlocked；
 //!           世界准入 admission::check_admission 为 S4 占位（当前"存在即通过"，留 TODO）；
-//!   - 每节拍固定额度（P4a 所有人相同）超限 → rejected("quota")。
+//!   - 托梦配额（R1，规格 §8【拍板 12】）：**每卡每阶段 N 条**（默认 3，运营可调，见
+//!     `dream_quota_per_stage`），超限 → rejected("quota")。
 //! GET /worlds/{id}/interventions/mine  我的干预记录与状态。
 //!
 //! accepted 的干预由 runtime 下一 tick 消费（whisper 进对应角色低优先层），消费后置 applied；本模块不改叙事状态。
+//! 注意：applied **仍计入配额**——消费不是退额度，否则配额形同虚设（见 `dream_quota_per_stage` 上方注释）。
 
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
@@ -25,18 +27,40 @@ use crate::error::ApiError;
 use crate::providers::ModerationVerdict;
 use crate::{idempotency, safety};
 
-/// 每用户每世界每节拍固定干预额度（P4a 所有人相同）。
-pub const PER_TICK_QUOTA: i64 = 3;
-
 const WHISPER_MAX_CHARS: usize = 100;
 
-/// Q-1：额度时间窗（ms）。将一天按世界的 tick_per_day 均分为若干窗口，额度按"本窗口内创建且仍
-/// accepted 的干预数"计——既保留 commit 时 accepted→applied 的自然复位，又与"是否成功提交"解耦：
-/// no_model / 单人(insufficient_members) / blocked / failed 反复走 finish_tick_noop（从不推进
-/// revision、从不复位）时，窗口随墙钟前移，旧 accepted 自然移出计数，合法用户不再被 COUNT(accepted)
-/// 永久锁额度。用逻辑 tick 节奏而非 MUSE_TICK_INTERVAL_MS 覆盖值，避免 dev 快跑开关扭曲额度语义。
-fn quota_window_ms(tick_per_day: i64) -> i64 {
-    (86_400_000 / tick_per_day.max(1)).max(1)
+/// 托梦配额默认值：每卡每阶段 3 条（规格 §8【拍板 12】）。稀缺化让"何时说、说什么"成为真决策，
+/// 物理封死"开局倒攻略"。
+const DEFAULT_DREAM_QUOTA_PER_STAGE: i64 = 3;
+
+/// 托梦配额（每卡每阶段）。**运营可调**（VALIDATION.md §0.2「产品规则参数化」，禁止写死）：
+/// 环境变量 `MUSE_DREAM_QUOTA_PER_STAGE`（正整数）覆盖，非法/缺省回落 `DEFAULT_DREAM_QUOTA_PER_STAGE`。
+/// 范式同 `runtime::token_cny_cents_per_1k`——本仓库尚无配置表，env 覆盖是当前唯一的运营开关形态；
+/// 将来配置表落地后只改本函数内部（读表 + env 兜底），调用点与拒绝语义不变。
+///
+/// ── R1 过渡口径：**一个 world 实例 = 一个阶段** ──────────────────────────────────────────────
+/// 规格 §8 的原文是"每卡每阶段"，但 Saga 阶段制（§3）在干预表上尚无 `saga_id` / `stage_no` 坐标，
+/// 故当前按 `(world_id, character_id)` **全量累计、不带时间窗**：一个世界实例从开局到终局即一个阶段。
+/// （若 Saga 最终落成"阶段 = 一个世界模板 / 一局世界"的粒度，本口径与规格原文等价，无需再改计数。）
+///
+/// 因此原 Q-1「按 tick 节奏把一天均分为额度时间窗」的计数（`quota_window_ms`）已废除：时间窗让配额
+/// 随墙钟自动回补（等价于每天 tick_per_day × N 条），与"每阶段 N 条"的稀缺语义直接冲突，封不死
+/// "开局倒攻略"。同理，计数覆盖 `status IN ('accepted','applied')`——runtime 在 commit 事务内把已
+/// 喂入引擎的托梦由 accepted 置 applied（`runtime::commit`），只数 accepted 会让托梦一被消费就白送
+/// 回额度；这两条是同一个漏洞的两面，必须一起堵。
+///
+/// TODO(saga)：若 Saga 落成"一个世界实例跨多个阶段"的粒度，需把 `stage_no`（或 `saga_id`）落到
+/// interventions 行上并加进计数 SQL 的 WHERE，口径即回到规格原文"每卡每阶段"；
+/// 届时无需改动调用点、拒绝语义（`reject_reason = "quota"`）与响应结构。
+fn dream_quota_per_stage() -> i64 {
+    parse_quota_override(std::env::var("MUSE_DREAM_QUOTA_PER_STAGE").ok().as_deref())
+}
+
+/// 配额覆盖值解析（与 env 读取分离，便于无副作用地测试回落规则）。
+fn parse_quota_override(raw: Option<&str>) -> i64 {
+    raw.and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_DREAM_QUOTA_PER_STAGE)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,13 +100,13 @@ async fn create_intervention(
         return Ok(Json(serde_json::from_str(cached).unwrap_or_else(|_| json!({}))));
     }
 
-    // 世界存在 + 运行态 + revision CAS（附带 tick_per_day 供额度时间窗）。
+    // 世界存在 + 运行态 + revision CAS。（tick_per_day 原供额度时间窗，R1 改为每卡每阶段累计后不再参与计数。）
     let world: Option<(i64, String, i64)> =
         sqlx::query_as("SELECT state_revision, status, tick_per_day FROM worlds WHERE id = ?")
             .bind(&world_id)
             .fetch_optional(&state.db)
             .await?;
-    let (state_revision, status, tick_per_day) = world.ok_or(ApiError::NotFound)?;
+    let (state_revision, status, _tick_per_day) = world.ok_or(ApiError::NotFound)?;
     if status != "open" && status != "running" {
         return Err(ApiError::Conflict("world_not_running".into()));
     }
@@ -183,20 +207,23 @@ async fn create_intervention(
         return Err(ApiError::BadRequest("whisper 不能超过 100 字".into()));
     }
 
-    // 额度校验（超限即 rejected("quota")，不作为攻击）。Q-1：按 tick 时间窗计数，与提交解耦——
-    // 仅统计本窗口内创建且仍 accepted 的干预（commit 会把它们置 applied，自然移出计数）。
+    // 托梦配额校验（超限即 rejected("quota")，不作为攻击）。R1 口径：按 **(world_id, character_id)**
+    // 全量累计、不带时间窗（"一个 world 实例 = 一个阶段"，详见 dream_quota_per_stage 上方注释）。
+    // - kind='whisper'：道具干预在上方已提前 return，从不写库，也不得被拖进计数；
+    // - status IN ('accepted','applied')：applied 是"已被引擎消费"，不是"额度归还"——只数 accepted
+    //   会让托梦一被 runtime 消费就白送回一格额度，配额形同虚设。
+    // 顺序红线：本校验必须在机审之前，否则被机审拒的文本也会吃掉额度。
     let mut reject_reason: Option<String> = None;
-    let window_start = crate::db::now_ms() - quota_window_ms(tick_per_day);
     let used: i64 = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM interventions \
-         WHERE world_id = ? AND user_id = ? AND status = 'accepted' AND created_at >= ?",
+         WHERE world_id = ? AND character_id = ? AND kind = 'whisper' \
+           AND status IN ('accepted', 'applied')",
     )
     .bind(&world_id)
-    .bind(&user.user_id)
-    .bind(window_start)
+    .bind(&req.character_id)
     .fetch_one(&state.db)
     .await?;
-    if used >= PER_TICK_QUOTA {
+    if used >= dream_quota_per_stage() {
         reject_reason = Some("quota".into());
     }
 
@@ -273,6 +300,42 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    /// 配额相关用例共享同一把锁：`MUSE_DREAM_QUOTA_PER_STAGE` 是进程级 env，
+    /// 覆盖用例与其它按默认配额断言的用例并发跑会互相污染，故串行化（中毒也照常取用，不阻塞后续）。
+    static QUOTA_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn quota_guard() -> std::sync::MutexGuard<'static, ()> {
+        QUOTA_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 直接插一条干预（绕过 API），用于预置配额基数：可指定 kind / status / created_at。
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_intervention(
+        state: &AppState,
+        id: &str,
+        world: &str,
+        user: &str,
+        character: &str,
+        kind: &str,
+        status: &str,
+        created_at: i64,
+    ) {
+        sqlx::query(
+            "INSERT INTO interventions (id, world_id, user_id, character_id, kind, payload_json, expected_revision, status, created_at) \
+             VALUES (?, ?, ?, ?, ?, '{}', 0, ?, ?)",
+        )
+        .bind(id)
+        .bind(world)
+        .bind(user)
+        .bind(character)
+        .bind(kind)
+        .bind(status)
+        .bind(created_at)
+        .execute(&state.db)
+        .await
+        .expect("seed intervention");
+    }
 
     async fn post_intervention(state: &AppState, token_str: &str, world: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
         let app = crate::app::build_router(state.clone());
@@ -425,57 +488,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quota_window_resets_when_world_never_commits() {
-        // Q-1：世界反复不提交（accepted 从不 →applied）时，上一窗口的 accepted 应随墙钟移出额度计数，
-        // 合法用户不再被永久锁额度。
+    async fn quota_never_resets_by_wall_clock() {
+        // 【原 quota_window_resets_when_world_never_commits 的重写】R1 口径下时间窗已废除：
+        // 世界反复不提交（accepted 从不 →applied）时，很久以前创建的托梦**依然占额度**，
+        // 额度不随墙钟回补——否则"每阶段 N 条"退化为"每天 tick_per_day × N 条"，封不死开局倒攻略。
+        let _g = quota_guard();
         let state = test_state().await;
         seed_user(&state.db, "u1").await;
         seed_world(&state.db, "w1", 0, "running").await;
         seed_member(&state.db, "m1", "w1", "u1", "c1", "active").await;
-        // tick_per_day=3 → 额度窗口 8h；置 3 条 9h 前创建、至今仍 accepted 的干预（模拟一直 noop）。
+        // 旧口径下 tick_per_day=3 → 窗口 8h；置 3 条 9h 前创建、至今仍 accepted 的托梦（模拟一直 noop）。
         let old = crate::db::now_ms() - 9 * 3_600_000;
-        for i in 0..PER_TICK_QUOTA {
-            sqlx::query(
-                "INSERT INTO interventions (id, world_id, user_id, character_id, kind, payload_json, expected_revision, status, created_at) \
-                 VALUES (?, 'w1', 'u1', 'c1', 'whisper', '{}', 0, 'accepted', ?)",
-            )
-            .bind(format!("old{i}"))
-            .bind(old)
-            .execute(&state.db)
-            .await
-            .unwrap();
+        for i in 0..DEFAULT_DREAM_QUOTA_PER_STAGE {
+            seed_intervention(&state, &format!("old{i}"), "w1", "u1", "c1", "whisper", "accepted", old).await;
         }
         let tk = token(&state, "u1");
         let (status, v) = post_intervention(
             &state,
             &tk,
             "w1",
-            json!({"kind": "whisper", "characterId": "c1", "payload": {"text": "新窗口的第一条"}, "expectedWorldRevision": 0}),
+            json!({"kind": "whisper", "characterId": "c1", "payload": {"text": "隔了很久再来一条"}, "expectedWorldRevision": 0}),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "body={v}");
-        assert_eq!(v["status"], "accepted", "旧窗口 accepted 不应永久占额度");
+        assert_eq!(v["status"], "rejected", "旧口径的时间窗回补必须已失效");
+        assert_eq!(v["rejectReason"], "quota");
     }
 
     #[tokio::test]
     async fn quota_exceeded_rejected() {
+        // 【重写】维度从 (world, user, 时间窗) 改为 (world, 卡)：同一张卡在本阶段内连发，
+        // 前 N 条 accepted，第 N+1 条 rejected("quota")。
+        let _g = quota_guard();
         let state = test_state().await;
         seed_user(&state.db, "u1").await;
         seed_world(&state.db, "w1", 0, "running").await;
         seed_member(&state.db, "m1", "w1", "u1", "c1", "active").await;
-        // 预置已达额度的 accepted 干预。
-        for i in 0..PER_TICK_QUOTA {
-            sqlx::query(
-                "INSERT INTO interventions (id, world_id, user_id, character_id, kind, payload_json, expected_revision, status, created_at) \
-                 VALUES (?, 'w1', 'u1', 'c1', 'whisper', '{}', 0, 'accepted', ?)",
-            )
-            .bind(format!("pre{i}"))
-            .bind(crate::db::now_ms())
-            .execute(&state.db)
-            .await
-            .unwrap();
-        }
         let tk = token(&state, "u1");
+
+        for i in 0..DEFAULT_DREAM_QUOTA_PER_STAGE {
+            let (status, v) = post_intervention(
+                &state,
+                &tk,
+                "w1",
+                json!({"kind": "whisper", "characterId": "c1", "payload": {"text": format!("第 {i} 条托梦")}, "expectedWorldRevision": 0}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "body={v}");
+            assert_eq!(v["status"], "accepted", "额度内第 {i} 条应受理");
+        }
+
         let (status, v) = post_intervention(
             &state,
             &tk,
@@ -486,5 +548,143 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "body={v}");
         assert_eq!(v["status"], "rejected");
         assert_eq!(v["rejectReason"], "quota");
+    }
+
+    #[tokio::test]
+    async fn applied_whispers_still_consume_quota() {
+        // 最关键的回归防线：runtime commit 会把已喂入引擎的托梦 accepted→applied。
+        // 若计数只数 accepted，托梦一被消费就白送回额度 → 配额形同虚设。applied 必须照样占额度。
+        let _g = quota_guard();
+        let state = test_state().await;
+        seed_user(&state.db, "u1").await;
+        seed_world(&state.db, "w1", 0, "running").await;
+        seed_member(&state.db, "m1", "w1", "u1", "c1", "active").await;
+        let now = crate::db::now_ms();
+        for i in 0..DEFAULT_DREAM_QUOTA_PER_STAGE {
+            seed_intervention(&state, &format!("ap{i}"), "w1", "u1", "c1", "whisper", "applied", now).await;
+        }
+        let tk = token(&state, "u1");
+        let (status, v) = post_intervention(
+            &state,
+            &tk,
+            "w1",
+            json!({"kind": "whisper", "characterId": "c1", "payload": {"text": "被消费后不该回血"}, "expectedWorldRevision": 0}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={v}");
+        assert_eq!(v["status"], "rejected", "applied 必须计入额度，消费不等于退额度");
+        assert_eq!(v["rejectReason"], "quota");
+    }
+
+    #[tokio::test]
+    async fn quota_counted_per_character() {
+        // "每卡"：c1 用满（accepted + applied 混合）不影响同一用户在同一世界的另一张卡 c2。
+        let _g = quota_guard();
+        let state = test_state().await;
+        seed_user(&state.db, "u1").await;
+        seed_world(&state.db, "w1", 0, "running").await;
+        seed_member(&state.db, "m1", "w1", "u1", "c1", "active").await;
+        seed_member(&state.db, "m2", "w1", "u1", "c2", "active").await;
+        let now = crate::db::now_ms();
+        for i in 0..DEFAULT_DREAM_QUOTA_PER_STAGE {
+            let st = if i % 2 == 0 { "accepted" } else { "applied" };
+            seed_intervention(&state, &format!("c1_{i}"), "w1", "u1", "c1", "whisper", st, now).await;
+        }
+        let tk = token(&state, "u1");
+
+        // c1 已满额 → 拒。
+        let (_s, v1) = post_intervention(
+            &state,
+            &tk,
+            "w1",
+            json!({"kind": "whisper", "characterId": "c1", "payload": {"text": "c1 超额"}, "expectedWorldRevision": 0}),
+        )
+        .await;
+        assert_eq!(v1["rejectReason"], "quota");
+
+        // c2 独立计数 → 受理。
+        let (status, v2) = post_intervention(
+            &state,
+            &tk,
+            "w1",
+            json!({"kind": "whisper", "characterId": "c2", "payload": {"text": "c2 的第一条"}, "expectedWorldRevision": 0}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={v2}");
+        assert_eq!(v2["status"], "accepted", "配额按卡独立，不应被同用户另一张卡吃掉");
+    }
+
+    #[tokio::test]
+    async fn item_interventions_excluded_from_quota() {
+        // 计数带 kind='whisper' 过滤：历史/外部写入的 item 行不得挤占托梦额度
+        //（现网 item 分支本就提前 return 不写库，此处防的是计数维度回归）。
+        let _g = quota_guard();
+        let state = test_state().await;
+        seed_user(&state.db, "u1").await;
+        seed_world(&state.db, "w1", 0, "running").await;
+        seed_member(&state.db, "m1", "w1", "u1", "c1", "active").await;
+        let now = crate::db::now_ms();
+        for i in 0..(DEFAULT_DREAM_QUOTA_PER_STAGE + 2) {
+            seed_intervention(&state, &format!("it{i}"), "w1", "u1", "c1", "item", "accepted", now).await;
+        }
+        let tk = token(&state, "u1");
+        let (status, v) = post_intervention(
+            &state,
+            &tk,
+            "w1",
+            json!({"kind": "whisper", "characterId": "c1", "payload": {"text": "item 不该吃托梦额度"}, "expectedWorldRevision": 0}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={v}");
+        assert_eq!(v["status"], "accepted", "item 干预不得计入托梦配额");
+    }
+
+    #[tokio::test]
+    async fn quota_configurable_via_env() {
+        // VALIDATION.md §0.2：配额必须运营可调。env 置 1 后，第 2 条即超额。
+        let _g = quota_guard();
+        std::env::set_var("MUSE_DREAM_QUOTA_PER_STAGE", "1");
+        assert_eq!(dream_quota_per_stage(), 1, "env 覆盖应生效");
+
+        let state = test_state().await;
+        seed_user(&state.db, "u1").await;
+        seed_world(&state.db, "w1", 0, "running").await;
+        seed_member(&state.db, "m1", "w1", "u1", "c1", "active").await;
+        let tk = token(&state, "u1");
+
+        let (_s1, v1) = post_intervention(
+            &state,
+            &tk,
+            "w1",
+            json!({"kind": "whisper", "characterId": "c1", "payload": {"text": "唯一的一条"}, "expectedWorldRevision": 0}),
+        )
+        .await;
+        assert_eq!(v1["status"], "accepted", "body={v1}");
+
+        // 默认配额 3 时这条会被受理，env 覆盖为 1 后必须被拒。
+        let (_s2, v2) = post_intervention(
+            &state,
+            &tk,
+            "w1",
+            json!({"kind": "whisper", "characterId": "c1", "payload": {"text": "第二条"}, "expectedWorldRevision": 0}),
+        )
+        .await;
+        std::env::remove_var("MUSE_DREAM_QUOTA_PER_STAGE");
+
+        assert_eq!(v2["status"], "rejected", "body={v2}");
+        assert_eq!(v2["rejectReason"], "quota");
+        assert_eq!(dream_quota_per_stage(), DEFAULT_DREAM_QUOTA_PER_STAGE, "移除 env 后回落默认值");
+    }
+
+    #[test]
+    fn quota_override_falls_back_on_invalid() {
+        // 非正整数/垃圾值一律回落默认，避免运营误配把配额调成 0 或负数把托梦通道锁死。
+        assert_eq!(parse_quota_override(Some("5")), 5);
+        assert_eq!(parse_quota_override(Some(" 2 ")), 2);
+        assert_eq!(parse_quota_override(Some("0")), DEFAULT_DREAM_QUOTA_PER_STAGE);
+        assert_eq!(parse_quota_override(Some("-1")), DEFAULT_DREAM_QUOTA_PER_STAGE);
+        assert_eq!(parse_quota_override(Some("abc")), DEFAULT_DREAM_QUOTA_PER_STAGE);
+        assert_eq!(parse_quota_override(Some("")), DEFAULT_DREAM_QUOTA_PER_STAGE);
+        assert_eq!(parse_quota_override(None), DEFAULT_DREAM_QUOTA_PER_STAGE);
     }
 }

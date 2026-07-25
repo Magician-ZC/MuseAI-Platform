@@ -7,7 +7,7 @@ use muse_engine::knowledge::types::RetrievedFragment;
 use muse_engine::model::ModelProfile;
 use muse_engine::narrative::state::NarrativeStore;
 use muse_engine::narrative::types::{
-    CostEstimate, NarrativeState, RoundBudget, RunMode, SceneRecord,
+    CostEstimate, Lethality, NarrativeState, RoundBudget, RunMode, SceneRecord,
 };
 use muse_engine::narrative::{ModelRoutes, NarrativeEngine, NarrativePrompts, RoundInput};
 use serde::Deserialize;
@@ -138,6 +138,10 @@ pub async fn start_narrative_round(app: AppHandle, request: RoundRequestDto) -> 
             locations: BTreeMap::new(),
             now_hint: 0,
             stall_hint: None,
+            // 生死契约（规格 §11）是**平台世界**的概念——本地模式没有多人契约、没有入场签署、
+            // 没有实名与未成年门，故桌面壳恒用默认档（同意制：不可逆事件仍走临场同意）。
+            // 双模式红线：本地能力与平台能力物理隔离，桌面壳不读也不暴露平台契约配置。
+            lethality: Lethality::default(),
         };
         let result = engine.run_round(&routes, &prompts, input, &flag).await;
         let payload = match &result {

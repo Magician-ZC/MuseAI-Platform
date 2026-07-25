@@ -22,7 +22,7 @@ use crate::providers::ModerationVerdict;
 use crate::worlds::load_world;
 
 use muse_engine::character::types::CharacterCardV2;
-use muse_engine::narrative::types::{LocationDef, LocationGate};
+use muse_engine::narrative::types::{IntensityWeights, LocationDef, LocationGate};
 
 // ---------- 输出：装配结果（写入 worlds.assembled_json 的 `assembly` 段，随实例钉住） ----------
 
@@ -48,11 +48,24 @@ pub struct AssembledInstance {
     /// 空 = 无驻留道具。悬空 id 静默丢弃（与 reward_item_ref/carried 同款防御式），建模板期由引用完整性校验前置拦截。
     #[serde(default)]
     pub resident_items: Vec<ResidentItemGroup>,
+    /// 身份池分配结果（总规格 §5【拍板 4、5】）：`(cloud_character_id, identity_id)`，按 cid 升序。
+    /// runtime 读回后**只作叙事层的开局站位**（"你在这个世界是户部主事 / 被退婚的嫡女"）。
+    ///
+    /// **平权红线（§0.1 平权宪法，锁进测试）**：身份不携带任何数值差异、准入门槛、产出加成或叙事特权——
+    /// 严禁任何下游据此改判定、改发奖、开权限、调难度。戏份靠玩出来。
+    /// 空 = 模板未声明 identityPool（`skip_serializing_if` 保证老模板 assembled_json 逐字节不变）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub identity_assignments: Vec<(String, String)>,
     /// 装配采样审计段（防刷第二环）：由固定实例种子驱动的子集采样结果，随实例钉住写入
     /// `worlds.assembled_json` 的 `/assembly/sampling`。**仅服务端 / 审计可见——绝不进 members_projection
     /// 或日报投影**。`None` = 退化路径（非超集旧模板：全量装配、不采样，与改造前行为完全一致）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sampling: Option<InstanceSampling>,
+    /// 公示产出表（总规格 §10【拍板 17】）：三层结算算贡献分 → 查本表 → 确定发放，随实例钉住。
+    /// `None` = 模板未声明 → ③ 世界线层只累计贡献分、不发放（未验证功能默认关闭，VALIDATION §0.1）。
+    /// `skip_serializing_if` 保证老实例 `assembled_json` 逐字节不变（同 `identity_assignments` 范式）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payout_table: Option<PayoutTable>,
 }
 
 /// 装配采样钉住结果（防刷第二环审计段）：种子 + 阵容指纹哈希 + 各维度被选子集 id。
@@ -80,6 +93,89 @@ pub struct InstanceSampling {
     /// 的部分（确定性序 = 入选模板序，保 replay 一致）。仅审计（不外泄）。
     #[serde(default)]
     pub culled_rare_budget: Vec<String>,
+    /// 身份池分配审计副本（总规格 §5【拍板 4、5】"身份配额进采样域"）：`(cid, identity_id)` 按 cid 升序。
+    /// 与 `AssembledInstance.identity_assignments` 同源同值，此处仅供服务端审计复算/replay 对账。
+    /// `#[serde(default)]` 兼容改造前已钉住实例的回读（同 `culled_over_tier` 范式）。
+    #[serde(default)]
+    pub identity_assignments: Vec<(String, String)>,
+}
+
+// ---------- 公示产出表（总规格 §10【拍板 17】：确定性产出，无 RNG 抽卡） ----------
+
+/// 公示产出表：**三层结算算贡献分 → 查本表 → 确定发放**。
+///
+/// 为什么钉在骨架/实例里而不是全局配置：产出表随模板版本走、随实例快照进 `assembled_json`，
+/// 于是「同一实例、同一贡献分 → 同一产出」可被 replay 复算，与 §12.5.3 确定性契约同源；
+/// 结算点（chapters::finish / runtime 终局）本就把 `assembled_json` 读在手里，零额外查询。
+///
+/// **合规定性防线（§16 去抽卡化）**：查表发放，**全程零随机数**——张力来自"能否完成钩子 / 推动主线"
+/// 的过程不确定性，不来自开箱爆率。任何在此引入 RNG 的改动都需显式评审。
+///
+/// **未验证功能默认关闭（VALIDATION §0.1）**：模板未声明 `payoutTable` → ③ 层只累计贡献分、
+/// 不发放任何产出。开闸靠运营录入数据，不靠代码合并。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PayoutTable {
+    /// ③ 世界线层阶梯（公示）：取「门槛 ≤ 贡献分」中门槛最高的一档发放；无档命中 → 不发放。
+    /// 空 = 有表但无档位（等价于不发放，留作运营灰度开关）。
+    #[serde(default)]
+    pub worldline_tiers: Vec<PayoutTier>,
+    /// 贡献分折算权重：**直接复用引擎 `IntensityWeights`**（同结构、同默认值 1.0/0.5/0.25/0.25）。
+    /// 口径一致由类型本身保证——server 侧逐角色折算的分项之和恒等于引擎 `round_intensity` 标量。
+    #[serde(default)]
+    pub contribution_weights: IntensityWeights,
+    /// 世界线崩塌系数（§9）：③ 归零 + ① 减半的参数化开关。
+    #[serde(default)]
+    pub collapse: CollapsePolicy,
+}
+
+/// 产出表的一档（公示口径）。**无概率字段**——命中即发，不存在爆率。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PayoutTier {
+    /// 档位公示名（前端展示 + 审计留痕）。
+    #[serde(default)]
+    pub label: String,
+    /// 进入本档所需的最低世界线贡献分（含）。同一表内不得重复（重复 = 同分歧义，破坏确定性）。
+    #[serde(default)]
+    pub min_score: f64,
+    /// 本档稀有产出（`None` = 只发历练）。
+    /// **产出封顶不可绕过**：`origin.powerTier > 实例星级` 由结算侧强制剔除（不降级、不替换）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<ItemDefinition>,
+    /// 本档世界线层历练（≤ 0 = 不发）。
+    #[serde(default)]
+    pub mileage: i64,
+}
+
+/// 世界线崩塌系数（总规格 §9）：崩塌 = ③ 归零 + ① 减半 + ② 已锁定保留。
+/// 两个系数均可由模板覆盖（VALIDATION §0.2 产品规则参数化），缺省回落 progression 平衡参数常量。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollapsePolicy {
+    /// ① 保底层折算系数（默认 0.5 = 减半）。
+    #[serde(default = "default_collapse_baseline_factor")]
+    pub baseline_factor: f64,
+    /// ③ 世界线层折算系数（默认 0.0 = 归零；≤ 0 即整层不发放）。
+    #[serde(default = "default_collapse_worldline_factor")]
+    pub worldline_factor: f64,
+}
+
+fn default_collapse_baseline_factor() -> f64 {
+    crate::progression::COLLAPSE_BASELINE_FACTOR
+}
+
+fn default_collapse_worldline_factor() -> f64 {
+    crate::progression::COLLAPSE_WORLDLINE_FACTOR
+}
+
+impl Default for CollapsePolicy {
+    fn default() -> Self {
+        Self {
+            baseline_factor: default_collapse_baseline_factor(),
+            worldline_factor: default_collapse_worldline_factor(),
+        }
+    }
 }
 
 /// 地点驻留道具组（Phase 3）：一个地点解引用后的驻留道具集。`is_secret_realm` 标记秘境隐藏道具，
@@ -161,6 +257,16 @@ struct Skeleton {
     /// 采样时按阵容加权 + 种子扰动选取脊柱子集。空 = 无 storyline 维度（走退化路径）。
     #[serde(default)]
     storylines: Vec<StorylineSpec>,
+    /// 身份池（总规格 §5【拍板 4、5】"身份配额进采样域"）：阶段模板声明可用的开局身份
+    /// （官员×N、商贾×N、江湖客×N、"被退婚主位"×1~2……各带配额与专属钩子引力），
+    /// 装配时按「内核匹配 + 种子随机」分配给入场卡。空 = 无身份维度（老模板零影响）。
+    #[serde(default)]
+    identity_pool: Vec<IdentitySpec>,
+    /// 公示产出表（总规格 §10【拍板 17】"确定性产出，无 RNG 抽卡"）：三层结算的 ③ 世界线层
+    /// 按贡献分查本表确定发放。装配时原样钉进 `assembled_json`（随模板版本快照，可 replay 复算）。
+    /// 缺省 `None` → ③ 层只累计贡献分、不发放（老模板零影响；开闸靠运营录入数据）。
+    #[serde(default)]
+    payout_table: Option<PayoutTable>,
     /// 副本采样计数提示（每维度每副本抽样量）。全空 = 走退化路径（不采样）。
     #[serde(default)]
     sampling: SamplingSpec,
@@ -185,6 +291,40 @@ struct StorylineSpec {
     /// 阵容倾向：strategist / combat / social / None（无倾向）。
     #[serde(default)]
     affinity: Option<String>,
+}
+
+/// 身份池条目（总规格 §5【拍板 4、5】）：一个可被分配的**开局站位**。
+///
+/// **平权红线（§0.1 平权宪法）**：身份 = 开局站位，**只进叙事层**——不携带数值差异、准入门槛、
+/// 产出加成或叙事特权。`quota` 只是"这个位最多几个人站"，`hookAffinity` 只影响"哪条戏更容易找上你"，
+/// `isLead` 只是戏眼站位的抽取倾向；三者都**不得**被任何下游用来改判定 / 改发奖 / 开权限 / 调难度。
+/// 戏份靠玩出来。
+///
+/// 全字段 `#[serde(default)]`：老模板无 `identityPool` → 空 Vec → 零影响（同 `SamplingSpec` 哲学）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IdentitySpec {
+    /// 身份 id（分配结果与审计的稳定键）。空 → 该条目不可分配（建模板期由校验前置拦截）。
+    #[serde(default)]
+    id: String,
+    /// 叙事展示名（"户部主事" / "漕帮舵主" / "被退婚的嫡女"）。空 → 展示层回落 id。
+    #[serde(default)]
+    label: String,
+    /// 配额：本实例最多几个人站这个位（**上限**，不是必须填满——实际人数由实例种子决定，
+    /// 于是"1 号世界 10 个官员、2 号世界 1 个"）。缺省 = 1；显式 0 建模板期被拒（运行期按不可分配处理）。
+    #[serde(default = "one_usize")]
+    quota: usize,
+    /// 主题词：与角色执念 / 恐惧 / 剧情种子做重叠匹配 —— **内核匹配**的依据（复用 `related` 口径）。
+    #[serde(default)]
+    themes: Vec<String>,
+    /// 专属钩子引力：指向 storyline id 或隐藏 / 支线池物品 id，声明这个身份天然贴近哪条戏。
+    /// 命中本实例在演的内容 → 抽取权重上调。**只影响叙事贴合度，不影响任何数值。**
+    #[serde(default)]
+    hook_affinity: Vec<String>,
+    /// 戏眼主位标记（"被退婚主位"×1~2 这类站位）：仅上调抽取权重，**不给任何特权**；
+    /// 不保证必被占用（人数不足或种子未选中时可空缺，由入场导演在叙事层处理）。
+    #[serde(default)]
+    is_lead: bool,
 }
 
 /// 副本采样计数提示（防刷第二环）：每维度每副本抽样量。字段全 `Option` + `#[serde(default)]`，
@@ -419,6 +559,14 @@ const DOMAIN_HIDDEN: u64 = 0x53;
 const DOMAIN_ENDING: u64 = 0x54;
 const DOMAIN_NPC: u64 = 0x55;
 const DOMAIN_LOC: u64 = 0x56;
+const DOMAIN_IDENTITY: u64 = 0x57;
+
+// ---------- 身份池分配权重（§5 拍板 4、5；纯叙事倾向常量，可调，禁止赋予任何数值含义） ----------
+
+/// 专属钩子引力加权：身份的 `hookAffinity` 每命中一条本实例在演的内容，抽取权重 +此值。
+const IDENTITY_HOOK_BOOST: f32 = 0.5;
+/// 戏眼主位加权：`isLead` 身份的抽取权重 +此值（**只影响谁更可能站上这个位，不给任何特权**）。
+const IDENTITY_LEAD_BOOST: f32 = 1.0;
 
 /// 权重整数化缩放（避免浮点 RNG / NaN 比较；每项 +1 保底 → 零权项仍最小概率可被选中）。
 fn scale_weight(w: f32) -> u64 {
@@ -560,6 +708,96 @@ fn affinity_boost(affinity: &Option<String>, profile: &(u32, u32, u32)) -> f32 {
     }
 }
 
+/// 身份内核匹配度：身份主题词 × 角色执念词条的重叠计数（复用 `related` 口径，与钩子匹配同款）。
+/// 这就是「内核匹配」——身份贴不贴这张卡的内核（恐惧 / 被否认的欲望 / 核心矛盾 / 剧情种子 / 拒绝规则），
+/// 而不是贴他的战力或资历。**匹配度只进抽取权重，不进任何数值。**
+fn identity_match_score(spec: &IdentitySpec, terms: &[String]) -> usize {
+    terms.iter().filter(|t| spec.themes.iter().any(|th| related(t.as_str(), th))).count()
+}
+
+/// 身份展示名：`label` 非空取 label，否则回落 id（仅用于人读的建模板期报错文案）。
+fn identity_display(spec: &IdentitySpec) -> &str {
+    let label = spec.label.trim();
+    if label.is_empty() {
+        spec.id.trim()
+    } else {
+        label
+    }
+}
+
+/// 身份池分配（总规格 §5【拍板 4、5】"身份配额进采样域"）：**内核匹配 + 种子随机**。
+///
+/// 算法（纯函数，整数 RNG，无系统随机 / 无浮点 RNG / 无 map 迭代序驱动 RNG）：
+/// 1. 阵容按 **cid 升序去重** 遍历（消 joined_at 顺序敏感，与 `roster_fingerprint` 同一哲学）——
+///    保证同一 (world_id, 阵容, template_version) 无论入场先后都得到**同一份分配**（确定性契约）。
+/// 2. 每人从「尚有余量的身份」里按权重抽一个：
+///    `w = 1 + 内核匹配数 + IDENTITY_HOOK_BOOST×在演钩子命中数 + (isLead ? IDENTITY_LEAD_BOOST : 0)`，
+///    走既有 `weighted_pick_one`（整数化权重，+1 保底 → 零匹配者仍有最小概率被选中，不会锁死成"只有内核
+///    匹配的人才有身份"）。
+/// 3. 抽中即扣该身份余量 —— **配额是硬上限，绝不超发**。
+///
+/// 配额边界策略（Σquota vs 实际入场人数不一致时）：
+/// - **人多于 Σquota**：配额用尽后剩余角色**不分配身份**（不在结果里出现）。无身份 = 无预设站位，
+///   由入场导演在叙事层自由安排处境；**不因此损失任何数值 / 产出 / 权限**（平权红线）。
+/// - **人少于 Σquota**：只分配到人数为止，多余槽位空置。不足额不是错误——身份是站位不是编制，
+///   `quota` 只封顶不保底（这正是"1 号世界 10 个官员、2 号世界 1 个"的来源：实际人数由种子决定）。
+/// - `quota == 0`（建模板期已被 `validate_skeleton_refs` 拒绝）或 id 空白 → 运行期按「不可分配」处理。
+///
+/// **平权红线**：返回值只写进 assembled_json 的叙事段供 runtime 当"开局站位"读，
+/// **绝不允许**任何下游据身份改判定、改发奖、开权限、调难度或改准入。
+fn assign_identities(
+    pool: &[IdentitySpec],
+    cards: &[(String, CharacterCardV2)],
+    in_play_ids: &std::collections::BTreeSet<&str>,
+    seed: u64,
+) -> Vec<(String, String)> {
+    if pool.is_empty() || cards.is_empty() {
+        return Vec::new(); // 老模板（无 identityPool）走原路径，零影响。
+    }
+    // 阵容：cid 升序去重（分配与入场顺序无关）。
+    let mut roster: Vec<(&str, &CharacterCardV2)> =
+        cards.iter().map(|(cid, card)| (cid.as_str(), card)).collect();
+    roster.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    roster.dedup_by(|a, b| a.0 == b.0);
+
+    // 余量按模板序（Vec 下标）跟踪 —— 不用 map 迭代序驱动 RNG。id 空白者置 0（不可分配）。
+    let mut remaining: Vec<usize> =
+        pool.iter().map(|s| if s.id.trim().is_empty() { 0 } else { s.quota }).collect();
+    let mut rng = Rng(seed ^ DOMAIN_IDENTITY);
+    let mut assignments: Vec<(String, String)> = Vec::new();
+
+    for (cid, card) in roster {
+        let terms = obsession_terms(card);
+        let open: Vec<usize> = (0..pool.len()).filter(|i| remaining[*i] > 0).collect();
+        if open.is_empty() {
+            break; // 配额全部用尽 → 其余角色无身份（人多于 Σquota 的边界）。
+        }
+        let weighted: Vec<(&usize, f32)> = open
+            .iter()
+            .map(|i| {
+                let spec = &pool[*i];
+                let matched = identity_match_score(spec, &terms) as f32;
+                let hooks = spec
+                    .hook_affinity
+                    .iter()
+                    .filter(|h| {
+                        let h = h.trim();
+                        !h.is_empty() && in_play_ids.contains(h)
+                    })
+                    .count() as f32;
+                let lead = if spec.is_lead { IDENTITY_LEAD_BOOST } else { 0.0 };
+                (i, 1.0 + matched + IDENTITY_HOOK_BOOST * hooks + lead)
+            })
+            .collect();
+        let Some(&picked) = weighted_pick_one(&mut rng, &weighted) else {
+            break;
+        };
+        remaining[picked] -= 1;
+        assignments.push((cid.to_string(), pool[picked].id.trim().to_string()));
+    }
+    assignments
+}
+
 /// 一次装配的被选子集（+ 钉住审计段）。`audit == None` → 退化路径（全量，不采样）。
 struct Selection {
     audit: Option<InstanceSampling>,
@@ -571,6 +809,8 @@ struct Selection {
     npc_ids: Vec<String>,
     /// 被选地点 id 子集（退化 = 全体）。
     loc_ids: Vec<String>,
+    /// 身份池分配结果 `(cid, identity_id)`，按 cid 升序。模板无 identityPool → 空（老模板零影响）。
+    identity_assignments: Vec<(String, String)>,
 }
 
 /// 地点采样（保连通 + 计数上限）：从「含驻留道具的地点 + 被选 NPC 主场」作必选种子，沿 connections
@@ -656,6 +896,7 @@ fn sample_location_ids(
 /// 退化路径（`is_superset != true` 或 storylines 空 或 sampling 全空）→ `audit=None` + 全量 id（不采样）。
 /// `star_rating`（波次 3 产出封顶）：仅超集采样路径生效——奖励档位 > 星级的钩子在采样前剔除 +
 /// 入选稀有奖励受 RARE_BUDGET 约束；退化路径不读星级（与改造前行为完全一致）。
+/// `cards`（§5 身份池）：身份是分配给**入场卡**的，故除阵容派生量外还需要卡本体做内核匹配。
 fn plan_sampling(
     skeleton: &Skeleton,
     fingerprint: &str,
@@ -663,6 +904,7 @@ fn plan_sampling(
     template_version: i64,
     profile: &(u32, u32, u32),
     roster_terms: &[String],
+    cards: &[(String, CharacterCardV2)],
     ending_threshold: f32,
     star_rating: i64,
 ) -> Selection {
@@ -670,12 +912,30 @@ fn plan_sampling(
         skeleton.is_superset && !skeleton.storylines.is_empty() && !skeleton.sampling.is_empty();
     if !superset_mode {
         // 退化：全量，行为与改造前完全一致，sampling=None。
+        // 身份池是**独立维度**（不搭超集判据的车）：模板声明了 identityPool 才分配；未声明 → 空 Vec
+        // → 老模板零行为变化（assemble 侧 skip_serializing_if 保证 assembled_json 也逐字节不变）。
+        // 退化路径无采样，故"在演内容" = 全部 storyline / 隐藏 / 支线钩子。
+        let identity_assignments = if skeleton.identity_pool.is_empty() {
+            Vec::new()
+        } else {
+            let mut in_play: std::collections::BTreeSet<&str> =
+                skeleton.storylines.iter().map(|s| s.id.as_str()).collect();
+            in_play.extend(skeleton.hidden_content_pool.iter().map(|p| p.id.as_str()));
+            in_play.extend(skeleton.side_hook_pool.iter().map(|p| p.id.as_str()));
+            assign_identities(
+                &skeleton.identity_pool,
+                cards,
+                &in_play,
+                instance_seed(world_id, fingerprint, template_version),
+            )
+        };
         return Selection {
             audit: None,
             hidden_ids: skeleton.hidden_content_pool.iter().map(|p| p.id.clone()).collect(),
             enabled_endings: weight_endings(&skeleton.ending_pool, profile, ending_threshold),
             npc_ids: skeleton.world_characters.iter().map(|w| w.card.id.clone()).collect(),
             loc_ids: skeleton.locations.iter().map(|l| l.id.clone()).collect(),
+            identity_assignments,
         };
     }
 
@@ -843,6 +1103,23 @@ fn plan_sampling(
     let loc_ids =
         sample_location_ids(&mut rng_loc, &skeleton.locations, &loc_seeds, skeleton.sampling.instance_location_count);
 
+    // 7) 身份池分配（总规格 §5【拍板 4、5】"身份配额进采样域"）：内核匹配 + 种子随机。
+    //    独立子流域 DOMAIN_IDENTITY，排在全部内容维度之后 → 不扰动前六段的 RNG 消费协议
+    //    （加不加 identityPool，剧情采样结果逐字段不变；有专项回归守护）。
+    //    "在演内容" = 本实例被选中的 storyline + 隐藏钩子 + 全部支线钩子（支线池不采样，恒在演）。
+    //    这是**防刷第二重**的第三条腿：连身份分布都随实例种子变（1 号世界 10 个官员、2 号世界 1 个），
+    //    外部攻略对不上盘。
+    //    **平权红线（§0.1）**：分配结果只进叙事层——身份不带数值差异、不带准入、不带产出加成、
+    //    不带叙事特权；戏份靠玩出来。任何下游据身份改判定/发奖/权限都属红线违规。
+    let identity_assignments = if skeleton.identity_pool.is_empty() {
+        Vec::new()
+    } else {
+        let mut in_play: std::collections::BTreeSet<&str> = sl_ids.iter().copied().collect();
+        in_play.extend(hidden_ids.iter().map(String::as_str));
+        in_play.extend(skeleton.side_hook_pool.iter().map(|p| p.id.as_str()));
+        assign_identities(&skeleton.identity_pool, cards, &in_play, seed)
+    };
+
     let audit = InstanceSampling {
         seed: format!("{seed:016x}"),
         roster_fingerprint: format!("{:016x}", fnv1a_64(fingerprint.as_bytes())),
@@ -854,8 +1131,9 @@ fn plan_sampling(
         selected_locations: loc_ids.clone(),
         culled_over_tier,
         culled_rare_budget,
+        identity_assignments: identity_assignments.clone(),
     };
-    Selection { audit: Some(audit), hidden_ids, enabled_endings, npc_ids, loc_ids }
+    Selection { audit: Some(audit), hidden_ids, enabled_endings, npc_ids, loc_ids, identity_assignments }
 }
 
 // ---------- assembled_json 包装（assembly 段钉住 + chapterState 段可变） ----------
@@ -925,6 +1203,7 @@ pub async fn assemble_instance(state: &AppState, world_id: &str) -> Result<Assem
         world.template_version,
         &profile,
         &agg_terms,
+        &cards,
         rules.ending_weight_threshold,
         star_rating,
     );
@@ -1044,7 +1323,13 @@ pub async fn assemble_instance(state: &AppState, world_id: &str) -> Result<Assem
         world_character_entries,
         location_graph,
         resident_items,
+        // 7) 身份池分配（§5 拍板 4、5）：随实例钉住，runtime 读回后作叙事层开局站位。
+        //    **平权红线**：只描述"你在这个世界站哪个位"，不带任何数值 / 准入 / 产出 / 特权差异。
+        identity_assignments: selection.identity_assignments,
         sampling: selection.audit,
+        // 8) 公示产出表（§10 拍板 17）：骨架声明什么就钉什么（不做任何加权/挑选/随机），
+        //    结算侧据此查表确定发放——"同贡献分必得同产出"的单一事实源。
+        payout_table: skeleton.payout_table.clone(),
     };
 
     // 持久化：assembly 段钉住（含派生的 templateVersion + 装配时模板星级快照），chapterState 段留给章节会话推进。
@@ -1225,6 +1510,98 @@ pub(crate) fn validate_skeleton_refs(skeleton: &Value) -> Result<(), String> {
         let home = wc.home_location.trim();
         if !home.is_empty() && !loc_ids.contains(home) {
             return Err(format!("homeLocation 悬空：世界角色 `{}` 落在不存在的地点 `{home}`", wc.card.id));
+        }
+    }
+
+    // 4) 身份池（§5【拍板 4、5】）：id 非空且唯一、quota ≥ 1、hookAffinity 指向存在的
+    //    storyline / 隐藏池 / 支线钩子池 id。空 identityPool（老模板）直接放行。
+    let storyline_ids: std::collections::BTreeSet<&str> =
+        sk.storylines.iter().map(|s| s.id.as_str()).collect();
+    let content_ids: std::collections::BTreeSet<&str> = sk
+        .hidden_content_pool
+        .iter()
+        .chain(sk.side_hook_pool.iter())
+        .map(|p| p.id.as_str())
+        .collect();
+    let mut seen_identity: std::collections::BTreeSet<&str> = Default::default();
+    for spec in &sk.identity_pool {
+        let id = spec.id.trim();
+        if id.is_empty() {
+            return Err(format!(
+                "identityPool 缺少 id：身份 `{}` 没有稳定 id，无法被分配与审计",
+                identity_display(spec)
+            ));
+        }
+        if !seen_identity.insert(id) {
+            return Err(format!("identityPool id 重复：`{id}`（身份 id 必须唯一，否则配额与分配无法对账）"));
+        }
+        if spec.quota == 0 {
+            return Err(format!("identityPool quota 非法：身份 `{id}` 的 quota 必须 ≥ 1（0 等于这个站位不存在）"));
+        }
+        for hook in &spec.hook_affinity {
+            let hook = hook.trim();
+            if hook.is_empty() {
+                continue;
+            }
+            if !storyline_ids.contains(hook) && !content_ids.contains(hook) {
+                return Err(format!(
+                    "hookAffinity 悬空：身份 `{id}` 引力指向不存在的 storyline / 内容池 id `{hook}`"
+                ));
+            }
+        }
+    }
+
+    // 5) 公示产出表（§10【拍板 17】确定性产出）：门槛有限且非负、**门槛互不重复**（同分歧义即非确定性）、
+    //    道具 id 非空、折算权重与崩塌系数取值合法。未声明 payoutTable（老模板）直接放行。
+    if let Some(table) = &sk.payout_table {
+        let w = &table.contribution_weights;
+        for (name, v) in [
+            ("success", w.success),
+            ("partial", w.partial),
+            ("failure", w.failure),
+            ("speak", w.speak),
+        ] {
+            if !v.is_finite() || v < 0.0 {
+                return Err(format!(
+                    "payoutTable.contributionWeights.{name} 非法：权重须为非负有限数（当前 {v}）"
+                ));
+            }
+        }
+        for (name, v) in [
+            ("baselineFactor", table.collapse.baseline_factor),
+            ("worldlineFactor", table.collapse.worldline_factor),
+        ] {
+            if !v.is_finite() || !(0.0..=1.0).contains(&v) {
+                return Err(format!(
+                    "payoutTable.collapse.{name} 非法：崩塌系数须落在 [0,1]（当前 {v}）"
+                ));
+            }
+        }
+        let mut seen_thresholds: Vec<String> = Vec::new();
+        for tier in &table.worldline_tiers {
+            if !tier.min_score.is_finite() || tier.min_score < 0.0 {
+                return Err(format!(
+                    "payoutTable.worldlineTiers 门槛非法：档位 `{}` 的 minScore 须为非负有限数（当前 {}）",
+                    tier.label, tier.min_score
+                ));
+            }
+            // 定点化后比较（与结算侧同一 milli 口径），杜绝浮点表示差异导致的"看着不同实则同档"。
+            let key = format!("{}", (tier.min_score * 1000.0).round() as i64);
+            if seen_thresholds.contains(&key) {
+                return Err(format!(
+                    "payoutTable.worldlineTiers 门槛重复：minScore `{}` 出现多次（同一贡献分必须只对应一档，否则产出非确定）",
+                    tier.min_score
+                ));
+            }
+            seen_thresholds.push(key);
+            if let Some(item) = &tier.item {
+                if item.id.trim().is_empty() {
+                    return Err(format!(
+                        "payoutTable.worldlineTiers 道具 id 为空：档位 `{}` 无法发货与幂等去重",
+                        tier.label
+                    ));
+                }
+            }
         }
     }
 
@@ -1562,7 +1939,13 @@ mod sampling_tests {
     }
 
     fn plan_star(sk: &Skeleton, world_id: &str, fp: &str, star: i64) -> Selection {
-        plan_sampling(sk, fp, world_id, 1, &PROFILE, &[], 0.5, star)
+        plan_sampling(sk, fp, world_id, 1, &PROFILE, &[], &[], 0.5, star)
+    }
+
+    /// 带阵容的规划（身份池分配需要卡本体做内核匹配）。
+    fn plan_with_roster(sk: &Skeleton, world_id: &str, cards: &[(String, CharacterCardV2)]) -> Selection {
+        let fp = roster_fingerprint(cards);
+        plan_sampling(sk, &fp, world_id, 1, &PROFILE, &[], cards, 0.5, 5)
     }
 
     // #10 PRNG 测试向量：锁死跨版本一致性（FNV-1a / SplitMix64 均为规范实现）。
@@ -1800,6 +2183,308 @@ mod sampling_tests {
                 .count();
             assert!(rare_count <= RARE_BUDGET, "实例 {i} 稀有奖励超预算: {:?}", a.selected_hidden);
         }
+    }
+
+    // ---------- R1 身份池进采样域（总规格 §5【拍板 4、5】）：内核匹配 + 种子随机 ----------
+
+    /// 测试用角色卡（只填内核匹配读到的字段：core_fear + plot_seeds）。
+    fn card(id: &str, fear: &str, seeds: &[&str]) -> CharacterCardV2 {
+        use muse_engine::character::types::{Agency, CardLifecycle, DramaticCore, Identity};
+        CharacterCardV2 {
+            schema_version: 2,
+            id: id.into(),
+            lifecycle: CardLifecycle::Ready,
+            identity: Identity { name: id.into(), ..Default::default() },
+            dramatic_core: DramaticCore { core_fear: fear.into(), ..Default::default() },
+            decision_model: Default::default(),
+            perception: Default::default(),
+            emotion_dynamics: Default::default(),
+            relation_grammar: Default::default(),
+            expression_fingerprint: Default::default(),
+            agency: Agency {
+                plot_seeds: seeds.iter().map(|s| (*s).to_string()).collect(),
+                ..Default::default()
+            },
+            growth_arc: Default::default(),
+            world_adaptation: Default::default(),
+            evidence_index: Default::default(),
+            revision: 1,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    /// 素阵容（无内核匹配词条）：只验分配协议本身。
+    fn roster(ids: &[&str]) -> Vec<(String, CharacterCardV2)> {
+        ids.iter().map(|id| ((*id).to_string(), card(id, "", &[]))).collect()
+    }
+
+    fn with_identities(mut sk: Skeleton, pool: serde_json::Value) -> Skeleton {
+        sk.identity_pool = serde_json::from_value(pool).unwrap();
+        sk
+    }
+
+    /// 标准身份池：官员×3 / 商贾×3 / 江湖客×3 / 被退婚主位×1（Σquota=10）。
+    fn standard_pool() -> serde_json::Value {
+        serde_json::json!([
+            { "id": "official", "label": "户部主事",     "quota": 3, "themes": ["朝堂"], "hookAffinity": ["arc-A"] },
+            { "id": "merchant", "label": "漕帮商贾",     "quota": 3, "themes": ["行商"] },
+            { "id": "wanderer", "label": "江湖客",       "quota": 3, "themes": ["刀口"] },
+            { "id": "jilted",   "label": "被退婚的嫡女", "quota": 1, "themes": ["退婚"], "isLead": true, "hookAffinity": ["hc-b1"] }
+        ])
+    }
+
+    fn counts(assignments: &[(String, String)], identity: &str) -> usize {
+        assignments.iter().filter(|(_, i)| i == identity).count()
+    }
+
+    // 确定性①：同 (world_id, 阵容, template_version) → 身份分配逐项一致。
+    #[test]
+    fn identity_assignment_is_deterministic() {
+        let sk = with_identities(superset(), standard_pool());
+        let cards = roster(&["cid-a", "cid-b", "cid-c", "cid-d"]);
+        let a = plan_with_roster(&sk, "world_id_det", &cards);
+        let b = plan_with_roster(&sk, "world_id_det", &cards);
+        assert!(!a.identity_assignments.is_empty(), "声明了 identityPool 就必须分配出身份");
+        assert_eq!(a.identity_assignments, b.identity_assignments, "同种子同阵容 → 身份分配必须完全一致");
+        assert_eq!(
+            a.audit.unwrap().identity_assignments,
+            b.audit.unwrap().identity_assignments,
+            "审计段身份分配同样可 replay"
+        );
+    }
+
+    // 确定性②：入场先后（joined_at 顺序）不得影响分配 —— 与 roster_fingerprint 同一哲学。
+    #[test]
+    fn identity_assignment_ignores_join_order() {
+        let sk = with_identities(superset(), standard_pool());
+        let cards = roster(&["cid-a", "cid-b", "cid-c", "cid-d"]);
+        let mut reversed = cards.clone();
+        reversed.reverse();
+        assert_eq!(
+            plan_with_roster(&sk, "world_id_order", &cards).identity_assignments,
+            plan_with_roster(&sk, "world_id_order", &reversed).identity_assignments,
+            "同一阵容换入场顺序 → 身份分配必须不变"
+        );
+    }
+
+    // 实例差异（防刷第二重）：不同 world_id、同阵容同模板 → 身份分布不同（攻略对不上盘）。
+    #[test]
+    fn identity_assignment_differs_across_instances() {
+        let sk = with_identities(superset(), standard_pool());
+        let cards = roster(&["cid-a", "cid-b", "cid-c", "cid-d"]);
+        let sigs: BTreeSet<String> = (0..16)
+            .map(|i| {
+                let s = plan_with_roster(&sk, &format!("world_ident_{i}"), &cards);
+                s.identity_assignments.iter().map(|(c, id)| format!("{c}={id}")).collect::<Vec<_>>().join(",")
+            })
+            .collect();
+        assert!(sigs.len() >= 2, "不同实例应分出不同身份分布，实得 {} 种", sigs.len());
+    }
+
+    // 配额是硬上限：任意实例下每个身份的分配数 ≤ 其 quota（不超发）。
+    #[test]
+    fn identity_quota_never_oversubscribed() {
+        let sk = with_identities(superset(), standard_pool());
+        let cards = roster(&["c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8"]);
+        for i in 0..16 {
+            let a = plan_with_roster(&sk, &format!("world_quota_{i}"), &cards).identity_assignments;
+            assert!(counts(&a, "official") <= 3, "official 超发: {a:?}");
+            assert!(counts(&a, "merchant") <= 3, "merchant 超发: {a:?}");
+            assert!(counts(&a, "wanderer") <= 3, "wanderer 超发: {a:?}");
+            assert!(counts(&a, "jilted") <= 1, "主位 jilted 超发: {a:?}");
+            let cids: BTreeSet<&str> = a.iter().map(|(c, _)| c.as_str()).collect();
+            assert_eq!(cids.len(), a.len(), "同一角色不得被分配两个身份: {a:?}");
+        }
+    }
+
+    // 边界①：人多于 Σquota → 配额用尽即止，多出的角色无身份（不超发、不报错）。
+    #[test]
+    fn identity_more_players_than_quota_leaves_remainder_unassigned() {
+        let sk = with_identities(
+            superset(),
+            serde_json::json!([
+                { "id": "official", "quota": 1 },
+                { "id": "merchant", "quota": 1 }
+            ]),
+        );
+        let cards = roster(&["c1", "c2", "c3", "c4", "c5"]);
+        for i in 0..8 {
+            let a = plan_with_roster(&sk, &format!("world_over_{i}"), &cards).identity_assignments;
+            assert_eq!(a.len(), 2, "Σquota=2 → 至多 2 人有身份（其余走无站位路径）: {a:?}");
+            assert_eq!(counts(&a, "official"), 1);
+            assert_eq!(counts(&a, "merchant"), 1);
+        }
+    }
+
+    // 边界②：人少于 Σquota → 每人一个身份，多余槽位空置（不足额不是错误）。
+    #[test]
+    fn identity_fewer_players_than_quota_assigns_everyone() {
+        let sk = with_identities(superset(), standard_pool()); // Σquota=10
+        let cards = roster(&["c1", "c2", "c3"]);
+        let a = plan_with_roster(&sk, "world_under", &cards).identity_assignments;
+        assert_eq!(a.len(), 3, "3 人 / Σquota=10 → 恰好 3 个分配: {a:?}");
+        let cids: Vec<&str> = a.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(cids, vec!["c1", "c2", "c3"], "输出按 cid 升序");
+    }
+
+    // 内核匹配生效：主题词命中角色执念的角色，更容易站上对应身份（只影响抽取权重，不影响任何数值）。
+    #[test]
+    fn identity_kernel_match_biases_assignment() {
+        let sk = with_identities(
+            superset(),
+            serde_json::json!([
+                { "id": "jilted", "quota": 5, "themes": ["退婚"] },
+                { "id": "plain",  "quota": 5 }
+            ]),
+        );
+        // c1 内核贴「退婚」（core_fear + 1 个剧情种子命中），c2 完全不贴。
+        let cards = vec![
+            ("c1".to_string(), card("c1", "退婚之耻", &["退婚当日的羞辱", "账房算错了银子"])),
+            ("c2".to_string(), card("c2", "怕黑", &["夜里赶路"])),
+        ];
+        let (mut c1_jilted, mut c2_jilted) = (0usize, 0usize);
+        for i in 0..60 {
+            let a = plan_with_roster(&sk, &format!("world_kernel_{i}"), &cards).identity_assignments;
+            for (cid, id) in &a {
+                if id == "jilted" {
+                    if cid == "c1" {
+                        c1_jilted += 1;
+                    } else {
+                        c2_jilted += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            c1_jilted > c2_jilted,
+            "内核贴合者应更常站上对应身份（c1={c1_jilted} / c2={c2_jilted}）"
+        );
+        assert!(c2_jilted > 0, "不贴合者仍应有机会（+1 保底权重，不得锁死成血统制）");
+    }
+
+    // 老模板零影响①：超集模板未声明 identityPool → 无分配，其余维度逐字段不变。
+    #[test]
+    fn no_identity_pool_means_no_assignment_and_no_disturbance() {
+        let bare = superset();
+        let with_pool = with_identities(superset(), standard_pool());
+        let cards = roster(&["c1", "c2", "c3"]);
+
+        let a = plan_with_roster(&bare, "world_zero_impact", &cards);
+        assert!(a.identity_assignments.is_empty(), "无 identityPool → 不产身份分配");
+        let sa = a.audit.unwrap();
+        assert!(sa.identity_assignments.is_empty(), "无 identityPool → 审计段身份为空");
+
+        // 加了身份维度也不得扰动剧情采样（DOMAIN_IDENTITY 独立子流域 + 排在最后）。
+        let sb = plan_with_roster(&with_pool, "world_zero_impact", &cards).audit.unwrap();
+        assert_eq!(sa.selected_storylines, sb.selected_storylines);
+        assert_eq!(sa.selected_mainline, sb.selected_mainline);
+        assert_eq!(sa.selected_hidden, sb.selected_hidden);
+        assert_eq!(sa.selected_endings, sb.selected_endings);
+        assert_eq!(sa.selected_npcs, sb.selected_npcs);
+        assert_eq!(sa.selected_locations, sb.selected_locations);
+    }
+
+    // 老模板零影响②：非超集老骨架（无 identityPool）→ 退化路径原样，身份为空。
+    #[test]
+    fn legacy_skeleton_has_no_identity_assignment() {
+        let sk: Skeleton = serde_json::from_value(serde_json::json!({
+            "mainlineNodes": [ { "id": "n1", "fated": true } ],
+            "hiddenContentPool": [ { "id": "h1", "themes": ["x"] } ],
+            "endingPool": [ { "id": "e1", "baseWeight": 1.0 } ]
+        }))
+        .unwrap();
+        let s = plan_with_roster(&sk, "world_legacy_ident", &roster(&["c1", "c2"]));
+        assert!(s.audit.is_none(), "退化路径不产采样审计段");
+        assert!(s.identity_assignments.is_empty(), "老模板无 identityPool → 零身份分配");
+    }
+
+    // 身份池是独立维度：非超集模板只要声明了 identityPool 也照常分配（且仍无采样审计段）。
+    #[test]
+    fn identity_pool_works_on_non_superset_template() {
+        let mut sk: Skeleton = serde_json::from_value(serde_json::json!({
+            "mainlineNodes": [ { "id": "n1", "fated": true } ],
+            "endingPool": [ { "id": "e1", "baseWeight": 1.0 } ]
+        }))
+        .unwrap();
+        sk.identity_pool = serde_json::from_value(standard_pool()).unwrap();
+        let cards = roster(&["c1", "c2"]);
+        let s = plan_with_roster(&sk, "world_plain_ident", &cards);
+        assert!(s.audit.is_none(), "非超集仍走退化采样路径");
+        assert_eq!(s.identity_assignments.len(), 2, "身份池不搭超集判据的车: {:?}", s.identity_assignments);
+        assert_eq!(
+            s.identity_assignments,
+            plan_with_roster(&sk, "world_plain_ident", &cards).identity_assignments,
+            "退化路径的身份分配同样确定"
+        );
+    }
+
+    // 空阵容不 panic（建房后未入场即装配的边角）。
+    #[test]
+    fn identity_assignment_with_empty_roster() {
+        let sk = with_identities(superset(), standard_pool());
+        let s = plan_with_roster(&sk, "world_empty_roster", &[]);
+        assert!(s.identity_assignments.is_empty());
+    }
+
+    // ---------- 建模板期校验：身份池引用完整性 ----------
+
+    fn skeleton_with_pool(pool: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "storylines": [ { "id": "arc-A", "hiddenPoolIds": ["h1"] } ],
+            "hiddenContentPool": [ { "id": "h1", "themes": ["x"] } ],
+            "sideHookPool": [ { "id": "s1", "themes": ["y"] } ],
+            "identityPool": pool
+        })
+    }
+
+    #[test]
+    fn validate_accepts_wellformed_identity_pool() {
+        let sk = skeleton_with_pool(serde_json::json!([
+            { "id": "official", "label": "户部主事", "quota": 3, "hookAffinity": ["arc-A", "h1", "s1"] },
+            { "id": "jilted", "label": "被退婚的嫡女", "isLead": true }
+        ]));
+        assert!(validate_skeleton_refs(&sk).is_ok(), "合法身份池不得被拦：{:?}", validate_skeleton_refs(&sk));
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_identity_id() {
+        let sk = skeleton_with_pool(serde_json::json!([
+            { "id": "official", "quota": 2 },
+            { "id": "official", "quota": 1 }
+        ]));
+        let err = validate_skeleton_refs(&sk).unwrap_err();
+        assert!(err.contains("id 重复"), "应报重复 id，实得：{err}");
+    }
+
+    #[test]
+    fn validate_rejects_zero_quota() {
+        let sk = skeleton_with_pool(serde_json::json!([{ "id": "official", "quota": 0 }]));
+        let err = validate_skeleton_refs(&sk).unwrap_err();
+        assert!(err.contains("quota"), "应报 quota 非法，实得：{err}");
+    }
+
+    #[test]
+    fn validate_rejects_dangling_hook_affinity() {
+        let sk = skeleton_with_pool(serde_json::json!([
+            { "id": "official", "quota": 1, "hookAffinity": ["arc-NOPE"] }
+        ]));
+        let err = validate_skeleton_refs(&sk).unwrap_err();
+        assert!(err.contains("hookAffinity 悬空"), "应报引力悬空，实得：{err}");
+    }
+
+    #[test]
+    fn validate_rejects_blank_identity_id() {
+        let sk = skeleton_with_pool(serde_json::json!([{ "id": "  ", "label": "无名位", "quota": 1 }]));
+        let err = validate_skeleton_refs(&sk).unwrap_err();
+        assert!(err.contains("缺少 id"), "应报缺少 id，实得：{err}");
+    }
+
+    // 老模板（无 identityPool）照旧放行。
+    #[test]
+    fn validate_passes_skeleton_without_identity_pool() {
+        let sk = serde_json::json!({ "hiddenContentPool": [ { "id": "h1" } ] });
+        assert!(validate_skeleton_refs(&sk).is_ok());
     }
 
     // 退化路径不读星级：非超集模板带高档奖励 + 1★ → 全量装配无剔除（与改造前行为完全一致）。

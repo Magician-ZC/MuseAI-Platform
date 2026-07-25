@@ -28,9 +28,12 @@ pub async fn pick_highlight_event(
     state: &AppState,
     world_id: &str,
 ) -> Result<Option<HighlightPick>, ApiError> {
+    // moderation 过滤（§15 第 2 层）：高光切片是直播/传播素材，外泄面最大——
+    // 被运行时词库拦下的事件仍落库留痕供人审，但绝不可进切片。
     let rows = sqlx::query(
         "SELECT id, event_type, arbiter_note, public_projection_json, sequence \
-         FROM world_events WHERE world_id = ? AND visibility = 'public' ORDER BY sequence ASC",
+         FROM world_events WHERE world_id = ? AND visibility = 'public' \
+         AND moderation = 'approved' ORDER BY sequence ASC",
     )
     .bind(world_id)
     .fetch_all(&state.db)
@@ -79,7 +82,7 @@ pub async fn generate_clip(
     event_id: &str,
 ) -> Result<String, ApiError> {
     let row = sqlx::query(
-        "SELECT event_type, actors_json, public_projection_json, visibility \
+        "SELECT event_type, actors_json, public_projection_json, visibility, moderation \
          FROM world_events WHERE id = ? AND world_id = ?",
     )
     .bind(event_id)
@@ -91,6 +94,12 @@ pub async fn generate_clip(
     let visibility: String = row.try_get("visibility")?;
     if visibility != "public" {
         return Err(ApiError::Forbidden); // 只切公共事件
+    }
+    // 本条按 id 单取，无法在 SQL 里随列表一起过滤，故在此复核（§15 第 2 层）：
+    // 未过审事件即便被指名，也不得渲染成切片——切片是最终对外传播物。
+    let moderation: String = row.try_get("moderation")?;
+    if moderation != "approved" {
+        return Err(ApiError::Forbidden);
     }
     let event_type: String = row.try_get("event_type")?;
     let actors_json: String = row.try_get("actors_json")?;
@@ -280,4 +289,37 @@ mod tests {
         let err = generate_clip(&state, "w1", "e1").await.unwrap_err();
         assert!(matches!(err, ApiError::Forbidden));
     }
+
+    /// §15 第 2 层红线：未过审事件绝不进切片链路。
+    /// 切片是最终对外传播物（直播/分享素材），外泄面比站内事件流更大——
+    /// 高光挑选与按 id 渲染两条路径都必须拦住，缺一条整层失效。
+    #[tokio::test]
+    async fn blocked_events_never_reach_clip_pipeline() {
+        let state = test_state().await;
+        seed_world(&state.db, "w1", 0, "running").await;
+        // e_bad 的 impact 更高（consent_request=100 > action），正常情况下必被选为高光。
+        seed_event(&state.db, "e_ok", "w1", 1, "action", "public", "干净的反击", &["c1"], None).await;
+        seed_event(&state.db, "e_bad", "w1", 2, "consent_request", "public", "被拦下的公开事实", &["c2"], None).await;
+        sqlx::query("UPDATE world_events SET moderation = 'pending' WHERE id = 'e_bad'")
+            .execute(&state.db)
+            .await
+            .unwrap();
+
+        // ① 高光挑选：跳过未过审事件，退而选次高的过审事件（而不是整体返回空）。
+        let pick = pick_highlight_event(&state, "w1").await.expect("pick").expect("应仍有高光");
+        assert_eq!(pick.event_id, "e_ok", "未过审事件不得被选为高光，即便 impact 更高");
+
+        // ② 按 id 渲染：即便被指名也拒绝（该路径按 id 单取，靠 Rust 侧复核）。
+        let err = generate_clip(&state, "w1", "e_bad").await.expect_err("未过审事件应拒绝渲染");
+        assert!(matches!(err, ApiError::Forbidden), "应为 Forbidden，实际 {err:?}");
+
+        // ③ 未过审事件仍在库里留痕（§0.3 落库即事实，不做事后删改，供人审/申诉）。
+        let n = crate::safety::testkit::count(
+            &state.db,
+            "SELECT COUNT(*) FROM world_events WHERE id='e_bad'",
+        )
+        .await;
+        assert_eq!(n, 1, "被拦事件必须仍然留痕");
+    }
+
 }

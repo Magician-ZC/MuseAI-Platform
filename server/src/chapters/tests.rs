@@ -1204,3 +1204,168 @@ async fn chapter_settlement_grants_mileage_with_items_and_only_once() {
     assert_eq!(mileage("chA").await, 150, "重复 finish 不得重复发通关/隐藏历练");
     assert_eq!(mileage("chB").await, 100, "重复 finish 不得重复发通关历练");
 }
+
+// ========== R1 三层结算 ③ 世界线层：章节房兑现点（确定性产出表 / 幂等 / 默认关闭） ==========
+
+/// 章节骨架 + **公示产出表**：单主线节点（首次 finish 即通关），无隐藏池（隔离 ② 层数额干扰）。
+const WORLDLINE_CHAPTER_SKELETON: &str = r#"{
+  "mainlineNodes": [ { "id": "n1", "fated": false } ],
+  "endingPool": [ { "id": "ending_a", "baseWeight": 0.9 } ],
+  "assemblyRules": { "hiddenPerCharacter": 1, "endingWeightThreshold": 0.5 },
+  "payoutTable": {
+    "worldlineTiers": [
+      { "label": "见证", "minScore": 1.0, "mileage": 20 },
+      { "label": "推动", "minScore": 3.0, "mileage": 80,
+        "item": { "id": "ch_wl_relic", "narrative": "章节世界线结晶", "effectTags": ["memento:worldline"],
+                  "origin": { "worldTemplateId": "tpl_wl_ch", "cosmology": ["myth"], "powerTier": 2 } } }
+    ]
+  }
+}"#;
+
+/// 同上但**不声明 payoutTable**：验证"未验证功能默认关闭"（VALIDATION §0.1）。
+const NO_PAYOUT_CHAPTER_SKELETON: &str = r#"{
+  "mainlineNodes": [ { "id": "n1", "fated": false } ],
+  "endingPool": [ { "id": "ending_a", "baseWeight": 0.9 } ],
+  "assemblyRules": { "hiddenPerCharacter": 1, "endingWeightThreshold": 0.5 }
+}"#;
+
+async fn set_template_star(state: &AppState, template_id: &str, star: i64) {
+    sqlx::query("UPDATE world_templates SET star_rating = ? WHERE id = ?")
+        .bind(star)
+        .bind(template_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+}
+
+/// 直接播种贡献账本（章节房测试不跑真实 tick；累计路径由 runtime::tests 覆盖）。
+async fn seed_contribution(state: &AppState, world_id: &str, cid: &str, milestone_milli: i64) {
+    sqlx::query(
+        "INSERT INTO world_contributions \
+         (world_id, character_id, score_milli, milestone_score_milli, settled_at, updated_at) \
+         VALUES (?, ?, ?, ?, 0, ?)",
+    )
+    .bind(world_id)
+    .bind(cid)
+    .bind(milestone_milli)
+    .bind(milestone_milli)
+    .bind(now_ms())
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+async fn mileage_of(state: &AppState, cid: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>("SELECT mileage FROM cloud_characters WHERE id = ?")
+        .bind(cid)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+}
+
+async fn hook_grants(state: &AppState, user: &str, hook_key: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM backpacks WHERE user_id=? AND reward_hook_key=?")
+        .bind(user)
+        .bind(hook_key)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+}
+
+/// 章节房通关结算：① 每张参与卡出席产出 + ③ 里程碑推动者按**公示产出表**确定发放；
+/// 无贡献者只拿 ①、不发 ③ 也不报错；重复结算（直接再调结算入口）被 settled_at CAS 挡住，绝不双发。
+#[tokio::test]
+async fn chapter_worldline_settlement_pays_by_table_and_never_double_pays() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    seed_user(&state, "usrW1").await;
+    seed_user(&state, "usrW2").await;
+    seed_char(&state, "chW1", "usrW1", &make_card("chW1", "苏未央", "害怕被遗忘", &[], None, true)).await;
+    seed_char(&state, "chW2", "usrW2", &make_card("chW2", "陆无咎", "害怕高处", &[], None, false)).await;
+    seed_template(&state, "tpl_wl_ch", "chapter", WORLDLINE_CHAPTER_SKELETON, r#"{"mode":"open"}"#).await;
+    set_template_star(&state, "tpl_wl_ch", 3).await; // 3★ 实例：powerTier 2 的产出在封顶内
+    let wid = make_chapter_world(&state, "tpl_wl_ch").await;
+    seed_member(&state, &wid, "usrW1", "chW1").await;
+    seed_member(&state, &wid, "usrW2", "chW2").await;
+    let t1 = token(&state, "usrW1");
+
+    let (st, _) = post(&app, &format!("/api/worlds/{wid}/chapters/start"), &t1, None, json!({})).await;
+    assert_eq!(st, StatusCode::OK);
+
+    // chW1 是里程碑推动者（4.0 分 → 命中"推动"档）；chW2 全程未推进任何里程碑（无贡献者）。
+    seed_contribution(&state, &wid, "chW1", 4_000).await;
+
+    let (st, f1) = post(&app, &format!("/api/worlds/{wid}/chapters/finish"), &t1, None, json!({})).await;
+    assert_eq!(st, StatusCode::OK, "{f1}");
+    assert_eq!(f1["cleared"], json!(true), "单主线节点 → 首次 finish 即通关");
+
+    // ③ 层明细回给前端：命中档位公示名 + 确定性分值（不含任何随机字段）。
+    let payouts = f1["worldlinePayouts"].as_array().unwrap();
+    assert_eq!(payouts.len(), 1, "只有里程碑推动者进 ③ 层: {f1}");
+    assert_eq!(payouts[0]["characterId"], json!("chW1"));
+    assert_eq!(payouts[0]["tier"], json!("推动"));
+    assert_eq!(payouts[0]["itemId"], json!("ch_wl_relic"));
+
+    // ① 出席 100（每张参与卡）+ ③ 推动档 80（仅推动者）。
+    assert_eq!(mileage_of(&state, "chW1").await, 180, "推动者 = ① 100 + ③ 80");
+    assert_eq!(mileage_of(&state, "chW2").await, 100, "无贡献者只得 ① 出席分，③ 不发放也不报错");
+    assert_eq!(hook_grants(&state, "usrW1", &format!("{wid}:chW1:worldline")).await, 1);
+    assert_eq!(hook_grants(&state, "usrW2", &format!("{wid}:chW2:worldline")).await, 0);
+
+    // 幂等防线②：直接再调 ③ 层结算入口（绕过 chapters 的通关转变沿）→ settled_at CAS 0 行命中 → 空发放。
+    let mut tx = state.db.begin().await.unwrap();
+    let again = crate::progression::settle_worldline_tx(
+        &mut tx,
+        &wid,
+        &[("chW1".into(), "usrW1".into()), ("chW2".into(), "usrW2".into())],
+        false,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert!(again.is_empty(), "重复结算必须一件不发: {again:?}");
+    assert_eq!(mileage_of(&state, "chW1").await, 180, "重复结算不得重复发历练");
+    assert_eq!(hook_grants(&state, "usrW1", &format!("{wid}:chW1:worldline")).await, 1, "不得二次发货");
+
+    // 幂等防线③：DB (user_id, reward_hook_key) 唯一键 —— 背包里该 hook 恒只有一行。
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM backpacks WHERE item_id='ch_wl_relic'")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(total, 1);
+}
+
+/// 未验证功能默认关闭（VALIDATION §0.1）：模板未声明 payoutTable → ③ 层只累计贡献分、不发放，
+/// 结算路径正常返回（不报错、不影响 ① 层与既有 ② 层链路）。
+#[tokio::test]
+async fn chapter_worldline_settlement_is_off_without_payout_table() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    seed_user(&state, "usrW3").await;
+    seed_char(&state, "chW3", "usrW3", &make_card("chW3", "苏未央", "害怕被遗忘", &[], None, true)).await;
+    seed_template(&state, "tpl_nopay", "chapter", NO_PAYOUT_CHAPTER_SKELETON, r#"{"mode":"open"}"#).await;
+    set_template_star(&state, "tpl_nopay", 5).await;
+    let wid = make_chapter_world(&state, "tpl_nopay").await;
+    seed_member(&state, &wid, "usrW3", "chW3").await;
+    let t3 = token(&state, "usrW3");
+
+    let (st, _) = post(&app, &format!("/api/worlds/{wid}/chapters/start"), &t3, None, json!({})).await;
+    assert_eq!(st, StatusCode::OK);
+    seed_contribution(&state, &wid, "chW3", 99_000).await; // 贡献再高也不发（无表即关闭）
+
+    let (st, f1) = post(&app, &format!("/api/worlds/{wid}/chapters/finish"), &t3, None, json!({})).await;
+    assert_eq!(st, StatusCode::OK, "{f1}");
+    assert_eq!(f1["cleared"], json!(true));
+    assert_eq!(f1["worldlinePayouts"], json!([]), "无产出表 → ③ 层空发放");
+    assert_eq!(mileage_of(&state, "chW3").await, 100, "只有 ① 出席分");
+    assert_eq!(hook_grants(&state, "usrW3", &format!("{wid}:chW3:worldline")).await, 0);
+    // 未结算 → settled_at 保持 0（表被打开后仍可正常结算，不因关闭期跑过一次就作废）。
+    let settled: i64 = sqlx::query_scalar(
+        "SELECT settled_at FROM world_contributions WHERE world_id=? AND character_id='chW3'",
+    )
+    .bind(&wid)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(settled, 0);
+}

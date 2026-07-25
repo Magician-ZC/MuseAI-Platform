@@ -91,7 +91,7 @@ export function ErrorAlert({ message, onRetry }: { message: string; onRetry?: ()
     <Alert
       type="error"
       showIcon
-      message="加载失败"
+      title="加载失败"
       description={message}
       style={{ marginBottom: 16 }}
       action={

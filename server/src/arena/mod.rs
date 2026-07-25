@@ -232,10 +232,12 @@ async fn get_report(
 
     let m = load_match(&state.db, &world_id).await?;
 
-    // 仅取 public 事件（透明战报是可公开验证的日志，不含任一 principal 的私有投影）。
+    // 仅取 public 且过审事件（透明战报是可公开验证的日志，不含任一 principal 的私有投影；
+    // moderation 过滤见 §15 第 2 层——被拦事件仍落库留痕，但不进任何对外读取面）。
     let rows = sqlx::query(
         "SELECT tick_no, sequence, event_type, actors_json, public_projection_json, arbiter_note \
-         FROM world_events WHERE world_id = ? AND visibility = 'public' ORDER BY sequence ASC LIMIT 1000",
+         FROM world_events WHERE world_id = ? AND visibility = 'public' \
+         AND moderation = 'approved' ORDER BY sequence ASC LIMIT 1000",
     )
     .bind(&world_id)
     .fetch_all(&state.db)
@@ -358,9 +360,11 @@ async fn get_replay(
     let cursor = q.cursor.unwrap_or(-1);
     let limit = q.limit.unwrap_or(200).clamp(1, 500);
 
+    // 回放同样只出 public + 过审事件（§15 第 2 层，与透明战报同口径）。
     let rows = sqlx::query(
         "SELECT id, tick_no, sequence, event_type, actors_json, public_projection_json, arbiter_note, occurred_at \
-         FROM world_events WHERE world_id = ? AND visibility = 'public' AND sequence > ? ORDER BY sequence ASC LIMIT ?",
+         FROM world_events WHERE world_id = ? AND visibility = 'public' \
+         AND moderation = 'approved' AND sequence > ? ORDER BY sequence ASC LIMIT ?",
     )
     .bind(&world_id)
     .bind(cursor)

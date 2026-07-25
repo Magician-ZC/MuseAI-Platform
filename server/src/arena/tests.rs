@@ -758,3 +758,42 @@ async fn settle_grants_participation_and_champion_mileage_exactly_once() {
         "荣誉奖励仍只一枚"
     );
 }
+
+/// §15 第 2 层红线：未过审事件不得进赛事对外读取面（透明战报 + 回放）。
+/// 赛事是观众可见面，且回放会被反复拉取——过滤漏一条等于第 2 层在这条链路上失效。
+#[tokio::test]
+async fn blocked_events_excluded_from_report_and_replay() {
+    let state = test_state().await;
+    seed_user(&state.db, "spectator").await;
+    seed_arena_world(&state.db, "w", "host", "public").await;
+
+    seed_public_event(&state.db, "w", 0, 0, "action", "干净的行礼", None).await;
+    seed_public_event(&state.db, "w", 0, 1, "dialogue", "被拦下的脏话播报", None).await;
+    seed_public_event(&state.db, "w", 1, 2, "action", "干净的拂袖", None).await;
+    // 第二条被运行时词库拦下（仍落库留痕，但不得对外）。
+    sqlx::query("UPDATE world_events SET moderation = 'pending' WHERE sequence = 1 AND world_id = 'w'")
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    // ① 透明战报：只出两条过审事件。
+    let (s, report) = get(&state, "/api/arena/w/report", "spectator").await;
+    assert_eq!(s, StatusCode::OK, "body={report}");
+    assert!(!report.to_string().contains("被拦下"), "战报不得含未过审文本");
+
+    // ② 回放：分页拉全量也拿不到被拦事件。
+    let (s, replay) = get(&state, "/api/arena/w/replay?limit=50", "spectator").await;
+    assert_eq!(s, StatusCode::OK, "body={replay}");
+    let evs = replay["events"].as_array().unwrap();
+    assert_eq!(evs.len(), 2, "回放只应出两条过审事件");
+    assert!(!replay.to_string().contains("被拦下"), "回放不得含未过审文本");
+    let seqs: Vec<i64> = evs.iter().map(|e| e["sequence"].as_i64().unwrap()).collect();
+    assert_eq!(seqs, vec![0, 2], "被拦事件的序号应整条缺席");
+
+    // ③ 仍在库里留痕（§0.3：落库即事实，供人审/申诉，不做事后删改）。
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_events WHERE world_id='w' AND moderation='pending'")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(n, 1, "被拦事件必须仍然留痕");
+}

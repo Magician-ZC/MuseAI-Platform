@@ -598,6 +598,264 @@ async fn world_list_and_detail_project_star_rating() {
     assert_eq!(detail["starRating"], 4, "详情应投影模板星级");
 }
 
+// ---------- R1：同源卡同世界唯一（规格 §7「这个世界只有一个唐三」） ----------
+
+/// 造一张带同源两列的已过审卡；两列即发布路径（assets::source_identity）的物化结果。
+async fn seed_source_char(
+    state: &AppState,
+    id: &str,
+    owner: &str,
+    name: &str,
+    fingerprint: Option<&str>,
+    pristine: i64,
+) {
+    sqlx::query(
+        "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, \
+         rights_declaration, moderation, withdrawn, source_fingerprint, pristine, created_at) \
+         VALUES (?, ?, ?, 1, ?, 'original', 'approved', 0, ?, ?, ?)",
+    )
+    .bind(id)
+    .bind(owner)
+    .bind(id)
+    .bind(sample_card_json(id, name))
+    .bind(fingerprint)
+    .bind(pristine)
+    .bind(now_ms())
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+async fn active_member_count(state: &AppState, world_id: &str) -> i64 {
+    sqlx::query("SELECT COUNT(*) AS n FROM world_members WHERE world_id=? AND status='active'")
+        .bind(world_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+        .try_get("n")
+        .unwrap()
+}
+
+/// 同一提取源的第二张**原味卡** join 同世界 → 409 + 引导文案；占位者离场后名额释放。
+#[tokio::test]
+async fn join_rejects_second_pristine_card_from_same_source() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    seed_user(&state, "usrT1").await;
+    seed_user(&state, "usrT2").await;
+    seed_source_char(&state, "chTang1", "usrT1", "唐三", Some("src-douluo"), 1).await;
+    seed_source_char(&state, "chTang2", "usrT2", "唐三", Some("src-douluo"), 1).await;
+    let wid = create_world(&state.db, CreateWorldParams::official("tpl", 1, "斗罗世界")).await.unwrap();
+    let uri = format!("/api/worlds/{wid}/join");
+    let t1 = token(&state, "usrT1");
+    let t2 = token(&state, "usrT2");
+
+    let (st, body) = post_json(&app, &uri, &t1, None, json!({ "cloudCharacterId": "chTang1" })).await;
+    assert_eq!(st, StatusCode::OK, "首张原味卡应成功: {body}");
+
+    // 同指纹的第二张原味卡（别人的卡）→ 409 + 规格文案（含角色名）。
+    let (st2, body2) = post_json(&app, &uri, &t2, None, json!({ "cloudCharacterId": "chTang2" })).await;
+    assert_eq!(st2, StatusCode::CONFLICT, "同源原味卡应 409: {body2}");
+    let msg = body2["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("这个世界已经有一个「唐三」了"), "文案应含角色名: {msg}");
+    assert!(msg.contains("编辑出你自己的版本，或换一个世界实例"), "文案应给出两条出路: {msg}");
+    assert_eq!(active_member_count(&state, &wid).await, 1, "被拒的同源卡不得落行");
+
+    // 占位者离场（非 active 不占名额）→ 同源卡可以进。
+    let (st_leave, _) = post_json(
+        &app,
+        &format!("/api/worlds/{wid}/leave"),
+        &t1,
+        None,
+        json!({ "cloudCharacterId": "chTang1" }),
+    )
+    .await;
+    assert_eq!(st_leave, StatusCode::OK);
+    let (st3, body3) = post_json(&app, &uri, &t2, None, json!({ "cloudCharacterId": "chTang2" })).await;
+    assert_eq!(st3, StatusCode::OK, "占位者离场后同源卡应放行: {body3}");
+}
+
+/// 硬约束：玩家**编辑过**的卡（pristine=0）即便同源也必须放行——撞卡压力转化为编辑创作激励。
+#[tokio::test]
+async fn join_allows_edited_card_from_same_source() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    seed_user(&state, "usrE1").await;
+    seed_user(&state, "usrE2").await;
+    seed_source_char(&state, "chE1", "usrE1", "唐三", Some("src-douluo"), 1).await;
+    seed_source_char(&state, "chE2", "usrE2", "唐三（我的版本）", Some("src-douluo"), 0).await;
+    let wid = create_world(&state.db, CreateWorldParams::official("tpl", 1, "斗罗世界")).await.unwrap();
+    let uri = format!("/api/worlds/{wid}/join");
+
+    let (st, body) =
+        post_json(&app, &uri, &token(&state, "usrE1"), None, json!({ "cloudCharacterId": "chE1" })).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let (st2, body2) =
+        post_json(&app, &uri, &token(&state, "usrE2"), None, json!({ "cloudCharacterId": "chE2" })).await;
+    assert_eq!(st2, StatusCode::OK, "编辑过的同源卡必须放行: {body2}");
+    assert_eq!(active_member_count(&state, &wid).await, 2, "两张卡都应在场");
+}
+
+/// 迁移前老卡（source_fingerprint IS NULL）一律放行——不因缺字段拒绝入世。
+#[tokio::test]
+async fn join_allows_legacy_cards_without_fingerprint() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    seed_user(&state, "usrL1").await;
+    seed_user(&state, "usrL2").await;
+    // 迁移回填态（NULL/0）与「原味但无提取源」（NULL/1，纯原创卡）两种都得放行。
+    seed_source_char(&state, "chL1", "usrL1", "无名氏", None, 0).await;
+    seed_source_char(&state, "chL2", "usrL2", "无名氏", None, 1).await;
+    let wid = create_world(&state.db, CreateWorldParams::official("tpl", 1, "老世界")).await.unwrap();
+    let uri = format!("/api/worlds/{wid}/join");
+
+    let (st, body) =
+        post_json(&app, &uri, &token(&state, "usrL1"), None, json!({ "cloudCharacterId": "chL1" })).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let (st2, body2) =
+        post_json(&app, &uri, &token(&state, "usrL2"), None, json!({ "cloudCharacterId": "chL2" })).await;
+    assert_eq!(st2, StatusCode::OK, "无指纹卡必须放行: {body2}");
+    assert_eq!(active_member_count(&state, &wid).await, 2);
+}
+
+/// 不同提取源的原味卡互不影响（闸只按指纹匹配，不按角色名/卡数）。
+#[tokio::test]
+async fn join_allows_pristine_cards_from_different_sources() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    seed_user(&state, "usrD1").await;
+    seed_user(&state, "usrD2").await;
+    seed_source_char(&state, "chD1", "usrD1", "唐三", Some("src-douluo"), 1).await;
+    seed_source_char(&state, "chD2", "usrD2", "萧炎", Some("src-doupo"), 1).await;
+    let wid = create_world(&state.db, CreateWorldParams::official("tpl", 1, "混搭世界")).await.unwrap();
+    let uri = format!("/api/worlds/{wid}/join");
+
+    let (st, body) =
+        post_json(&app, &uri, &token(&state, "usrD1"), None, json!({ "cloudCharacterId": "chD1" })).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let (st2, body2) =
+        post_json(&app, &uri, &token(&state, "usrD2"), None, json!({ "cloudCharacterId": "chD2" })).await;
+    assert_eq!(st2, StatusCode::OK, "不同提取源应互不影响: {body2}");
+    assert_eq!(active_member_count(&state, &wid).await, 2);
+}
+
+/// 回归：同一张原味卡重复 join 仍走成员行幂等分支，不被同源闸误伤（排除本卡自身）。
+#[tokio::test]
+async fn join_same_pristine_card_repeat_stays_idempotent() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    seed_user(&state, "usrR1").await;
+    seed_source_char(&state, "chR1", "usrR1", "唐三", Some("src-douluo"), 1).await;
+    let wid = create_world(&state.db, CreateWorldParams::official("tpl", 1, "幂等世界")).await.unwrap();
+    let uri = format!("/api/worlds/{wid}/join");
+    let t1 = token(&state, "usrR1");
+
+    let (st, body) = post_json(&app, &uri, &t1, None, json!({ "cloudCharacterId": "chR1" })).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let mid = body["membershipId"].as_str().unwrap().to_string();
+
+    let (st2, body2) = post_json(&app, &uri, &t1, None, json!({ "cloudCharacterId": "chR1" })).await;
+    assert_eq!(st2, StatusCode::OK, "同卡重复 join 不得被同源闸拦截: {body2}");
+    assert_eq!(body2["membershipId"].as_str().unwrap(), mid, "应返回同一 membership");
+    assert_eq!(active_member_count(&state, &wid).await, 1, "重复 join 不得多落行");
+}
+
+/// 发布路径物化两列：原味卡（draft + revision 0 + sourceWork）→ (指纹, 1)；
+/// 改过 revision → pristine 0；无 sourceWork（纯原创）→ 指纹 NULL。
+#[tokio::test]
+async fn publish_materializes_source_fingerprint_and_pristine() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    seed_user(&state, "usrPub").await;
+    let tp = token(&state, "usrPub");
+
+    let card = |lifecycle: &str, revision: i64, with_source: bool| {
+        let mut c = json!({
+            "schemaVersion": 2,
+            "id": "local-card",
+            "lifecycle": lifecycle,
+            "revision": revision,
+            "identity": { "name": "唐三" },
+        });
+        if with_source {
+            c["identity"]["sourceWork"] =
+                json!({ "sourceId": "hash-douluo", "title": "斗罗大陆" });
+        }
+        c
+    };
+    let publish = |local_id: &'static str, card: Value| {
+        json!({ "localCardId": local_id, "cardJson": card, "rightsDeclaration": "original" })
+    };
+
+    for (local_id, body) in [
+        ("card-pristine", publish("card-pristine", card("draft", 0, true))),
+        ("card-edited", publish("card-edited", card("draft", 3, true))),
+        ("card-original", publish("card-original", card("draft", 0, false))),
+    ] {
+        let (st, v) =
+            post_json(&app, "/api/assets/characters", &tp, Some(local_id), body).await;
+        assert_eq!(st, StatusCode::OK, "发布应成功: {v}");
+    }
+
+    let read = |local_id: &'static str| {
+        let db = state.db.clone();
+        async move {
+            let row = sqlx::query(
+                "SELECT source_fingerprint, pristine FROM cloud_characters WHERE local_card_id = ?",
+            )
+            .bind(local_id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+            let fp: Option<String> = row.try_get("source_fingerprint").unwrap();
+            let pristine: i64 = row.try_get("pristine").unwrap();
+            (fp, pristine)
+        }
+    };
+    assert_eq!(read("card-pristine").await, (Some("hash-douluo".to_string()), 1), "原味卡应物化指纹 + pristine=1");
+    assert_eq!(read("card-edited").await, (Some("hash-douluo".to_string()), 0), "改过 revision 即非原味");
+    assert_eq!(read("card-original").await, (None, 1), "无 sourceWork → 指纹 NULL（不参与同源判定）");
+}
+
+/// 端到端：两个用户发布同一张原味卡 → 第二人 join 被同源闸拒（发布提取与 join 判定字段口径一致）。
+#[tokio::test]
+async fn published_identical_pristine_cards_collide_on_join() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    seed_user(&state, "usrX1").await;
+    seed_user(&state, "usrX2").await;
+    let card = json!({
+        "schemaVersion": 2,
+        "id": "local-card",
+        "lifecycle": "draft",
+        "revision": 0,
+        "identity": { "name": "唐三", "sourceWork": { "sourceId": "hash-douluo", "title": "斗罗大陆" } },
+    });
+    let body = json!({ "localCardId": "唐三卡", "cardJson": card, "rightsDeclaration": "original" });
+
+    let mut ids = Vec::new();
+    for (user, idem) in [("usrX1", "px1"), ("usrX2", "px2")] {
+        let (st, v) =
+            post_json(&app, "/api/assets/characters", &token(&state, user), Some(idem), body.clone()).await;
+        assert_eq!(st, StatusCode::OK, "发布应成功: {v}");
+        assert_eq!(v["moderation"], "approved", "机审 stub 直过（join 前置条件）: {v}");
+        ids.push(v["id"].as_str().unwrap().to_string());
+    }
+
+    let wid = create_world(&state.db, CreateWorldParams::official("tpl", 1, "斗罗世界")).await.unwrap();
+    let uri = format!("/api/worlds/{wid}/join");
+    let (st, b) =
+        post_json(&app, &uri, &token(&state, "usrX1"), None, json!({ "cloudCharacterId": ids[0] })).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    let (st2, b2) =
+        post_json(&app, &uri, &token(&state, "usrX2"), None, json!({ "cloudCharacterId": ids[1] })).await;
+    assert_eq!(st2, StatusCode::CONFLICT, "同源原味卡应被拒: {b2}");
+    assert!(
+        b2["error"]["message"].as_str().unwrap_or("").contains("这个世界已经有一个「唐三」了"),
+        "文案应含角色名: {b2}"
+    );
+}
+
 // ---------- 阵容头像按机审裁决过滤（Phase A 红线：未过审绝不下发） ----------
 
 #[tokio::test]

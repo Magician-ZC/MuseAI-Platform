@@ -36,6 +36,16 @@ pub enum ModerationVerdict {
 
 #[async_trait]
 pub trait ModerationProvider: Send + Sync {
+    /// 文本机审。**这就是总规格 §15 五层漏斗第 3 层（小模型语义分类）的接口位**——
+    /// 现状只被静态内容路径（`safety::moderate_and_queue`：角色卡/世界模板/装配钩子/入站托梦）调用。
+    ///
+    /// TODO(§15-L3)：接入运行时产出的语义复核——公开投影**全量**、私有投影**抽样**（抽样率是运营
+    /// 配置，禁止写死）。**约束：必须在 tick 事务之外异步执行**——本方法是网络调用，放进
+    /// `runtime::commit_tick` 的事务会（a）单连接池下再借连接死锁 PoolTimedOut，
+    /// （b）让 tick 事务的持有时长被外部 RTT 绑架。落地形态：tick 提交后另起任务复核本 tick 的
+    /// world_events，非 Approved 时收紧 `world_events.moderation`（不改写已下发内容，仅停止外发），
+    /// 配合 §15 第 4 层「直播场延迟 1-2 拍缓冲」留出拦截窗口。
+    /// 第 2 层（本地敏感词库，≈0 成本）已在事务内同步生效，见 `safety::lexicon`。
     async fn check_text(&self, text: &str) -> Result<ModerationVerdict, String>;
 
     /// 图片机审（角色头像等二进制资产）。

@@ -10,12 +10,13 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
     <ConfigProvider
       locale={zhCN}
       theme={{
+        // 色值以 docs/design/admin-ui-design.md §5 为准，不引入表外近似值。
         token: {
-          colorPrimary: '#c96d49',
-          colorInfo: '#c96d49',
-          colorSuccess: '#6f985e',
-          colorWarning: '#d8943a',
-          colorError: '#c95345',
+          colorPrimary: '#c96845',
+          colorInfo: '#c96845',
+          colorSuccess: '#749b63',
+          colorWarning: '#d99535',
+          colorError: '#ca5547',
           colorText: '#2e2b28',
           colorTextSecondary: '#827b73',
           colorBorder: '#e4ded6',

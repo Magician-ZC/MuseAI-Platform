@@ -1,3 +1,5 @@
+/* 世界运行监控样式。几何与色值以 docs/design/admin-ui-design.md §4/§5 为准：
+   表格行高 58px、表头 36px、面板圆角 8px、诊断栏 390px、主/辅间距 16px、页面内边距 左24/右8/上8。 */
 .world-console {
   min-height: 100%;
   padding: 8px 8px 20px 24px;
@@ -28,6 +30,23 @@
   box-shadow: none;
 }
 
+/* 统计日期为只读展示（对应后端预算日），沿用按钮外形但不可点击。 */
+.world-console__date {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 36px;
+  padding: 0 14px;
+  border: 1px solid #e4ded6;
+  border-radius: 8px;
+  background: #fffdfa;
+  color: #46413d;
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 几何自洽（§4）：侧栏 220 + 页面内边距 32 + 主区 680 + 间距 16 + 诊断栏 390 = 1338px。
+   低于该宽度由文件末尾的 1360px 断点放开主区最小宽度，表格/时间线在面板内部横向滚动。 */
 .world-console__grid {
   display: grid;
   grid-template-columns: minmax(680px, 1fr) 390px;
@@ -73,7 +92,7 @@
   bottom: 16px;
   left: 0;
   width: 1px;
-  background: #ebe5de;
+  background: #e7e1da;
   content: '';
 }
 
@@ -119,6 +138,19 @@
   align-self: end;
 }
 
+/* 正式模式无成本折算口径：不画趋势图，改为单列 + 空态说明。 */
+.world-health-strip__metric.is-cost.has-no-chart {
+  grid-template-columns: 1fr;
+}
+
+.world-health-strip__note {
+  grid-column: 1;
+  margin: 5px 0 0;
+  color: #8d867e;
+  font-size: 10px;
+  line-height: 1.5;
+}
+
 .world-table-panel__header,
 .world-timeline > header {
   display: flex;
@@ -126,7 +158,7 @@
   justify-content: space-between;
   min-height: 52px;
   padding: 0 16px;
-  border-bottom: 1px solid #e8e2db;
+  border-bottom: 1px solid #e7e1da;
 }
 
 .world-table-panel__header > div,
@@ -164,6 +196,12 @@
   overflow-x: auto;
 }
 
+.world-table-panel__more {
+  padding: 10px 16px;
+  border-top: 1px solid #e7e1da;
+  text-align: center;
+}
+
 .world-table {
   width: 100%;
   min-width: 760px;
@@ -175,7 +213,7 @@
 .world-table th {
   height: 36px;
   padding: 0 9px;
-  border-bottom: 1px solid #e9e3dc;
+  border-bottom: 1px solid #e7e1da;
   background: #fbfaf7;
   color: #837c74;
   font-weight: 500;
@@ -185,12 +223,26 @@
 .world-table td {
   height: 58px;
   padding: 6px 9px;
-  border-bottom: 1px solid #ebe5de;
+  border-bottom: 1px solid #e7e1da;
   color: #514c46;
 }
 
 .world-table tbody tr:last-child td {
   border-bottom: 0;
+}
+
+/* §6.2：整行是主入口（点击 / Enter / 空格都会更新右侧诊断栏）。 */
+.world-table tbody tr {
+  cursor: pointer;
+}
+
+.world-table tbody tr:hover:not(.is-selected) td {
+  background: #faf5ef;
+}
+
+.world-table tbody tr:focus-visible {
+  outline: 2px solid #d37a57;
+  outline-offset: -2px;
 }
 
 .world-table tbody tr.is-selected td {
@@ -202,11 +254,7 @@
   align-items: center;
   gap: 9px;
   min-width: 118px;
-  padding: 0;
-  border: 0;
-  background: transparent;
   color: #38342f;
-  cursor: pointer;
   text-align: left;
 }
 
@@ -220,11 +268,6 @@
 .world-table__world strong {
   font-size: 12px;
   font-weight: 600;
-}
-
-.world-table__world:focus-visible {
-  outline: 2px solid #d37a57;
-  outline-offset: 3px;
 }
 
 .world-status {
@@ -250,9 +293,9 @@
 .world-status.is-danger { background: #fbe6e3; color: #c64d40; }
 .world-status.is-paused { background: #f2eee9; color: #7d746a; }
 
-.world-value.is-good { color: #639154; }
-.world-value.is-warning { color: #be7a25; }
-.world-value.is-danger { color: #c84d40; }
+.world-value.is-good { color: #5d8750; }
+.world-value.is-warning { color: #bb7623; }
+.world-value.is-danger { color: #c64d40; }
 
 .world-table-panel__loading,
 .world-table-panel__empty {
@@ -273,7 +316,7 @@
   gap: 10px;
   min-height: 54px;
   padding: 7px 16px;
-  border-bottom: 1px solid #ebe5de;
+  border-bottom: 1px solid #e7e1da;
   font-size: 11px;
 }
 
@@ -304,6 +347,22 @@
   color: #8c857d;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.world-timeline__more {
+  padding: 9px 16px;
+  border-top: 1px solid #e7e1da;
+  color: #918a82;
+  font-size: 11px;
+  text-align: center;
+}
+
+.world-timeline__empty {
+  display: grid;
+  min-height: 250px;
+  place-items: center;
+  color: #918a82;
+  font-size: 12px;
 }
 
 .world-inspector {
@@ -344,15 +403,18 @@
   font-weight: 650;
 }
 
+/* 摘要行单行显示：诊断栏固定 390px，超长内容省略号收口，既不折断时间戳也不撑破面板。 */
 .world-inspector__identity p {
+  overflow: hidden;
   margin: 5px 0 0;
   color: #827b73;
   font-size: 10px;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .world-inspector section {
-  border-bottom: 1px solid #e8e2db;
+  border-bottom: 1px solid #e7e1da;
 }
 
 .world-inspector section h3 {
@@ -377,7 +439,20 @@
   position: absolute;
   right: 12px;
   bottom: 28px;
-  color: #c86843;
+  color: #c96845;
+  font-size: 11px;
+}
+
+.world-inspector__latency > strong.is-alert {
+  color: #c64d40;
+}
+
+.world-inspector__chart-empty {
+  display: grid;
+  min-height: 142px;
+  padding-bottom: 12px;
+  place-items: center;
+  color: #918a82;
   font-size: 11px;
 }
 
@@ -392,7 +467,7 @@
 }
 
 .world-inspector__metrics > div + div {
-  border-left: 1px solid #e8e2db;
+  border-left: 1px solid #e7e1da;
 }
 
 .world-inspector__metrics span,
@@ -401,6 +476,10 @@
   margin: 0;
   color: #827b73;
   font-size: 10px;
+}
+
+.world-inspector__metrics > div > p {
+  margin-top: 4px;
 }
 
 .world-inspector__metrics strong {
@@ -418,7 +497,7 @@
 }
 
 .world-inspector__metrics b {
-  color: #cb5145;
+  color: #c64d40;
 }
 
 .world-inspector__incident,
@@ -436,10 +515,16 @@
   gap: 10px;
   margin-top: 9px;
   padding: 13px 10px;
-  border: 1px solid #eadfd4;
+  border: 1px solid #e7e1da;
   border-radius: 7px;
   background: #fdfbf7;
-  color: #d18b31;
+  color: #d99535;
+}
+
+.world-inspector__incident > div.world-inspector__incident-empty {
+  justify-content: center;
+  color: #918a82;
+  font-size: 11px;
 }
 
 .world-inspector__incident p {
@@ -480,7 +565,12 @@
   height: 6px;
   margin-right: 5px;
   border-radius: 50%;
-  background: #719a60;
+  background: #749b63;
+}
+
+/* 备用路由无数据源时用中性色点，避免"绿点=正常"的误读。 */
+.world-inspector__route span i.is-idle {
+  background: #c4bdb4;
 }
 
 .world-inspector__route strong {
@@ -550,16 +640,43 @@
   color: #918a82;
 }
 
-@media (max-width: 1280px) {
+/* 窄视口（含 1100px 最小支持宽度与 1280px 验收宽度）：
+   诊断栏保持 390px 不变，主区放开最小宽度并压缩内部栅格，
+   表格改为面板内部横向滚动，页面不被撑宽（§4 / §6.2）。 */
+@media (max-width: 1360px) {
   .world-console__grid {
-    grid-template-columns: minmax(650px, 1fr) 360px;
+    grid-template-columns: minmax(0, 1fr) 390px;
+  }
+
+  /* 指标格最小内容宽：状态格 12+8+文字36+内边距28≈84；成本格 值82+趋势图84+内边距28≈196。 */
+  .world-health-strip {
+    grid-template-columns: repeat(3, minmax(84px, 1fr)) minmax(196px, 1.35fr);
   }
 
   .world-health-strip__metric {
     padding-inline: 14px;
   }
 
-  .world-inspector__identity p {
-    white-space: normal;
+  .world-timeline__row {
+    grid-template-columns: 56px 52px minmax(0, 1fr) 96px;
+  }
+}
+
+/* ≤1160px：一行四格最少需 ~448px 主区宽度，此处已不足，折成 2×2 保证四项都完整可读。 */
+@media (max-width: 1160px) {
+  .world-health-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .world-health-strip__metric:nth-child(3)::before {
+    display: none;
+  }
+
+  .world-health-strip__metric:nth-child(n + 3) {
+    border-top: 1px solid #e7e1da;
+  }
+
+  .world-health-strip__metric.is-cost {
+    grid-template-columns: 1fr auto;
   }
 }

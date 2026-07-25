@@ -6,7 +6,8 @@
 //!   （token + cny 熔断则暂停世界，B-2）→ **回灌：DB narrative_state_json 物化到引擎 FS(单一事实源，E-1)**
 //!   （首 tick 用 assembled_json/skeleton 种子硬节点/禁止谓词/在场角色）→ 组装 RoundInput
 //!   → NarrativeEngine::run_round(可注入 mock model) → 同一事务写 narrative_state(CAS)/world_ticks(done,
-//!   **实测 token 计费 B-1**)/world_events 投影/**仅本 tick 实际喂入的干预 applied(Q-3)**/预算累计 → 广播增量。
+//!   **实测 token 计费 B-1**)/world_events 投影(**先过 §15 第 2 层敏感词库闸**)/
+//!   **仅本 tick 实际喂入的干预 applied(Q-3)**/预算累计 → 广播增量(未过审事件不广播)。
 //! - CAS 冲突 = 终态化(C-2)，不再无限 re-enqueue；worker Err = 退避重试 + 上限终态化(C-9)。
 //! - dev 态：世界无模型配置 → tick 跳过并 warn，不 panic。
 
@@ -30,8 +31,8 @@ use muse_engine::character::types::CharacterCardV2;
 use muse_engine::host::{CancelFlag, EngineEvent, EngineHost, HostEvents, HostFs, StdFs, SystemClock};
 use muse_engine::model::{HttpModelClient, ModelClient, ModelProfile};
 use muse_engine::narrative::types::{
-    CharacterState, ConstraintLevel, DomainEvent, DomainEventType, ForbiddenPredicate, LocationDef,
-    NarrativeState, NodeStatus, OutlineNode, RoundBudget, RunMode,
+    CharacterState, ConstraintLevel, DomainEvent, DomainEventType, ForbiddenPredicate, Lethality,
+    LocationDef, NarrativeState, NodeStatus, OutlineNode, RoundBudget, RunMode,
 };
 use muse_engine::narrative::{ModelRoutes, NarrativeEngine, NarrativePrompts, RoundInput, Terminal};
 
@@ -877,12 +878,17 @@ fn select_ending(world: &WorldRow) -> Option<String> {
 /// **arena 红线（§2.5）**：奖励只入 `arena_rewards`（称号/荣誉，schema 无任何强度/属性字段）——
 /// **荣誉非战力、无买判定**（不经任何计费/订单路径、不写强度）。幂等：唯一索引 (world,character,kind)
 /// + `ON CONFLICT DO NOTHING`，重复/并发不重复发放。仅当选出结局（`ending=Some`）时发奖。
+///
+/// R1 三层结算（总规格 §9）：`participants` 传 `(cloud_character_id, user_id)`——③ 世界线层要给
+/// **卡的主人**发产出道具，只有角色 id 不够。① 保底层 + ③ 世界线层的发放逻辑整体收在
+/// `progression::settle_idle_world_ending_tx`（本文件不出现任何成长数值字段，守红线 grep 断言）；
+/// 崩塌判定只把 `reason` 串交给 progression 判，系数与产出表都在那边。
 async fn finalize_ending_tx(
     tx: &mut Transaction<'_, Any>,
     world_id: &str,
     reason: &str,
     ending: Option<&str>,
-    member_char_ids: &[String],
+    participants: &[(String, String)],
 ) -> Result<(), ApiError> {
     // 终局审计留痕（reason + 选定结局）。
     sqlx::query(
@@ -896,14 +902,17 @@ async fn finalize_ending_tx(
     .execute(&mut **tx)
     .await?;
 
-    // 终局历练（波次 2）：每张在场卡发放 idle 终局历练，与终局停机同事务（只在真正结算那一次；
-    // member_char_ids 仅含玩家成员卡，NPC 不在列）。发放逻辑收在 progression 模块——本文件
-    // （RoundInput 组装处）不引用任何历练字段，红线「历练不进引擎决策」grep 级可验。
-    crate::progression::settle_idle_world_ending_tx(tx, member_char_ids).await?;
+    // 三层结算（波次 2 + R1）：① 保底层（每张在场卡的出席产出）+ ③ 世界线层（里程碑推动者按贡献分
+    // 查公示产出表确定发放，无随机数），与终局停机同事务（只在真正结算那一次；participants 仅含
+    // 玩家成员卡，NPC 不在列）。世界线崩塌（关键角色退场等 reason）→ ③ 归零 + ① 减半 + ② 已锁定保留，
+    // 系数与判定全在 progression。发放逻辑收在 progression 模块——本文件（RoundInput 组装处）
+    // 不引用任何成长数值字段，红线「成长数值不进引擎决策」grep 级可验。
+    let collapsed = crate::progression::is_collapse_reason(reason);
+    crate::progression::settle_idle_world_ending_tx(tx, world_id, participants, collapsed).await?;
 
     // 终局荣誉奖励：每位在场成员角色获一枚「结局」荣誉（label=选定结局 id）。无强度、无购买。
     if let Some(ending_id) = ending {
-        for cid in member_char_ids {
+        for (cid, _) in participants {
             sqlx::query(
                 "INSERT INTO arena_rewards (id, world_id, character_id, kind, label, season, created_at) \
                  VALUES (?, ?, ?, 'ending', ?, NULL, ?) \
@@ -971,8 +980,10 @@ async fn conclude_world_no_round(
     let rows = end_world_tx(&mut tx, world_id, reason).await?;
     let concluded = rows > 0;
     if concluded {
-        let member_ids: Vec<String> = members.iter().map(|m| m.character_key.clone()).collect();
-        finalize_ending_tx(&mut tx, world_id, reason, ending, &member_ids).await?;
+        // (cid, user_id)：③ 世界线层产出发给卡的主人，故 user_id 必须一并带上。
+        let participants: Vec<(String, String)> =
+            members.iter().map(|m| (m.character_key.clone(), m.user_id.clone())).collect();
+        finalize_ending_tx(&mut tx, world_id, reason, ending, &participants).await?;
     }
     tx.commit().await?;
     if concluded {
@@ -1516,6 +1527,12 @@ async fn process_tick_inner(
             now_hint: 0,
             // 僵局打破提示（B）：连续 blocked ≥ 阈值时携带最近原因，None = 无僵局（默认路径零变化）。
             stall_hint: stall_hint.clone(),
+            // R1 生死契约三档（总规格 §11）：引擎已具备三档能力，server 侧尚未落 worlds.lethality 列，
+            // 故恒传默认档 = 同意制（现行机制：不可逆事件当事人临场同意，超时保守）。
+            // 待 worlds 表加 lethality 列 + join 契约签署落地后，此处改为从世界行回灌。
+            // 未验证功能默认关闭（VALIDATION.md §0.1）：在契约签署与未成年准入门就位前，
+            // 生死状档不得对任何世界生效。
+            lethality: Lethality::default(),
         };
         let cancel = CancelFlag::new();
         // 时间线模式分派（第二块 Phase 2）：event 世界走 DES 调度器 run_event_step（内部做 cohort 过滤 +
@@ -1609,7 +1626,8 @@ async fn process_tick_inner(
     Ok(TickStatus::Failed)
 }
 
-/// 同一事务写：narrative_state(CAS)/world_ticks(done,实测 token 成本)/world_events 投影/
+/// 同一事务写：narrative_state(CAS)/world_ticks(done,实测 token 成本)/world_events 投影
+/// （**过 §15 第 2 层敏感词库闸**：命中即打码 + 置 moderation='pending' + 记险）/
 /// 本 tick 实际喂入的 whisper 干预 applied/预算累计。
 ///
 /// P1 Phase 0：CAS 成功后、tx.commit 前，插入放置房终局评估——引擎终局信号（`terminal`：event 步跑完回合后
@@ -1659,6 +1677,24 @@ async fn commit_tick(
         return Ok(TickStatus::Skipped("cas_conflict"));
     }
 
+    // ③ 世界线层贡献归因（R1，总规格 §9）：把引擎本回合已定序的 decisions/outcomes 与 state_patch
+    // 交给 progression，逐角色折算并累积进独立账本 world_contributions。与状态 CAS 同事务——
+    // tick 回滚则贡献同滚，绝无"状态没提交但贡献已记"的错位。
+    //
+    // **必须排在下方终局评估之前**：触发终局的那一拍，正是把最后一个里程碑推过阈值的一拍；
+    // 若排在终局结算之后，这笔最具决定性的贡献会被系统性漏记，③ 层归因就失真了。
+    //
+    // 🔴 绝不写进 narrative_state_json：那份 JSON 每 tick 回灌进引擎 RoundInput，任何写进去的数值
+    //    都可能被 role_decide / 仲裁读到，直接违反平权红线（§0.1 数值优势不得进入引擎决策）。
+    crate::progression::accumulate_contributions_tx(
+        &mut tx,
+        world_id,
+        &outcome.scene.decisions,
+        &outcome.scene.outcomes,
+        &outcome.scene.state_patch,
+    )
+    .await?;
+
     // 放置房终局评估（P1 Phase 0）：CAS 成功后、commit 前，与状态 CAS 同事务。严格门 policy.enabled(idle) +
     // 防秒结束地板 min_world_ticks。终局条件本 Phase：引擎信号(MainlineDone/TimeCapReached/Starved) ∨
     // 世界时间上限(reached_time_limit)。命中 → end_world_tx 停机（幂等 WHERE running）→ Concluded。
@@ -1675,9 +1711,10 @@ async fn commit_tick(
             // rows>0 = 本 tick 真正结算 → Concluded + 终局产出（审计 + 荣誉奖励，同事务原子）；
             // rows==0 = 已被并发 tick 结算（幂等）→ 保持 Done、不重复产出。
             if end_world_tx(&mut tx, world_id, reason).await? > 0 {
-                let member_ids: Vec<String> =
-                    members.iter().map(|m| m.character_key.clone()).collect();
-                finalize_ending_tx(&mut tx, world_id, reason, ending, &member_ids).await?;
+                // (cid, user_id)：③ 世界线层产出发给卡的主人，故 user_id 必须一并带上。
+                let participants: Vec<(String, String)> =
+                    members.iter().map(|m| (m.character_key.clone(), m.user_id.clone())).collect();
+                finalize_ending_tx(&mut tx, world_id, reason, ending, &participants).await?;
                 final_status = TickStatus::Concluded;
             }
         }
@@ -1695,8 +1732,15 @@ async fn commit_tick(
     .execute(&mut *tx)
     .await?;
 
-    // 受众投影 + 落库（分配 per-world sequence）。
-    let projected = events::project_domain_events(&outcome.scene.events, members);
+    // 受众投影 + 内容安全第 2 层 + 落库（分配 per-world sequence）。
+    //
+    // 拦截点选在「投影之后、落库之前」：此处的 ProjectedEvent.summary 已是**面向用户的最终文本**
+    // （引擎 DomainEvent 的原始负载永不下发），比在引擎里拦更准；且整段仍在本事务内，与状态 CAS
+    // 同成同败——CAS 冲突回滚时打码与风控留痕一并消失，不产生「事实没落但险已记」的错位。
+    // 第 2 层是纯本地词表匹配（≈0 成本、无 IO），放事务内安全；**第 3 层语义分类是网络调用，
+    // 绝不能挪进来**（单连接池会死锁 PoolTimedOut，见 safety::moderate_runtime_projection 的 TODO）。
+    let mut projected = events::project_domain_events(&outcome.scene.events, members);
+    crate::safety::moderate_runtime_projection(&mut tx, world_id, &mut projected).await?;
     let stored = events::insert_events_tx(&mut tx, world_id, tick_no, &projected).await?;
 
     // Q-3：只消费本 tick 实际喂入的 accepted 干预（按 id 精确置 applied），不 blanket 标全部 accepted。

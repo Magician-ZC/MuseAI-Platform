@@ -260,7 +260,7 @@ function PromptGovernance() {
         cancelText="取消"
         width={640}
       >
-        <Alert type="info" showIcon style={{ marginBottom: 12 }} message="新版本默认未激活，不影响线上；需在列表中显式激活。" />
+        <Alert type="info" showIcon style={{ marginBottom: 12 }} title="新版本默认未激活，不影响线上；需在列表中显式激活。" />
         <Form form={form} layout="vertical" initialValues={{ scope: 'writer' }}>
           <Space size="large" style={{ display: 'flex' }}>
             <Form.Item name="scope" label="环节" rules={[{ required: true }]} style={{ flex: 1 }}>
@@ -286,7 +286,7 @@ function PromptGovernance() {
         {older && newer && (
           <>
             {older.scope !== newer.scope && (
-              <Alert type="warning" showIcon style={{ marginBottom: 12 }} message="所选两版本环节不同，diff 仅作文本对比参考。" />
+              <Alert type="warning" showIcon style={{ marginBottom: 12 }} title="所选两版本环节不同，diff 仅作文本对比参考。" />
             )}
             <Space style={{ marginBottom: 12 }}>
               <Tag color="red">- 旧：{older.version}</Tag>
@@ -416,7 +416,7 @@ function ModelRoutes() {
         <Button onClick={reload}>刷新</Button>
         <Button type="primary" onClick={() => setCreateOpen(true)}>新建路由版本</Button>
       </Space>
-      <Alert type="info" showIcon style={{ marginBottom: 16 }} message="全局单活跃路由：激活某版本即互斥切换；一键回滚 = 激活旧版本。" />
+      <Alert type="info" showIcon style={{ marginBottom: 16 }} title="全局单活跃路由：激活某版本即互斥切换；一键回滚 = 激活旧版本。" />
 
       {list.error && <ErrorAlert message={list.error} onRetry={reload} />}
 

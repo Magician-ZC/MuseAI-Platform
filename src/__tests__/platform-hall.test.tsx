@@ -48,6 +48,7 @@ describe('PlatformHall', () => {
         };
       }
       if (path === '/api/me/reports') return { reports: [], nextCursor: null };
+      if (path === '/api/me/notifications') return { notifications: [], nextCursor: null };
       throw new Error(`unexpected ${path}`);
     });
 
@@ -63,6 +64,7 @@ describe('PlatformHall', () => {
     fetchMock.mockImplementation(async (path: string) => {
       if (path.startsWith('/api/worlds?')) throw new TypeError('network down');
       if (path === '/api/me/reports') return { reports: [], nextCursor: null };
+      if (path === '/api/me/notifications') return { notifications: [], nextCursor: null };
       throw new Error(`unexpected ${path}`);
     });
 
@@ -90,6 +92,7 @@ describe('PlatformHall', () => {
         return { worlds: [world], nextCursor: 'cur-next' };
       }
       if (path === '/api/me/reports') return { reports: [], nextCursor: null };
+      if (path === '/api/me/notifications') return { notifications: [], nextCursor: null };
       throw new Error(`unexpected ${path}`);
     });
 
@@ -218,6 +221,7 @@ describe('PlatformHall', () => {
         };
       }
       if (path === '/api/assets/worlds/mine') return [];
+      if (path === '/api/me/notifications') return { notifications: [], nextCursor: null };
       if (path === '/api/worlds/w1/events') {
         return {
           events: [

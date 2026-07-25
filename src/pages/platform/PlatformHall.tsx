@@ -56,6 +56,32 @@ interface PublishedWorld {
   createdAt: number;
 }
 
+/** GET /api/me/notifications 的一条。payload 结构随 kind 而异，故按未知对象处理。 */
+interface NotificationItem {
+  id: string;
+  kind: string;
+  payload?: Record<string, unknown> | null;
+  status?: string;
+  createdAt: number;
+}
+
+/** 通知类型的中文名。取不到 payload 文案时回落到它，不臆造内容。 */
+const NOTIFICATION_KIND_TEXT: Record<string, string> = {
+  daily_report: '世界日报已生成',
+  consent_request: '有一个不可逆事件等待你的同意',
+  consent_reminder: '同意征询即将超时',
+};
+
+/** 从 payload 里取一条可读文案；字段名随 kind 而异，逐个试，都没有就回落 kind 中文名。 */
+function notificationText(item: NotificationItem): string {
+  const p = item.payload ?? {};
+  for (const key of ['summary', 'title', 'text', 'message']) {
+    const v = p[key];
+    if (typeof v === 'string' && v.trim()) return v;
+  }
+  return NOTIFICATION_KIND_TEXT[item.kind] ?? '你有一条新通知';
+}
+
 const DEMO_WORLDS: WorldSummary[] = [
   {
     id: 'mist-sea-age',
@@ -136,6 +162,11 @@ const DEMO_EVENTS: WorldEventItem[] = [
     projection: { summary: '静止山脉东麓的古道被发现。探索队在碎石封闭的古道旁发现了仍在运转的星象装置。' },
     occurredAt: Date.UTC(2026, 6, 25, 5, 7),
   },
+];
+
+const DEMO_NOTIFICATIONS: NotificationItem[] = [
+  { id: 'ntf_1', kind: 'daily_report', payload: { summary: '「雾海纪元」第 12 拍日报已生成' }, createdAt: 0 },
+  { id: 'ntf_2', kind: 'consent_request', payload: { summary: '林昭的决斗请求等待你的同意' }, createdAt: 0 },
 ];
 
 const DEMO_PUBLISHED: PublishedWorld[] = [
@@ -266,6 +297,7 @@ const PlatformHall: React.FC = () => {
   const [searchText, setSearchText] = useState(worldsQuery);
   const [events, setEvents] = useState<WorldEventItem[]>([]);
   const [publishedWorlds, setPublishedWorlds] = useState<PublishedWorld[]>([]);
+  const [notifications, setNotifications] = useState<NotificationItem[]>([]);
 
   useEffect(() => {
     if (previewMode) return;
@@ -287,6 +319,27 @@ const PlatformHall: React.FC = () => {
       })
       .catch(() => {
         if (!cancelled) setPublishedWorlds([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [previewMode]);
+
+  // 站内通知（设计文档 §6「必要的账号提示」）。端点 GET /api/me/notifications 是现成的，
+  // 返回 {id, kind, payload, status, createdAt}——payload 结构随 kind 而异，故只取能稳定拿到的
+  // 文案字段，取不到就回落 kind 的中文名，不臆造内容。
+  useEffect(() => {
+    if (previewMode) {
+      setNotifications(DEMO_NOTIFICATIONS);
+      return;
+    }
+    let cancelled = false;
+    cloudFetch<{ notifications: NotificationItem[] }>('/api/me/notifications')
+      .then((data) => {
+        if (!cancelled) setNotifications((data.notifications ?? []).slice(0, 3));
+      })
+      .catch(() => {
+        if (!cancelled) setNotifications([]);
       });
     return () => {
       cancelled = true;
@@ -533,6 +586,24 @@ const PlatformHall: React.FC = () => {
               </div>
             ) : (
               <p className="related-empty">投放角色后，与你相关的羁绊会出现在这里。</p>
+            )}
+          </section>
+
+          <section className="related-section">
+            <h3>最新通知</h3>
+            {notifications.length > 0 ? (
+              <ul className="notification-list">
+                {notifications.map((item) => (
+                  <li key={item.id}>
+                    <span className="notification-text">{notificationText(item)}</span>
+                    {item.createdAt > 0 && (
+                      <time dateTime={new Date(item.createdAt).toISOString()}>{relativeTime(item.createdAt)}</time>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="related-empty">暂时没有新通知。</p>
             )}
           </section>
 

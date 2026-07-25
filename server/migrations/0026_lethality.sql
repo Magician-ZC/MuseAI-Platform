@@ -1,0 +1,24 @@
+-- MuseAI 平台库 0026（R1：生死契约三档 · 世界级风险维度）。
+-- 总规格 §11【拍板 24】「星级 × 历练 × 生死契约（三维正交）」：契约档是**独立于星级的新维度**，
+-- 星级 = 内容规格档位（0020）· 历练 = 参与产出（0019）· 本列 = 世界的死亡规则档。
+--
+-- 枚举值（与引擎 `muse_engine::narrative::types::Lethality` 的 serde camelCase 逐字对齐）：
+--   'sanctuary'  庇护世界   —— 死亡不可能：致死行动在场景写作前被引擎降级为重伤/退场
+--   'consent'    同意制世界 —— 现行机制：不可逆事件当事人临场同意，超时保守门控（**默认**）
+--   'deathmatch' 生死状世界 —— 入场即签、事后不再临场征询；死亡判定仍受仲裁叙事合理性硬约束
+--                              （IrreversibleRules 不变，取消的是被杀者否决权，不是裁判）
+--
+-- 默认值语义（未验证功能默认关闭，VALIDATION.md §0.1）：
+--   DEFAULT 'consent' → **全部历史世界行落到同意制**，即现行机制，行为零变化。
+--   生死状档另有进程级运营开关（worlds::deathmatch_enabled，默认关闭）：开关未开时，
+--   即便本列存 'deathmatch' 也在**读取侧**降级为同意制（join 契约门与引擎回灌同源），
+--   故本列落库值只表达"建房方的意图"，是否真的生效由运营开关裁定。
+--
+-- 未成年禁入生死状（真红线 §0.4）在 join 侧把守（worlds::join_world 读 users.age_declared，
+-- 年龄未知按未成年处理），不在本层用约束表达——数据库无法看见"谁在入场"。
+--
+-- 双库可移植子集（db.rs 约定）：单列 ADD COLUMN + NOT NULL DEFAULT，SQLite/Postgres 通用，
+-- 无 CHECK 约束（枚举合法性在应用层归一：非法值一律读作 consent，见 worlds::effective_lethality）。
+-- SQLite 不支持单条 ALTER 多列，故本迁移只加一列。
+
+ALTER TABLE worlds ADD COLUMN lethality TEXT NOT NULL DEFAULT 'consent';

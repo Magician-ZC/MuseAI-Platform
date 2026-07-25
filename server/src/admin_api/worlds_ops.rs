@@ -12,7 +12,10 @@ use crate::app::AppState;
 use crate::auth::{AdminUser, AuthUser};
 use crate::db::{new_id, now_ms};
 use crate::error::ApiError;
-use crate::worlds::{create_world as create_world_inner, load_world, CreateWorldParams};
+use crate::worlds::{
+    create_world as create_world_inner, deathmatch_enabled, is_valid_lethality, load_world,
+    CreateWorldParams, LETHALITY_DEATHMATCH,
+};
 
 use super::dashboards::{cents_to_cny, tokens_to_cents, utc_day_start_ms, DAY_MS};
 use super::{audit, clamp_limit, parse_cursor, require_role, ActionQuery};
@@ -330,6 +333,10 @@ pub(super) async fn diagnostics(
             "modelRouteVersion": world.model_route_version,
             "templateId": world.template_id,
             "templateVersion": world.template_version,
+            // 生死契约档（§11）：lethality = 落库原值（建房意图）；effectiveLethality = 实际生效档。
+            // 二者不一致即「运营开关正在把生死状降级为同意制」，运营一眼可辨急停阀是否生效。
+            "lethality": world.lethality,
+            "effectiveLethality": crate::worlds::lethality_label(&world.lethality),
         },
         "ticks": ticks,
         "budget": budget_json,
@@ -410,6 +417,14 @@ pub(super) struct CreateWorldReq {
     timeline_mode: Option<String>,
     /// 平台指派主播：赛事房（arena）必须指定；idle/chapter 可选。
     host_user_id: Option<String>,
+    /// 生死契约档（总规格 §11【拍板 24】）：'sanctuary' | 'consent' | 'deathmatch'。
+    /// 省略 = consent（同意制，现行机制，老行为不变）。
+    ///
+    /// **由运营显式指定，星级不自动决定档位**：规格给的「1-2★ 庇护 / 3★ 同意制 / 4-5★ 生死状可选、
+    /// 官方赛事强制」是默认映射建议，规格同时明确要求"可分离、可配置"——同一星级要能同时开
+    /// 庇护场与生死场（同剧情、不同契约、不同产出表），把映射写成代码规则会直接堵死这个产品形态。
+    /// 故此处不做任何星级联动，只收显式入参。
+    lethality: Option<String>,
 }
 
 fn default_template_version() -> i64 {
@@ -488,19 +503,39 @@ pub(super) async fn create_world(
         }
         p.host_user_id = Some(h);
     }
+    if let Some(l) = req.lethality {
+        if !is_valid_lethality(&l) {
+            return Err(ApiError::BadRequest(
+                "lethality 非法（仅 sanctuary/consent/deathmatch）".into(),
+            ));
+        }
+        // 🔴 未验证功能默认关闭（VALIDATION.md §0.1）：生死状档是待验证的默认策略，
+        // 代码合并不等于对用户开放——必须运营先打开开关（MUSE_LETHALITY_DEATHMATCH），才允许建生死场。
+        // 建房这一道是"前门拒绝"（建不出来），读取侧 worlds::effective_lethality 还有一道
+        // "后门降级"（开关关掉后既有生死场立即按同意制跑），两道都在，开关才是真的急停阀。
+        if l == LETHALITY_DEATHMATCH && !deathmatch_enabled() {
+            return Err(ApiError::BadRequest(
+                "生死状档尚未开启：该档属未验证功能，需运营先显式打开开关（MUSE_LETHALITY_DEATHMATCH）后方可建生死场"
+                    .into(),
+            ));
+        }
+        p.lethality = l;
+    }
     if p.room_type == "arena" && p.host_user_id.is_none() {
         return Err(ApiError::BadRequest(
             "赛事房（arena）必须指定 hostUserId（平台指派主播）".into(),
         ));
     }
+    // 建房留痕带上契约档：生死场是高风险配置，"谁在什么时候把哪个世界建成生死场"必须可溯。
     let host_note = match &p.host_user_id {
-        Some(h) => format!("official world, host={h}"),
-        None => "official world".to_string(),
+        Some(h) => format!("official world, host={h}, lethality={}", p.lethality),
+        None => format!("official world, lethality={}", p.lethality),
     };
 
+    let lethality = p.lethality.clone();
     let world_id = create_world_inner(&state.db, p).await?;
     audit(&state.db, &admin.0, "world.create", &world_id, &host_note).await?;
-    Ok(Json(json!({ "worldId": world_id })))
+    Ok(Json(json!({ "worldId": world_id, "lethality": lethality })))
 }
 
 // ---------------- 世界模板库 ----------------

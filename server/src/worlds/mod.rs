@@ -32,8 +32,123 @@ use crate::db::{new_id, now_ms};
 use crate::error::ApiError;
 use crate::idempotency;
 
+use muse_engine::narrative::types::Lethality;
+
 #[cfg(test)]
 mod tests;
+
+// ---------- 生死契约三档（总规格 §11【拍板 24】）：枚举归一 + 运营开关 ----------
+
+/// 落库枚举值：庇护世界（死亡不可能，引擎写作前降级致死行动）。
+pub const LETHALITY_SANCTUARY: &str = "sanctuary";
+/// 落库枚举值：同意制世界（**默认**，现行机制——不可逆事件当事人临场同意，超时保守）。
+pub const LETHALITY_CONSENT: &str = "consent";
+/// 落库枚举值：生死状世界（入场即签，事后不再临场征询；仲裁硬约束不变）。
+pub const LETHALITY_DEATHMATCH: &str = "deathmatch";
+
+/// 生死状档运营开关环境变量。
+const ENV_DEATHMATCH_ENABLED: &str = "MUSE_LETHALITY_DEATHMATCH";
+/// 生死状档默认值 = **关闭**。
+///
+/// 🔴 VALIDATION.md §0.1「未验证功能默认关闭」：永久死亡是待验证的默认策略（不是红线），
+/// 且 §2 的阶段计划把生死状明确排在 T2「暂不验证」之后。因此代码合并不等于对用户开放——
+/// 必须运营显式打开本开关，生死状档才可能生效。
+const DEFAULT_DEATHMATCH_ENABLED: bool = false;
+
+/// 生死状档是否已由运营开启（env 覆盖 + 默认常量，范式同 `runtime::token_cny_cents_per_1k`
+/// 与 `interventions::dream_quota_per_stage`——本仓库尚无配置表，env 是当前唯一的运营开关形态；
+/// 将来配置表落地后只改本函数内部，调用点与降级语义不变）。
+///
+/// 开关的定位是**全局急停阀**，不是建房时的一次性校验：它在**读取侧**生效
+/// （`effective_lethality`），故关掉之后所有已建的生死状世界**立即**降级为同意制
+/// （join 不再要求签署、引擎收到 Consent），再打开则原样恢复。
+pub fn deathmatch_enabled() -> bool {
+    match std::env::var(ENV_DEATHMATCH_ENABLED) {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "on" | "yes" => true,
+            "0" | "false" | "off" | "no" => false,
+            // 配错不静默开启高危档：回落默认（关闭）。
+            _ => DEFAULT_DEATHMATCH_ENABLED,
+        },
+        Err(_) => DEFAULT_DEATHMATCH_ENABLED,
+    }
+}
+
+/// 测试专用：生死状运营开关的 RAII 夹具。
+///
+/// `MUSE_LETHALITY_DEATHMATCH` 是**进程级** env，而 worlds 与 admin_api 的用例同属一个测试二进制、
+/// 默认并发跑，故所有对开关敏感的用例共用**同一把锁**串行化（跨模块可见，故定义在这里而非某个
+/// tests 子模块），并在 Drop 时把 env 恢复原状——一个用例绝不把开关状态留给下一个用例。
+/// （锁中毒也照常取用，不阻塞后续用例；范式同 `interventions` 的 QUOTA_ENV_LOCK。）
+#[cfg(test)]
+pub(crate) struct DeathmatchSwitch {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    prev: Option<String>,
+}
+
+#[cfg(test)]
+impl DeathmatchSwitch {
+    /// 取锁并把开关置为 on/off；返回值存活期间开关状态稳定。
+    pub(crate) fn set(on: bool) -> Self {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var(ENV_DEATHMATCH_ENABLED).ok();
+        std::env::set_var(ENV_DEATHMATCH_ENABLED, if on { "1" } else { "0" });
+        Self { _guard: guard, prev }
+    }
+}
+
+#[cfg(test)]
+impl Drop for DeathmatchSwitch {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(v) => std::env::set_var(ENV_DEATHMATCH_ENABLED, v),
+            None => std::env::remove_var(ENV_DEATHMATCH_ENABLED),
+        }
+    }
+}
+
+/// 契约档字符串是否为合法枚举值（建房入参校验用）。
+pub fn is_valid_lethality(raw: &str) -> bool {
+    matches!(raw, LETHALITY_SANCTUARY | LETHALITY_CONSENT | LETHALITY_DEATHMATCH)
+}
+
+/// 落库字符串 → **生效**契约档（引擎入参）。join 契约门与 runtime 回灌共用这一个函数，
+/// 保证"玩家签的那一档"与"引擎跑的那一档"永远同源，不会一边签生死状一边跑同意制。
+///
+/// 两处降级（方向恒为更保守，绝不反向）：
+/// - 非法/未知值（脏数据、未来枚举回滚）→ `Consent`：默认档即现行机制，不放大死亡权限。
+/// - `deathmatch` 但运营开关未开 → `Consent`：未验证功能默认关闭（VALIDATION.md §0.1）。
+pub fn effective_lethality(stored: &str) -> Lethality {
+    match stored {
+        LETHALITY_SANCTUARY => Lethality::Sanctuary,
+        LETHALITY_DEATHMATCH if deathmatch_enabled() => Lethality::Deathmatch,
+        // deathmatch 但开关未开 → 降级；其余（consent / 非法值）→ 默认档。
+        _ => Lethality::Consent,
+    }
+}
+
+/// 生效契约档的 JSON 投影值（字面量与落库枚举一致）。大厅/详情把它明示给玩家——
+/// 「join 前明示」（规格 §11）的前提是**列表页与详情页看得见档位**，冷静提示由前端据此渲染。
+/// 投影的是**生效档**而非落库原值：开关未开时玩家看到的就是同意制，所见即所签。
+pub fn lethality_label(stored: &str) -> &'static str {
+    match effective_lethality(stored) {
+        Lethality::Sanctuary => LETHALITY_SANCTUARY,
+        Lethality::Consent => LETHALITY_CONSENT,
+        Lethality::Deathmatch => LETHALITY_DEATHMATCH,
+    }
+}
+
+/// 落库前的防御式归一化：非法值兜底为 `consent`（默认行为零变化）。
+/// **不在此处应用运营开关**——落库值表达建房方意图，是否生效由读取侧 `effective_lethality` 裁定，
+/// 这样开关才是可逆的急停阀而非一次性阉割。
+fn normalize_lethality(raw: &str) -> &str {
+    if is_valid_lethality(raw) {
+        raw
+    } else {
+        LETHALITY_CONSENT
+    }
+}
 
 /// 世界行（worlds 表投影，runtime 复用）。
 #[derive(Debug, Clone)]
@@ -64,6 +179,10 @@ pub struct WorldRow {
     /// 保留供后续 Phase/展示层读「当前游戏时刻」而不必反序列化整份 narrative_state_json。
     #[allow(dead_code)]
     pub game_time: i64,
+    /// 生死契约档**落库原值**（'sanctuary' | 'consent' | 'deathmatch'，0026）：建房方意图。
+    /// 消费方一律经 `effective_lethality(&row.lethality)` 换算生效档（含运营开关降级），
+    /// 不要直接字符串比较——那会绕过急停阀。
+    pub lethality: String,
 }
 
 fn map_world(row: &sqlx::any::AnyRow) -> Result<WorldRow, ApiError> {
@@ -86,6 +205,7 @@ fn map_world(row: &sqlx::any::AnyRow) -> Result<WorldRow, ApiError> {
         assembled_json: row.try_get("assembled_json")?,
         timeline_mode: row.try_get("timeline_mode")?,
         game_time: row.try_get("game_time")?,
+        lethality: row.try_get("lethality")?,
     })
 }
 
@@ -152,6 +272,8 @@ fn world_list_item(row: &sqlx::any::AnyRow, id: &str) -> Result<Value, ApiError>
         "memberCount": row.try_get::<i64, _>("member_count")?,
         "tickPerDay": row.try_get::<i64, _>("tick_per_day")?,
         "starRating": row.try_get::<i64, _>("star_rating")?,
+        // 生死契约档（§11）：与 starRating 并列的独立维度，供大厅筛选「选难度 = 选星级 × 选契约」。
+        "lethality": lethality_label(&row.try_get::<String, _>("lethality")?),
         "aiLabel": { "visible": true },
     }))
 }
@@ -186,7 +308,7 @@ async fn list_worlds_new(
     let page = params.limit.unwrap_or(20).clamp(1, 100);
     // 仅可见世界：open/running 且 official/public。
     let mut sql = format!(
-        "SELECT id, room_type, title, status, visibility, member_limit, tick_per_day, created_at, \
+        "SELECT id, room_type, title, status, visibility, member_limit, tick_per_day, created_at, lethality, \
          (SELECT COUNT(*) FROM world_members m WHERE m.world_id = worlds.id AND m.status='active') AS member_count, \
          {STAR_RATING_SUBQUERY} \
          FROM worlds \
@@ -251,7 +373,7 @@ async fn list_worlds_hot(
     // SUM 可移植性：CAST(COALESCE(SUM(x),0) AS BIGINT)（先例 admin_api/reconcile.rs）；
     // 整体分再 CAST 一次，保证双库返回 BIGINT。gift_events 表恒存在（迁移不随 feature 门控）。
     let mut sql = format!(
-        "SELECT id, room_type, title, status, visibility, member_limit, tick_per_day, created_at, \
+        "SELECT id, room_type, title, status, visibility, member_limit, tick_per_day, created_at, lethality, \
          (SELECT COUNT(*) FROM world_members m WHERE m.world_id = worlds.id AND m.status='active') AS member_count, \
          {STAR_RATING_SUBQUERY}, \
          CAST( \
@@ -361,6 +483,12 @@ async fn world_detail(
         "memberCount": roster.len(),
         "tickPerDay": world.tick_per_day,
         "starRating": star_rating,
+        // 生死契约档（§11【拍板 24】）：与星级正交的风险维度。**join 前明示**的载体——
+        // 前端据此在投放前渲染档位说明与冷静提示；生死状档还须玩家二次确认（见 join 的 acceptDeathContract）。
+        "lethality": lethality_label(&world.lethality),
+        // 生死状世界的入场契约要求（客户端不必硬编码规则）：true 时 join 必须带 acceptDeathContract=true，
+        // 且仅已声明成年（真红线 §0.4 未成年禁入生死状）可入。
+        "deathContractRequired": lethality_label(&world.lethality) == LETHALITY_DEATHMATCH,
         // 客户端干预用 expectedWorldRevision 做乐观并发校验（C1 集成缝）。
         "stateRevision": world.state_revision,
         "templateId": world.template_id,
@@ -422,6 +550,11 @@ struct JoinRequest {
     cloud_character_id: String,
     #[serde(default)]
     boundary: Value,
+    /// 生死状二次确认（§11【拍板 24】「入场二次确认 + 冷静提示」）。
+    /// **仅生死状世界要求为 true**；庇护/同意制世界忽略本字段（缺省 false，老客户端零影响）。
+    /// 缺确认一律拒绝——签生死状这件事绝不默认代签。
+    #[serde(default)]
+    accept_death_contract: bool,
 }
 
 async fn join_world(
@@ -469,6 +602,35 @@ async fn join_world(
     }
     if withdrawn != 0 {
         return Err(ApiError::Conflict("character_withdrawn".into()));
+    }
+
+    // ---------- 生死契约入场门（§11【拍板 24】，与星级/历练三维正交） ----------
+    // 生效档由落库值经运营开关归一：开关未开的生死状降级为同意制 → 本段整体跳过。
+    // 庇护/同意制世界（含**全部历史世界**，0026 默认 'consent'）本段零动作，行为与历史完全一致。
+    let lethality = effective_lethality(&world.lethality);
+    if lethality == Lethality::Deathmatch {
+        // 🔴 真红线 §0.4 未成年人保护：**未成年禁入生死状**。
+        // fail-closed：仅 age_declared==1（已声明成年）放行；未声明(0)、未成年(2)、用户行缺失
+        // 一律 403 —— **年龄未知按未成年处理**，无法可靠判断年龄前绝不放行（口径与 billing 保守拒充一致，
+        // 堵住"只拦已声明的未成年"这种空防）。声明入口：POST /auth/age-declaration。
+        // 用 403（而非本端点资格类拒绝惯用的 409）：这是永久禁入而非可解冲突，重试不可能通过；
+        // 语义与既有红线先例（billing 拒充）逐字一致。前端已从世界详情拿到 deathContractRequired，
+        // 可在投放前就把「未成年不可进入生死状世界」讲清楚，不必依赖本响应体文案。
+        let age: Option<(i64,)> = sqlx::query_as("SELECT age_declared FROM users WHERE id = ?")
+            .bind(&user.user_id)
+            .fetch_optional(&state.db)
+            .await?;
+        if !matches!(age, Some((1,))) {
+            return Err(ApiError::Forbidden);
+        }
+        // 入场即签：明示在前（详情页 lethality/deathContractRequired），确认在此。
+        if !body.accept_death_contract {
+            return Err(ApiError::Conflict(
+                "这是生死状世界：入场即签生死状，你的角色可能真的死去，事后不再逐次征询同意。\
+                 请确认知情后带 acceptDeathContract=true 重新投放"
+                    .into(),
+            ));
+        }
     }
 
     // 历练准入（波次 3 星级门槛，与防自刷同为投放资格校验）：模板 star≥3 时要求**本次投放的卡**
@@ -562,6 +724,9 @@ async fn join_world(
     // C-4：人数上限原子化。旧实现是 count→check→insert 的 TOCTOU（唯一索引只挡同角色重复，挡不住并发凑满）。
     // 改为「带人数子查询守卫的条件写」：limit 判定与写入在同一条语句里求值，rows_affected==0 即满员。
     // （sqlite 语句级原子；postgres 同快照下将 TOCTOU 窗口收敛到单语句，配合唯一索引把越额上限收敛到并发不同角色数。）
+    // 本次调用是否真的把一张卡投放进场（新投放 / 复活）。已 active 的幂等重放为 false ——
+    // 生死状签署留痕只认真实入场，重放不重复留痕。
+    let mut entered_now = false;
     let membership_id: String = if let Some(m) = existing {
         let mid: String = m.try_get("id")?;
         let mstatus: String = m.try_get("status")?;
@@ -583,6 +748,7 @@ async fn join_world(
             if res.rows_affected() == 0 {
                 return Err(ApiError::Conflict("world_full".into()));
             }
+            entered_now = true;
         }
         // 已 active：幂等，无需再判上限。
         mid
@@ -606,19 +772,42 @@ async fn join_world(
         .await;
         match res {
             Ok(r) if r.rows_affected() == 0 => return Err(ApiError::Conflict("world_full".into())),
-            Ok(_) => {}
-            // 并发下同角色抢插：唯一索引兜底 → 视为已在场（幂等成功）。
+            Ok(_) => entered_now = true,
+            // 并发下同角色抢插：唯一索引兜底 → 视为已在场（幂等成功），非本次入场，不留痕。
             Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {}
             Err(e) => return Err(e.into()),
         }
         mid
     };
 
+    // 生死状签署留痕（§0.2「资产单一写入路径与全链审计」的同一口径：高风险不可逆授权必须可溯）。
+    // 每次真实入场落一条 audit_logs——"谁、哪张卡、什么时候、在哪个世界签了生死状"，
+    // 事后死亡争议与未成年申诉都靠这条痕对质。actor_role 记 'user'（玩家自签，非运营代操作）。
+    // 位置在成员写入之后：被人数上限/资格门拒掉的请求不会留下"签过"的假痕。
+    if lethality == Lethality::Deathmatch && entered_now {
+        sqlx::query(
+            "INSERT INTO audit_logs (id, actor_id, actor_role, action, subject, reason, created_at) \
+             VALUES (?, ?, 'user', 'world.death_contract_signed', ?, ?, ?)",
+        )
+        .bind(new_id("aud"))
+        .bind(&user.user_id)
+        .bind(&id)
+        .bind(format!(
+            "lethality=deathmatch|character={}|membership={}",
+            body.cloud_character_id, membership_id
+        ))
+        .bind(now_ms())
+        .execute(&state.db)
+        .await?;
+    }
+
     let response = json!({
         "membershipId": membership_id,
         "worldId": id,
         "cloudCharacterId": body.cloud_character_id,
         "status": "active",
+        // 回执明示本次入场生效的契约档（生死状时即"你已签署"的凭据面）。
+        "lethality": lethality_label(&world.lethality),
     });
     guard.store_response(&state.db, &response.to_string()).await?;
     Ok(Json(response))
@@ -674,6 +863,13 @@ pub struct CreateWorldParams {
     pub status: Option<String>,
     /// 时间线模式：'interval'（默认）或 'event'（放置房 DES）。落 worlds.timeline_mode 列，供调度分派。
     pub timeline_mode: String,
+    /// 生死契约档：'sanctuary' | 'consent'（默认）| 'deathmatch'。落 worlds.lethality 列（0026）。
+    ///
+    /// **由建房方显式指定，星级不自动决定档位**（规格 §11 的「1-2★ 庇护 / 3★ 同意制 / 4-5★ 生死状可选」
+    /// 是运营默认映射建议，明确要求"可分离、可配置"）：星级 = 内容规格，契约 = 风险档，两维正交，
+    /// 同一星级可同时开庇护场与生死场（"选难度 = 选星级 × 选生死契约"）。把映射写死成代码规则
+    /// 会直接堵死这个产品形态，故本层只收显式入参；缺省 = 同意制（现行机制，行为零变化）。
+    pub lethality: String,
     pub engine_version: Option<String>,
     pub prompt_set_version: Option<String>,
     pub model_route_version: Option<String>,
@@ -701,6 +897,8 @@ impl CreateWorldParams {
             daily_cny_budget_cents: 2_000,
             status: None,
             timeline_mode: "interval".into(),
+            // 默认同意制 = 现行机制（未验证功能默认关闭）：不显式指定就没有任何行为变化。
+            lethality: LETHALITY_CONSENT.into(),
             engine_version: None,
             prompt_set_version: None,
             model_route_version: None,
@@ -748,12 +946,15 @@ pub async fn create_world_tx(tx: &mut Transaction<'_, Any>, p: CreateWorldParams
     } else {
         "interval"
     };
+    // 同上：admin 入口已做枚举校验 + 运营开关校验，此处仅兜非法值 → consent，
+    // 保证落库的 lethality 恒为合法枚举（房主建房路径不暴露本参数，恒取默认同意制）。
+    let lethality = normalize_lethality(&p.lethality);
 
     sqlx::query(
         "INSERT INTO worlds (id, template_id, template_version, engine_version, prompt_set_version, \
          model_route_version, room_type, title, status, visibility, host_user_id, member_limit, \
-         tick_per_day, timeline_mode, assembled_json, state_revision, narrative_state_json, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+         tick_per_day, timeline_mode, lethality, assembled_json, state_revision, narrative_state_json, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&p.template_id)
@@ -769,6 +970,7 @@ pub async fn create_world_tx(tx: &mut Transaction<'_, Any>, p: CreateWorldParams
     .bind(p.member_limit)
     .bind(p.tick_per_day)
     .bind(timeline_mode)
+    .bind(lethality)
     .bind(&p.assembled_json)
     .bind(p.initial_state_json.unwrap_or_else(|| "{}".into()))
     .bind(now)
@@ -910,6 +1112,9 @@ async fn create_room(
         daily_cny_budget_cents: 2_000,
         status: None,
         timeline_mode: "interval".into(),
+        // 房主建房暂不开放契约档选择：自定义房沿用同意制（规格 §11 的生死状先在官方场验证，
+        // 玩家自建生死场需先有房主侧的明示/确认/未成年门 UI 与运营审核，属后续波次）。
+        lethality: LETHALITY_CONSENT.into(),
         engine_version: None,
         prompt_set_version: None,
         model_route_version: None,

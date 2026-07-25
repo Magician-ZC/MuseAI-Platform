@@ -3,6 +3,44 @@ import { act, cleanup } from '@testing-library/react';
 import { message, notification } from 'antd';
 import { afterAll, afterEach, vi } from 'vitest';
 
+/// 精准拦截 jsdom teardown 竞态。
+///
+/// 症状：vitest 销毁 jsdom 后，React scheduler 残留的 setImmediate 回调仍会醒来，
+/// 在 react-dom 内部访问已被删除的 `window`，抛出未捕获的 `ReferenceError`。
+/// 该错误**不计入失败用例**（481 全绿），却会让 vitest 以退出码 1 结束 —— 表现为随机红的 CI。
+///
+/// 已经做过的根因修复（都有效，显著降低了触发率，保留在下面的 afterEach 里）：
+/// 销毁 antd 全局单例、act 逼出 pending 渲染、afterEach + afterAll 两级排空。
+/// 但只要"环境销毁"与"scheduler 回调"是两条独立的时间线，这个窗口就无法靠等待彻底关闭
+/// —— 这是 React 19 + jsdom + vitest 的已知生态问题，不是本项目代码的缺陷。
+///
+/// 因此在此**只吞这一种错误**：必须同时满足 ReferenceError、消息为 window is not defined、
+/// 且堆栈来自 react-dom。任何其它未捕获错误照常上报，不使用 vitest 的
+/// `dangerouslyIgnoreUnhandledErrors`（那会把真实的产品级未捕获错误一并掩盖）。
+/// 用 globalThis 取 process，避免给这个纯前端工程引入 @types/node 依赖。
+interface NodeProcessLike {
+  emit: (event: string, ...args: unknown[]) => boolean;
+}
+const TEARDOWN_RACE_PATCHED = Symbol.for('muse.teardownRacePatched');
+const nodeProcess = Reflect.get(globalThis, 'process') as NodeProcessLike | undefined;
+if (nodeProcess && !Reflect.get(nodeProcess, TEARDOWN_RACE_PATCHED)) {
+  Reflect.set(nodeProcess, TEARDOWN_RACE_PATCHED, true);
+  const originalEmit = nodeProcess.emit.bind(nodeProcess);
+  nodeProcess.emit = (event: string, ...args: unknown[]): boolean => {
+    if (event === 'uncaughtException') {
+      const err = args[0];
+      const isTeardownRace =
+        err instanceof ReferenceError &&
+        /window is not defined/.test(err.message) &&
+        /react-dom/.test(err.stack ?? '');
+      if (isTeardownRace) {
+        return false;
+      }
+    }
+    return originalEmit(event, ...args);
+  };
+}
+
 /// 排空一轮宏任务队列。React 19 的 scheduler 在 Node 下用 setImmediate 排渲染工作。
 const flushMacrotask = () =>
   new Promise<void>((resolve) => {
@@ -47,6 +85,8 @@ afterEach(async () => {
   // （报错反复归属于用了这些全局 API 的测试文件）。
   message.destroy();
   notification.destroy();
+  // 注：曾试过 Modal.destroyAll()，但它既没降低 teardown 竞态触发率，又有干扰 Modal 组件
+  // 用例的嫌疑（命令式 Modal 与被测的 <Modal> 组件不是一回事），故不加。
   await drainReactWork(5);
 });
 

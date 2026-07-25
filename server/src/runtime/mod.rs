@@ -25,14 +25,14 @@ use crate::db::{new_id, now_ms};
 use crate::error::ApiError;
 use crate::events::{self, ProjectionMember, WsMessage};
 use crate::queue;
-use crate::worlds::{load_world, WorldRow};
+use crate::worlds::{effective_lethality, load_world, WorldRow};
 
 use muse_engine::character::types::CharacterCardV2;
 use muse_engine::host::{CancelFlag, EngineEvent, EngineHost, HostEvents, HostFs, StdFs, SystemClock};
 use muse_engine::model::{HttpModelClient, ModelClient, ModelProfile};
 use muse_engine::narrative::types::{
-    CharacterState, ConstraintLevel, DomainEvent, DomainEventType, ForbiddenPredicate, Lethality,
-    LocationDef, NarrativeState, NodeStatus, OutlineNode, RoundBudget, RunMode,
+    CharacterState, ConstraintLevel, DomainEvent, DomainEventType, ForbiddenPredicate, LocationDef,
+    NarrativeState, NodeStatus, OutlineNode, RoundBudget, RunMode,
 };
 use muse_engine::narrative::{ModelRoutes, NarrativeEngine, NarrativePrompts, RoundInput, Terminal};
 
@@ -1527,12 +1527,12 @@ async fn process_tick_inner(
             now_hint: 0,
             // 僵局打破提示（B）：连续 blocked ≥ 阈值时携带最近原因，None = 无僵局（默认路径零变化）。
             stall_hint: stall_hint.clone(),
-            // R1 生死契约三档（总规格 §11）：引擎已具备三档能力，server 侧尚未落 worlds.lethality 列，
-            // 故恒传默认档 = 同意制（现行机制：不可逆事件当事人临场同意，超时保守）。
-            // 待 worlds 表加 lethality 列 + join 契约签署落地后，此处改为从世界行回灌。
-            // 未验证功能默认关闭（VALIDATION.md §0.1）：在契约签署与未成年准入门就位前，
-            // 生死状档不得对任何世界生效。
-            lethality: Lethality::default(),
+            // R1 生死契约三档（总规格 §11【拍板 24】）：从世界行 `worlds.lethality`（0026）回灌。
+            // `effective_lethality` 与 join 契约门是**同一个函数**——玩家签的那一档就是引擎跑的那一档，
+            // 不可能出现"签了生死状却跑同意制"或反过来的错配。
+            // 两处保守降级都在该函数内：非法/未知值 → 同意制；生死状但运营开关未开 → 同意制
+            //（未验证功能默认关闭，VALIDATION.md §0.1）。历史世界落库即 'consent'，行为零变化。
+            lethality: effective_lethality(&world.lethality),
         };
         let cancel = CancelFlag::new();
         // 时间线模式分派（第二块 Phase 2）：event 世界走 DES 调度器 run_event_step（内部做 cohort 过滤 +

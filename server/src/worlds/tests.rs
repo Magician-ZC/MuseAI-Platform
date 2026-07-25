@@ -856,6 +856,383 @@ async fn published_identical_pristine_cards_collide_on_join() {
     );
 }
 
+// ==================== R1 生死契约三档（总规格 §11【拍板 24】）====================
+
+mod lethality {
+    //! 契约档三维正交的 server 侧接线：迁移默认 · join 契约签署 · 未成年红线 · 运营开关 · 引擎回灌。
+    use super::*;
+    use crate::worlds::{
+        deathmatch_enabled, effective_lethality, lethality_label, DeathmatchSwitch,
+        LETHALITY_CONSENT, LETHALITY_DEATHMATCH, LETHALITY_SANCTUARY,
+    };
+    use muse_engine::narrative::types::Lethality;
+
+    /// 造用户并指定年龄声明（0 未声明 / 1 成年 / 2 未成年）——顶层 `seed_user` 恒落 0。
+    async fn seed_user_age(state: &AppState, id: &str, age: i64) {
+        sqlx::query(
+            "INSERT INTO users (id, nickname, age_declared, status, created_at, updated_at) \
+             VALUES (?, '', ?, 'active', ?, ?)",
+        )
+        .bind(id)
+        .bind(age)
+        .bind(now_ms())
+        .bind(now_ms())
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+
+    /// 建一个指定契约档的世界（走内部建房，不经 admin 开关校验——落库值即建房意图）。
+    async fn seed_world_with(state: &AppState, title: &str, lethality: &str) -> String {
+        let mut p = CreateWorldParams::official("tpl", 1, title);
+        p.lethality = lethality.into();
+        create_world(&state.db, p).await.unwrap()
+    }
+
+    async fn stored_lethality(state: &AppState, wid: &str) -> String {
+        sqlx::query_scalar::<_, String>("SELECT lethality FROM worlds WHERE id = ?")
+            .bind(wid)
+            .fetch_one(&state.db)
+            .await
+            .unwrap()
+    }
+
+    async fn sign_audit_count(state: &AppState, wid: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM audit_logs WHERE action='world.death_contract_signed' AND subject=?",
+        )
+        .bind(wid)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+    }
+
+    // ---------- 迁移 0026：默认档 = 同意制，历史世界行为零变化 ----------
+
+    #[tokio::test]
+    async fn migration_defaults_existing_worlds_to_consent() {
+        let state = test_state().await;
+        let app = build_router(state.clone());
+
+        // 模拟"迁移前就存在的世界行"：INSERT 显式不写 lethality 列，全靠迁移的 DEFAULT 兜。
+        let wid = new_id("wld");
+        let now = now_ms();
+        sqlx::query(
+            "INSERT INTO worlds (id, template_id, template_version, engine_version, prompt_set_version, \
+             model_route_version, room_type, title, status, visibility, member_limit, tick_per_day, \
+             state_revision, narrative_state_json, created_at, updated_at) \
+             VALUES (?, 'tpl', 1, 'e', 'p', 'm', 'idle', '历史世界', 'open', 'official', 10, 3, 0, '{}', ?, ?)",
+        )
+        .bind(&wid)
+        .bind(now)
+        .bind(now)
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+        assert_eq!(stored_lethality(&state, &wid).await, LETHALITY_CONSENT, "历史行须落同意制");
+        let world = load_world(&state.db, &wid).await.unwrap();
+        assert_eq!(
+            effective_lethality(&world.lethality),
+            Lethality::Consent,
+            "历史世界生效档 = 同意制（引擎侧行为与迁移前完全一致）"
+        );
+
+        // 行为零变化：join 不需要任何新字段，也不写签署留痕。
+        seed_user(&state, "usrLegacy").await; // age_declared=0（未声明）——同意制世界不设年龄门
+        seed_char(&state, "chLegacy", "usrLegacy", "approved", 0).await;
+        let (st, body) = post_json(
+            &app,
+            &format!("/api/worlds/{wid}/join"),
+            &token(&state, "usrLegacy"),
+            None,
+            json!({ "cloudCharacterId": "chLegacy" }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "同意制世界 join 不受契约门影响: {body}");
+        assert_eq!(body["lethality"], LETHALITY_CONSENT);
+        assert_eq!(sign_audit_count(&state, &wid).await, 0, "非生死状世界不得留签署痕");
+    }
+
+    #[tokio::test]
+    async fn create_world_defaults_and_persists_lethality() {
+        let state = test_state().await;
+        // 缺省 = 同意制。
+        let default_wid =
+            create_world(&state.db, CreateWorldParams::official("tpl", 1, "默认档世界")).await.unwrap();
+        assert_eq!(stored_lethality(&state, &default_wid).await, LETHALITY_CONSENT);
+
+        // 显式庇护档落库。
+        let sanctuary = seed_world_with(&state, "庇护世界", LETHALITY_SANCTUARY).await;
+        assert_eq!(stored_lethality(&state, &sanctuary).await, LETHALITY_SANCTUARY);
+
+        // 非法值防御式归一为同意制（不落脏枚举）。
+        let bogus = seed_world_with(&state, "非法档世界", "bogus").await;
+        assert_eq!(stored_lethality(&state, &bogus).await, LETHALITY_CONSENT);
+    }
+
+    // ---------- 枚举归一 + 运营开关（VALIDATION.md §0.1 未验证功能默认关闭） ----------
+
+    #[test]
+    fn deathmatch_switch_defaults_to_off() {
+        let _sw = DeathmatchSwitch::set(false);
+        std::env::remove_var("MUSE_LETHALITY_DEATHMATCH");
+        assert!(!deathmatch_enabled(), "生死状档必须默认关闭（未验证功能默认关闭）");
+        // 配错的值不得静默开启高危档。
+        std::env::set_var("MUSE_LETHALITY_DEATHMATCH", "maybe");
+        assert!(!deathmatch_enabled(), "非法开关值须回落关闭");
+        std::env::set_var("MUSE_LETHALITY_DEATHMATCH", "on");
+        assert!(deathmatch_enabled(), "显式 on 应开启");
+    }
+
+    #[test]
+    fn effective_lethality_degrades_conservatively() {
+        {
+            let _sw = DeathmatchSwitch::set(false);
+            assert_eq!(
+                effective_lethality(LETHALITY_DEATHMATCH),
+                Lethality::Consent,
+                "开关未开 → 生死状降级为同意制"
+            );
+            assert_eq!(lethality_label(LETHALITY_DEATHMATCH), LETHALITY_CONSENT, "投影同步降级");
+        }
+        {
+            let _sw = DeathmatchSwitch::set(true);
+            assert_eq!(effective_lethality(LETHALITY_DEATHMATCH), Lethality::Deathmatch);
+            assert_eq!(lethality_label(LETHALITY_DEATHMATCH), LETHALITY_DEATHMATCH);
+        }
+        // 开关无关的两档 + 脏数据兜底。
+        assert_eq!(effective_lethality(LETHALITY_SANCTUARY), Lethality::Sanctuary);
+        assert_eq!(effective_lethality(LETHALITY_CONSENT), Lethality::Consent);
+        assert_eq!(effective_lethality(""), Lethality::Consent, "空值 → 默认档");
+        assert_eq!(effective_lethality("DEATHMATCH"), Lethality::Consent, "大小写不匹配 → 默认档");
+        assert_eq!(effective_lethality("bogus"), Lethality::Consent, "未知值 → 默认档");
+    }
+
+    // ---------- join 契约签署：二次确认 ----------
+
+    #[tokio::test]
+    async fn join_deathmatch_requires_second_confirmation() {
+        let _sw = DeathmatchSwitch::set(true);
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_user_age(&state, "usrAdult", 1).await;
+        seed_char(&state, "chAdult", "usrAdult", "approved", 0).await;
+        let wid = seed_world_with(&state, "生死场", LETHALITY_DEATHMATCH).await;
+        let uri = format!("/api/worlds/{wid}/join");
+        let tk = token(&state, "usrAdult");
+
+        // join 前明示：详情页必须能看见档位与契约要求。
+        let (st, detail) = get_json(&app, &format!("/api/worlds/{wid}"), &tk).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(detail["lethality"], LETHALITY_DEATHMATCH, "详情须明示契约档: {detail}");
+        assert_eq!(detail["deathContractRequired"], true);
+
+        // 缺二次确认 → 409 + 中文长句引导（绝不默认代签）。
+        let (st, body) = post_json(&app, &uri, &tk, None, json!({ "cloudCharacterId": "chAdult" })).await;
+        assert_eq!(st, StatusCode::CONFLICT, "缺确认应被拒: {body}");
+        let msg = body["error"]["message"].as_str().unwrap_or("");
+        assert!(msg.contains("生死状"), "文案须点明生死状: {body}");
+        assert!(msg.contains("acceptDeathContract"), "文案须给出补救方式: {body}");
+        // 被拒即零副作用：无成员行、无签署痕。
+        assert_eq!(active_member_count(&state, &wid).await, 0);
+        assert_eq!(sign_audit_count(&state, &wid).await, 0);
+
+        // 显式 false 同样被拒（不接受"字段在但不确认"）。
+        let (st, _) = post_json(
+            &app,
+            &uri,
+            &tk,
+            None,
+            json!({ "cloudCharacterId": "chAdult", "acceptDeathContract": false }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CONFLICT);
+
+        // 成年 + 确认 → 放行。
+        let (st, body) = post_json(
+            &app,
+            &uri,
+            &tk,
+            None,
+            json!({ "cloudCharacterId": "chAdult", "acceptDeathContract": true }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "成年 + 确认应可入: {body}");
+        assert_eq!(body["status"], "active");
+        assert_eq!(body["lethality"], LETHALITY_DEATHMATCH, "回执须明示签署的档位");
+        assert_eq!(active_member_count(&state, &wid).await, 1);
+    }
+
+    // ---------- 🔴 真红线 §0.4：未成年禁入生死状（fail-closed） ----------
+
+    #[tokio::test]
+    async fn join_deathmatch_rejects_minor() {
+        let _sw = DeathmatchSwitch::set(true);
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_user_age(&state, "usrMinor", 2).await; // 已声明未成年
+        seed_char(&state, "chMinor", "usrMinor", "approved", 0).await;
+        let wid = seed_world_with(&state, "生死场", LETHALITY_DEATHMATCH).await;
+
+        // 即便带齐二次确认也一律拒——红线不因用户"愿意"而让路。
+        let (st, body) = post_json(
+            &app,
+            &format!("/api/worlds/{wid}/join"),
+            &token(&state, "usrMinor"),
+            None,
+            json!({ "cloudCharacterId": "chMinor", "acceptDeathContract": true }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "未成年禁入生死状（红线）: {body}");
+        assert_eq!(active_member_count(&state, &wid).await, 0);
+        assert_eq!(sign_audit_count(&state, &wid).await, 0, "被拒不得留签署痕");
+    }
+
+    #[tokio::test]
+    async fn join_deathmatch_rejects_undeclared_age_fail_closed() {
+        let _sw = DeathmatchSwitch::set(true);
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_user(&state, "usrUnknown").await; // age_declared = 0（未声明）
+        seed_char(&state, "chUnknown", "usrUnknown", "approved", 0).await;
+        let wid = seed_world_with(&state, "生死场", LETHALITY_DEATHMATCH).await;
+
+        // fail-closed：年龄未知按未成年处理，绝不放行。
+        let (st, body) = post_json(
+            &app,
+            &format!("/api/worlds/{wid}/join"),
+            &token(&state, "usrUnknown"),
+            None,
+            json!({ "cloudCharacterId": "chUnknown", "acceptDeathContract": true }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "年龄未声明须按未成年拒绝: {body}");
+        assert_eq!(active_member_count(&state, &wid).await, 0);
+
+        // 同一世界的同意制对照：未声明年龄照常可入（年龄门只挂在生死状档上，不外溢）。
+        let consent_wid = seed_world_with(&state, "同意制场", LETHALITY_CONSENT).await;
+        let (st, body) = post_json(
+            &app,
+            &format!("/api/worlds/{consent_wid}/join"),
+            &token(&state, "usrUnknown"),
+            None,
+            json!({ "cloudCharacterId": "chUnknown" }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "年龄门不得外溢到同意制世界: {body}");
+    }
+
+    // ---------- 签署留痕（§0.2 全链审计） ----------
+
+    #[tokio::test]
+    async fn join_deathmatch_writes_signature_audit_log() {
+        let _sw = DeathmatchSwitch::set(true);
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_user_age(&state, "usrSign", 1).await;
+        seed_char(&state, "chSign", "usrSign", "approved", 0).await;
+        let wid = seed_world_with(&state, "生死场", LETHALITY_DEATHMATCH).await;
+        let uri = format!("/api/worlds/{wid}/join");
+        let tk = token(&state, "usrSign");
+        let body = json!({ "cloudCharacterId": "chSign", "acceptDeathContract": true });
+
+        let (st, _) = post_json(&app, &uri, &tk, Some("k-sign"), body.clone()).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(sign_audit_count(&state, &wid).await, 1, "入场须留一条签署痕");
+
+        // 痕内容：谁签的、哪张卡、什么档。
+        let row = sqlx::query(
+            "SELECT actor_id, actor_role, reason FROM audit_logs \
+             WHERE action='world.death_contract_signed' AND subject=?",
+        )
+        .bind(&wid)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(row.try_get::<String, _>("actor_id").unwrap(), "usrSign");
+        assert_eq!(row.try_get::<String, _>("actor_role").unwrap(), "user");
+        let reason: String = row.try_get("reason").unwrap();
+        assert!(reason.contains("lethality=deathmatch"), "留痕须记档位: {reason}");
+        assert!(reason.contains("character=chSign"), "留痕须记角色卡: {reason}");
+
+        // 幂等重放 + 已在场重复 join：都不重复留痕（签署只认真实入场）。
+        let (st, _) = post_json(&app, &uri, &tk, Some("k-sign"), body.clone()).await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, _) = post_json(&app, &uri, &tk, None, body.clone()).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(sign_audit_count(&state, &wid).await, 1, "重放不得重复留痕");
+
+        // 离场后复活 = 再次入场 → 再签一次。
+        let (st, _) = post_json(
+            &app,
+            &format!("/api/worlds/{wid}/leave"),
+            &tk,
+            None,
+            json!({ "cloudCharacterId": "chSign" }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, _) = post_json(&app, &uri, &tk, None, body).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(sign_audit_count(&state, &wid).await, 2, "复活入场须重新留痕");
+    }
+
+    // ---------- 运营开关关闭：生死状不生效（前后门双保险的"后门降级"） ----------
+
+    #[tokio::test]
+    async fn deathmatch_world_degrades_to_consent_when_switch_off() {
+        let _sw = DeathmatchSwitch::set(false);
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_user(&state, "usrOff").await; // 未声明年龄
+        seed_char(&state, "chOff", "usrOff", "approved", 0).await;
+        // 落库仍是建房方的意图（deathmatch），但开关未开 → 生效档降级。
+        let wid = seed_world_with(&state, "被降级的生死场", LETHALITY_DEATHMATCH).await;
+        assert_eq!(stored_lethality(&state, &wid).await, LETHALITY_DEATHMATCH, "落库值保留意图");
+        let world = load_world(&state.db, &wid).await.unwrap();
+        assert_eq!(effective_lethality(&world.lethality), Lethality::Consent, "生效档降级为同意制");
+
+        let tk = token(&state, "usrOff");
+        // 详情页所见即所签：显示的是降级后的同意制，且不要求签署。
+        let (_st, detail) = get_json(&app, &format!("/api/worlds/{wid}"), &tk).await;
+        assert_eq!(detail["lethality"], LETHALITY_CONSENT);
+        assert_eq!(detail["deathContractRequired"], false);
+
+        // 不带确认、年龄未声明也能入（= 同意制世界的现行行为），且不留签署痕。
+        let (st, body) = post_json(
+            &app,
+            &format!("/api/worlds/{wid}/join"),
+            &tk,
+            None,
+            json!({ "cloudCharacterId": "chOff" }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "开关未开时应按同意制放行: {body}");
+        assert_eq!(body["lethality"], LETHALITY_CONSENT);
+        assert_eq!(sign_audit_count(&state, &wid).await, 0, "未生效的生死状不得留签署痕");
+    }
+
+    // ---------- 引擎回灌：runtime 从世界行取档，而非恒传默认 ----------
+
+    /// runtime 组装 RoundInput 时必须**从世界行回灌**契约档，且必须复用 `effective_lethality`
+    /// （与 join 契约门同源）——否则会出现"玩家签的档"与"引擎跑的档"错配，或绕过运营开关降级。
+    /// 采源码级断言（体例同 progression 的红线 grep 测试）：RoundInput 在 tick 事务深处组装，
+    /// 端到端断言需要真实模型调用，成本不抵收益；而这条接线一旦被改回默认值，本断言立即红。
+    #[test]
+    fn runtime_backfills_lethality_from_world_row() {
+        let runtime_src = include_str!("../runtime/mod.rs");
+        assert!(
+            runtime_src.contains("lethality: effective_lethality(&world.lethality)"),
+            "runtime 组装 RoundInput 必须从 worlds.lethality 回灌生效档"
+        );
+        assert!(
+            !runtime_src.contains("lethality: Lethality::default()"),
+            "runtime 不得再恒传默认档——那会让生死状/庇护两档永不生效"
+        );
+    }
+}
+
 // ---------- 阵容头像按机审裁决过滤（Phase A 红线：未过审绝不下发） ----------
 
 #[tokio::test]

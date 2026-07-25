@@ -713,3 +713,37 @@
     gap: 12px;
   }
 }
+
+/* 最新通知（设计文档 §6 辅助栏「必要的账号提示」）。数据源 GET /api/me/notifications。 */
+.notification-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.notification-list li {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid #ebe6df;
+}
+
+.notification-list li:last-child {
+  padding-bottom: 0;
+  border-bottom: none;
+}
+
+.notification-text {
+  color: #34312d;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.notification-list time {
+  color: #938b82;
+  font-size: 12px;
+}

@@ -787,6 +787,120 @@ async fn world_create_pause_resume_and_diagnostics() {
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
 
+// ---------------- 建房 lethality（R1 生死契约三档，总规格 §11【拍板 24】） ----------------
+
+/// 建房参数须暴露契约档，且**星级不自动决定档位**（规格要求可分离、可配置）。
+/// 生死状档另受运营开关把守：开关未开时建房直接 400（未验证功能默认关闭，VALIDATION.md §0.1）。
+#[tokio::test]
+async fn world_create_lethality_option() {
+    use crate::worlds::DeathmatchSwitch;
+    let _sw = DeathmatchSwitch::set(false);
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+
+    async fn stored(state: &AppState, wid: &str) -> String {
+        sqlx::query("SELECT lethality FROM worlds WHERE id=?")
+            .bind(wid)
+            .fetch_one(&state.db)
+            .await
+            .unwrap()
+            .try_get::<String, _>("lethality")
+            .unwrap()
+    }
+
+    // 省略 lethality → consent（同意制，老行为不变）。
+    let (st, body) = post(
+        &app,
+        "/api/admin/worlds",
+        Some(&admin),
+        json!({ "templateId": "tpl1", "templateVersion": 1, "title": "默认档", "roomType": "idle" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let wid = body["worldId"].as_str().unwrap().to_string();
+    assert_eq!(stored(&state, &wid).await, "consent");
+    assert_eq!(body["lethality"], "consent", "回执须回显契约档");
+
+    // 显式 sanctuary（庇护场）落库；开关无关。
+    let (st, body) = post(
+        &app,
+        "/api/admin/worlds",
+        Some(&admin),
+        json!({ "templateId": "tpl1", "templateVersion": 1, "title": "庇护场", "lethality": "sanctuary" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let wid_s = body["worldId"].as_str().unwrap().to_string();
+    assert_eq!(stored(&state, &wid_s).await, "sanctuary");
+
+    // 非法枚举 → 400。
+    let (st, _) = post(
+        &app,
+        "/api/admin/worlds",
+        Some(&admin),
+        json!({ "templateId": "tpl1", "templateVersion": 1, "title": "非法档", "lethality": "hardcore" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // 🔴 开关未开 → 生死场建不出来（前门拒绝）。
+    let (st, err) = post(
+        &app,
+        "/api/admin/worlds",
+        Some(&admin),
+        json!({ "templateId": "tpl1", "templateVersion": 1, "title": "生死场", "lethality": "deathmatch" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "开关未开不得建生死场: {err}");
+    assert!(
+        err["error"]["message"].as_str().unwrap_or("").contains("生死状档尚未开启"),
+        "文案须说明是运营开关未开: {err}"
+    );
+    assert_eq!(
+        count(&state, "SELECT COUNT(*) AS n FROM worlds WHERE lethality='deathmatch'").await,
+        0,
+        "被拒不得落库"
+    );
+}
+
+#[tokio::test]
+async fn world_create_deathmatch_allowed_when_switch_on() {
+    use crate::worlds::DeathmatchSwitch;
+    let _sw = DeathmatchSwitch::set(true);
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+
+    let (st, body) = post(
+        &app,
+        "/api/admin/worlds",
+        Some(&admin),
+        json!({ "templateId": "tpl1", "templateVersion": 1, "title": "生死场", "roomType": "idle", "lethality": "deathmatch" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "开关已开应可建生死场: {body}");
+    let wid = body["worldId"].as_str().unwrap().to_string();
+    assert_eq!(body["lethality"], "deathmatch");
+
+    // 建房留痕带契约档（高风险配置须可溯）。
+    let n = count(
+        &state,
+        &format!(
+            "SELECT COUNT(*) AS n FROM audit_logs WHERE action='world.create' AND subject='{wid}' \
+             AND reason LIKE '%lethality=deathmatch%'"
+        ),
+    )
+    .await;
+    assert_eq!(n, 1, "建生死场须在 audit_logs 记下档位");
+
+    // 诊断视图同时给出落库值与生效档（运营据此判断急停阀是否在生效）。
+    let (st, diag) = get(&app, &format!("/api/admin/worlds/{wid}/diagnostics"), Some(&admin)).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(diag["world"]["lethality"], "deathmatch");
+    assert_eq!(diag["world"]["effectiveLethality"], "deathmatch");
+}
+
 // ---------------- 建房 timelineMode（缺口①） ----------------
 
 #[tokio::test]

@@ -62,6 +62,8 @@ const CONSENT_TTL_MS: i64 = 86_400_000;
 const DEFAULT_MIN_WORLD_TICKS: i64 = 3;
 /// 放置房世界时间上限默认值（P1 Phase 0，回退口径 = world_ticks.tick_no 计数）：兜底保证任意 idle 房必终止。
 const DEFAULT_MAX_WORLD_TICKS: i64 = 120;
+/// 叙事 critic 报告落库开关的 env 名（§0.2 参数化：可关，不写死）。
+const ENV_CRITIC_PERSIST: &str = "MUSE_CRITIC_PERSIST";
 
 fn token_cny_cents_per_1k() -> i64 {
     std::env::var("MUSE_TOKEN_CNY_CENTS_PER_1K")
@@ -1229,6 +1231,81 @@ async fn create_consents_for_round(state: &AppState, world_id: &str, events: &[D
     }
 }
 
+// ---------- 叙事 critic 报告落库（叙事质量 SLO「状态-文本矛盾率」的数据源，docs/VALIDATION.md §4.2 ①） ----------
+
+/// critic 落库是否开启（`MUSE_CRITIC_PERSIST`）。
+///
+/// **默认开启**，与 §0.1「未验证功能默认关闭」不冲突：那条约束管的是**对用户开放的产品功能**
+/// （能不能玩到、能不能买到），而本项是纯观测记录——不产生任何面向玩家的行为差异、不进任何读取面、
+/// 引擎也永不读取它。默认关掉等于把「补齐 SLO 数据缺口」这件事本身关掉，缺口原地不动。
+///
+/// 之所以仍留一个开关（§0.2 参数化）：它是每 tick 一次的额外写。虽然相对同一 tick 内 5+ 次模型调用
+/// 可忽略（纯本地 INSERT、无 IO、无额外事务），但真遇到写放大问题时要能一键停掉而不必改代码发版。
+/// 取值：`0` / `false` / `off`（大小写不敏感）关闭，其余一律开启（**配错值不静默丢数据**）。
+fn critic_persist_enabled() -> bool {
+    critic_persist_from_env_value(std::env::var(ENV_CRITIC_PERSIST).ok().as_deref())
+}
+
+/// `critic_persist_enabled` 的纯判定部分（抽出以便测试：进程 env 是全局的，并行测试里不可写）。
+pub(crate) fn critic_persist_from_env_value(raw: Option<&str>) -> bool {
+    match raw {
+        Some(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"),
+        None => true,
+    }
+}
+
+/// 把本回合的叙事 critic 报告落进 `world_tick_critic`（迁移 0030），**在调用方的 tick 事务内**。
+///
+/// 背景：引擎每回合已经跑了一次 critic（`muse_engine::narrative::continuity::narrative_critic`），
+/// 产出三条结构化列表随 `RoundOutcome.critic` 传回 —— 此前在这里被直接丢弃。模型已经算了、
+/// token 已经花了，不留就是白扔（VALIDATION §4.2 把它列为「最可惜的缺口」）。
+///
+/// 🔴 **绝不写进 `worlds.narrative_state_json`**：那份 JSON 每 tick 经 `build_seed_state` 原样回灌进
+/// 引擎 `RoundInput.state`，写进去的任何东西都可能被 `role_decide` / 仲裁读到。critic 是**对模型自身
+/// 产出的评价**，回灌即「引擎读自己的评分再决策」，属 §0.1 平权红线禁区（同 `world_contributions`
+/// 与角色成长数值的口径）。本表是纯结算/观测侧账本，**引擎永不读取**。
+///
+/// 🔴 **本表不是读取面**：issue 文本是模型原始输出、**未过 §15 第 2 层敏感词库闸**
+/// （那道闸作用在 `ProjectedEvent` 上）。仅供运营 SLO 统计与人工复盘，不得未经过闸下发给玩家。
+///
+/// **每个已提交 tick 恒落一行**（哪怕三条列表全空）：行的存在本身就是「critic 跑过」的证据，
+/// 也就是矛盾率的**分母**。只在有问题时才写的话，「跑了但很干净」与「压根没落库」在库里无法区分。
+///
+/// 幂等：主键 (world_id, tick_no) 与 `world_ticks` 唯一索引同口径；CAS 只放行一次提交，
+/// 故正常路径不可能重复插入。真撞上（并发重放）则唯一冲突 → 视为已记录，静默跳过，不牵连 tick。
+async fn persist_critic_report_tx(
+    tx: &mut Transaction<'_, Any>,
+    world_id: &str,
+    tick_no: i64,
+    critic: &muse_engine::narrative::continuity::CriticReport,
+) -> Result<(), ApiError> {
+    if !critic_persist_enabled() {
+        return Ok(());
+    }
+    // 序列化失败（理论上不可能：三个 Vec<String>）→ 退化为空报告，只保留计数，绝不因观测数据阻断 tick。
+    let report_json = serde_json::to_string(critic).unwrap_or_else(|_| "{}".into());
+    let res = sqlx::query(
+        "INSERT INTO world_tick_critic (world_id, tick_no, consistency_issue_count, \
+         causal_issue_count, revision_suggestion_count, report_json, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(world_id)
+    .bind(tick_no)
+    .bind(critic.character_consistency_issues.len() as i64)
+    .bind(critic.causal_issues.len() as i64)
+    .bind(critic.revision_suggestions.len() as i64)
+    .bind(&report_json)
+    .bind(now_ms())
+    .execute(&mut **tx)
+    .await;
+    match res {
+        Ok(_) => Ok(()),
+        // 并发重放兜底：同一 (world, tick) 已有记录 → 幂等跳过。
+        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 // ---------- 核心：处理一个 tick ----------
 
 /// 处理一个 tick（生产入口：内部构建 HttpModelClient）。幂等：重复投递被吸收。
@@ -1395,10 +1472,14 @@ async fn process_tick_inner(
     };
 
     // 6) 组装成员卡与 principal 投影表。
+    // 次级排序键 cloud_character_id 不可省，理由同 assembly::load_active_cards：joined_at 撞毫秒时
+    // 行序由 DB 决定，会让每 tick 的成员遍历序在重放间漂移。本处影响面比装配层更直接——
+    // other_cards_brief 与 principal 投影都按此序构造，进而喂给引擎。
     let mrows = sqlx::query(
         "SELECT wm.cloud_character_id AS cid, wm.user_id AS uid, cc.card_json AS card \
          FROM world_members wm JOIN cloud_characters cc ON cc.id = wm.cloud_character_id \
-         WHERE wm.world_id = ? AND wm.status='active' ORDER BY wm.joined_at ASC",
+         WHERE wm.world_id = ? AND wm.status='active' \
+         ORDER BY wm.joined_at ASC, wm.cloud_character_id ASC",
     )
     .bind(world_id)
     .fetch_all(db)
@@ -1856,6 +1937,13 @@ async fn commit_tick(
     .bind(tick_no)
     .execute(&mut *tx)
     .await?;
+
+    // 叙事 critic 报告落库（VALIDATION §4.2 ①「状态-文本矛盾率」的数据源）：模型本回合已经跑过的
+    // 一致性/因果审校结果，此前在本函数的 outcome 解构处被直接丢弃。与状态 CAS 同事务——
+    // critic 是观测数据、丢了不影响正确性，但同事务更简单且同成同败：CAS 冲突回滚时 critic 行一并
+    // 消失，(world_id, tick_no) 与 world_ticks 的 done 行严格一一对应，不会留孤儿观测行。
+    // 🔴 只进独立表，绝不进 narrative_state_json（回灌引擎 = 平权红线，见 persist_critic_report_tx）。
+    persist_critic_report_tx(&mut tx, world_id, tick_no, &outcome.critic).await?;
 
     // 受众投影 + 内容安全第 2 层 + 落库（分配 per-world sequence）。
     //

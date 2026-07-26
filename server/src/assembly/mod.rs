@@ -1386,10 +1386,15 @@ async fn load_skeleton(db: &AnyPool, template_id: &str) -> Result<(Skeleton, i64
 }
 
 async fn load_active_cards(db: &AnyPool, world_id: &str) -> Result<Vec<(String, CharacterCardV2)>, ApiError> {
+    // 次级排序键 cloud_character_id 不可省：joined_at 是毫秒时间戳，两名成员并发 join 撞同一
+    // 毫秒时行序就由 DB 决定，装配产物（perCharacterHooks / difficultyNotes 等按此序生成的数组）
+    // 会在两次重放间漂移，破坏「同一实例可 replay」的确定性契约。
+    // 该问题由黄金世界回归（runtime/golden.rs）首次运行时抓到。
     let rows = sqlx::query(
         "SELECT wm.cloud_character_id AS cid, cc.card_json AS card \
          FROM world_members wm JOIN cloud_characters cc ON cc.id = wm.cloud_character_id \
-         WHERE wm.world_id = ? AND wm.status = 'active' ORDER BY wm.joined_at ASC",
+         WHERE wm.world_id = ? AND wm.status = 'active' \
+         ORDER BY wm.joined_at ASC, wm.cloud_character_id ASC",
     )
     .bind(world_id)
     .fetch_all(db)
@@ -2506,6 +2511,164 @@ mod sampling_tests {
             s.hidden_ids,
             vec!["h1".to_string(), "h2".to_string()],
             "退化路径不读星级：tier5 奖励钩子照旧全量装配"
+        );
+    }
+}
+
+/// `load_active_cards` 的定序回归。
+///
+/// 背景：本查询原先只按 `joined_at ASC` 排序。`joined_at` 是毫秒时间戳，两名成员并发 join
+/// 撞同一毫秒时行序就由 DB 决定，装配产物（`per_character_hooks` 等按成员序生成的数组）
+/// 会在两次重放间漂移，破坏「同一实例可 replay」的确定性契约。
+/// 该问题由黄金世界回归（`runtime/golden.rs`）首次运行时抓到——它当时用固定错开的
+/// `joined_at` 绕开，所以撞毫秒这条路径没有回归保护，本模块补上。
+///
+/// ⚠️ **为什么必须有源码级断言**：下面两个行为测试在 dev 的 SQLite 上**证伪不了这个 bug**——
+/// 该查询会走 `world_members` 的 `UNIQUE(world_id, cloud_character_id)` 索引，扫描序恰好就是
+/// cid 序，所以即便删掉次级键、行为测试照样全绿（实测验证过）。而 Postgres 无此保证，
+/// 生产上问题是真实的。行为测试只能作为**口径文档**，真正防回归的是 `order_by_clause_pins_secondary_key`。
+/// 这条经验适用于所有「靠 DB 返回序」的断言：**在一种引擎上碰巧通过，不等于契约成立**。
+#[cfg(test)]
+mod member_order_tests {
+    use super::*;
+    use crate::safety::testkit::test_state;
+
+    /// 造一张可反序列化的 CharacterCardV2。
+    /// 注意：`load_active_cards` 对解析失败是**静默跳过**（`if let Ok(card)`），
+    /// 手写简化 JSON 会让成员凭空消失、测试假绿——必须用结构体构造后序列化。
+    async fn seed_char(db: &AnyPool, id: &str) {
+        use muse_engine::character::types::{CardLifecycle, Identity};
+        let card = serde_json::to_string(&CharacterCardV2 {
+            schema_version: 2,
+            id: id.into(),
+            lifecycle: CardLifecycle::Ready,
+            identity: Identity { name: id.into(), ..Default::default() },
+            dramatic_core: Default::default(),
+            decision_model: Default::default(),
+            perception: Default::default(),
+            emotion_dynamics: Default::default(),
+            relation_grammar: Default::default(),
+            expression_fingerprint: Default::default(),
+            agency: Default::default(),
+            growth_arc: Default::default(),
+            world_adaptation: Default::default(),
+            evidence_index: Default::default(),
+            revision: 1,
+            created_at: 0,
+            updated_at: 0,
+        })
+        .expect("card json");
+        sqlx::query(
+            "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, \
+             rights_declaration, moderation, withdrawn, created_at) \
+             VALUES (?, 'u1', 'local', 1, ?, 'original', 'approved', 0, 0)",
+        )
+        .bind(id)
+        .bind(card)
+        .execute(db)
+        .await
+        .expect("seed char");
+    }
+
+    /// 同一毫秒的成员，**无论插入顺序如何**，都必须按 cloud_character_id 稳定定序。
+    #[tokio::test]
+    async fn same_joined_at_orders_by_character_id_regardless_of_insert_order() {
+        let state = test_state().await;
+        // 两个世界的成员完全相同、joined_at 完全相同，只有 INSERT 先后相反。
+        // 若查询缺次级键，两边拿到的行序就会取决于 DB 的物理返回序。
+        for (world_id, first, second) in [("w_fwd", "c_alpha", "c_beta"), ("w_rev", "c_beta", "c_alpha")] {
+            crate::safety::testkit::seed_world(&state.db, world_id, 0, "running").await;
+            for cid in [first, second] {
+                if sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM cloud_characters WHERE id = ?")
+                    .bind(cid)
+                    .fetch_one(&state.db)
+                    .await
+                    .unwrap()
+                    == 0
+                {
+                    seed_char(&state.db, cid).await;
+                }
+                // joined_at 恒为 777：模拟并发 join 撞同一毫秒。
+                sqlx::query(
+                    "INSERT INTO world_members (id, world_id, user_id, cloud_character_id, \
+                     boundary_json, status, joined_at) VALUES (?, ?, 'u1', ?, '{}', 'active', 777)",
+                )
+                .bind(format!("m_{world_id}_{cid}"))
+                .bind(world_id)
+                .bind(cid)
+                .execute(&state.db)
+                .await
+                .expect("seed member");
+            }
+        }
+
+        let fwd: Vec<String> =
+            load_active_cards(&state.db, "w_fwd").await.unwrap().into_iter().map(|(cid, _)| cid).collect();
+        let rev: Vec<String> =
+            load_active_cards(&state.db, "w_rev").await.unwrap().into_iter().map(|(cid, _)| cid).collect();
+
+        assert_eq!(fwd, vec!["c_alpha".to_string(), "c_beta".to_string()], "应按 cid 字典序，与插入顺序无关");
+        assert_eq!(fwd, rev, "插入顺序相反时行序必须仍然一致——这正是重放漂移的来源");
+    }
+
+    /// 次级键不得喧宾夺主：joined_at 不同时仍按时间先后，保持「先来后到」的既有语义。
+    #[tokio::test]
+    async fn distinct_joined_at_still_orders_by_time_first() {
+        let state = test_state().await;
+        crate::safety::testkit::seed_world(&state.db, "w_time", 0, "running").await;
+        // 字典序靠后的 c_zeta 先加入，字典序靠前的 c_alpha 后加入。
+        for (cid, joined) in [("c_zeta", 100i64), ("c_alpha", 200i64)] {
+            seed_char(&state.db, cid).await;
+            sqlx::query(
+                "INSERT INTO world_members (id, world_id, user_id, cloud_character_id, \
+                 boundary_json, status, joined_at) VALUES (?, 'w_time', 'u1', ?, '{}', 'active', ?)",
+            )
+            .bind(format!("m_{cid}"))
+            .bind(cid)
+            .bind(joined)
+            .execute(&state.db)
+            .await
+            .expect("seed member");
+        }
+
+        let order: Vec<String> =
+            load_active_cards(&state.db, "w_time").await.unwrap().into_iter().map(|(cid, _)| cid).collect();
+        assert_eq!(
+            order,
+            vec!["c_zeta".to_string(), "c_alpha".to_string()],
+            "joined_at 不同时先来后到优先，次级键只在撞毫秒时生效"
+        );
+    }
+
+    /// 🔴 真正的防回归闸：源码级断言 ORDER BY 必须带次级键。
+    ///
+    /// 上面两个行为测试在 SQLite 下删掉次级键也会绿（索引扫描恰好有序），
+    /// 只有本断言能拦住「有人图省事把次级键删了」。体例同
+    /// `progression::tests::red_line_engine_decision_paths_never_reference_mileage`。
+    #[test]
+    fn order_by_clause_pins_secondary_key() {
+        // ⚠️ include_str! 会把**本测试自己**也读进来，断言里的字面量会匹配到自身：
+        //    「必须存在」的断言因此永远为真（假绿），「不得存在」的断言因此永远为假（假红）。
+        //    故先按第一个 #[cfg(test)] 截断，只扫描生产代码段。
+        let cut = |s: &'static str| s.split("#[cfg(test)]").next().unwrap_or(s).to_string();
+        let src = cut(include_str!("mod.rs"));
+        // 成员卡装配（本文件）与 runtime 的成员遍历必须同口径，两处都查。
+        assert!(
+            src.contains("ORDER BY wm.joined_at ASC, wm.cloud_character_id ASC"),
+            "assembly::load_active_cards 的 ORDER BY 必须带 cloud_character_id 次级键：\n\
+             joined_at 撞毫秒时行序由 DB 决定，装配产物会在重放间漂移（Postgres 上尤其如此，\n\
+             SQLite 因走唯一索引恰好有序，行为测试证伪不了）"
+        );
+        assert!(
+            !src.contains("ORDER BY wm.joined_at ASC\","),
+            "不得存在只按 joined_at 排序的成员查询"
+        );
+
+        let runtime_src = cut(include_str!("../runtime/mod.rs"));
+        assert!(
+            runtime_src.contains("ORDER BY wm.joined_at ASC, wm.cloud_character_id ASC"),
+            "runtime 的成员卡查询必须与 assembly 同口径——它构造的 other_cards_brief \n\
+             与 principal 投影会直接喂给引擎，漂移影响比装配层更直接"
         );
     }
 }

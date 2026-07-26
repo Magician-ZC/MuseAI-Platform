@@ -39,6 +39,9 @@ use sqlx::{AnyPool, Row};
 use crate::app::AppState;
 use crate::db::now_ms;
 use crate::runtime::{insert_tick, process_tick_with_model, TickStatus};
+// 叙事质量指标的口径与实现已提升为生产代码（`crate::slo`，VALIDATION §4.2 三件套第二件）——
+// 本模块只借用同一套口径，绝不再维护第二份实现：回归与运营看板必须永远算的是同一个数。
+use crate::slo::{classify_conclusion, gini_coefficient, is_forced_conclusion, max_silent_streaks, ConclusionKind};
 use crate::worlds::load_world;
 
 use muse_engine::character::types::CharacterCardV2;
@@ -548,187 +551,28 @@ const COST_ARBITRATED_TICK: i64 = 2040;
 const COST_MAIN_TOTAL: i64 = COST_PLAIN_TICK * 2 + COST_ARBITRATED_TICK;
 
 // ============================================================================
-// §6 叙事质量指标（VALIDATION §4.2 的三个"现在就算得出来"口径，此前全仓无任何代码在算）
+// §6 叙事质量指标（口径与实现在 `crate::slo`，本节只留回归侧的取数适配）
 // ============================================================================
+//
+// 这三个指标（基尼 / 最长连续无戏份 / 收尾分类）曾经只活在本模块的 `#[cfg(test)]` 里，
+// 生产代码拿不到。现已整体提升为 `crate::slo`（VALIDATION §4.2 验证基建第二件，进运营看板），
+// **口径注释一并搬过去**——那些注释解释的是「为什么这么定义」，比代码本身更值钱。
+// 本节只保留三个 `.unwrap()` 适配（回归里数据必然存在，失败即测试该炸），
+// 保证「黄金世界回归看到的数」与「运营看板上的数」逐字节同源。
 
-/// 基尼系数：叙事注意力公平度，**T2 门槛「≤0.35」的算法实现**。
-///
-/// `G = ΣᵢΣⱼ|xᵢ-xⱼ| / (2·n·Σx)`，值域 `[0, 1)`：0 = 完全均分，越大越集中。
-///
-/// 🔴 输入必须是**已与 `world_members` 取过交集**的成员贡献分。`world_contributions` 把 NPC
-/// （世界固有角色）一并入表（引擎按 character_id 折算不区分主体，见迁移 0025 注释），
-/// 不取交集就会把"NPC 拿了多少戏"算进玩家公平度里 —— 见 `attention_gini` 与
-/// `gini_excludes_world_controlled_npc` 用例。
-///
-/// 纯函数、无 IO、无浮点 RNG；空集与全零集返回 0.0（"无人有戏"不是不公平，是没开演）。
-fn gini_coefficient(values: &[i64]) -> f64 {
-    let n = values.len();
-    if n == 0 {
-        return 0.0;
-    }
-    let total: i128 = values.iter().map(|v| *v as i128).sum();
-    if total <= 0 {
-        return 0.0;
-    }
-    let mut abs_diff_sum: i128 = 0;
-    for a in values {
-        for b in values {
-            abs_diff_sum += (*a as i128 - *b as i128).abs();
-        }
-    }
-    abs_diff_sum as f64 / (2.0 * n as f64 * total as f64)
-}
-
-/// 读账本算基尼：`world_contributions.score_milli` ∩ `world_members`（active 与已退场的都算——
-/// 退场者在场时挣的戏份不该凭空消失），返回 `(基尼, 参与统计的成员数)`。
+/// 读账本算基尼（单世界口径，见 `slo::world_attention_gini`）。
 async fn attention_gini(db: &AnyPool, world_id: &str) -> (f64, usize) {
-    let rows = sqlx::query(
-        "SELECT wc.score_milli AS s FROM world_contributions wc \
-         JOIN world_members wm ON wm.world_id = wc.world_id AND wm.cloud_character_id = wc.character_id \
-         WHERE wc.world_id = ? ORDER BY wc.character_id ASC",
-    )
-    .bind(world_id)
-    .fetch_all(db)
-    .await
-    .unwrap();
-    let values: Vec<i64> = rows.iter().map(|r| r.try_get::<i64, _>("s").unwrap()).collect();
-    (gini_coefficient(&values), values.len())
+    crate::slo::world_attention_gini(db, world_id).await.unwrap()
 }
 
-/// 「有效戏份」的事件类型口径：只认叙事事件（行动 / 对白）。
-/// `consent_request` 这类**流程事件**不构成戏份——否则"被同意门拦下、这一拍什么也没演成"
-/// 会被算作有戏，正好把最该被指标抓住的情况漏掉。
-const NARRATIVE_EVENT_TYPES: &[&str] = &["action", "dialogue"];
-
-/// 每个成员的**最长连续无有效戏份拍数**（VALIDATION §4.2「角色连续 N 拍无有效戏份比例」的底座）。
-///
-/// `appearances` 是 `(tick_no, character_id)` 的**规范化**出场集合 —— 刻意不用现有查询的
-/// `LIKE '%cid%'`：那种写法在 id 互为前缀时会误判（`li` 命中 `lixia`），做统计必须精确解析
-/// `actors_json`。纯函数，`ticks` 与 `members` 由调用方给定全域。
-fn max_silent_streaks(
-    members: &[String],
-    ticks: &[i64],
-    appearances: &BTreeSet<(i64, String)>,
-) -> BTreeMap<String, i64> {
-    let mut out = BTreeMap::new();
-    for m in members {
-        let (mut cur, mut best) = (0i64, 0i64);
-        for t in ticks {
-            if appearances.contains(&(*t, m.clone())) {
-                cur = 0;
-            } else {
-                cur += 1;
-                best = best.max(cur);
-            }
-        }
-        out.insert(m.clone(), best);
-    }
-    out
-}
-
-/// 读库算无戏份拍数。
-///
-/// **拍域口径** = 真正跑了回合并计费的拍（`world_ticks.status='done' AND cost_tokens > 0`）。
-/// 终局短路拍 / `insufficient_members` 跳过拍根本没有回合，把它们算作「没戏份」是噪声。
+/// 读库算最长连续无有效戏份拍数（单世界口径，见 `slo::world_silent_streaks`）。
 async fn silent_streaks(db: &AnyPool, world_id: &str) -> BTreeMap<String, i64> {
-    let members: Vec<String> = sqlx::query(
-        "SELECT cloud_character_id AS c FROM world_members WHERE world_id = ? ORDER BY cloud_character_id ASC",
-    )
-    .bind(world_id)
-    .fetch_all(db)
-    .await
-    .unwrap()
-    .iter()
-    .map(|r| r.try_get::<String, _>("c").unwrap())
-    .collect();
-
-    let ticks: Vec<i64> = sqlx::query(
-        "SELECT tick_no FROM world_ticks WHERE world_id = ? AND status = 'done' AND cost_tokens > 0 \
-         ORDER BY tick_no ASC",
-    )
-    .bind(world_id)
-    .fetch_all(db)
-    .await
-    .unwrap()
-    .iter()
-    .map(|r| r.try_get::<i64, _>("tick_no").unwrap())
-    .collect();
-
-    let rows = sqlx::query(
-        "SELECT tick_no, event_type, actors_json FROM world_events WHERE world_id = ? ORDER BY sequence ASC",
-    )
-    .bind(world_id)
-    .fetch_all(db)
-    .await
-    .unwrap();
-    let mut appearances: BTreeSet<(i64, String)> = BTreeSet::new();
-    for r in &rows {
-        let et: String = r.try_get("event_type").unwrap();
-        if !NARRATIVE_EVENT_TYPES.contains(&et.as_str()) {
-            continue;
-        }
-        let tick_no: i64 = r.try_get("tick_no").unwrap();
-        let raw: String = r.try_get("actors_json").unwrap();
-        // 规范化解析，不用 LIKE 子串匹配。
-        for actor in serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default() {
-            appearances.insert((tick_no, actor));
-        }
-    }
-    max_silent_streaks(&members, &ticks, &appearances)
+    crate::slo::world_silent_streaks(db, world_id).await.unwrap()
 }
 
-/// 收尾类型（VALIDATION §4.2「强制收尾率」）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConclusionKind {
-    /// 主线走完 —— 唯一的自然收尾。
-    Natural,
-    /// 世界时间上限 / 无可调度角色 —— 被系统掐掉。
-    Forced,
-    /// 世界线崩塌（关键角色永久退场）—— 也是强制收尾，但结算口径不同（③ 归零 · ① 减半）。
-    Collapsed,
-    /// 尚未收尾 / reason 无法识别。
-    Unknown,
-}
-
-/// `terminal_reason()` 与 runtime 终局路径产出的 reason 串 → 收尾类型。
-///
-/// 口径来源：`runtime::terminal_reason`（`mainline_complete` / `time_cap` / `starved`）+
-/// `commit_tick` 的时间上限 `time_limit` + `key_character_exited` 的 `key_character_exit`。
-/// **未知 reason 一律不算自然收尾**（保守：宁可把强制收尾率算高，也不许悄悄漏掉）。
-fn classify_conclusion(reason: &str) -> ConclusionKind {
-    match reason {
-        "mainline_complete" => ConclusionKind::Natural,
-        "time_cap" | "time_limit" | "starved" => ConclusionKind::Forced,
-        "key_character_exit" => ConclusionKind::Collapsed,
-        "" => ConclusionKind::Unknown,
-        _ => ConclusionKind::Unknown,
-    }
-}
-
-/// 是否**强制收尾**（`Natural` 之外全是；`Unknown` 保守计入强制）。
-fn is_forced_conclusion(reason: &str) -> bool {
-    classify_conclusion(reason) != ConclusionKind::Natural
-}
-
-/// 从审计取本世界的收尾 `(reason, ending)`。
-///
-/// 事实源选 `audit_logs('world.ended')` 而非 `world_ticks.error`：走 `commit_tick` 的收尾会把
-/// `world_ticks.error` 置 NULL（同一条 UPDATE 里），只有 `conclude_world_no_round` 那条路径才写 error。
-/// 审计行两条路径都写，是唯一齐全的口径。
+/// 从审计取本世界的收尾 `(reason, ending)`（见 `slo::world_conclusion`）。
 async fn conclusion_of(db: &AnyPool, world_id: &str) -> (String, String) {
-    let Some(row) =
-        sqlx::query("SELECT reason FROM audit_logs WHERE action = 'world.ended' AND subject = ? LIMIT 1")
-            .bind(world_id)
-            .fetch_optional(db)
-            .await
-            .unwrap()
-    else {
-        return (String::new(), String::new());
-    };
-    let raw: String = row.try_get("reason").unwrap();
-    // 写入格式：`{reason}|ending={ending}`（见 finalize_ending_tx）。
-    let (reason, rest) = raw.split_once('|').unwrap_or((raw.as_str(), ""));
-    (reason.to_string(), rest.trim_start_matches("ending=").to_string())
+    crate::slo::world_conclusion(db, world_id).await.unwrap()
 }
 
 // ============================================================================
@@ -1436,6 +1280,10 @@ async fn golden_world_metrics_and_cost_baseline() {
 // ============================================================================
 // §15 指标纯函数单测（不落库、不起引擎，专测口径本身）
 // ============================================================================
+//
+// 被测函数现居 `crate::slo`（生产代码）。这几个用例**刻意留在黄金世界回归里**：
+// 它们是回归基线的一部分——口径被改动时，`cargo test golden` 就该红。
+// `slo::tests` 另测聚合查询与后台响应形态，两层不重复。
 
 #[test]
 fn gini_coefficient_covers_edge_and_typical_distributions() {

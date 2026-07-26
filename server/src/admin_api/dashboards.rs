@@ -1,4 +1,7 @@
 //! 数据看板（总览 + 按天趋势）+ 经济运营。均为只读 SQL 聚合/取数，不产生副作用、不建结算。
+//!
+//! `/admin/metrics/overview` 含三段：核心运营计数 · 成本仪表（§17【拍板 16】）·
+//! **叙事质量 SLO**（`narrativeSlo`，VALIDATION §4.2，口径与聚合在 `crate::slo`）。
 
 use std::collections::{HashMap, HashSet};
 
@@ -90,6 +93,11 @@ const DEFAULT_COST_TREND_DAYS: i64 = 7;
 pub(super) struct OverviewQuery {
     /// 成本趋势窗口天数，clamp 到 [1,60]（与 trends 同），默认 7。
     cost_days: Option<i64>,
+    /// 叙事质量 SLO 观测窗口天数，clamp 到 [1,365]，默认 `slo::DEFAULT_SLO_WINDOW_DAYS`（30）。
+    slo_days: Option<i64>,
+    /// `?slo=0` 跳过叙事质量 SLO 段（高频轮询减负开关）。缺省即计算。
+    /// 用整数而不是 bool：query string 里 `slo=0` 比 `slo=false` 更顺手，serde 的 bool 只认 true/false。
+    slo: Option<i64>,
 }
 
 /// GET /admin/metrics/overview：核心运营指标聚合。
@@ -225,6 +233,30 @@ pub(super) async fn metrics_overview(
     let today_tokens = *day_tokens.last().unwrap_or(&0);
     let today_cents = tokens_to_cents(today_tokens);
 
+    // ============ 叙事质量 SLO（VALIDATION §4.2 验证基建三件套第二件） ============
+    // **为什么挂在 overview 的新顶层键、而不是新开 /admin/metrics/slo**：
+    // ① 运营看板本来就一次拉 overview——"这个平台现在健康吗"里，叙事质量与成本仪表是同一屏的
+    //    两半（成本回答"贵不贵"，SLO 回答"演得好不好"），拆两个端点只是让前端多轮询一次；
+    // ② RBAC / 日界 / CAST 口径与本文件已有的成本仪表逐条一致，复用而非另立一套；
+    // ③ 新增端点要改 `admin_api/mod.rs` 的路由表，那是并发改动面，本次刻意不碰。
+    // 代价是 overview 变重 → 用三道闸控住（见 slo 模块头注释）：滚动窗口（默认 30 天）、
+    // 每指标一次 GROUP BY / 范围扫描（无 N+1）、逐行扫描项带 `LIMIT cap+1` 溢出探测超限即跳过。
+    // 另留 `?slo=0` 给高频轮询彻底减负。真要拆出独立端点时，`slo::narrative_slo` 已是自洽入口，
+    // 加一条 route + 一个薄 handler 即可，本段可原样搬走。
+    let slo_days = q.slo_days.unwrap_or(crate::slo::DEFAULT_SLO_WINDOW_DAYS).clamp(1, 365);
+    let narrative_slo = if q.slo == Some(0) {
+        crate::slo::skipped_by_request(slo_days)
+    } else {
+        // 日界口径复用本文件的 `utc_day_start_ms` + `DAY_MS`（UTC 日界，与成本仪表/trends 同源）；
+        // SQL 侧只收 BIGINT 毫秒区间，不出现任何 strftime/date_trunc 方言函数。
+        let slo_cfg = crate::slo::SloConfig::from_env(
+            slo_days,
+            today_start - (slo_days - 1) * DAY_MS,
+            today_start + DAY_MS, // 右开区间，含今天整天
+        );
+        crate::slo::narrative_slo(db, &slo_cfg).await?
+    };
+
     // 审核积压 / 活跃世界 / 熔断世界 / 风控事件。
     let audit_backlog =
         count(db, "SELECT COUNT(*) AS n FROM audit_queue WHERE status = 'open'").await?;
@@ -285,6 +317,9 @@ pub(super) async fn metrics_overview(
                 "日界为 UTC（与 metrics/trends、world_budgets.budget_day 同口径）；趋势末桶即今天。",
             ],
         },
+        // 叙事质量 SLO（VALIDATION §4.2）。只读观测，七项：四项算得出来、
+        // 🔴 三项显式标注 status="no_data_source" + value=null（后台必须显示 —，显示 0% 即误报）。
+        "narrativeSlo": narrative_slo,
         "auditBacklog": audit_backlog,
         "worlds": { "active": worlds_active, "fused": worlds_fused },
         "riskEvents": risk_total,

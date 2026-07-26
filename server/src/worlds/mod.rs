@@ -13,7 +13,7 @@
 //!   防自刷：同一世界每位用户仅可投放一张 active 角色卡（退出后可换卡再进）；
 //!   同源唯一（R1）：同一提取源的未编辑原味卡同世界仅可在场一张（编辑过的卡/无指纹卡放行）；
 //!   历练准入（波次 3）：模板 star≥3 时投放卡 mileage 须达门槛（3★=300/4★=1000/5★=3000），1-2★ 免检
-//! POST /worlds/{id}/leave                离场：置成员 left（离场事件交由下个 tick 叙事化）
+//! POST /worlds/{id}/leave                离场：置成员 left + 记 left_at 退出时刻（离场事件交由下个 tick 叙事化）
 //! POST /worlds/{id}/cover                上传世界封面位图（官方房运营 / 创作者房房主）：
 //!   base64 JSON → MIME 白名单 → 1MB 上限 → 对象存储 → 图审 → worlds.cover_* 三列；
 //!   🔴 仅机审 approved 才在任何读取面下发 coverUrl（未过审绝不外泄，口径同角色立绘）
@@ -987,8 +987,13 @@ async fn join_world(
         let mstatus: String = m.try_get("status")?;
         if mstatus != "active" {
             // 复活：仅当仍有空位时置 active（人数守卫内嵌）；已满 → world_full。
+            // `left_at=NULL`（迁移 0030）：复活本来就已经重写 `joined_at`（成员纪元重置），
+            // 若留着上一段的退出时刻会得到 `left_at < joined_at` 的自相矛盾行，污染一切留存/时序统计。
+            // 这不违反「公共事实不可回滚」——那条红线约束的是世界的公共叙事事实
+            //（world_events / 账本 / 结算），world_members 是可变的成员状态行（status/user_id/joined_at
+            // 本来就随复活重写）。
             let res = sqlx::query(
-                "UPDATE world_members SET status='active', user_id=?, boundary_json=?, joined_at=? \
+                "UPDATE world_members SET status='active', user_id=?, boundary_json=?, joined_at=?, left_at=NULL \
                  WHERE id=? AND status != 'active' \
                  AND (SELECT COUNT(*) FROM world_members WHERE world_id=? AND status='active') < ?",
             )
@@ -1076,6 +1081,15 @@ struct LeaveRequest {
     cloud_character_id: String,
 }
 
+/// 离场：置 `status='left'` 并**记下退出时刻** `left_at`（迁移 0030）。
+///
+/// `left_at` 补的是 `docs/VALIDATION.md` §4.2「用户跳过/退出率」那一格的「⚠️ 半」——此前只有
+/// `joined_at`，退出不留时刻，于是退出率只能拿当前 status 算一个截面，画不出留存曲线、
+/// 做不了任何时序分析。
+///
+/// **幂等且不覆盖首次时刻**：UPDATE 的 `status='active'` 守卫使重复 leave 的第二次
+/// `rows_affected=0` → 直接 404 返回，绝不会用第二次的墙钟把首次退出时刻改掉
+/// （「只增不改」——已经发生的退出是既成事实）。
 async fn leave_world(
     State(state): State<AppState>,
     user: AuthUser,
@@ -1083,9 +1097,10 @@ async fn leave_world(
     Json(body): Json<LeaveRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let res = sqlx::query(
-        "UPDATE world_members SET status='left' \
+        "UPDATE world_members SET status='left', left_at=? \
          WHERE world_id=? AND cloud_character_id=? AND user_id=? AND status='active'",
     )
+    .bind(now_ms())
     .bind(&id)
     .bind(&body.cloud_character_id)
     .bind(&user.user_id)

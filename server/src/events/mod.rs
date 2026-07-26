@@ -127,10 +127,42 @@ fn display_type(t: DomainEventType) -> &'static str {
     }
 }
 
-/// 面向用户的公共摘要：只取事实层可展示字段，不下发链式推理/私密状态（§9.4 透明战报边界）。
+/// 摘要取值的**优先级键表**（顺序即优先级，第一个非空者胜出）。
+///
+/// 分两梯队，都是「事实层可展示字段」，不下发链式推理/私密状态（§9.4 透明战报边界）：
+///
+/// 1. **显式摘要**（`summary` / `narrative` / `text`）：合成事件（arena 等）自带的成稿文案，优先级最高。
+/// 2. **引擎事实字段**（`consequence` / `purpose` / `action`）：引擎 `DomainEvent` 真正携带的内容
+///    （`crates/muse-engine/src/narrative/mod.rs` 的事件构造处）——
+///    `ActionResolved.fact = {result, action, consequence}`、`DialogueSpoken.fact = {purpose}`。
+///    这一梯队此前**完全缺席**，导致引擎产的每一条事件都掉进下方兜底分支、投影成
+///    `"action · 沈砚"` 这种零信息串：事件流里根本不存在可比对的叙事文本，
+///    `docs/VALIDATION.md` §4.2「剧情重复率」因此无从计算。
+///
+/// 取值顺序的理由：
+/// - `consequence` 是仲裁给出的**结果事实**（这一步实际发生了什么），是公共事实层最权威、
+///   也是重复率比对最该用的那段文本；
+/// - `purpose` 是发言的公开目的（`DialogueSpoken` 唯一的事实字段）；
+/// - `action` 是角色的行动描述，仅在仲裁未给出 consequence 时兜底。
+///
+/// 刻意**只取一个字段、不做拼接**（如 `"{action} · {consequence}"`）：两段模型文本拼在一起会把
+/// 同一件事的措辞重复计入，正是「剧情重复率」这个指标最怕的噪声源；且投影是对外展示文本，
+/// 单句比拼接串更像人写的战报。
+const SUMMARY_KEYS: [&str; 6] = ["summary", "narrative", "text", "consequence", "purpose", "action"];
+
+/// 面向用户的公共摘要：按 `SUMMARY_KEYS` 取首个非空事实字段；全空则退化为 `"{类型} · {演员}"`。
+///
+/// 🔴 **本函数的产出是对外读取面文本**，但它**不是**内容安全的把关处：调用它的
+/// `project_domain_events` 产出 `ProjectedEvent`，`runtime::commit_tick` 随后在**同一事务内、
+/// 落库之前**对 `ProjectedEvent.summary` 跑 §15 第 2 层闸 `safety::moderate_runtime_projection`。
+/// 也就是说这里新增的 `consequence`/`purpose`/`action` 文本与原有的 `summary`/`narrative`/`text`
+/// 走的是**同一条闸**，不存在绕过词库过滤的旁路（见 `events::tests` 的
+/// `engine_fact_text_still_passes_through_the_safety_gate` 红线用例）。
+/// 任何将来新增的摘要来源都必须落在这个函数里，而不是绕到 `insert_events_tx` 之后再拼文本。
 fn event_summary(ev: &DomainEvent) -> String {
-    for key in ["summary", "narrative", "text"] {
+    for key in SUMMARY_KEYS {
         if let Some(s) = ev.fact.get(key).and_then(Value::as_str) {
+            let s = s.trim();
             if !s.is_empty() {
                 return s.to_string();
             }
@@ -1054,6 +1086,139 @@ mod tests {
         assert_eq!(off, 0, "ai_label 必须恒为 1，不可被审核路径改写或绕过");
         let (_, body) = get_events(&state, &token(&state, "u1"), "w1").await;
         assert_eq!(body["events"][0]["aiLabel"]["visible"], json!(true));
+    }
+
+    // ---------- §4.2 ②：引擎事实字段（consequence / purpose / action）进事件投影 ----------
+
+    /// 造一条引擎口径的 DomainEvent（字段与 `crates/muse-engine/src/narrative/mod.rs` 的事件构造处一致）。
+    fn domain_event(id: &str, event_type: DomainEventType, actors: &[&str], fact: Value) -> DomainEvent {
+        DomainEvent {
+            schema_version: 1,
+            id: id.into(),
+            run_id: "w1".into(),
+            sequence: 0,
+            timestamp: 0,
+            event_type,
+            actor_ids: actors.iter().map(|s| s.to_string()).collect(),
+            target_ids: None,
+            fact,
+            state_patch_id: "patch-0".into(),
+            caused_by: Vec::new(),
+            visibility: EventVisibility::Public,
+        }
+    }
+
+    fn summary_of(ev: &DomainEvent) -> String {
+        project_domain_events(std::slice::from_ref(ev), &[]).remove(0).summary
+    }
+
+    /// `ActionResolved.fact = {result, action, consequence}` / `DialogueSpoken.fact = {purpose}` —— 此前
+    /// 这些键一个都不在取值表里，引擎产的每条事件都掉进兜底分支投影成 `"action · 沈砚"`，
+    /// 事件流里没有任何可比对的叙事文本（VALIDATION §4.2「剧情重复率」缺口的直接成因）。
+    #[test]
+    fn engine_fact_fields_enter_projection_summary() {
+        // ① ActionResolved：取仲裁给出的结果事实 consequence（而非 result 枚举名、而非兜底串）。
+        let action = domain_event(
+            "de-act",
+            DomainEventType::ActionResolved,
+            &["shenyan"],
+            json!({ "result": "Success", "action": "上前拱手行礼", "consequence": "裴照侧身避开了这一礼。" }),
+        );
+        assert_eq!(summary_of(&action), "裴照侧身避开了这一礼。");
+
+        // ② DialogueSpoken：唯一的事实字段就是 purpose。
+        let dialogue =
+            domain_event("de-say", DomainEventType::DialogueSpoken, &["cuie"], json!({ "purpose": "试探对方来意" }));
+        assert_eq!(summary_of(&dialogue), "试探对方来意");
+
+        // ③ 仲裁未给 consequence（空串）→ 回落 action，仍是有信息的文本。
+        let no_conseq = domain_event(
+            "de-noc",
+            DomainEventType::ActionResolved,
+            &["shenyan"],
+            json!({ "result": "PartialSuccess", "action": "推开半掩的门", "consequence": "" }),
+        );
+        assert_eq!(summary_of(&no_conseq), "推开半掩的门");
+
+        // ④ 显式摘要优先级仍最高（合成事件/arena 自带成稿文案不被引擎字段抢走）。
+        let explicit = domain_event(
+            "de-sum",
+            DomainEventType::ActionResolved,
+            &["shenyan"],
+            json!({ "summary": "成稿文案", "action": "行礼", "consequence": "被避开" }),
+        );
+        assert_eq!(summary_of(&explicit), "成稿文案");
+
+        // ⑤ 事实层全空 → 仍退化为原兜底串（老行为不回退）。
+        let empty = domain_event(
+            "de-empty",
+            DomainEventType::ActionResolved,
+            &["shenyan", "peizhao"],
+            json!({ "result": "Success", "action": "   ", "consequence": "" }),
+        );
+        assert_eq!(summary_of(&empty), "action · shenyan,peizhao");
+    }
+
+    /// 🔴 **红线用例**：新增的事实字段文本必须与原有摘要走**同一条**内容安全闸。
+    ///
+    /// 复刻 `runtime::commit_tick` 的真实次序（投影 → §15 第 2 层闸 → 落库），断言一条带敏感词的
+    /// `consequence` 被打码 + 置 pending + 不进广播 + 不进读取面。若 `event_summary` 新增的文本
+    /// 绕到闸之后再拼进投影，这条会红 —— 那等于开了一条绕过词库过滤的通道。
+    #[tokio::test]
+    async fn engine_fact_text_still_passes_through_the_safety_gate() {
+        let state = test_state().await;
+        seed_user(&state.db, "u1").await;
+        seed_world(&state.db, "w1", 0, "running").await;
+        seed_member(&state.db, "m1", "w1", "u1", "c1", "active").await;
+
+        let dirty = domain_event(
+            "de-dirty",
+            DomainEventType::ActionResolved,
+            &["c1"],
+            json!({ "result": "Success", "action": "翻开包袱", "consequence": "他从怀里掏出一包冰毒。" }),
+        );
+        let clean = domain_event(
+            "de-clean",
+            DomainEventType::DialogueSpoken,
+            &["c1"],
+            json!({ "purpose": "邀对方入席共饮" }),
+        );
+
+        // 闸之前：敏感文本确实已经进了投影（证明它走的是被把关的那条路，而不是绕过去的旁路）。
+        let mut projected = project_domain_events(&[dirty, clean], &[]);
+        assert_eq!(projected[0].summary, "他从怀里掏出一包冰毒。", "consequence 必须在过闸前就进投影");
+
+        // commit_tick 的真实次序：同一事务内 投影 → 第 2 层闸 → 落库。
+        let mut tx = state.db.begin().await.unwrap();
+        let blocked = crate::safety::moderate_runtime_projection(&mut tx, "w1", &mut projected).await.unwrap();
+        let stored = insert_events_tx(&mut tx, "w1", 0, &projected).await.unwrap();
+        tx.commit().await.unwrap();
+
+        assert_eq!(blocked, 1, "带敏感词的 consequence 必须被闸拦下");
+        assert!(!projected[0].summary.contains('冰') && !projected[0].summary.contains('毒'), "{}", projected[0].summary);
+        assert_eq!(projected[0].moderation, "pending", "命中事件置为待人审");
+        assert_eq!(projected[1].summary, "邀对方入席共饮", "未命中的 purpose 文本原样放行");
+        assert_eq!(projected[1].moderation, MODERATION_APPROVED);
+
+        // 落库的即是打码后的最终事实（§0.3 落库前改写，不做事后回滚）。
+        let db_proj: String = sqlx::query_scalar(
+            "SELECT public_projection_json FROM world_events WHERE domain_event_id='de-dirty'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert!(!db_proj.contains("冰毒"), "落库文本不得含敏感词：{db_proj}");
+
+        // 推送层：未过审事件不进广播。
+        assert_eq!(stored.len(), 1);
+        assert!(stored[0].payload_json.contains("de-clean"));
+        assert!(!stored[0].payload_json.contains("冰毒"));
+
+        // 查询层：未过审事件不下发。
+        let (code, body) = get_events(&state, &token(&state, "u1"), "w1").await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        assert_eq!(domain_ids(body["events"].as_array().unwrap()), vec!["de-clean"]);
+        assert!(!body.to_string().contains("冰毒"), "读取面不得泄露被拦文本");
     }
 
     #[tokio::test]

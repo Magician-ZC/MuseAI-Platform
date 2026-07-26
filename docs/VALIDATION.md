@@ -171,15 +171,13 @@
    | 角色连续 N 拍无有效戏份比例 | ✅ | `world_events.actors_json` × `tick_no` 对 `world_members` 全集做差集。注意 `actors_json` 是 JSON 文本，现有查询用 `LIKE '%cid%'`，大规模统计需改规范化解析 |
    | 强制收尾率 | ✅ | `terminal_reason()` 产 `mainline_complete`/`time_cap`/`starved`，落 `world_ticks.error` 与 `audit_logs('world.ended')`。强制 = time_cap/time_limit/starved，自然 = mainline_complete |
    | 同角色二次入世率 | ✅ | `world_members` 唯一索引 `(world_id, cloud_character_id)` + `joined_at`，`COUNT(DISTINCT world_id) >= 2` |
-   | 用户跳过/退出率 | ⚠️ 半 | 退出可算（`world_members.status='left'/'retired'`）但**只有 `joined_at`、没有 `left_at`** → 只能算截面、算不了留存曲线。「跳过」全仓无埋点 |
-   | 状态-文本矛盾率 | ❌ | 引擎的 `CriticReport`（characterConsistencyIssues/causalIssues）**模型已经算了，server 侧解构后直接丢弃、从未落库**——这是最可惜的缺口。可用的替代口径只有 `world_ticks.error='blocked'`（不变量 I1-I4 阻断数） |
-   | 剧情重复率 | ❌ | **prose 从未落库**。事件投影的 `event_summary` 只找 fact 的 `summary`/`narrative`/`text` 三键，而 `ActionResolved` 的 fact 是 `{result,action,consequence}`、`DialogueSpoken` 是 `{purpose}`，全部落到兜底分支。正文只存在于引擎 FS 的 scene 文件 |
-   | OOC 申诉率 | ❌ | 全仓唯一申诉表 `moderation_appeals` 是**内容风控申诉**（只允许 rejected 的卡/头像、每主体终身一次），与「角色演得不像/裁决不公」零关系。需新建叙事质量反馈表 + 客户端入口，**是唯一的真新建** |
+   | 状态-文本矛盾率 | ✅（2026-07-26 补齐） | `world_tick_critic`（迁移 0030）落 `CriticReport` 三类问题的计数列 + 完整 `report_json`。**每个已提交 tick 恒落一行（哪怕三列全空）**——行的存在本身就是分母；只在有问题时才写，「跑了但干净」与「从未落库」在库里长得一样，分母永远算不准。写在 commit 事务内：崩在 commit 之后、写 critic 之前，得到的不是「少一条数据」而是「一个看起来很干净的 tick」，比缺数据更坏 |
+   | 剧情重复率 | ✅（2026-07-26 补齐） | `event_summary` 取值表从 3 键扩到 6 键，补 `consequence`/`purpose`/`action`。**只取一个字段、不拼接**——两段模型文本拼一起会把同一件事的措辞重复计入，正是本指标最怕的噪声源。新增文本走原有内容安全闸（在闸之前进投影，有红线用例验证无旁路） |
+   | 用户跳过/退出率 | ⚠️ 半（退出已补齐） | `world_members.left_at`（迁移 0030）在 leave 时写入、复活时清 NULL（否则会出现 `left_at < joined_at` 的自相矛盾行）。**历史行不回填**（NULL = 退出时刻未知，不是没退出）→ 统计留存曲线须显式排除 `status <> 'active' AND left_at IS NULL` 的盲区行。「跳过」仍无埋点 |
+   | OOC 申诉率 | ❌ **唯一未解** | 全仓唯一申诉表 `moderation_appeals` 是**内容风控申诉**（只允许 rejected 的卡/头像、每主体终身一次），与「角色演得不像/裁决不公」零关系，**不得拿来充数**。需新建叙事质量反馈表 + 客户端入口 |
 
-   补齐性价比排序：① `CriticReport` 落库（模型已跑，白扔）② `fact.consequence` 进事件投影
-   ③ `world_members` 加 `left_at`。另有一处同类浪费：`ModelCallLog` 的分环节 token
-   （agent/model_id/latency/retries）被 `TokenMeter` 求和成标量即丢弃，导致成本无法做
-   「decide 换便宜模型省了多少」的分环节归因。
+   > 还有一处同类浪费未处理：`ModelCallLog` 的分环节 token（agent/model_id/latency/retries）
+   > 被 `TokenMeter` 求和成标量即丢弃，导致成本做不了「decide 换便宜模型省了多少」的分环节归因。
 3. **台账维护**：每次合并/发布更新 §3 表；发布评审以台账为准，禁止口头"已完成"。
 
 ## 5. AI 失败安全降级（写入门槛，因公共事实不可回滚）

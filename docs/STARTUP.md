@@ -58,7 +58,7 @@ cd server && cargo run --features billing,arena # 含 P4b 计费 + P6 赛事房
 ```
 
 - 默认 dev 态:SQLite 内存库 + 内存队列 + Dev providers,**无需任何外部依赖**,监听 `127.0.0.1:8787`。
-- 迁移(`server/migrations/0001-0020`)启动时自动执行。
+- 迁移(`server/migrations/0001-0029`)启动时自动执行。
 - **状态诚实声明**:短信、内容审核(含图审)、实名、TTS、支付当前均为 **Dev 桩**(直过/回显),
   按七档状态语言属 `Implemented`,**不是 `Production-ready`**——上线需接真实 Provider、
   补实名闭环(当前接口存在请求方直提 verified 的 dev 口子)并完成"生成式 AI 服务 + 游戏监管"双轨合规评估。
@@ -120,11 +120,13 @@ cd server && MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo ru
 
 ## 5. 数据库与迁移
 
-- 迁移文件 `server/migrations/0001-0025`,启动自动按版本号顺序执行(sqlx migrate)。
+- 迁移文件 `server/migrations/0001-0029`,启动自动按版本号顺序执行(sqlx migrate)。
 - 可移植 SQL 子集(TEXT id / BIGINT 毫秒 / TEXT JSON / INTEGER 布尔),SQLite 与 Postgres 双跑。
 - dev 内存库每次启动重建;需要持久化 dev 数据用文件库 `sqlite://muse-dev.db`(已 gitignore)。
-- ⚠️ **`0023` 号已跳过,不要补**。R1 并行开发时预留给「运行时内容安全」,但该项复用了 `0001` 就有的
-  `world_events.moderation` 列、无需建表。sqlx 只要求版本号唯一递增、不要求连续,跳号本身无害;
+- ⚠️ **`0023` 与 `0028` 是空号,不要补**。两者都是并行开发时预留、最终判定不需要建表的:
+  `0023` 预留给「运行时内容安全」(复用了 `0001` 就有的 `world_events.moderation` 列);
+  `0028` 预留给「成员羁绊字段」(全部是对既有表的 join,无新表新列)。
+  sqlx 只要求版本号唯一递增、不要求连续,跳号本身无害;
   但**事后往回插入一个比已应用版本更小的号会让已迁移的库报错**——需要新迁移一律往后取号。
 
 | 迁移 | 内容 |
@@ -153,6 +155,9 @@ cd server && MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo ru
 | `0022_dream_quota_index` | **托梦配额**(§8)按卡计数索引 `(world_id, character_id, status)` |
 | `0024_saga_stage` | **Saga 归组**(§3):`world_templates` 加 `saga_id` + `stage_no`(0023 见上方跳号说明) |
 | `0025_worldline_contribution` | **三层结算③世界线层**(§9):贡献归因表(独立于 `narrative_state_json`,绝不回灌引擎) |
+| `0026_lethality` | **生死契约三档**(§11):`worlds` 加 `lethality`(默认 `consent`,历史行行为零变化) |
+| `0027_world_cover` | 世界封面三列(复刻 0016 立绘范式:object_key/url/moderation,过审才下发) |
+| `0029_engagement_invitations` | 发布物浏览·收藏计数(append-only 登记表,无可变计数列即无热点行)+ 房间邀请(默认关闭) |
 
 ---
 
@@ -166,16 +171,16 @@ cd server && MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo ru
 
 ## 7. 冒烟验证
 
-全绿基线(**校验于 2026-07-25**,数字随开发增长——对不上先确认是新增测试还是漏跑):
+全绿基线(**校验于 2026-07-26**,数字随开发增长——对不上先确认是新增测试还是漏跑):
 
 ```bash
 # 引擎 + 后端 + 桌面壳
-cargo test --manifest-path crates/muse-engine/Cargo.toml          # 226 passed
-(cd server && cargo test)                                          # 273 passed(default)
-(cd server && cargo test --features billing,arena)                 # 349 passed
+cargo test --manifest-path crates/muse-engine/Cargo.toml          # 237 passed
+(cd server && cargo test)                                          # 422 passed(default,含黄金世界回归 12 项)
+(cd server && cargo test --features billing,arena)                 # 500 passed
 cargo test --manifest-path src-tauri/Cargo.toml                    # 208 passed
 # 前端 + 后台
-npm run test                                                       # 477 passed / 79 files
+npm run test                                                       # 481 passed / 79 files
 npx tsc --noEmit                                                   # 0 错误
 (cd admin && npx tsc --noEmit && npm run build)                    # 0 错误 + 产出 dist
 ```

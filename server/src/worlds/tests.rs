@@ -330,6 +330,118 @@ async fn leave_marks_member_left() {
     assert_eq!(status, "left");
 }
 
+// ---------- 退出时刻 left_at（迁移 0030；docs/VALIDATION.md §4.2 ③「退出率只能算截面」的成因） ----------
+
+/// 读某成员行的 (status, joined_at, left_at)。`left_at` 可空 → Option。
+async fn member_row(state: &AppState, world_id: &str, char_id: &str) -> (String, i64, Option<i64>) {
+    sqlx::query_as::<_, (String, i64, Option<i64>)>(
+        "SELECT status, joined_at, left_at FROM world_members WHERE world_id=? AND cloud_character_id=?",
+    )
+    .bind(world_id)
+    .bind(char_id)
+    .fetch_one(&state.db)
+    .await
+    .expect("成员行应存在")
+}
+
+/// leave 写入退出时刻；**重复 leave 幂等且不覆盖首次时刻**（`status='active'` 守卫使第二次 rows=0 → 404）。
+#[tokio::test]
+async fn leave_records_left_at_and_repeat_leave_never_overwrites_it() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    seed_user(&state, "usrA").await;
+    seed_char(&state, "chA", "usrA", "approved", 0).await;
+    let wid = create_world(&state.db, CreateWorldParams::official("tpl", 1, "世界")).await.unwrap();
+    let ta = token(&state, "usrA");
+    let join_uri = format!("/api/worlds/{wid}/join");
+    let leave_uri = format!("/api/worlds/{wid}/leave");
+
+    let (st, _) = post_json(&app, &join_uri, &ta, None, json!({ "cloudCharacterId": "chA" })).await;
+    assert_eq!(st, StatusCode::OK);
+
+    // 在场期间：left_at 必须是 NULL（没退出就没有退出时刻，不预填任何值）。
+    let (status, joined_at, left_at) = member_row(&state, &wid, "chA").await;
+    assert_eq!(status, "active");
+    assert_eq!(left_at, None, "在场成员不得有退出时刻");
+
+    let (st_leave, _) = post_json(&app, &leave_uri, &ta, None, json!({ "cloudCharacterId": "chA" })).await;
+    assert_eq!(st_leave, StatusCode::OK);
+
+    let (status, _, first_left_at) = member_row(&state, &wid, "chA").await;
+    assert_eq!(status, "left");
+    let first = first_left_at.expect("leave 必须记下退出时刻（否则只能算截面、算不了留存曲线）");
+    assert!(first >= joined_at, "退出时刻不得早于加入时刻：left_at={first} joined_at={joined_at}");
+
+    // 重复 leave：守卫 status='active' 命不中 → 404，首次时刻原样保留（只增不改）。
+    let (st_again, _) = post_json(&app, &leave_uri, &ta, None, json!({ "cloudCharacterId": "chA" })).await;
+    assert_eq!(st_again, StatusCode::NOT_FOUND, "重复 leave 应 404（幂等）");
+    let (_, _, second_left_at) = member_row(&state, &wid, "chA").await;
+    assert_eq!(second_left_at, Some(first), "重复 leave 不得用新墙钟覆盖首次退出时刻");
+}
+
+/// 历史行（本迁移之前退出的成员）保持 `left_at IS NULL` —— **不回填**成 joined_at 或 now：
+/// 那是凭空编造一个从未被观测到的时刻，会让留存曲线看起来有数据而实际是假的，比缺数据更坏。
+#[tokio::test]
+async fn historical_left_members_keep_null_left_at_without_backfill() {
+    let state = test_state().await;
+    let wid = create_world(&state.db, CreateWorldParams::official("tpl", 1, "世界")).await.unwrap();
+    // 直接落一行「老数据」：已退出但没有退出时刻（迁移前的形态）。
+    sqlx::query(
+        "INSERT INTO world_members (id, world_id, user_id, cloud_character_id, boundary_json, status, joined_at) \
+         VALUES (?, ?, 'usrOld', 'chOld', '{}', 'left', ?)",
+    )
+    .bind(new_id("wm"))
+    .bind(&wid)
+    .bind(now_ms())
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    let (status, _, left_at) = member_row(&state, &wid, "chOld").await;
+    assert_eq!(status, "left");
+    assert_eq!(left_at, None, "历史退出行的时刻是「未知」，迁移不得编造");
+
+    // 口径提醒：统计留存曲线必须显式排除这批行，而不是把 NULL 当成 0 或当成「没退出」。
+    let unknown = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM world_members WHERE status <> 'active' AND left_at IS NULL",
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(unknown, 1, "历史盲区行可被显式识别（status 非 active 但无 left_at）");
+}
+
+/// 复活（left → active）把 `left_at` 清回 NULL：该分支本来就重写 `joined_at`（成员纪元重置），
+/// 若留着上一段的退出时刻会得到 `left_at < joined_at` 的自相矛盾行，污染一切时序统计。
+#[tokio::test]
+async fn rejoin_clears_left_at_so_it_never_predates_joined_at() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    seed_user(&state, "usrA").await;
+    seed_char(&state, "chA", "usrA", "approved", 0).await;
+    let wid = create_world(&state.db, CreateWorldParams::official("tpl", 1, "世界")).await.unwrap();
+    let ta = token(&state, "usrA");
+    let join_uri = format!("/api/worlds/{wid}/join");
+    let leave_uri = format!("/api/worlds/{wid}/leave");
+
+    post_json(&app, &join_uri, &ta, None, json!({ "cloudCharacterId": "chA" })).await;
+    post_json(&app, &leave_uri, &ta, None, json!({ "cloudCharacterId": "chA" })).await;
+    assert!(member_row(&state, &wid, "chA").await.2.is_some(), "退出后应有时刻");
+
+    // 复活同一张卡。
+    let (st, body) = post_json(&app, &join_uri, &ta, None, json!({ "cloudCharacterId": "chA" })).await;
+    assert_eq!(st, StatusCode::OK, "body={body}");
+    let (status, _, left_at) = member_row(&state, &wid, "chA").await;
+    assert_eq!(status, "active");
+    assert_eq!(left_at, None, "复活后不得留着上一段的退出时刻（否则 left_at < joined_at）");
+
+    // 再次退出重新记时刻，且不早于新的 joined_at。
+    post_json(&app, &leave_uri, &ta, None, json!({ "cloudCharacterId": "chA" })).await;
+    let (status, joined_at, left_at) = member_row(&state, &wid, "chA").await;
+    assert_eq!(status, "left");
+    assert!(left_at.unwrap() >= joined_at, "第二段的退出时刻仍不得早于第二段的加入时刻");
+}
+
 // ---------- 防自刷：同一世界每位用户仅可投放一张角色卡 ----------
 
 /// 同 user 第二张卡 join 同世界 → 409 固定文案；不同 user 一人一卡互不影响。

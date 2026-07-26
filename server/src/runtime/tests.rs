@@ -2672,3 +2672,182 @@ async fn assignments_without_pool_in_template_degrade_completely() {
     let world = load_world(&state.db, &wid).await.unwrap();
     assert!(load_identity_display_names(&state.db, &world).await.is_empty(), "模板缺失 → 退化，不 panic");
 }
+
+// ---------- 叙事 critic 报告落库（叙事质量 SLO「状态-文本矛盾率」数据源，docs/VALIDATION.md §4.2 ①） ----------
+//
+// 🔴 平权红线（§0.1）：critic 是**对模型自身产出的评价**，只进独立表 `world_tick_critic`，
+//    **绝不进 `worlds.narrative_state_json`** —— 那份 JSON 每 tick 回灌进引擎 `RoundInput.state`，
+//    写进去即「引擎读自己的评分再决策」。下方 `critic_report_never_reaches_engine_state_redline`
+//    就是这条红线的断言（口径同 world_contributions / mileage）。
+
+use crate::runtime::critic_persist_from_env_value;
+
+/// 产出**非空** critic 报告的 mock：其余环节与 `MockModel` 同款合法占位 JSON。
+struct CriticIssuesMock;
+
+/// 与 mock 返回值逐字一致的期望值（断言用，避免两处漂移）。
+const CRITIC_CONSISTENCY: [&str; 2] = ["李在第 2 段忽然改用现代口语，与卡上的文言底色不符", "王的怯懦设定与其强硬发言矛盾"];
+const CRITIC_CAUSAL: [&str; 1] = ["门在上一句还是锁着的，这一句人已经在屋内"];
+const CRITIC_SUGGESTION: [&str; 1] = ["补一句开锁动作，或把入场改为窗口"];
+
+#[async_trait]
+impl ModelClient for CriticIssuesMock {
+    async fn complete(&self, spec: &ModelCallSpec, cancel: &CancelFlag) -> Result<ModelOutput, EngineError> {
+        cancel.check()?;
+        let content = match spec.agent.as_str() {
+            "director" => r#"{"situation":"密室之中，烛火摇曳，两人对坐。"}"#.to_string(),
+            "roleDecide" => r#"{"intent":"观望","action":"上前拱手行礼","speak":{"willSpeak":true,"purpose":"寒暄"},"targets":[],"acceptableCosts":[],"predictions":[]}"#.to_string(),
+            "arbiter" => r#"{"outcomes":[]}"#.to_string(),
+            "writer" => r#"{"prose":"两位大臣于烛下各怀心事。"}"#.to_string(),
+            "critic" => json!({
+                "characterConsistencyIssues": CRITIC_CONSISTENCY,
+                "causalIssues": CRITIC_CAUSAL,
+                "revisionSuggestions": CRITIC_SUGGESTION,
+            })
+            .to_string(),
+            _ => "{}".to_string(),
+        };
+        Ok(ModelOutput { content, input_tokens: Some(5), output_tokens: Some(5) })
+    }
+}
+
+async fn critic_row(db: &AnyPool, world_id: &str, tick_no: i64) -> (i64, i64, i64, String) {
+    sqlx::query_as::<_, (i64, i64, i64, String)>(
+        "SELECT consistency_issue_count, causal_issue_count, revision_suggestion_count, report_json \
+         FROM world_tick_critic WHERE world_id=? AND tick_no=?",
+    )
+    .bind(world_id)
+    .bind(tick_no)
+    .fetch_one(db)
+    .await
+    .expect("本 tick 应有 critic 行")
+}
+
+/// 落库正确 + **结构化字段可读回**：三条列表逐字还原成 `CriticReport`，计数列与列表长度一致。
+#[tokio::test]
+async fn critic_report_is_persisted_with_structured_fields_readable_back() {
+    let state = test_state().await;
+    let wid = running_world_with_two_members(&state).await;
+    let model: Arc<dyn ModelClient> = Arc::new(CriticIssuesMock);
+
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 0, model.clone()).await.unwrap(), TickStatus::Done);
+
+    let (c_cnt, causal_cnt, sug_cnt, report_json) = critic_row(&state.db, &wid, 0).await;
+    // 计数列是 SLO 聚合的口径（纯 SQL，不解析 JSON）。
+    assert_eq!(c_cnt, 2, "人物一致性问题计数");
+    assert_eq!(causal_cnt, 1, "因果问题计数");
+    assert_eq!(sug_cnt, 1, "修订建议计数");
+
+    // 结构化读回：serde 直还原为引擎的 CriticReport，逐条文本不丢、不截断、不改序。
+    let back: muse_engine::narrative::continuity::CriticReport =
+        serde_json::from_str(&report_json).expect("report_json 必须能读回 CriticReport");
+    assert_eq!(back.character_consistency_issues, CRITIC_CONSISTENCY.map(String::from).to_vec());
+    assert_eq!(back.causal_issues, CRITIC_CAUSAL.map(String::from).to_vec());
+    assert_eq!(back.revision_suggestions, CRITIC_SUGGESTION.map(String::from).to_vec());
+    // 计数列与列表长度必须自洽（否则 SLO 分子会与原始数据脱节）。
+    assert_eq!(back.character_consistency_issues.len() as i64, c_cnt);
+    assert_eq!(back.causal_issues.len() as i64, causal_cnt);
+    assert_eq!(back.revision_suggestions.len() as i64, sug_cnt);
+
+    // 跨 tick 各落一行，(world_id, tick_no) 一一对应。
+    insert_tick(&state.db, &wid, 1, 1).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 1, model).await.unwrap(), TickStatus::Done);
+    assert_eq!(
+        i64_one(&state.db, "SELECT COUNT(*) FROM world_tick_critic WHERE world_id=?", &wid).await,
+        2,
+        "两个已提交 tick 各落一行"
+    );
+    let _ = critic_row(&state.db, &wid, 1).await;
+}
+
+/// 🔴 **红线断言**：critic 文本绝不进 `worlds.narrative_state_json`（那份 JSON 每 tick 回灌进引擎），
+/// 也不进任何对玩家下发的事件投影。同 `world_contributions` / `mileage` 的隔离口径。
+#[tokio::test]
+async fn critic_report_never_reaches_engine_state_redline() {
+    let state = test_state().await;
+    let wid = running_world_with_two_members(&state).await;
+    let model: Arc<dyn ModelClient> = Arc::new(CriticIssuesMock);
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 0, model).await.unwrap(), TickStatus::Done);
+
+    // ① 权威叙事状态（下一 tick 会被原样回灌进引擎 RoundInput.state）里不得出现任何 critic 内容。
+    let w = load_world(&state.db, &wid).await.unwrap();
+    for probe in CRITIC_CONSISTENCY.iter().chain(CRITIC_CAUSAL.iter()).chain(CRITIC_SUGGESTION.iter()) {
+        assert!(
+            !w.narrative_state_json.contains(probe),
+            "critic 文本渗入 narrative_state_json = 引擎读自己的评分再决策（平权红线）：{probe}"
+        );
+    }
+    for key in ["criticReport", "characterConsistencyIssues", "causalIssues", "revisionSuggestions"] {
+        assert!(!w.narrative_state_json.contains(key), "critic 字段名不得出现在引擎状态：{key}");
+    }
+
+    // ② 也不得混进对外事件投影（critic 是内部观测，不是公共事实）。
+    let events_dump: String = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM world_events WHERE world_id=? AND (COALESCE(public_projection_json,'') LIKE '%现代口语%' \
+         OR COALESCE(private_projections_json,'') LIKE '%现代口语%')",
+    )
+    .bind(&wid)
+    .fetch_one(&state.db)
+    .await
+    .unwrap()
+    .to_string();
+    assert_eq!(events_dump, "0", "critic 文本不得出现在任何事件投影");
+
+    // ③ critic 确实落到了它该在的地方（防"两边都没有"的假绿）。
+    assert_eq!(i64_one(&state.db, "SELECT COUNT(*) FROM world_tick_critic WHERE world_id=?", &wid).await, 1);
+}
+
+/// **分母**：critic 跑过但一条问题都没有时**仍要落一行**（计数全 0）——否则「干净的 tick」与
+/// 「压根没落库的历史 tick」在库里无法区分，矛盾率的分母就永远算不准。
+/// 同时校验：未提交的 tick（superseded/未跑回合）不留孤儿观测行（同事务的直接后果）。
+#[tokio::test]
+async fn clean_critic_still_writes_a_row_and_uncommitted_ticks_write_none() {
+    let state = test_state().await;
+    let wid = running_world_with_two_members(&state).await;
+    // MockModel 的 critic 三条列表全空。
+    let model: Arc<dyn ModelClient> = Arc::new(MockModel { input_tokens: 5, output_tokens: 5 });
+
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 0, model.clone()).await.unwrap(), TickStatus::Done);
+
+    let (c, causal, sug, report_json) = critic_row(&state.db, &wid, 0).await;
+    assert_eq!((c, causal, sug), (0, 0, 0), "干净回合三项计数为 0，但**行必须存在**（分母）");
+    let back: muse_engine::narrative::continuity::CriticReport = serde_json::from_str(&report_json).unwrap();
+    assert!(back.character_consistency_issues.is_empty() && back.causal_issues.is_empty());
+
+    // 陈旧 tick（base_revision 不匹配 → superseded，从未跑回合、从未提交）→ 不留 critic 行。
+    insert_tick(&state.db, &wid, 1, 0).await.unwrap();
+    assert_eq!(
+        process_tick_with_model(&state, &wid, 1, model).await.unwrap(),
+        TickStatus::Skipped("superseded")
+    );
+    assert_eq!(
+        i64_one(&state.db, "SELECT COUNT(*) FROM world_tick_critic WHERE world_id=?", &wid).await,
+        1,
+        "未提交回合不得留下孤儿 critic 行（与状态 CAS 同事务的直接后果）"
+    );
+
+    // 分子/分母都能纯 SQL 算出来：矛盾率 = 有问题的 tick / critic 跑过的 tick。
+    let with_issues = i64_one(
+        &state.db,
+        "SELECT COUNT(*) FROM world_tick_critic WHERE world_id=? AND (consistency_issue_count > 0 OR causal_issue_count > 0)",
+        &wid,
+    )
+    .await;
+    assert_eq!(with_issues, 0, "本用例全干净 → 矛盾率分子为 0");
+}
+
+/// 开关是参数（§0.2），**默认开启**：观测数据不属 §0.1「对用户开放的功能」，
+/// 默认关掉等于把补缺口这件事本身关掉。配错值一律回落开启（不静默丢数据）。
+#[test]
+fn critic_persist_switch_defaults_on_and_misconfig_keeps_recording() {
+    assert!(critic_persist_from_env_value(None), "未配置 → 默认开启");
+    for off in ["0", "false", "off", "OFF", " False "] {
+        assert!(!critic_persist_from_env_value(Some(off)), "{off} 应关闭");
+    }
+    for on in ["1", "true", "on", "", "yes", "随便写的值"] {
+        assert!(critic_persist_from_env_value(Some(on)), "{on} 应保持开启（配错不静默丢数据）");
+    }
+}

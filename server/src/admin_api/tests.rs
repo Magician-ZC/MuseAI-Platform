@@ -2226,3 +2226,234 @@ async fn diagnostics_budget_exposes_cny_and_usage_ratio() {
     assert!(diag["budget"]["cnyUsageRatio"].is_null(), "无 cny 上限 → 用量比 null");
     assert_eq!(diag["budget"]["tokenUsageRatio"].as_f64().unwrap(), 0.0);
 }
+
+// ================= 叙事质量 SLO（VALIDATION §4.2 验证基建第二件） =================
+// 落点：GET /admin/metrics/overview 的 `narrativeSlo` 顶层键（口径与聚合在 crate::slo）。
+// 本节测的是**接进后台之后**的事：响应形态、RBAC、窗口参数、减负开关、
+// 🔴 三项不可算指标是否如实标注为「无数据源」而不是显示 0。
+// 聚合口径本身的正确性（基尼/无戏份/收尾率/二次入世率）在 slo::tests 里逐项断言。
+
+async fn slo_ins_contribution(state: &AppState, world: &str, character: &str, score_milli: i64) {
+    sqlx::query(
+        "INSERT INTO world_contributions (world_id, character_id, score_milli, milestone_score_milli, \
+         settled_at, updated_at) VALUES (?, ?, ?, 0, 0, ?)",
+    )
+    .bind(world)
+    .bind(character)
+    .bind(score_milli)
+    .bind(now_ms())
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+async fn slo_ins_event(state: &AppState, world: &str, tick_no: i64, seq: i64, kind: &str, actors: &[&str]) {
+    sqlx::query(
+        "INSERT INTO world_events (id, world_id, tick_no, sequence, domain_event_id, event_type, \
+         actors_json, visibility, occurred_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'public', ?)",
+    )
+    .bind(format!("slo_ev_{world}_{tick_no}_{seq}"))
+    .bind(world)
+    .bind(tick_no)
+    .bind(seq)
+    .bind(format!("slo_dev_{world}_{tick_no}_{seq}"))
+    .bind(kind)
+    .bind(serde_json::to_string(actors).unwrap())
+    .bind(now_ms())
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+/// 四项可算指标进后台：数值正确、🔴 NPC 不污染基尼、门槛与窗口回显齐全。
+#[tokio::test]
+async fn metrics_overview_exposes_narrative_slo_four_computable_metrics() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+    let now = now_ms();
+
+    // 世界 A（在跑）：三名玩家 8000/1000/1000 → 基尼 0.467 越 T2 门槛；另有一名 NPC 独占大头。
+    ins_world(&state, "slo_w1", "running", now).await;
+    for (mid, score) in [("p1", 8000i64), ("p2", 1000), ("p3", 1000)] {
+        ins_member(&state, mid, "slo_w1", &format!("u_{mid}"), "active").await;
+        slo_ins_contribution(&state, "slo_w1", &format!("cc_{mid}"), score).await;
+    }
+    slo_ins_contribution(&state, "slo_w1", "npc_slo", 90_000).await;
+
+    // 拍域 3 拍；cc_p1 每拍有戏，cc_p2 只有第 0 拍，cc_p3 只被同意门拦下（不算戏份）。
+    for t in 0..3 {
+        ins_tick_st(&state, &format!("slo_tk_{t}"), "slo_w1", t, 100, "done", now).await;
+        slo_ins_event(&state, "slo_w1", t, t * 10, "action", &["cc_p1"]).await;
+        slo_ins_event(&state, "slo_w1", t, t * 10 + 2, "consent_request", &["cc_p3"]).await;
+    }
+    slo_ins_event(&state, "slo_w1", 0, 1, "dialogue", &["cc_p2"]).await;
+
+    // 世界 B（已结束，强制收尾）+ 世界 C（已结束，自然收尾）。
+    ins_world(&state, "slo_w2", "ended", now).await;
+    ins_world(&state, "slo_w3", "ended", now).await;
+    for (w, reason) in [("slo_w2", "time_cap|ending=none"), ("slo_w3", "mainline_complete|ending=peace")] {
+        sqlx::query(
+            "INSERT INTO audit_logs (id, actor_id, actor_role, action, subject, reason, created_at) \
+             VALUES (?, 'system', 'system', 'world.ended', ?, ?, ?)",
+        )
+        .bind(format!("slo_aud_{w}"))
+        .bind(w)
+        .bind(reason)
+        .bind(now)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+
+    // 二次入世：cc_p1 再进一个世界；两张未下架卡入库。
+    ins_member(&state, "p1b", "slo_w2", "u_p1", "active").await;
+    sqlx::query("UPDATE world_members SET cloud_character_id = 'cc_p1' WHERE id = 'p1b'")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    seed_character(&state, "cc_p1", "u_p1", "沈砚", "approved", None).await;
+    seed_character(&state, "cc_p2", "u_p2", "裴照", "approved", None).await;
+
+    let (st, m) = get(&app, "/api/admin/metrics/overview", Some(&admin)).await;
+    assert_eq!(st, StatusCode::OK, "{m}");
+    let slo = &m["narrativeSlo"];
+    assert_eq!(slo["status"], "ok", "{slo}");
+    assert_eq!(slo["windowDays"], 30, "SLO 默认窗口 30 天");
+    assert_eq!(slo["thresholds"]["attentionGiniMax"], 0.35, "T2 门槛必须回显在响应里");
+
+    // ① 基尼：只统计 slo_w1（3 名玩家），NPC 已被 world_members 交集剔除。
+    let g = &slo["metrics"]["attentionGini"];
+    assert_eq!(g["status"], "ok");
+    assert_eq!(g["worldsCounted"], 1);
+    assert_eq!(g["worstWorlds"][0]["worldId"], "slo_w1");
+    assert_eq!(g["worstWorlds"][0]["members"], 3, "🔴 NPC 不得进玩家公平度分母");
+    let gini = g["worstWorlds"][0]["gini"].as_f64().unwrap();
+    assert!((gini - 7000.0 / 15000.0).abs() < 1e-9, "8000/1000/1000 的基尼应为 0.4667，实测 {gini}");
+    assert_eq!(g["worldsOverThreshold"], 1, "该世界越过 T2 门槛 0.35");
+
+    // ② 最长连续无有效戏份：cc_p3 全程被同意门拦下 → 3 拍；cc_p2 → 2 拍；cc_p1 → 0。
+    let s = &slo["metrics"]["silentStreak"];
+    assert_eq!(s["status"], "ok");
+    assert_eq!(s["ticksCounted"], 3);
+    assert_eq!(s["maxStreak"], 3, "consent_request 不构成有效戏份");
+    let worst = s["worstMembers"].as_array().unwrap();
+    let streak = |cid: &str| worst.iter().find(|w| w["characterId"] == cid).unwrap()["streak"].as_i64().unwrap();
+    assert_eq!(streak("cc_p3"), 3);
+    assert_eq!(streak("cc_p2"), 2);
+    assert_eq!(streak("cc_p1"), 0);
+
+    // ③ 强制收尾率：两个已结束世界，一个 time_cap（强制）一个 mainline_complete（自然）。
+    let f = &slo["metrics"]["forcedConclusionRate"];
+    assert_eq!(f["endedWorlds"], 2);
+    assert_eq!(f["forcedWorlds"], 1);
+    assert_eq!(f["forcedRate"], 0.5);
+    assert_eq!(f["byKind"]["natural"], 1);
+    assert_eq!(f["byKind"]["forced"], 1);
+
+    // ④ 同角色二次入世率：cc_p1 进过两个世界，分母是两张未下架卡。
+    let r = &slo["metrics"]["repeatEntryRate"];
+    assert_eq!(r["charactersTotal"], 2);
+    assert_eq!(r["charactersTwoPlusWorlds"], 1);
+    assert_eq!(r["repeatEntryRate"], 0.5);
+}
+
+/// 🔴 三项没有数据源的 SLO 必须在后台响应里**如实标注**：status=no_data_source + value=null，
+/// 并说清为什么算不了。后台显示 `—` 与显示 `0%` 是两个完全不同的经营判断。
+#[tokio::test]
+async fn narrative_slo_marks_remaining_metrics_as_no_data_source() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+
+    // 造一条内容风控申诉：它**不是** OOC 申诉，绝不能被当成 OOC 申诉率的数据源。
+    seed_character(&state, "ch_ap", "u_ap", "被驳回的卡", "rejected", None).await;
+    seed_appeal(&state, "ap1", "ch_ap", "u_ap", "open", now_ms()).await;
+
+    let (st, m) = get(&app, "/api/admin/metrics/overview", Some(&admin)).await;
+    assert_eq!(st, StatusCode::OK);
+    let slo = &m["narrativeSlo"];
+
+    let expected = ["oocAppealRate", "plotRepetitionRate"];
+    let listed: Vec<&str> =
+        slo["unavailable"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+    assert_eq!(listed, expected);
+    for key in expected {
+        let x = &slo["metrics"][key];
+        assert_eq!(x["status"], "no_data_source", "{key}: {x}");
+        assert!(x["value"].is_null(), "{key} 必须是 null，不许是 0：{x}");
+        assert!(!x["reason"].as_str().unwrap().is_empty(), "{key} 必须说清为什么算不了");
+        assert!(!x["blockedBy"].as_str().unwrap().is_empty(), "{key} 必须说清补齐它需要什么");
+    }
+    // 内容风控申诉确实存在，但 OOC 申诉率照样是「无数据源」——两张表不可互相冒充。
+    assert_eq!(
+        count(&state, "SELECT COUNT(*) AS n FROM moderation_appeals").await,
+        1,
+        "前提：库里确实有一条内容风控申诉"
+    );
+    assert!(slo["metrics"]["oocAppealRate"]["reason"].as_str().unwrap().contains("moderation_appeals"));
+}
+
+/// 空平台：SLO 段不除零、不报错、不 panic，四项可算指标一律 ok 且计数为 0。
+#[tokio::test]
+async fn narrative_slo_is_zero_safe_on_empty_platform() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let (st, m) = get(&app, "/api/admin/metrics/overview", Some(&admin_token(&state))).await;
+    assert_eq!(st, StatusCode::OK, "{m}");
+    let slo = &m["narrativeSlo"];
+    assert_eq!(slo["status"], "ok");
+    assert_eq!(slo["metrics"]["attentionGini"]["worldsCounted"], 0);
+    assert_eq!(slo["metrics"]["silentStreak"]["membersCounted"], 0);
+    assert_eq!(slo["metrics"]["forcedConclusionRate"]["forcedRate"], 0.0);
+    assert_eq!(slo["metrics"]["repeatEntryRate"]["repeatEntryRate"], 0.0);
+    // 均值类无数据时给 null（"没数据"不是"均值为 0"）。
+    assert!(slo["metrics"]["attentionGini"]["meanGini"].is_null());
+    assert!(slo["metrics"]["silentStreak"]["meanStreak"].is_null());
+}
+
+/// 窗口参数 clamp 到 [1,365]；`?slo=0` 是给高频轮询的减负开关，且与"无数据源"是两种状态。
+#[tokio::test]
+async fn narrative_slo_window_clamps_and_can_be_skipped_for_polling() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+
+    let (_, m) = get(&app, "/api/admin/metrics/overview?sloDays=7", Some(&admin)).await;
+    assert_eq!(m["narrativeSlo"]["windowDays"], 7);
+    let (_, m) = get(&app, "/api/admin/metrics/overview?sloDays=0", Some(&admin)).await;
+    assert_eq!(m["narrativeSlo"]["windowDays"], 1, "下限 clamp 到 1");
+    let (_, m) = get(&app, "/api/admin/metrics/overview?sloDays=9999", Some(&admin)).await;
+    assert_eq!(m["narrativeSlo"]["windowDays"], 365, "上限 clamp 到 365");
+
+    // 减负开关：跳过态自成一档，仍如实列出三项无数据源指标。
+    let (st, m) = get(&app, "/api/admin/metrics/overview?slo=0", Some(&admin)).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(m["narrativeSlo"]["status"], "skipped_by_request");
+    assert_eq!(m["narrativeSlo"]["metrics"].as_object().unwrap().len(), 0);
+    assert_eq!(m["narrativeSlo"]["unavailable"].as_array().unwrap().len(), 2);
+    // 其余看板段不受影响。
+    assert!(m["cost"]["centsPer1kTokens"].as_i64().unwrap() > 0);
+}
+
+/// RBAC 沿用 operator/finance（admin 直通），不放宽：reviewer/support 403、匿名 401。
+#[tokio::test]
+async fn narrative_slo_role_gate_operator_finance_admin_only() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let ov = "/api/admin/metrics/overview";
+
+    for role in ["operator", "finance"] {
+        let (st, m) = get(&app, ov, Some(&role_token(&state, role))).await;
+        assert_eq!(st, StatusCode::OK, "{role} 应可读 SLO");
+        assert_eq!(m["narrativeSlo"]["status"], "ok");
+    }
+    let (st, m) = get(&app, ov, Some(&admin_token(&state))).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(m["narrativeSlo"]["status"], "ok");
+
+    assert_eq!(get(&app, ov, Some(&role_token(&state, "reviewer"))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(get(&app, ov, Some(&role_token(&state, "support"))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(get(&app, ov, Some(&user_token(&state))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(get(&app, ov, None).await.0, StatusCode::UNAUTHORIZED);
+}

@@ -26,6 +26,8 @@ mod queue;
 mod reports;
 mod runtime;
 mod safety;
+// 叙事质量 SLO（VALIDATION §4.2）：只读观测口径 + 平台级聚合，供运营看板消费。
+mod slo;
 mod worlds;
 
 #[cfg(feature = "arena")]

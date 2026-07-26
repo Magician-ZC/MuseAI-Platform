@@ -41,7 +41,9 @@
 `subplotCardRefs`，装配期忽略容器字段走原路径**；`memorial`（传世卡 · 遗作馆）全部端点
 **与封卷本身**由 `MUSE_MEMORIAL` 控制，**默认关闭 → 端点 404 且不发生任何封卷**；世界的生死状档由
 `MUSE_LETHALITY_DEATHMATCH` 控制，默认关闭 → 读取侧降级为同意制；`annotations`（OOC 注解权）
-全部端点由 `MUSE_OOC_ANNOTATIONS` 控制，**默认关闭 → 六端点全 404 且一行都不落库**。
+全部端点由 `MUSE_OOC_ANNOTATIONS` 控制，**默认关闭 → 六端点全 404 且一行都不落库**；
+`livestage`（直播场：定档 + 延迟缓冲 + 弹幕，见 §6）全部端点由 `MUSE_LIVE_STAGE` 控制，
+**默认关闭 → 八端点全 404 且零副作用**（不记观众足迹、不落弹幕、不建场次、不写审计）。
 
 ---
 
@@ -625,6 +627,63 @@ if 线：   从终局那一拍岔出去的、只属于你的一条平行线   �
 | GET | `/api/arena/{worldId}/clips` | JWT | 高光切片（TtsProvider/切片为 Dev 桩） |
 | POST | `/api/livegate/webhook` | 验签 | 直播平台礼物回调。`MUSE_LIVEGATE_SECRET` 未配置时 **fail-closed** |
 
+### 直播场（livestage，migration 0042；总规格 §2 场次节奏三档「直播场」+ §15 第 4 层）
+
+> ⚠️ **不在 `arena` feature 门控内**（模块挂在默认构建里，见 `app.rs`）：延迟缓冲是**内容安全机制**
+> （§15 五层漏斗的第 4 层），把它编进可选 feature 等于让默认构建缺一层安全闸；且它只依赖
+> `events`/`safety`/`flags`，与 `ledger` 无关。能力本身由**运行时开关** `MUSE_LIVE_STAGE` 控制。
+>
+> 与既有观战的分工：观战（`/worlds/{id}/events`、`WS /worlds/{id}/stream`、`arena` 战报/回放）
+> 已实现且**一行未改**；本模块只补三件它没有的东西——**定档**、**延迟缓冲**、**弹幕**。
+
+| 方法 | 路径 | 鉴权 | 说明 |
+|---|---|---|---|
+| GET | `/live/sessions?status=&cursor=&cursorId=&limit=` | AuthUser | 节目单。**只列 `announceAt <= now` 的场次**；复合游标 `(startsAt, id)` |
+| GET | `/live/sessions/{id}` | AuthUser | 单场详情。含 `broadcast{delayTicks, publishedThroughTick, worldTickNow, pendingTicks}` |
+| GET | `/live/sessions/{id}/feed?cursor=&cursorId=&limit=` | AuthUser | **播出面**（延迟缓冲后的公开事件）。复合游标 `(sequence, id)`；副作用：记一行观众足迹 |
+| POST | `/live/sessions/{id}/danmaku` | AuthUser | 发弹幕 `{body}`。🔴 成年门 + 限频(429) + 审核链；仅 `approved` 才经 `WsHub` 外发 |
+| GET | `/live/sessions/{id}/danmaku?anchorTick=&cursor=&cursorId=` | AuthUser | 弹幕列表（只出过审）。复合游标 `(createdAt, id)` |
+| POST | `/admin/live/sessions` | AdminUser(operator) | 定档 `{worldId, startsAt, announceAt?, endsAt?, title?, delayTicks?, capacity?}` |
+| POST | `/admin/live/sessions/{id}` | AdminUser(operator) | 状态迁移 `{status}` / **延迟拍数调整** `{delayTicks}` + `{reason}` |
+| POST | `/admin/live/sessions/{id}/withhold` | AdminUser(reviewer) | 缓冲窗口内把一条**从本场播出面**撤下 `{eventId, reason?}` |
+
+**运行时开关 `MUSE_LIVE_STAGE`（默认关闭，经 `flags::is_enabled` 解析）。**
+关闭时上述 8 个端点**全部 404 且零副作用**（不记观众足迹、不落弹幕、不建场次、不写审计），
+由 `livestage::tests::red_line_disabled_by_default_every_endpoint_404_with_zero_side_effect` 锁死。
+
+| 项 | 取值 |
+|---|---|
+| ① 定档 | `live_sessions`：预告时刻 `announce_at` + 开播时刻 `starts_at` + 容量。状态机**单向**：`scheduled → live \| canceled`，`live → ended`，终局不可回头（CAS 落库，并发下只有一个请求能完成迁移）。节目单只列已到预告时刻的场次 |
+| ② 延迟缓冲 | 🔴 **是内容安全机制不是体验设计**。播出边界 = `max(最新 done 拍 - delayTicks, publishedThroughTick)`；`scheduled`/`canceled` 一拍不播；`ended` 且过了 `MUSE_LIVE_DRAIN_GRACE_MS` 放尾拍（否则最后 N 拍永远卡在缓冲里） |
+| 🔴 待播内容存在哪 | **存在它本来就在的地方**（`world_events`），**不建任何副本表**。一拍提交时事实已落定（§0.3），延迟的是**公开投影的播出时刻**，不是事实。建副本表会立刻产生两个事实源——那才是事实错乱 |
+| 🔴 已播出不缩回 | `live_sessions.published_high_tick` 是单调下界：**上调 `delayTicks` 只勒住未来**，已在观众屏幕上滚过去的拍不会消失。用例 `raising_delay_ticks_never_retracts_already_published_ticks` |
+| 🔴 世界内不延迟 | 延迟只作用于世界**外**的观众；成员的 `/worlds/{id}/events` 一拍不延——延后当事人等于让世界停摆。用例 `delay_buffer_holds_recent_ticks_but_never_delays_world_members` |
+| 🔴 审核不过怎么处理 | **不外发 ≠ 回滚**。①自动：§15 第 2 层落库前打码置 `pending`，第 3 层异步复核在缓冲期内收紧 `moderation`——播出面只出 `approved`，与观战/回放同口径；②人工：`withhold` 写 `live_withholds` **独立表**，`world_events` **逐字节不动**，战报/回放/日报/成员读取面全不受影响 |
+| `preemptive` 标注 | 撤下如实记 `preemptive`：`true`=播出前拦下（缓冲生效，观众从未看见）／`false`=播出后撤下（**收不回已经看见的**，不假装能撤回）。`withheldPreemptiveRate` < 1 即「延迟拍数配得不够」的直接证据 |
+| ③ 弹幕 | 过 `safety::mask`（就地打码）+ `safety::moderate_and_queue`（**传原文**——`***` 会把注入句式抹平，等于用第 2 层蒙住第 3 层的眼睛；落库仍是打码版）。🔴 **词库命中 → 打码后仍不外发，置 `pending` 转人审**（弹幕是实时公开发言面，拦一条零代价）。非 `approved` 落库但读取面不出 |
+| 🔴 弹幕不是世界事实 | **永不进 `world_events`**（源码级用例 `red_line_module_never_writes_world_events`），因而不进战报/回放/日报/`RoundInput`。观众的一句话不会变成世界里发生过的事，也不影响任何角色决策 |
+| 🔴 弹幕锚定播出拍 | `anchor_tick` 由**服务端按播出水位线**计算，**不接受客户端传值**——否则观众可把弹幕锚到尚未播出的拍上，等于替世界剧透。这是「时间差不造成事实错乱」的关键一步，回放按它与画面对齐 |
+| 🔴 未成年保护 | `ensure_adult_live` 挂发弹幕端点第一行（`ensure_enabled` 之后、任何读写之前，403 发生在**零副作用**位置）：只有 `users.age_declared == 1` 放行，未声明(0)/未成年(2)/用户行缺失一律 403，口径与 `social::ensure_adult_social` / `worlds::join_world` 生死状门逐字一致。⚠️ **只挡写不挡看**——未成年可观看直播（观战本就开放），年龄门挡的是新增的公开发言面 |
+| 面具（§14） | 弹幕响应体只出 `displayName`（`观众xxxx` = `sha256(sessionId:userId)` 前 4 位），**无 `userId`、无昵称、无手机号**。同场稳定、跨场不可关联 |
+| 限频 | `MUSE_LIVE_DANMAKU_RATE_PER_WINDOW` 条 / `MUSE_LIVE_DANMAKU_WINDOW_MS` 毫秒 → 超限 **429**（新增 `ApiError::TooManyRequests`；409 是"状态不允许"，429 是"太快了"，客户端的正确反应不同）。🔴 **被拒的弹幕照样计数**，否则可靠发违规内容白嫖额度 |
+| ④ 转化度量 | `live_viewers` 是 VALIDATION §2 T5 门槛「观众→玩家转化 ≥2%」的**唯一数据源**（此前全仓无任何直播观看埋点）。聚合挂在 `GET /admin/metrics/overview` 的 **`liveStage`** 顶层键，口径见下表 |
+| 参数化（§0.2） | `MUSE_LIVE_DELAY_TICKS`(2，规格 §15「1-2 拍」取上限) / `_ANNOUNCE_LEAD_MS`(1h) / `_SESSION_CAPACITY`(0=不限) / `_DRAIN_GRACE_MS`(5min) / `_DANMAKU_RATE_PER_WINDOW`(20) / `_DANMAKU_WINDOW_MS`(60s) / `_DANMAKU_MAX_LEN`(80) / `_CONVERSION_MIN`(0.02) |
+| 🔴 与错峰调度解耦 | `runtime::offpeak` 的「直播场（`room_type='arena'` ∨ `tick_per_day ≥ MUSE_OFFPEAK_LIVE_TICK_PER_DAY`）**永不延后**」红线**一行未改**。豁免判据必须是世界自身的节奏属性，**不是「有没有定档记录」**——否则运营建一条定档就顺手改掉一个世界的调度行为。播出排期（`live_sessions`）与引擎拍排期（`schedule_due_ticks`）输入完全不相交，双向源码级用例 `red_line_offpeak_live_exemption_untouched` 钉住 |
+| ⚠️ 运营须知 | 只按 `world` 作用域灰度时，观众能进那一场却在**节目单**里看不到它（节目单跨世界，无 world 坐标）。**推荐灰度作用域是 `user` 或 `global`**，`world` 只用于「临时关掉某个出问题世界的直播入口」这种收窄动作 |
+
+**「直播场观众→玩家转化率」口径**（`GET /api/admin/metrics/overview` → `liveStage`，operator/finance；
+窗口与 `narrativeSlo` 同一把尺 = `?sloDays=`，默认 30、UTC 日界；`?slo=0` 一并跳过）：
+
+| 项 | 定义 |
+|---|---|
+| 分母 | 窗口内**首次观看**直播、且**当时还不是玩家**的人数，按 `userId` 去重（取 `MIN(first_seen_at)`）。🔴 `was_player` **在首次观看那一刻冻结**，绝不在统计时现算——现算的话，看完就入场的人会因为"现在是玩家了"被移出分母，分子分母一起缩水 |
+| 分子 | 其中在**首次观看之后**且仍在窗口内入场的人数（`world_members.joined_at > 首次观看时刻`）。🔴 `>` 这个**严格**方向是要害：先入场后看直播不是转化，把它算进分子等于把留存记成拉新 |
+| 恒等式 | 分子的过滤是分母的**子集条件**（同一张派生表上加 `EXISTS`），故 分子 ≤ 分母 恒成立，不会出现 >100% 的转化率 |
+| 三态 | `entry_not_open`（`MUSE_LIVE_STAGE` 从未对任何人开放，value=null，显示 `—`）/ `no_data_in_window`（入口开着但窗口内零新观众，value=null，`—`）/ `ok`（真数，**可以是 0.0**）。🔴 三者不可混同：本功能默认关闭，若直接报 0% 会得到「一个看起来糟透了、实际上什么都没测的数」，而 T5 恰恰要拿它决定继续/调整/停止。入口判定走 `livestage::entry_ever_open`（覆盖按世界/按用户灰度，fail-safe 方向是「没开过」） |
+| 门槛方向 | `thresholdMin` = `MUSE_LIVE_CONVERSION_MIN`，默认 **0.02**（T5 原文「≥2%」，作为默认值而非常量语义）。⚠️ 这是**下限**门槛（`belowThreshold` = 未达标），与基尼那种上限门槛方向相反，别把比较符抄串 |
+| 辅助数 | `sessionsInWindow` · `danmakuTotal` / `danmakuBlocked`（弹幕审核负担，供 T5 门槛「内容审核成本 ≤ 生成成本的 5%」参考）· `withheldTotal` / `withheldPreemptive` / **`withheldPreemptiveRate`**（延迟缓冲的**有效性**度量：< 1 = 有内容已播出才被撤下 = 延迟拍数配得不够，即 T5 预案「上调延迟拍数」的判据；一条撤下都没有 → null，"没发生过"不是"0% 拦住了"） |
+| 埋点位置 | 只在观众**真正拉取播出面**（`GET /live/sessions/{id}/feed`）时记一行，「打开了节目单」不算观看。幂等 upsert（唯一键 `(session_id, user_id)`），随后刷新 `last_seen_at` |
+
 ## 7. 运营后台（admin_api）
 
 后台前端见 `admin/`（端口 1430）。全部端点需管理员 token；`require_role` 语义：`admin` 角色恒通过，
@@ -651,9 +710,11 @@ if 线：   从终局那一拍岔出去的、只属于你的一条平行线   �
 | GET | `/api/admin/sagas/{sagaId}` | operator | 人工校准：单系列逐阶段结构（按 `stage_no` 升序 = 剧情顺序）+ 每阶段骨架形状指标。系列不存在 → 404 |
 | GET | `/api/admin/identity-pools` | operator | 人工校准：声明了 `identityPool` 的模板目录（未声明者不列出） |
 | GET | `/api/admin/world-templates/{id}/identity-pool?limit=` | operator | 人工校准：身份池声明 + 实际分配分布（`limit` 为扫描世界数，默认 100，clamp [1,500]） |
+| GET | `/api/admin/realm-tiers` | operator | 人工校准：声明了 `realmTier`（境界档）的模板目录。另给 `undeclaredInSagaCount`（系列里缺戏服的阶段 = 校准缺口）/ `undeclaredStandaloneCount`（独立模板，只作对照） |
+| GET | `/api/admin/world-templates/{id}/realm-tier?limit=` | operator | 人工校准：境界档声明 + 同系列各阶对照 + 实例钉住情况（`limit` 同上） |
 | GET | `/api/admin/economy/overview` | finance | 经济只读聚合 |
 | GET | `/api/admin/ledger/reconcile` | finance | 全账复式恒等 SUM=0 + 物化余额对账（只读，无提现） |
-| GET | `/api/admin/metrics/overview?costDays=` | operator, finance | 数据看板。含 `cost` 对象：`today`（今日 token/分/元）、`trend[]`（近 N 日，默认 7，clamp [1,60]，每项另含 `offPeakTokens`）、`byWorld[]`（每局 Top10 含 `tokensPerPlayer`）、`total`、`centsPer1kTokens`、**`offPeak`**（错峰调度仪表：占比 / 估算折让 / 延后时长 / 档位分桶，字段与单位见 §3「错峰调度」小节）。**每玩家成本口径为人均等分**（`world_ticks` 是整拍口径、无 per-member 分解），局限见响应 `notes` |
+| GET | `/api/admin/metrics/overview?costDays=` | operator, finance | 数据看板。含 `cost` 对象：`today`（今日 token/分/元）、`trend[]`（近 N 日，默认 7，clamp [1,60]，每项另含 `offPeakTokens`）、`byWorld[]`（每局 Top10 含 `tokensPerPlayer`）、`total`、`centsPer1kTokens`、**`offPeak`**（错峰调度仪表：占比 / 估算折让 / 延后时长 / 档位分桶，字段与单位见 §3「错峰调度」小节）。**每玩家成本口径为人均等分**（`world_ticks` 是整拍口径、无 per-member 分解），局限见响应 `notes`。另含顶层键 **`liveStage`**（直播场观众→玩家转化率，T5 门槛；三态 `entry_not_open`/`no_data_in_window`/`ok`，口径见 §6「直播场」小节；`?slo=0` 一并跳过） |
 | GET | `/api/admin/metrics/trends` | operator, finance | 按天趋势（UTC 日界） |
 | GET | `/api/admin/prompts` | operator | Prompt 版本列表 |
 | POST | `/api/admin/prompts` | **admin 专属** | 建 Prompt 版本 |
@@ -673,16 +734,17 @@ if 线：   从终局那一拍岔出去的、只属于你的一条平行线   �
 
 ### 人工校准面（无迁移；总规格 §79/§83「人工校准 → 仿真试跑 → 世界质量回归」的第一环）
 
-四个端点读的都是**已有数据**（`world_templates.saga_id`/`stage_no` 来自迁移 0024，
-身份分配来自 `worlds.assembled_json` 的 `/assembly/identityAssignments`），**不新增迁移、不新增列**。
-实现在 `server/src/admin_api/calibration.rs`；后台页面在 `admin/src/pages/Calibration.tsx`
-（世界运营 → 更多模块 → 人工校准，或 `/worlds?view=calibration`）。
+端点读的都是**已有数据**（`world_templates.saga_id`/`stage_no` 来自迁移 0024，
+身份分配来自 `worlds.assembled_json` 的 `/assembly/identityAssignments`，
+境界档来自 `world_templates.skeleton_json.realmTier` → `assembled_json` 的 `/assembly/realmTier`），
+**不新增迁移、不新增列**。实现在 `server/src/admin_api/calibration.rs`；后台页面在
+`admin/src/pages/Calibration.tsx`（世界运营 → 更多模块 → 人工校准，或 `/worlds?view=calibration`）。
 
-🔴 **本期只做阶段切分与身份池两维，不含境界档**：境界档在 `assembly::Skeleton` 里没有任何字段落点
-（`identity_pool` 有、`payout_table` 有、境界档没有），补 schema 会改动装配产物与黄金世界快照字节，
-属独立评审项。
+**三维不同构，别当成同一张表读**：阶段切分是**坐标**（连续性诊断），身份池是**各不相同的开局站位**
+（分布诊断），境界档是**全员统一的一件戏服**（有没有 / 各阶是否在换 / 实例钉住没有）。
+境界档没有「分布」——它零抽样、无配额（总规格 §6）。
 
-🔴 **四个端点全只读，只可视化、不可编辑**：无写入、无副作用、不落 `audit_logs`（没改数据，
+🔴 **端点全只读，只可视化、不可编辑**：无写入、无副作用、不落 `audit_logs`（没改数据，
 写审计只会制造噪声），因此**不挂运营开关**（同 dashboards：VALIDATION §0.1 约束的是写入面）。
 每个响应恒带 `editable: false` + `editPath`（说明唯一写入路径仍是 `POST /api/admin/world-templates`），
 后台页面把这两个字段直接渲染出来，而不是自己写死「只读」二字。
@@ -710,6 +772,59 @@ if 线：   从终局那一拍岔出去的、只属于你的一条平行线   �
 
 因此本页能回答「分配结果长什么样、是否失衡」，**不能**回答「这样分配是不是更好」——
 后者要先把身份维接进 `slo/`，属独立工作。
+
+#### 境界档（`skeletonJson.realmTier`，总规格 §6【拍板 3】戏服原则）
+
+**它是什么**：阶段模板发给**全员的同一件戏服**——「进黑角域篇全员领斗王档」。
+与身份池正相反：**身份各不相同（有池、有配额、有种子分配），境界人人一样（无池、无配额、零抽样）**。
+所以境界档这一维**没有「分布」可看**，它的校准问题是「有没有 / 各阶是不是在换 / 实例钉住没有」。
+
+Schema（全部字符串或字符串数组，**一个数字都没有**——§6「跨体系靠风味翻译，不靠数值换算」）：
+
+```jsonc
+"realmTier": {
+  "id": "tier-douwang",              // 必填，跨阶段对账与审计的稳定键
+  "label": "斗王档",                  // 公示档名；空则展示层回落 id
+  "cosmology": "cultivation",        // ∈ admission::KNOWN_COSMOLOGIES；**留空 = 无战力体系题材**（都市/言情/历史），合法
+  "genre": "xuanhuan",               // ∈ assembly::KNOWN_GENRES；空 = 未标注
+  "conflictIntensity": "martial",    // civil 文斗 / martial 武斗 / lethal 生死；空 = 未标注
+  "briefing": "本篇全员领斗王档戏服……",  // 入场导演的统一设定
+  "flavorNotes": ["魂技译为斗气招式风味，内核不变"]
+}
+```
+
+三项枚举写自由文本 → 建模板期 400（口径同 `gate.requiredCosmologies`）。
+`conflictIntensity: "lethal"` **不是死亡开关**：世界是否致命由建房参数 `lethality` 与 §11 死亡规则
+独立决定，两者互不读取。`genre: "history"` 触发响应里的 `stricterModerationHint`，
+但**未接进任何审核链路**（状态 `Concept`，仅提示人工按更严标准复核）。
+
+🔴 **境界档的真实效力（`effect` 段五层，后台必须显式渲染）**：
+
+| 层 | 状态（§0.3 七档） | 事实 |
+|---|---|---|
+| 声明层 `declarationLayer` | `Implemented` | `assembly::RealmTier` schema + `validate_skeleton_refs` 第 6 段取值域校验 |
+| 钉住层 `pinningLayer` | `Implemented` | 装配时原样钉进 `assembled_json./assembly/realmTier`（**零抽样、不占 RNG 域常量**，下一个可用域仍是 `0x5C`） |
+| 叙事感知层 `narrativeLayer` | **`Missing`** | `runtime` **不读**这个键——境界档目前对玩家**零可见**，戏服挂在衣架上没人穿 |
+| 数值层 `numericLayer` | `NeverByDesign` | §6 + §0.1 平权：`RealmTier` 全字段是字符串 / 字符串数组，`realm_tier_carries_no_numeric_field` 锁住 |
+| 校准闭环 `calibrationLoop` | `Missing` | 没有任何指标度量「换境界档 → 叙事变化」 |
+
+所以这一维现在只到 **Implemented**（VALIDATION §0.3），**不是 Integrated**：
+调整境界档在玩家侧观察不到任何变化，本页的「已声明 / 已钉住」只证明数据在库里。
+
+**未声明即零影响（逐字节）**：`Skeleton.realm_tier` 与 `AssembledInstance.realm_tier` 都是
+`Option` + `skip_serializing_if`（同 `payoutTable` 范式），模板不写 `realmTier` 时
+`assembled_json` **一个字节都不变**，黄金世界快照因此不受影响。
+
+| 字段 | 口径 |
+|---|---|
+| `undeclaredInSagaCount` | 归属某个 Saga 却没声明境界档的模板数 = **校准缺口**（§6「阶段天然携带境界档」，每一阶都该有戏服） |
+| `undeclaredStandaloneCount` | 独立模板（非 Saga 阶段）没戏服，**只作对照不是缺口** |
+| `sagaStages.reusedTierIds` | 同一系列多个阶段发同一件戏服 →「你选阶段就是在选境界」在这几阶之间不成立 |
+| `sagaStages.distinctCosmologies` | 多于一个值 = 同系列跨了体系；按 §6 跨体系应走风味翻译而非换档，值得复核 |
+| `pinning.worldsWithRealmTier` | 少于 `worldsAssembled` 属正常：模板声明戏服**之前**装配的实例不会回溯补写 |
+| `pinning.staleTierIds` | 实例钉着的档 id ≠ 模板当前声明（模板改版后老实例保持原样）。模板未声明时恒空 |
+| `matchesTemplate` | `null` = 模板未声明 / 实例未钉住，「是否一致」这个问题不成立——**不得当 `false` 渲染** |
+| `invalidEnumFields` / `blankTierId` | 填了官方枚举外的自由文本 / 缺 id。建模板端点拦得住，出现在此 = 历史数据或直写库 |
 
 ### 运行时开关（flags，migration 0036；VALIDATION.md §0.1 的 R1 补齐项）
 

@@ -228,6 +228,18 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
         wired: true,
     },
     FlagDef {
+        name: "MUSE_LIVE_STAGE",
+        default_enabled: false,
+        owner: "livestage",
+        desc: "直播场（定档场次 + 延迟缓冲 + 弹幕）。总规格 §2 场次节奏三档「直播场」+ §15 第 4 层\
+               「直播场延迟 1-2 拍缓冲」；同时是 VALIDATION §2 T5 门槛「观众→玩家转化 ≥2%」的\
+               唯一数据源（`live_viewers`）。🔴 延迟缓冲是内容安全机制不是体验设计——延迟拍数\
+               `MUSE_LIVE_DELAY_TICKS` 是 T5 预案「审核成本失控 → 直播延迟拍数上调」的运营旋钮",
+        // 🔵 与 OOC 注解权 / if 线 / 真人社交解锁同理：R3 新建件，没有需要保留的历史 env 语义，
+        // 从建成之日起就经本体系解析。
+        wired: true,
+    },
+    FlagDef {
         name: "MUSE_OFFPEAK_SCHEDULING",
         default_enabled: false,
         owner: "runtime",

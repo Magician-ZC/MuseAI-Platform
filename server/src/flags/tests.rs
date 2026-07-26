@@ -231,13 +231,16 @@ fn red_line_only_safety_chain_defaults_on() {
     // 语义连续（env 仍是解析链第 ④ 层兜底），变化只是前面多了 user/world/global 三层，
     // 错峰从「全局一刀切」变成可按世界灰度。
     //
+    // 13 → 14：`MUSE_LIVE_STAGE`（直播场 = 定档 + 延迟缓冲 + 弹幕，R3 收官件）。
+    // 与 OOC 注解权 / if 线 / 真人社交解锁同性质——新建件，无历史 env 语义，建成即接线。
+    //
     // 这些都是登记表**新增了默认关闭的开关**，不是断言被放宽——上面那个循环仍逐条钉死
     // 「除审核链外默认值必须为 false」，新开关同样在其中。
     assert_eq!(
         KNOWN_FLAGS.len(),
-        13,
+        14,
         "登记表应覆盖 9 个存量 env 开关 + R3 新建的 MUSE_OOC_ANNOTATIONS / MUSE_IFLINE_PARALLEL / \
-         MUSE_SOCIAL_IDENTITY_UNLOCK，其中 MUSE_OFFPEAK_SCHEDULING 已由纯 env 迁入体系"
+         MUSE_SOCIAL_IDENTITY_UNLOCK / MUSE_LIVE_STAGE，其中 MUSE_OFFPEAK_SCHEDULING 已由纯 env 迁入体系"
     );
 }
 
@@ -900,6 +903,7 @@ async fn list_endpoint_reports_effective_global_state() {
     //   - `MUSE_OOC_ANNOTATIONS`：R3 新建件，无历史 env 语义要保留，建成即接线；
     //   - `MUSE_IFLINE_PARALLEL`：同上（R3 if 线付费副本，§7 人设保险第 3 级）；
     //   - `MUSE_SOCIAL_IDENTITY_UNLOCK`：同上（R3 真人社交解锁，§14【拍板 22】恨隔面具原则）。
+    //   - `MUSE_LIVE_STAGE`：同上（R3 直播场 = 定档 + 延迟缓冲 + 弹幕，§2 场次节奏三档 + §15 第 4 层）。
     //   - `MUSE_OFFPEAK_SCHEDULING`：⚠️ **不同性质**——第一个从纯 env 迁进体系的**存量**开关。
     //     `runtime::offpeak::enabled_for_world` 早已写好「已登记走体系、未登记退 env」的分支，
     //     所以登记这一步不需要改 runtime 一行代码，世界级灰度即刻可用。
@@ -916,9 +920,10 @@ async fn list_endpoint_reports_effective_global_state() {
             "MUSE_OOC_ANNOTATIONS",
             "MUSE_IFLINE_PARALLEL",
             "MUSE_SOCIAL_IDENTITY_UNLOCK",
+            "MUSE_LIVE_STAGE",
             "MUSE_OFFPEAK_SCHEDULING"
         ],
-        "已接线清单：0036 的参考接线 + R3 新建的 OOC 注解权 / if 线 / 真人社交解锁 + 迁入体系的错峰调度"
+        "已接线清单：0036 的参考接线 + R3 新建的 OOC 注解权 / if 线 / 真人社交解锁 / 直播场 + 迁入体系的错峰调度"
     );
     assert!(b["records"].as_array().unwrap().is_empty());
 }

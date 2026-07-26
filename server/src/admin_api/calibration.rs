@@ -1,17 +1,20 @@
 //! 人工校准面（总规格 §79/§83 内容生产流水线的第一环：**人工校准 → 仿真试跑 → 世界质量回归**）。
 //!
-//! 本模块只做**两维**：**阶段切分**（`world_templates.saga_id` / `stage_no`，迁移 0024）与
-//! **身份池**（`skeleton_json.identityPool` → `assembled_json./assembly/identityAssignments`）。
-//! **境界档不在本模块**——它在 `assembly::Skeleton` 里没有任何字段落点（`identity_pool` 有、
-//! `payout_table` 有、境界档没有），补 schema 会改动装配产物与黄金世界快照字节，属独立评审项。
+//! 本模块做**三维**（§79 流水线里「人工校准」明列的那三项）：
+//! **阶段切分**（`world_templates.saga_id` / `stage_no`，迁移 0024）、
+//! **身份池**（`skeleton_json.identityPool` → `assembled_json./assembly/identityAssignments`）、
+//! **境界档**（`skeleton_json.realmTier` → `assembled_json./assembly/realmTier`，总规格 §6）。
+//!
+//! 三维彼此不是同构的，别混着读：阶段切分是**坐标**（连续性诊断），身份池是**各不相同的站位**
+//! （分布诊断），境界档是**全员统一的一件戏服**（有没有 / 各阶是否在换 / 实例钉住没有）。
 //!
 //! # 🔴 只读，且只可视化、不可编辑
 //!
-//! 四个端点全是 SELECT 聚合，无任何写入、无任何副作用，因此**不挂运营开关**（同 `dashboards`
+//! 本模块的端点**全是** SELECT 聚合，无任何写入、无任何副作用，因此**不挂运营开关**（同 `dashboards`
 //! 的处理：VALIDATION §0.1 约束的是「让用户看到 / 用到新能力」的写入面）。响应恒带
 //! `editable:false` + `editPath`：校准参数的唯一写入路径仍是**建模板**
-//! （`POST /admin/world-templates` 的 `sagaId` / `stageNo` / `skeletonJson.identityPool`）。
-//! 谁读到这份 JSON 都不该以为「这里能调」。
+//! （`POST /admin/world-templates` 的 `sagaId` / `stageNo` / `skeletonJson.identityPool` /
+//! `skeletonJson.realmTier`）。谁读到这份 JSON 都不该以为「这里能调」。
 //!
 //! # 🔴 身份池的真实效力（本模块必须如实呈现，不得让运营以为「调了就会变强」）
 //!
@@ -24,6 +27,19 @@
 //!
 //! 所以本页能回答的是「**分配结果长什么样、是否失衡**」，**不能**回答「这样分配是不是更好」。
 //! 后者要先把身份维接进质量指标（`slo/`），那是另一件事。
+//!
+//! # 🔴 境界档的真实效力：比身份池还弱一层
+//!
+//! | 层 | 状态（§0.3 七档） | 事实 |
+//! |---|---|---|
+//! | 声明层 | **Implemented** | `assembly::RealmTier` schema + `validate_skeleton_refs` 第 6 段取值域校验 |
+//! | 钉住层 | **Implemented** | 装配时原样钉进 `assembled_json./assembly/realmTier`（零抽样、不占 RNG 域） |
+//! | 叙事感知层 | **缺失** | `runtime` **不读**这个键——境界档目前对玩家**零可见**，戏服挂在衣架上没人穿 |
+//! | 数值层 | **设计上永不生效** | §6「跨体系靠风味翻译，不靠数值换算」+ §0.1 平权：`RealmTier` 结构里一个数字都没有，有测试锁 |
+//! | 校准闭环 | **缺失** | 没有任何指标度量「换境界档 → 叙事变化」 |
+//!
+//! 所以境界档这一维能回答的只是「**配了没有、各阶是不是在换、实例钉住没有**」，
+//! 连「玩家能不能感知到」都还回答不了。前端 `EffectPanel` 必须把这五层原样渲染。
 //!
 //! # 双库可移植 SQL（db.rs 约定）
 //!
@@ -61,13 +77,13 @@ const SAGA_SCAN_MAX: usize = 2000;
 const SAGA_DETAIL_TEMPLATE_MAX: i64 = 200;
 /// 缺号清单最多列几个（只有 999 号一个阶段时缺号有 998 个，列表本身就成了噪声）。
 const MISSING_STAGES_MAX: usize = 50;
-/// 身份池目录一次扫描的模板行上限。
-const IDENTITY_DIRECTORY_SCAN_MAX: usize = 2000;
+/// 骨架维度目录（身份池 / 境界档）一次扫描的模板行上限。
+const TEMPLATE_DIRECTORY_SCAN_MAX: usize = 2000;
 /// 需要读骨架的分页扫描每页行数（峰值内存 ≈ 本页骨架大小之和）。
 const SCAN_PAGE: i64 = 200;
-/// 身份池分布默认 / 最大扫描世界数。
-const IDENTITY_WORLD_SCAN_DEFAULT: i64 = 100;
-const IDENTITY_WORLD_SCAN_MAX: i64 = 500;
+/// 实例侧扫描（身份分配分布 / 境界档钉住情况）默认 / 最大扫描世界数。
+const WORLD_SCAN_DEFAULT: i64 = 100;
+const WORLD_SCAN_MAX: i64 = 500;
 /// 单条 `IN (…)` 最多绑几个参数（SQLite 老版本 `SQLITE_MAX_VARIABLE_NUMBER` 默认 999，
 /// 不分批会在大页面上直接报错）。
 const BIND_CHUNK: usize = 200;
@@ -272,6 +288,7 @@ fn skeleton_shape(raw: &str) -> Value {
         v.get(key).and_then(Value::as_array).map(|a| a.len() as i64).unwrap_or(0)
     };
     let pool = parse_identity_pool(raw);
+    let realm = parse_realm_tier(raw);
     json!({
         "parsed": true,
         "skeletonBytes": raw.len() as i64,
@@ -287,6 +304,10 @@ fn skeleton_shape(raw: &str) -> Value {
         "identityQuotaTotal": pool.iter().map(|s| s.quota.max(0)).sum::<i64>(),
         "identityLeadCount": pool.iter().filter(|s| s.is_lead).count() as i64,
         "hasPayoutTable": v.get("payoutTable").is_some_and(|x| !x.is_null()),
+        // 境界档是「有 / 无」的一件戏服，不是可计数的池 —— 故这里只给布尔 + 档名，
+        // 和 identityPoolSize 那种规模指标不同构（§6 全员统一，没有"几个境界"这回事）。
+        "hasRealmTier": realm.is_some(),
+        "realmTierLabel": realm.as_ref().map(RealmEntry::display),
         "hasEndgame": v.get("endgame").is_some_and(|x| !x.is_null()),
         "isSuperset": v.get("isSuperset").and_then(Value::as_bool).unwrap_or(false),
     })
@@ -511,7 +532,7 @@ fn parse_assignments(assembled_json: Option<&str>) -> Vec<(String, String)> {
 /// GET /admin/identity-pools：**声明了身份池的模板目录**。
 ///
 /// 校准的入口问题是「哪些模板配了身份池、池有多大」——没有这张表，运营只能逐个模板点开碰运气。
-/// 按主键分页扫描（每页 `SCAN_PAGE` 行，解析完即丢），扫满 `IDENTITY_DIRECTORY_SCAN_MAX` 行即
+/// 按主键分页扫描（每页 `SCAN_PAGE` 行，解析完即丢），扫满 `TEMPLATE_DIRECTORY_SCAN_MAX` 行即
 /// 停并置 `truncated`；**未声明 `identityPool` 的模板不进结果**（它们在这一维上零影响）。
 pub(super) async fn list_identity_pools(
     State(state): State<AppState>,
@@ -558,7 +579,7 @@ pub(super) async fn list_identity_pools(
                 "leadCount": pool.iter().filter(|e| e.is_lead).count() as i64,
             }));
         }
-        if scanned >= IDENTITY_DIRECTORY_SCAN_MAX {
+        if scanned >= TEMPLATE_DIRECTORY_SCAN_MAX {
             truncated = page.len() as i64 == SCAN_PAGE;
             break;
         }
@@ -588,7 +609,7 @@ pub(super) async fn list_identity_pools(
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct IdentityPoolQuery {
+pub(super) struct WorldScanQuery {
     /// 扫描多少个该模板开出的世界实例（按创建时间倒序取最近的）。默认 100，clamp [1, 500]。
     limit: Option<i64>,
 }
@@ -637,10 +658,10 @@ pub(super) async fn template_identity_pool(
     State(state): State<AppState>,
     admin: AdminUser,
     Path(template_id): Path<String>,
-    Query(q): Query<IdentityPoolQuery>,
+    Query(q): Query<WorldScanQuery>,
 ) -> Result<Json<Value>, ApiError> {
     require_role(&admin, &["operator"])?;
-    let scan = q.limit.unwrap_or(IDENTITY_WORLD_SCAN_DEFAULT).clamp(1, IDENTITY_WORLD_SCAN_MAX);
+    let scan = q.limit.unwrap_or(WORLD_SCAN_DEFAULT).clamp(1, WORLD_SCAN_MAX);
 
     let tpl = sqlx::query(
         "SELECT id, title, room_type, version, moderation, saga_id, stage_no, skeleton_json \
@@ -827,6 +848,419 @@ pub(super) async fn template_identity_pool(
 }
 
 // ============================================================================
+// 维度三：境界档（skeleton.realmTier → assembled_json./assembly/realmTier）
+// 总规格 §6【拍板 3】「戏服原则——境界即布景」
+// ============================================================================
+//
+// 🔴 **它与身份池是两种东西，界面上不许混着读**：
+//   - 身份池（§5）：**各不相同**的开局站位，有池、有配额、有种子分配 → 该看「分布 / 是否失衡」；
+//   - 境界档（§6）：**全员统一**的一件戏服，无池、无配额、**零抽样** → 该看
+//     「这一阶有没有戏服、同系列各阶是不是在换戏服、已开出的实例钉住了没有」。
+//
+// 🔴 **本维度的效力比身份池弱一层，必须说清楚**：声明层与钉住层已落地，
+// 但 `runtime` **不读** `assembled_json./assembly/realmTier` —— 境界档目前对玩家**零可见**。
+// 详见 `realm_tier_effect()` 下发的五层自述。
+
+/// 境界档的**只读投影**（同 `IdentityEntry` 的哲学：对脏数据宽容，照样报出来供运营发现）。
+struct RealmEntry {
+    id: String,
+    label: String,
+    cosmology: String,
+    genre: String,
+    conflict_intensity: String,
+    briefing: String,
+    flavor_notes: Vec<String>,
+}
+
+impl RealmEntry {
+    /// 展示名：label 优先，空则回落 id（与 `assembly::identity_display` 同款口径）。
+    fn display(&self) -> String {
+        if self.label.is_empty() {
+            self.id.clone()
+        } else {
+            self.label.clone()
+        }
+    }
+
+    /// 取值域自检：三项枚举里有几项是「填了但不在官方枚举内」。建模板端点拦得住，
+    /// 历史数据与直写库拦不住 —— 校准面的价值之一就是把它们摆到运营面前。
+    /// **留空不算问题**（§6：空体系 = 无战力体系题材，境界泛化为处境）。
+    fn invalid_enums(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if !self.cosmology.is_empty()
+            && !crate::admission::KNOWN_COSMOLOGIES.contains(&self.cosmology.as_str())
+        {
+            out.push("cosmology");
+        }
+        if !self.genre.is_empty() && !crate::assembly::KNOWN_GENRES.contains(&self.genre.as_str()) {
+            out.push("genre");
+        }
+        if !self.conflict_intensity.is_empty()
+            && !crate::assembly::KNOWN_CONFLICT_INTENSITIES.contains(&self.conflict_intensity.as_str())
+        {
+            out.push("conflictIntensity");
+        }
+        out
+    }
+}
+
+/// 解析 `skeleton_json.realmTier`。缺省 / 结构不符 / 坏 JSON → `None`（老模板零影响）。
+/// **不做取值域过滤**：非法枚举照样解出来，交给 `invalid_enums()` 报成问题项。
+fn parse_realm_tier(skeleton_raw: &str) -> Option<RealmEntry> {
+    let v: Value = serde_json::from_str(skeleton_raw).ok()?;
+    let rt = v.get("realmTier")?;
+    if !rt.is_object() {
+        return None;
+    }
+    let s = |k: &str| rt.get(k).and_then(Value::as_str).unwrap_or("").trim().to_string();
+    Some(RealmEntry {
+        id: s("id"),
+        label: s("label"),
+        cosmology: s("cosmology"),
+        genre: s("genre"),
+        conflict_intensity: s("conflictIntensity"),
+        briefing: s("briefing"),
+        flavor_notes: rt
+            .get("flavorNotes")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|x| !x.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    })
+}
+
+/// 从实例 `assembled_json` 读回钉住的境界档 `(id, label)`。
+///
+/// 结构口径与 `assembly::AssembledInstance.realm_tier` 一致，但同 `parse_assignments` 一样
+/// **刻意不跨模块复用类型**：观测面挂了不该有能力影响装配 / tick，两边各自防御式解析正是要的隔离。
+/// 未装配 / 坏 JSON / 无该键 → `None`（后者是绝大多数存量实例的真实状态，不是错误）。
+fn parse_pinned_realm(assembled_json: Option<&str>) -> Option<(String, String)> {
+    let v: Value = serde_json::from_str(assembled_json?).ok()?;
+    let rt = v.pointer("/assembly/realmTier")?;
+    let id = rt.get("id").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    if id.is_empty() {
+        return None;
+    }
+    let label = rt.get("label").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    Some((id, label))
+}
+
+/// 🔴 境界档的效力自述（五层）。前端必须显式渲染，不得只画一张"已配置"的绿标。
+///
+/// 与身份池的四层相比多一层、且**关键的那层是缺的**：runtime 不读 `realmTier`，
+/// 于是境界档现在**对玩家零可见**——它是一件挂在衣架上、没人穿的戏服。
+fn realm_tier_effect() -> Value {
+    json!({
+        "declarationLayer": "Implemented",
+        "pinningLayer": "Implemented",
+        "narrativeLayer": "Missing",
+        "numericLayer": "NeverByDesign",
+        "calibrationLoop": "Missing",
+        // 🔴 下发文案一律**纯文本**：前端把它当普通字符串渲染，写 Markdown 星号只会在界面上
+        // 露出两个字面的 `**`。强调一律用中文引号「」。
+        "summary": "境界档 = 世界发给全员的同一件戏服（总规格 §6「境界跟着副本走，不跟着角色走」）。它全员统一、无配额、装配层零抽样，只是把模板声明原样钉进实例 assembled_json。与身份池正相反：身份各不相同，境界人人一样。",
+        "warning": "钉住不等于生效：runtime 目前不读 assembled_json 的 realmTier，境界档还没有进入任何引擎上下文、也不出现在任何玩家可见文案里——本页的「已声明 / 已钉住」只证明数据在库里，不证明这一篇的戏服真的穿到了角色身上。叙事感知层接通之前，调整境界档在玩家侧观察不到任何变化。",
+    })
+}
+
+/// GET /admin/realm-tiers：**声明了境界档的模板目录**。
+///
+/// 与身份池目录的一处刻意差别：本端点**同时报未声明的模板数**。
+/// 身份池未声明 = 这一维零影响，属正常状态；而 §6 说「阶段天然携带境界档——你选阶段，
+/// 就是在选境界」，所以一个**归属于某个 Saga 的阶段模板没有境界档，本身就是校准缺口**。
+/// 两者分开计数（`undeclaredInSagaCount` / `undeclaredStandaloneCount`），不混为一谈。
+pub(super) async fn list_realm_tiers(
+    State(state): State<AppState>,
+    admin: AdminUser,
+) -> Result<Json<Value>, ApiError> {
+    require_role(&admin, &["operator"])?;
+
+    let mut cursor = String::new();
+    let mut scanned = 0usize;
+    let mut items: Vec<Value> = Vec::new();
+    let mut ids: Vec<String> = Vec::new();
+    let mut undeclared_in_saga = 0i64;
+    let mut undeclared_standalone = 0i64;
+    let mut truncated = false;
+    loop {
+        let page = sqlx::query(
+            "SELECT id, title, room_type, moderation, saga_id, stage_no, skeleton_json \
+             FROM world_templates WHERE id > $1 ORDER BY id ASC LIMIT $2",
+        )
+        .bind(&cursor)
+        .bind(SCAN_PAGE)
+        .fetch_all(&state.db)
+        .await?;
+        if page.is_empty() {
+            break;
+        }
+        for r in &page {
+            let id: String = r.try_get("id")?;
+            cursor = id.clone();
+            scanned += 1;
+            let raw: String = r.try_get("skeleton_json")?;
+            let saga_id: String = r.try_get("saga_id")?;
+            let Some(rt) = parse_realm_tier(&raw) else {
+                if saga_id.is_empty() {
+                    undeclared_standalone += 1;
+                } else {
+                    undeclared_in_saga += 1;
+                }
+                continue;
+            };
+            ids.push(id.clone());
+            let invalid = rt.invalid_enums();
+            items.push(json!({
+                "templateId": id,
+                "title": r.try_get::<String, _>("title")?,
+                "roomType": r.try_get::<String, _>("room_type")?,
+                "moderation": r.try_get::<String, _>("moderation")?,
+                "sagaId": saga_id,
+                "stageNo": r.try_get::<i64, _>("stage_no")?,
+                "tierId": rt.id,
+                "label": rt.display(),
+                "cosmology": rt.cosmology,
+                "genre": rt.genre,
+                "conflictIntensity": rt.conflict_intensity,
+                "flavorNoteCount": rt.flavor_notes.len() as i64,
+                "invalidEnumFields": invalid,
+            }));
+        }
+        if scanned >= TEMPLATE_DIRECTORY_SCAN_MAX {
+            truncated = page.len() as i64 == SCAN_PAGE;
+            break;
+        }
+    }
+
+    let counts = world_counts_by_template(&state.db, &ids).await?;
+    for item in &mut items {
+        let id = item["templateId"].as_str().unwrap_or_default().to_string();
+        let (n, live) = counts.get(&id).copied().unwrap_or((0, 0));
+        item["worldCount"] = json!(n);
+        item["liveWorldCount"] = json!(live);
+    }
+
+    Ok(Json(json!({
+        "templates": items,
+        "scannedTemplates": scanned as i64,
+        "truncated": truncated,
+        // 校准缺口的分子分母：归属系列却没戏服的阶段，是真正要补的那批。
+        "undeclaredInSagaCount": undeclared_in_saga,
+        "undeclaredStandaloneCount": undeclared_standalone,
+        "effect": realm_tier_effect(),
+        "editable": false,
+        "editPath": "境界档只在建模板时录入：POST /admin/world-templates 的 skeletonJson.realmTier。本端点只读，不提供在线改档 / 换戏服。",
+        "notes": [
+            "只列出声明了 realmTier 对象的模板；其余模板在境界这一维上零影响（装配产物逐字节不变）。",
+            "undeclaredInSagaCount 是校准缺口：总规格 §6「阶段天然携带境界档」，归属某个 Saga 的阶段本应各有一件戏服。",
+            "undeclaredStandaloneCount 只作对照，不是缺口：独立模板（非 Saga 阶段）没有戏服是正常的。",
+            "invalidEnumFields 非空 = 该字段填了官方枚举外的自由文本（建模板端点会拦，出现在此说明是历史数据或直写库）。",
+            "cosmology 留空不是缺数据：§6「无战力体系题材（都市/言情/历史），境界泛化为处境」，留空即此意。",
+        ],
+    })))
+}
+
+/// GET /admin/world-templates/{id}/realm-tier?limit=：**境界档声明 + 同系列各阶对照 + 实例钉住情况**。
+///
+/// 三段回答三个问题：
+/// 1. `declaration`：这一阶发的是什么戏服（含取值域自检）；
+/// 2. `sagaStages`：**同一系列各阶段是不是真的在换戏服**——§6「你选阶段，就是在选境界」，
+///    若各阶同档或多阶缺档，这句话就不成立，是本维度最该被发现的校准问题；
+/// 3. `pinning`：这个模板已开出的实例里，有几个真的钉住了境界档、有几个钉的是**旧档**
+///    （模板改版后老实例不回溯，同 `unknownIdentityIds` 的处境）。
+pub(super) async fn template_realm_tier(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path(template_id): Path<String>,
+    Query(q): Query<WorldScanQuery>,
+) -> Result<Json<Value>, ApiError> {
+    require_role(&admin, &["operator"])?;
+    let scan = q.limit.unwrap_or(WORLD_SCAN_DEFAULT).clamp(1, WORLD_SCAN_MAX);
+
+    let tpl = sqlx::query(
+        "SELECT id, title, room_type, version, moderation, saga_id, stage_no, skeleton_json \
+         FROM world_templates WHERE id = $1",
+    )
+    .bind(&template_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or(ApiError::NotFound)?;
+
+    let skeleton_raw: String = tpl.try_get("skeleton_json")?;
+    let saga_id: String = tpl.try_get("saga_id")?;
+    let realm = parse_realm_tier(&skeleton_raw);
+
+    let declaration = match &realm {
+        None => Value::Null,
+        Some(rt) => json!({
+            "tierId": rt.id,
+            "label": rt.display(),
+            "cosmology": rt.cosmology,
+            "genre": rt.genre,
+            "conflictIntensity": rt.conflict_intensity,
+            "briefing": rt.briefing,
+            "flavorNotes": rt.flavor_notes,
+            "invalidEnumFields": rt.invalid_enums(),
+            "blankTierId": rt.id.is_empty(),
+            // §6「历史题材涉真实人物走更严审核档（合规）」。
+            // 🔴 状态 = Concept：**没有接进任何审核链路**，纯提示。
+            "stricterModerationHint": crate::assembly::STRICTER_MODERATION_GENRES.contains(&rt.genre.as_str()),
+        }),
+    };
+
+    // ---- 同系列各阶对照（独立模板 → 空段，不是错误）----
+    let mut stages: Vec<Value> = Vec::new();
+    let mut stages_without: Vec<i64> = Vec::new();
+    let mut tier_stage_map: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+    let mut cosmologies: BTreeSet<String> = BTreeSet::new();
+    let mut genres: BTreeSet<String> = BTreeSet::new();
+    if !saga_id.is_empty() {
+        let rows = sqlx::query(
+            "SELECT id, title, stage_no, skeleton_json FROM world_templates \
+             WHERE saga_id = $1 ORDER BY stage_no ASC, id ASC LIMIT $2",
+        )
+        .bind(&saga_id)
+        .bind(SAGA_DETAIL_TEMPLATE_MAX)
+        .fetch_all(&state.db)
+        .await?;
+        for r in &rows {
+            let sid: String = r.try_get("id")?;
+            let stage_no: i64 = r.try_get("stage_no")?;
+            let raw: String = r.try_get("skeleton_json")?;
+            let rt = parse_realm_tier(&raw);
+            match &rt {
+                Some(rt) if !rt.id.is_empty() => {
+                    tier_stage_map.entry(rt.id.clone()).or_default().push(stage_no);
+                    if !rt.cosmology.is_empty() {
+                        cosmologies.insert(rt.cosmology.clone());
+                    }
+                    if !rt.genre.is_empty() {
+                        genres.insert(rt.genre.clone());
+                    }
+                }
+                _ => stages_without.push(stage_no),
+            }
+            stages.push(json!({
+                "templateId": sid,
+                "title": r.try_get::<String, _>("title")?,
+                "stageNo": stage_no,
+                "declared": rt.is_some(),
+                "tierId": rt.as_ref().map(|x| x.id.clone()),
+                "label": rt.as_ref().map(RealmEntry::display),
+                "cosmology": rt.as_ref().map(|x| x.cosmology.clone()),
+                "isSelf": sid == template_id,
+            }));
+        }
+    }
+    // 多阶共用同一个档 id：「你选阶段就是在选境界」在这几阶之间不成立。
+    let reused: Vec<Value> = tier_stage_map
+        .iter()
+        .filter(|(_, v)| v.len() > 1)
+        .map(|(id, v)| json!({ "tierId": id, "stageNos": v }))
+        .collect();
+
+    // ---- 实例钉住情况 ----
+    let world_rows = sqlx::query(
+        "SELECT id, title, status, assembled_json FROM worlds WHERE template_id = $1 \
+         ORDER BY created_at DESC, id DESC LIMIT $2",
+    )
+    .bind(&template_id)
+    .bind(scan + 1)
+    .fetch_all(&state.db)
+    .await?;
+    let worlds_truncated = world_rows.len() as i64 > scan;
+    let world_rows: Vec<_> = world_rows.into_iter().take(scan as usize).collect();
+
+    let declared_id = realm.as_ref().map(|r| r.id.clone()).unwrap_or_default();
+    let mut worlds_assembled = 0i64;
+    let mut worlds_with_realm = 0i64;
+    let mut stale: BTreeMap<String, i64> = BTreeMap::new();
+    let mut world_items: Vec<Value> = Vec::with_capacity(world_rows.len());
+    for r in &world_rows {
+        let assembled: Option<String> = r.try_get("assembled_json")?;
+        let has_assembled = assembled.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+        if has_assembled {
+            worlds_assembled += 1;
+        }
+        let pinned = parse_pinned_realm(assembled.as_deref());
+        if pinned.is_some() {
+            worlds_with_realm += 1;
+        }
+        // 「钉的是旧档」只在模板当前**确有声明**时才谈得上：模板本就没声明的话，
+        // 实例钉着什么都只是历史，报成 stale 会制造假问题。
+        let matches = match (&pinned, declared_id.is_empty()) {
+            (Some((pid, _)), false) => Some(pid == &declared_id),
+            _ => None,
+        };
+        if matches == Some(false) {
+            if let Some((pid, _)) = &pinned {
+                *stale.entry(pid.clone()).or_insert(0) += 1;
+            }
+        }
+        world_items.push(json!({
+            "id": r.try_get::<String, _>("id")?,
+            "title": r.try_get::<String, _>("title")?,
+            "status": r.try_get::<String, _>("status")?,
+            "assembled": has_assembled,
+            "pinnedTierId": pinned.as_ref().map(|(id, _)| id.clone()),
+            "pinnedLabel": pinned.as_ref().map(|(id, label)| {
+                if label.is_empty() { id.clone() } else { label.clone() }
+            }),
+            // null = 模板未声明境界档，"是否与模板一致"这个问题不成立（不得当 false 读）。
+            "matchesTemplate": matches,
+        }));
+    }
+    let stale_list: Vec<Value> = stale
+        .iter()
+        .map(|(id, n)| json!({ "tierId": id, "worldCount": n }))
+        .collect();
+
+    Ok(Json(json!({
+        "templateId": tpl.try_get::<String, _>("id")?,
+        "title": tpl.try_get::<String, _>("title")?,
+        "roomType": tpl.try_get::<String, _>("room_type")?,
+        "version": tpl.try_get::<i64, _>("version")?,
+        "moderation": tpl.try_get::<String, _>("moderation")?,
+        "sagaId": saga_id,
+        "stageNo": tpl.try_get::<i64, _>("stage_no")?,
+        "declared": realm.is_some(),
+        "declaration": declaration,
+        "sagaStages": {
+            "stages": stages,
+            "stagesWithoutRealmTier": stages_without,
+            "reusedTierIds": reused,
+            "distinctCosmologies": cosmologies,
+            "distinctGenres": genres,
+        },
+        "pinning": {
+            "worldsScanned": world_rows.len() as i64,
+            "worldsTruncated": worlds_truncated,
+            "worldsAssembled": worlds_assembled,
+            "worldsWithRealmTier": worlds_with_realm,
+            "staleTierIds": stale_list,
+            "worlds": world_items,
+        },
+        "effect": realm_tier_effect(),
+        "editable": false,
+        "editPath": "境界档的唯一写入路径是模板骨架：POST /admin/world-templates 的 skeletonJson.realmTier（新建模板）。本端点只读，不提供在线改档 / 换戏服 / 补写老实例。已开出的世界其境界档在装配时即钉死在 assembled_json，改模板不会回溯改写既有实例。",
+        "notes": [
+            "境界档全员统一（§6）：它没有配额、没有分配、装配层对它零抽样，所以本页没有「分布」可看——那是身份池（§5）的问题，不是境界的。",
+            "sagaStages 只在本模板归属某个 Saga 时非空；独立模板的这一段为空，不是缺数据。",
+            "reusedTierIds 非空 = 同一系列多个阶段发同一件戏服，「你选阶段就是在选境界」在这几阶之间不成立，值得复核是不是漏改。",
+            "distinctCosmologies 出现多于一个值 = 同一系列跨了体系，按 §6 跨体系应走风味翻译而不是换档，值得复核。",
+            "worldsWithRealmTier 少于 worldsAssembled 属正常：在模板声明境界档之前装配的实例不会回溯补写。",
+            "staleTierIds = 实例钉着的档 id 与模板当前声明不一致（模板改版后老实例保持原样）。模板未声明时该项恒为空，matchesTemplate 为 null。",
+        ],
+    })))
+}
+
+// ============================================================================
 // 纯函数单测（端点级集成测试在 `admin_api/tests.rs`，那里有 build_router / token 等设施）
 // ============================================================================
 
@@ -939,5 +1373,97 @@ mod tests {
         assert_eq!(full["identityPoolSize"], 2);
         assert_eq!(full["identityQuotaTotal"], 5);
         assert_eq!(full["identityLeadCount"], 1);
+    }
+
+    // ---------------- 维度三：境界档 ----------------
+
+    /// 老模板（无 realmTier）→ None，零影响；坏 JSON / 类型不符同样退化为 None，不 panic。
+    #[test]
+    fn realm_tier_parse_absence_and_garbage() {
+        assert!(parse_realm_tier(r#"{"mainlineNodes":[]}"#).is_none(), "无 realmTier → None");
+        assert!(parse_realm_tier("不是 JSON").is_none(), "坏 JSON → None，不 panic");
+        assert!(parse_realm_tier(r#"{"realmTier":"斗王档"}"#).is_none(), "不是对象 → None");
+        assert!(parse_realm_tier(r#"{"realmTier":[]}"#).is_none(), "数组 → None（境界不是池）");
+    }
+
+    /// 字段解析 + label 回落 id + 空 flavorNotes 条目被丢掉。
+    #[test]
+    fn realm_tier_parse_fields_and_display_fallback() {
+        let rt = parse_realm_tier(
+            r#"{"realmTier":{"id":"tier-douwang","label":" 斗王档 ","cosmology":"cultivation",
+                 "genre":"xuanhuan","conflictIntensity":"martial","briefing":"全员斗王水位",
+                 "flavorNotes":["魂技译为斗气招式", "  ", ""]}}"#,
+        )
+        .unwrap();
+        assert_eq!(rt.id, "tier-douwang");
+        assert_eq!(rt.display(), "斗王档", "两侧空白必须去掉");
+        assert_eq!(rt.cosmology, "cultivation");
+        assert_eq!(rt.flavor_notes, vec!["魂技译为斗气招式".to_string()], "空条目不进列表");
+        assert!(rt.invalid_enums().is_empty(), "全合法枚举不得报问题");
+
+        let bare = parse_realm_tier(r#"{"realmTier":{"id":"tier-x"}}"#).unwrap();
+        assert_eq!(bare.display(), "tier-x", "label 空 → 回落 id");
+        assert!(bare.invalid_enums().is_empty(), "三项留空是合法的（§6 无战力体系题材）");
+    }
+
+    /// 脏数据必须**留在结果里并被报出来**（校准面的价值），不能像装配层那样直接拒绝。
+    #[test]
+    fn realm_tier_parse_reports_invalid_enums() {
+        let rt = parse_realm_tier(
+            r#"{"realmTier":{"id":"t","cosmology":"斗气","genre":"宫斗","conflictIntensity":"很凶"}}"#,
+        )
+        .unwrap();
+        assert_eq!(rt.invalid_enums(), vec!["cosmology", "genre", "conflictIntensity"]);
+
+        let blank = parse_realm_tier(r#"{"realmTier":{"label":"没有 id"}}"#).unwrap();
+        assert_eq!(blank.id, "", "空 id 条目必须留下供运营发现（装配层是拒绝，校准面是报出来）");
+        assert_eq!(blank.display(), "没有 id", "有 label 就用 label，缺 id 另由 blankTierId 报");
+
+        let nothing = parse_realm_tier(r#"{"realmTier":{}}"#).unwrap();
+        assert_eq!(nothing.display(), "", "id 与 label 都空 → 展示名为空，不编内容");
+    }
+
+    /// 实例侧读回的退化契约：未装配 / 坏 JSON / 无键 / 空 id 一律 None。
+    #[test]
+    fn pinned_realm_parse_degrades_defensively() {
+        assert!(parse_pinned_realm(None).is_none(), "未装配 → None");
+        assert!(parse_pinned_realm(Some("{")).is_none(), "坏 JSON → None");
+        assert!(parse_pinned_realm(Some(r#"{"assembly":{}}"#)).is_none(), "无该键 → None（存量实例的常态）");
+        assert!(
+            parse_pinned_realm(Some(r#"{"assembly":{"realmTier":{"id":"  ","label":"无 id"}}}"#)).is_none(),
+            "空 id 钉不住任何东西 → None"
+        );
+        assert_eq!(
+            parse_pinned_realm(Some(r#"{"assembly":{"realmTier":{"id":"t1","label":"斗王档"}}}"#)),
+            Some(("t1".to_string(), "斗王档".to_string()))
+        );
+    }
+
+    /// 🔴 效力自述：叙事感知层必须是 `Missing`，数值层必须是 `NeverByDesign`。
+    /// 哪天 runtime 真读了 `realmTier`，改的是这里 —— 而不是让界面自己猜。
+    #[test]
+    fn realm_tier_effect_states_narrative_layer_is_missing() {
+        let e = realm_tier_effect();
+        assert_eq!(e["declarationLayer"], "Implemented");
+        assert_eq!(e["pinningLayer"], "Implemented");
+        assert_eq!(e["narrativeLayer"], "Missing", "runtime 不读 realmTier，境界档对玩家零可见");
+        assert_eq!(e["numericLayer"], "NeverByDesign", "§6 跨体系靠风味翻译，不靠数值换算");
+        assert_eq!(e["calibrationLoop"], "Missing");
+        // 下发文案必须是纯文本（前端按普通字符串渲染，Markdown 星号会在界面上露出字面量）。
+        for k in ["summary", "warning"] {
+            assert!(!e[k].as_str().unwrap().contains("**"), "{k} 混入了 Markdown 强调");
+        }
+    }
+
+    /// 骨架形状里境界档是**布尔 + 档名**，不是规模数字（§6 全员统一，没有"几个境界"这回事）。
+    #[test]
+    fn skeleton_shape_reports_realm_tier_as_presence_not_size() {
+        let none = skeleton_shape(r#"{"mainlineNodes":[]}"#);
+        assert_eq!(none["hasRealmTier"], false);
+        assert!(none["realmTierLabel"].is_null(), "未声明 → null，不是空串");
+
+        let some = skeleton_shape(r#"{"realmTier":{"id":"t1","label":"斗王档"}}"#);
+        assert_eq!(some["hasRealmTier"], true);
+        assert_eq!(some["realmTierLabel"], "斗王档");
     }
 }

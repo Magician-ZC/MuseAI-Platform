@@ -222,3 +222,87 @@
   background: #fdf5e9;
   color: #bb7623;
 }
+
+/* 戏服带（维度三 · 境界档）：把「同一系列各阶段各发什么戏服」画成一条可扫视的带子。
+   与阶段条（calibration__stage-strip）刻意不同构——阶段条数的是号，戏服带读的是名字，
+   所以这里是带两行文字的方块，不是数字小格。 */
+.calibration__realm-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 12px;
+}
+
+.calibration__realm-chip {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 132px;
+  padding: 8px 12px;
+  border: 1px solid #e4ded6;
+  border-radius: 8px;
+  background: #fffdfa;
+  color: #38342f;
+  font-size: 13px;
+}
+
+.calibration__realm-chip b {
+  color: #6d665e;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.calibration__realm-chip small {
+  color: #bb7623;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+/* 缺戏服 = 校准缺口（§6「阶段天然携带境界档」），高风险色；文字也写「缺戏服」，不只靠颜色。 */
+.calibration__realm-chip.is-missing {
+  border-color: #ca5547;
+  background: #fdf1ef;
+  color: #c64d40;
+}
+
+/* 与其他阶复用同一档 → 「选阶段 = 选境界」在这几阶之间不成立，需关注色。 */
+.calibration__realm-chip.is-duplicate {
+  border-color: #d99535;
+  background: #fdf5e9;
+  color: #bb7623;
+}
+
+/* 当前正在看的那一阶：加粗左边框定位，不改配色（避免与「缺 / 复用」两种状态色打架）。 */
+.calibration__realm-chip.is-self {
+  border-left: 4px solid #c96845;
+}
+
+/* 键值对块：境界档的声明是几个并列字段，不是表格也不是指标卡。 */
+.calibration__kv {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px 20px;
+  margin: 0 0 12px;
+}
+
+.calibration__kv dt {
+  margin: 0 0 2px;
+  color: #6d665e;
+  font-size: 12px;
+}
+
+.calibration__kv dd {
+  margin: 0;
+  color: #292724;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.calibration__kv dd small {
+  display: block;
+  margin-top: 2px;
+  color: #6d665e;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.5;
+}

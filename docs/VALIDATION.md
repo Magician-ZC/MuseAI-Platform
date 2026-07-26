@@ -9,9 +9,10 @@
 1. **未验证功能默认关闭**：经 feature flag / 运营开关 / 数据配置启用（现状抓手：cargo feature
    `billing`/`arena`、admin 建房控制、建房参数；**运行时开关体系基础设施已落地**——
    迁移 `0036` + `server/src/flags/`，按用户/世界/全局三作用域灰度 + 时间窗 + 审计留痕，
-   env 作为兜底层，详见 §3.1。已接线 `MUSE_ONBOARDING`（参考接线）+ R3 三条新建件
-   （`MUSE_OOC_ANNOTATIONS` / `MUSE_IFLINE_PARALLEL` / `MUSE_SOCIAL_IDENTITY_UNLOCK`）
-   + 首个由纯 env 迁入的存量开关 `MUSE_OFFPEAK_SCHEDULING`，其余存量开关待逐个迁移。
+   env 作为兜底层，详见 §3.1。已接线 `MUSE_ONBOARDING`（参考接线）+ R3 四条新建件
+   （`MUSE_OOC_ANNOTATIONS` / `MUSE_IFLINE_PARALLEL` / `MUSE_SOCIAL_IDENTITY_UNLOCK` /
+   `MUSE_LIVE_STAGE`）+ 首个由纯 env 迁入的存量开关 `MUSE_OFFPEAK_SCHEDULING`，
+   其余存量开关待逐个迁移。
    ⚠️ 开关个数以 `flags::KNOWN_FLAGS` 为唯一权威，本文不复述计数——历次加开关都漏改过散落各处的数字）。
 2. **产品规则参数化**：托梦配额、死亡规则、奖励系数、成员规模、tick 节奏、历练阈值、
    崩塌惩罚系数等一律可配置，禁止写死。
@@ -103,7 +104,7 @@
 | 申诉复审 / 运行时内容安全 | Implemented / Specified(五层漏斗) | T2 起随开 | 审核链恒开 |
 | 生死契约（三档参数化） | Specified | T5 待测 | 关闭（默认庇护/同意制） |
 | 副本卡 + 自定义房装配 | Specified（R2） | T4 待测 | 关闭 |
-| 赛事直播 / 弹幕 | Implemented（观战）/ Specified（直播场） | T5 待测 | 关闭 |
+| 赛事直播 / 弹幕 | Implemented（观战）/ **Implemented**（直播场：0042；定档 + 延迟缓冲 + 弹幕，见 §3.4） | T5 待测 | 关闭（`MUSE_LIVE_STAGE`）⚠️ T5 开测前必须先打开，否则 `liveStage` 返回 `entry_not_open` 而非 0% |
 | 真人社交解锁 | **Implemented**（0040；解锁门槛 / 拉黑 / 举报队列 / 青少年服务端拒绝 / 「一起死过」凭证） | T4+ 待测 | 关闭（`MUSE_SOCIAL_IDENTITY_UNLOCK`） |
 | 人设保险三级出口（事前底线 / 事中注解权 / 事后 if 线） | 事前 engine Implemented · 事中 **Implemented**（0037）· 事后 **Implemented（开局 + 推进）**（0039/0041） | T1 起（注解权是 T1 门槛的测量手段）/ if 线 T3 待测 | 三级**全部默认关闭** |
 | 内容中台工业线 | Concept | — | — |
@@ -236,21 +237,24 @@
 > SLO 的叙事注意力基尼按 `character_id` 聚合，与身份 id 无关，所以运营调完身份池
 > **看不到因果**，只能看到分配结果本身。把身份维接进 `slo/` 是独立一步，本批次未做。
 
-### 3.1.1 人工校准面（阶段切分 + 身份池两维，**落地于 2026-07-27**）
+### 3.1.1 人工校准面（阶段切分 + 身份池 + 境界档三维，**落地于 2026-07-27**）
 
-§4 末尾登记的「仍未做：人工校准面」中，**阶段切分与身份池两维已落地为只读运营视图**；
-**境界档仍未做**，原因不变（`Skeleton` 无字段落点，须先补 schema，会改动装配产物与黄金世界快照）。
+§4 末尾登记的「仍未做：人工校准面」**三维已全部落地为只读运营视图**。
+境界档原本卡在「`Skeleton` 无字段落点」，本次补齐 schema（`assembly::RealmTier`）——
+补的是 `Option` + `skip_serializing_if` 字段，模板不声明时 `assembled_json` 逐字节不变，
+**黄金世界快照因此未变**（取证方式见本节末「境界档的三条限定」第 1 条）。
 
 | 项 | 开发状态 | 代码锚点 | 默认开关 |
 |---|---|---|---|
 | 阶段切分校准视图 | **Implemented（只可视化，不可编辑）** | `server/src/admin_api/calibration.rs` `list_sagas` / `saga_detail`；页面 `admin/src/pages/Calibration.tsx`。诊断项：缺号（**从 1 起算**，故「缺开篇」也报）/ 重号 / 未编号 / 审核态分布 / 星级跨度 / 骨架形状指标 / 世界实例数 | 恒开（只读聚合，同 dashboards） |
 | 身份池校准视图 | **Implemented（只可视化，不可编辑）** | 同文件 `list_identity_pools` / `template_identity_pool`。给出池声明、逐身份分配人次 / 覆盖世界 / 填充率、从未被分配的站位、模板已删除的残留身份、在场无站位角色数、集中度基尼（复用 `slo::gini_coefficient`） | 恒开（只读聚合） |
-| 境界档校准视图 | **Concept** | 无。`Skeleton` 里没有境界档字段，无数据可展示 | — |
+| 境界档校准视图 | **Implemented（只可视化，不可编辑）** | 同文件 `list_realm_tiers` / `template_realm_tier`；schema 在 `server/src/assembly/mod.rs` `RealmTier`。给出戏服声明（档名 / 体系 / 题材 / 冲突烈度 / 入场导演设定 / 风味翻译提示）、同系列各阶对照（缺档 / 复用同一档 / 跨体系）、实例钉住情况（含钉着旧档的实例） | 恒开（只读聚合） |
 
 🔴 三条必须一起读的限定：
 
-1. **只可视化，不可编辑**。四个端点无写入、无副作用、不落 `audit_logs`；校准参数的唯一写入路径
-   仍是建模板（`POST /admin/world-templates` 的 `sagaId`/`stageNo`/`skeletonJson.identityPool`）。
+1. **只可视化，不可编辑**。全部端点无写入、无副作用、不落 `audit_logs`；校准参数的唯一写入路径
+   仍是建模板（`POST /admin/world-templates` 的 `sagaId`/`stageNo`/`skeletonJson.identityPool`/
+   `skeletonJson.realmTier`）。
    响应恒带 `editable:false` + `editPath`，页面直接渲染该字段而非写死文案。
    **本批次不含任何在线调参**，故不需要新开关（§0.1 约束的是写入面）。
 2. **身份池视图不构成效果验证**。它回答「分配成了什么样、是否失衡」，**不回答「这样分配更好」**——
@@ -258,6 +262,29 @@
    运营把分布图误读成调参有效的证据。
 3. **`Implemented` ≠ 可上线**。视图口径未经真实运营数据检验；缺号/失衡的**阈值**目前没有产品定义
    （页面只呈现事实，不给「合格/不合格」判语）。
+
+🔴 **境界档的三条限定**（总规格 §6【拍板 3】戏服原则；比身份池还多一层缺口）：
+
+1. **未声明即零影响，且已逐字节取证**。`Skeleton.realm_tier` 与 `AssembledInstance.realm_tier`
+   都是 `Option` + `skip_serializing_if`（同 `payoutTable` 范式）。取证方式：开 pristine HEAD 与
+   「仅含本次改动」两棵 git worktree，注入**同一段**探针 dump 四个钉死 `world_id` 的黄金世界产物
+   —— 两侧输出 md5 相同、`cmp` 逐字节相等。再在改动侧给黄金骨架加上 `realmTier`
+   重跑，逐路径比对的结果是：**新增路径全部落在 `/assembly/realmTier` 子树下，取值改变的路径为 0 条**
+   （storyline / mainline / hidden / ending / NPC / 地点 / 身份分配 / 结局定盘 / 逐拍状态 /
+   事件流 / 贡献分 / 终局全部未动）。仓库内另有 `realm_tier_does_not_disturb_any_sampling_dimension`
+   与 `realm_tier_absent_keeps_assembled_json_byte_identical` 两条测试常驻守护。
+2. **叙事感知层是缺的——这一维目前对玩家零可见**。`runtime` 不读
+   `assembled_json./assembly/realmTier`，`briefing` 与 `flavorNotes` 进不了任何引擎上下文。
+   所以状态只到 **Implemented**，**不是 Integrated**：调整境界档在玩家侧观察不到任何变化，
+   校准面的「已声明 / 已钉住」只证明数据在库里。接通叙事层要改 `runtime/`，是独立一步。
+3. **零数值是红线，不是风格**。§6「跨体系靠风味翻译，不靠数值换算」+ §0.1 平权：`RealmTier`
+   全字段是字符串 / 字符串数组，`realm_tier_carries_no_numeric_field` 逐字段断言序列化产物里
+   没有任何数字——给它加 `level`/`powerTier` 就等于把「选阶段」变成「选强度」，须显式评审。
+   另：`conflictIntensity: "lethal"` **不是死亡开关**（世界是否致命由建房参数 `lethality` 与 §11
+   独立决定），`genre: "history"` 的严审提示**未接进审核链路**（状态 `Concept`，纯人工提示）。
+
+**本次未做（登记为下一步）**：境界档接进 `runtime` 叙事上下文；把境界维接进 `slo/` 形成校准闭环；
+题材 → 审核档位的真实联动。三项都不在本批次范围内。
 
 ### 3.2 R3 批次台账 —— 人设保险三级出口（总规格 §7，**校验于 2026-07-26**）
 
@@ -441,6 +468,52 @@ PG 对 `ORDER BY` 并列行的顺序**不作任何保证**（可随计划、并�
 两条都需要迁移，且整条短信通道当前是 Dev 桩（`DevSms`，按 §0.3 本就不可上线），
 故排在 ① 之后。**在此之前不得给它补 `id DESC` 充数。**
 
+### 3.4 R3 收官批次台账 —— 直播场（总规格 §2 + §15 第 4 层，**落地于 2026-07-27**）
+
+> R3 路线图（总规格 §19）的最后一项：**直播场（定档调度 + 延迟缓冲 + 弹幕）**。
+> 它同时是 T5「50-100 人世界；直播场 + 弹幕」这条开放范围里除生死状之外的全部内容。
+
+| R3 项 | 开发状态 | 代码锚点 | 默认开关 |
+|---|---|---|---|
+| ① 定档 | **Implemented** | 迁移 `0042`（`live_sessions`）；`server/src/livestage/`。预告时刻 + 开播时刻 + 场次容量；状态机单向 `scheduled → live \| canceled`、`live → ended`（CAS 落库）；节目单只列已到预告时刻的场次。定档提前量参数化 `MUSE_LIVE_ANNOUNCE_LEAD_MS` | **关闭**（`MUSE_LIVE_STAGE`） |
+| ② 延迟缓冲 | **Implemented** | 播出水位线 `max(最新 done 拍 - delay_ticks, published_high_tick)`；撤下面 `live_withholds`。🔴 **是内容安全机制不是体验设计** —— 它就是 `safety/mod.rs` 的 `TODO(§15-L3)` 原文里等的那个「拦截窗口」 | 同上 |
+| ③ 弹幕 | **Implemented** | `live_danmaku`；过 `safety::mask` + `safety::moderate_and_queue`（静态 UGC 唯一入队/记险入口）+ 限频 429 + 成年门 403 + §14 面具。🔴 **永不进 `world_events`** | 同上 |
+| ④ 转化度量 | **Implemented** | `live_viewers`（**新建的数据源**）+ `livestage::conversion_block` → `/admin/metrics/overview` 的 `liveStage` 顶层键 | 同上（指标本身只读恒算） |
+
+**② 延迟缓冲的四条结构性要点（都已锁进测试，改动需显式评审）**：
+
+1. 🔴 **待播内容不另存副本**。一拍提交时 `world_events` 已是世界事实（§0.3），延迟的是**公开投影的
+   播出时刻**，不是事实本身。建一张 `pending_broadcast_events` 副本表会立刻产生两个事实源
+   （副本写失败 = 世界演过了而直播永远缺一拍；副本被改写 = 观众看到的与世界记载的不是同一件事）——
+   **那才是事实错乱**。现在一份内容一处存储，播出面只多一条水位线。
+2. 🔴 **延迟只作用于世界外**。世界成员的 `/worlds/{id}/events` 一拍不延——他们的角色正在经历这些事，
+   延后当事人等于让世界停摆。用例 `delay_buffer_holds_recent_ticks_but_never_delays_world_members`。
+3. 🔴 **已播出的不缩回**。`published_high_tick` 是单调下界，于是 T5 预案「审核成本失控 → **直播延迟
+   拍数上调**」这个旋钮**只勒住未来**：把 `delayTicks` 从 1 调到 5 不会让已在观众屏幕上滚过去的
+   4 拍从播出面消失（那是对已公开内容的回滚）。用例
+   `raising_delay_ticks_never_retracts_already_published_ticks`。
+4. 🔴 **审核不过 = 不外发，不是回滚**。人工撤下写 `live_withholds` **独立表**，`world_events`
+   **逐字节不动**，战报 / 回放 / 日报 / 成员读取面全部不受影响。回执如实标注 `preemptive`
+   （播出前拦下 / 播出后撤下——后者明说「收不回已经看见的」）。用例
+   `withholding_leaves_the_worldline_byte_identical_and_scoped_to_this_session`。
+
+**🔴 与错峰调度那条既有红线的关系**：`runtime::offpeak` 的「直播场（`room_type='arena'` ∨
+`tick_per_day ≥ MUSE_OFFPEAK_LIVE_TICK_PER_DAY`）永不延后」**一行未改**，且**不得**改成
+「有没有定档记录」——豁免判据必须是世界自身的节奏属性，否则运营建一条定档就顺手改掉一个世界的
+调度行为，那是两个不该耦合的旋钮。播出排期（`live_sessions`）与引擎拍排期（`schedule_due_ticks`）
+输入完全不相交，双向源码级用例 `red_line_offpeak_live_exemption_untouched` 钉住。
+
+**测量手段（2026-07-27 补齐）**：T5 门槛「**直播场观众→玩家转化 ≥2%**」此前**无从判定**——
+全仓没有任何直播观看埋点（`world_members` 只记入场的玩家，`world_events` 只记世界内发生的事，
+观众来过一次不留任何痕迹）。这与 T1「OOC 申诉率」曾经的处境完全同构：
+**门槛写了却没有数据源，就等于测不了**。现由 `live_viewers` 提供数据源，指标口径见
+`docs/API.md` §6「直播场」小节。
+⚠️ 开测前**必须先把 `MUSE_LIVE_STAGE` 打开**（默认关闭）：入口没开时该指标返回
+`entry_not_open`（显示 `—`）而非 0%，正是为了防止把「没测过」误读成「没人转化」而误判为不通过。
+另有 `withheldPreemptiveRate`（撤下里播出前拦住的占比）直接作为「延迟拍数够不够」的判据 ——
+它 < 1 就是 T5 预案「上调延迟拍数」该被触发的信号，`danmakuBlocked/danmakuTotal` 则是
+「内容审核成本 ≤ 生成成本的 5%」那条门槛的一手输入。
+
 ## 4. 验证基建三件套（优先于新增功能）
 
 1. **黄金世界回归**：一个公版/原创标准样板（固定角色卡 + 世界模板 + 20-30 个关键剧情测试点，
@@ -594,11 +667,14 @@ record-and-replay `ModelClient`：**工具已建**（`muse_engine::replay`，202
 其中**境界档在 `Skeleton` 里没有任何字段落点**（`identity_pool` 有、`payout_table` 有、境界档没有），
 故校准面在补上 schema 之前无数据可展示——这是它的真前置件，不是 UI 工作量问题。
 
-> **2026-07-27 更新**：上段「仍未做」已部分兑现——**阶段切分与身份池两维**的只读校准视图已落地
-> （`server/src/admin_api/calibration.rs` + `admin/src/pages/Calibration.tsx`，台账见 §3.1.1）。
-> **境界档仍未做，原因与上段完全一致**（无 schema 落点）。
-> 另注意上段说的是「可视化**与调参**」，本次**只做了可视化，没做调参**：四个端点全只读，
-> 校准参数的写入路径仍是建模板。
+> **2026-07-27 更新**：上段「仍未做」的**可视化部分已全部兑现**——阶段切分 / 身份池 / **境界档**
+> 三维的只读校准视图均已落地（`server/src/admin_api/calibration.rs` +
+> `admin/src/pages/Calibration.tsx`，台账见 §3.1.1）。
+> 上段说的「境界档在 `Skeleton` 里没有字段落点」**已不再成立**：schema 已补为
+> `assembly::RealmTier`（`Option` + `skip_serializing_if`，未声明时装配产物逐字节不变）。
+> 另注意上段说的是「可视化**与调参**」，三维**都只做了可视化，没做调参**：全部端点只读，
+> 校准参数的写入路径仍是建模板。境界档另有一层更弱的限定——`runtime` 还不读它，
+> 这一维目前**对玩家零可见**（§3.1.1「境界档的三条限定」第 2 条）。
 
 ### 4.5 录制-回放接线（新增于 2026-07-27 · 任务 #46 · 状态 `Implemented`）
 

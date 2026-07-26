@@ -19,6 +19,11 @@ pub enum ApiError {
     Conflict(String),
     #[error("幂等键重复但载荷不一致")]
     IdempotencyMismatch,
+    /// 限频（429）。与 `Conflict`(409) 分开是因为语义不同：409 是「状态不允许你这么做」，
+    /// 429 是「这么做没问题，只是太快了，等等再来」——客户端对二者的正确反应也不同
+    /// （前者应停止重试，后者应退避重试）。当前唯一使用者是弹幕限频（`livestage`）。
+    #[error("请求过于频繁: {0}")]
+    TooManyRequests(String),
     #[error("已被风控拦截")]
     RiskBlocked,
     #[error("内部错误")]
@@ -42,6 +47,7 @@ impl ApiError {
             Self::BadRequest(_) => "bad_request",
             Self::Conflict(_) => "conflict",
             Self::IdempotencyMismatch => "idempotency_mismatch",
+            Self::TooManyRequests(_) => "too_many_requests",
             Self::RiskBlocked => "risk_blocked",
             Self::Internal(_) => "internal",
         }
@@ -53,6 +59,7 @@ impl ApiError {
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Conflict(_) | Self::IdempotencyMismatch => StatusCode::CONFLICT,
+            Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::RiskBlocked => StatusCode::FORBIDDEN,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }

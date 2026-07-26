@@ -56,6 +56,11 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::annotations::router())
         .merge(crate::ifline::router())
         .merge(crate::social::router())
+        // 直播场（定档 + 延迟缓冲 + 弹幕）。**不挂 `arena` feature 门控**：延迟缓冲是内容
+        // 安全机制（§15 第 4 层），把它编进可选 feature 等于让默认构建缺一层安全闸；
+        // 且它只依赖 events/safety/flags，与 ledger 无关。能力本身由运行时开关
+        // `MUSE_LIVE_STAGE` 控制，默认关闭。
+        .merge(crate::livestage::router())
         .merge(crate::admin_api::router());
 
     #[cfg(feature = "arena")]

@@ -182,7 +182,7 @@ function Shell() {
                 {
                   key: 'calibration',
                   icon: <ExperimentOutlined />,
-                  label: '人工校准（阶段 / 身份池）',
+                  label: '人工校准（阶段 / 身份池 / 境界档）',
                   onClick: () => navigate(`/worlds?${designPreview ? 'design=preview&' : ''}view=calibration`),
                 },
                 { type: 'divider' },

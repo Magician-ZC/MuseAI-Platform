@@ -1,15 +1,21 @@
 // 人工校准面（总规格 §79/§83 内容生产流水线第一环：人工校准 → 仿真试跑 → 世界质量回归）。
 //
-// 本页只做**两维**：阶段切分（saga_id / stage_no）与身份池（skeleton.identityPool → 实例分配）。
-// 境界档不在本页——它在 Skeleton 里没有任何字段落点，补 schema 会动到装配产物与黄金世界快照，
-// 属独立评审项（见 server/src/admin_api/calibration.rs 模块头）。
+// 本页做**三维**（§79 里「人工校准」明列的那三项）：阶段切分（saga_id / stage_no）、
+// 身份池（skeleton.identityPool → 实例分配）、境界档（skeleton.realmTier → 实例钉住，总规格 §6）。
+//
+// 三维不是同构的，界面上也不该长得一样：
+//   · 阶段切分 = 坐标 → 看连续性（缺号 / 重号）；
+//   · 身份池   = 各不相同的开局站位 → 看分布（填充率 / 基尼）；
+//   · 境界档   = 全员统一的一件戏服 → 看「有没有 / 各阶是不是在换 / 实例钉住没有」。
+//     **境界档没有「分布」可看**——它零抽样、无配额，谁要在这一维画分布图就是没读 §6。
 //
 // 🔴 两条必须在界面上说清楚、不得靠运营自行推断的事：
-//   ① **只可视化，不可编辑**：后端四个端点全只读，恒下发 `editable:false` + `editPath`。
+//   ① **只可视化，不可编辑**：后端六个端点全只读，恒下发 `editable:false` + `editPath`。
 //      页面把这两个字段渲染出来，而不是自己写死一句「只读」——后端哪天开了写入面，界面自动跟上。
-//   ② **身份池的真实效力**：分配层与叙事感知层都已落地，但按平权红线永不进数值层，
-//      且没有任何指标度量「调身份池 → 戏份分布变化」。这四层状态由后端 `effect` 段下发，
-//      本页原样渲染（`EffectPanel`），**不得只画分布图**。
+//   ② **每一维的真实效力**：身份池的分配层与叙事感知层都已落地（但永不进数值层）；
+//      境界档的**叙事感知层是缺的**——runtime 不读 realmTier，这件戏服目前没人穿。
+//      这些层状态一律由后端 `effect` 段下发，本页原样渲染（`EffectPanel`），
+//      **不得只画一张「已配置」的绿标**。
 //
 // 数据诚实纪律（设计文档 §9.1）：只渲染接口真实返回的字段，null 一律显示 `—`，
 // 比率为 null 时不得当 0% 渲染（formatPercent 已处理）。
@@ -69,6 +75,9 @@ interface StageShape {
   identityQuotaTotal?: number;
   identityLeadCount?: number;
   hasPayoutTable?: boolean;
+  /** 境界档是「有 / 无」，不是规模——§6 全员统一，没有「几个境界」这回事。 */
+  hasRealmTier?: boolean;
+  realmTierLabel?: string | null;
   hasEndgame?: boolean;
   isSuperset?: boolean;
 }
@@ -145,13 +154,15 @@ interface IdentityStat {
   fillRatio: number | null;
 }
 
+/**
+ * 效力自述段：后端下发「哪一层已经生效、哪一层永不生效、哪一层根本没有」。
+ * 层的**数量与名字按维度不同**（身份池四层、境界档五层），故这里用索引签名，
+ * 由各维度自己给 `layers` 顺序表 —— 前端不猜、不补、不合并。
+ */
 interface EffectScope {
-  assignmentLayer: string;
-  narrativeLayer: string;
-  numericLayer: string;
-  calibrationLoop: string;
   summary: string;
   warning: string;
+  [layer: string]: string;
 }
 
 interface IdentityDetailRes {
@@ -195,6 +206,105 @@ interface IdentityDetailRes {
   notes: string[];
 }
 
+// ---- 维度三：境界档（总规格 §6【拍板 3】戏服原则） ----
+
+interface RealmRow {
+  templateId: string;
+  title: string;
+  roomType: string;
+  moderation: string;
+  sagaId: string;
+  stageNo: number;
+  tierId: string;
+  label: string;
+  cosmology: string;
+  genre: string;
+  conflictIntensity: string;
+  flavorNoteCount: number;
+  /** 填了官方枚举外的自由文本的字段名（建模板端点会拦，出现在此 = 历史数据 / 直写库）。 */
+  invalidEnumFields: string[];
+  worldCount: number;
+  liveWorldCount: number;
+}
+
+interface RealmDirectoryRes {
+  templates: RealmRow[];
+  scannedTemplates: number;
+  truncated: boolean;
+  /** 归属某个 Saga 却没有戏服的模板数 = 真正的校准缺口（§6「阶段天然携带境界档」）。 */
+  undeclaredInSagaCount: number;
+  /** 独立模板没戏服，只作对照，不是缺口。 */
+  undeclaredStandaloneCount: number;
+  effect: EffectScope;
+  editable: boolean;
+  editPath: string;
+  notes: string[];
+}
+
+interface RealmStage {
+  templateId: string;
+  stageNo: number;
+  title: string;
+  declared: boolean;
+  tierId: string | null;
+  label: string | null;
+  cosmology: string | null;
+  isSelf: boolean;
+}
+
+interface RealmDetailRes {
+  templateId: string;
+  title: string;
+  roomType: string;
+  version: number;
+  moderation: string;
+  sagaId: string;
+  stageNo: number;
+  declared: boolean;
+  /** 未声明 → null（不是空对象）。 */
+  declaration: {
+    tierId: string;
+    label: string;
+    cosmology: string;
+    genre: string;
+    conflictIntensity: string;
+    briefing: string;
+    flavorNotes: string[];
+    invalidEnumFields: string[];
+    blankTierId: boolean;
+    /** §6 历史题材严审提示。🔴 只是提示，未接进任何审核链路。 */
+    stricterModerationHint: boolean;
+  } | null;
+  sagaStages: {
+    stages: RealmStage[];
+    stagesWithoutRealmTier: number[];
+    reusedTierIds: { tierId: string; stageNos: number[] }[];
+    distinctCosmologies: string[];
+    distinctGenres: string[];
+  };
+  pinning: {
+    worldsScanned: number;
+    worldsTruncated: boolean;
+    worldsAssembled: number;
+    worldsWithRealmTier: number;
+    staleTierIds: { tierId: string; worldCount: number }[];
+    worlds: {
+      id: string;
+      title: string;
+      status: string;
+      assembled: boolean;
+      pinnedTierId: string | null;
+      pinnedLabel: string | null;
+      /** null = 模板未声明境界档，「是否一致」这个问题不成立——不得当 false 渲染。 */
+      matchesTemplate: boolean | null;
+    }[];
+  };
+  effect: EffectScope;
+  editable: boolean;
+  editPath: string;
+  notes: string[];
+}
+
 // ---------------- 展示映射 ----------------
 
 const ROOM_TYPE_TEXT: Record<string, string> = { idle: '放置世界', chapter: '章节房', arena: '赛事房' };
@@ -209,6 +319,44 @@ const WORLD_STATUS_TEXT: Record<string, string> = {
   paused: '已暂停',
   ended: '已结束',
 };
+
+/**
+ * 境界档三项枚举的中文映射（与 server/src/assembly/mod.rs 的 KNOWN_COSMOLOGIES /
+ * KNOWN_GENRES / KNOWN_CONFLICT_INTENSITIES 一一对应）。
+ * 🔴 后端加了新取值而这里没跟上时，一律**原样回显英文** —— 绝不 fallback 成"其他"把新值吞掉。
+ */
+const COSMOLOGY_TEXT: Record<string, string> = {
+  magic: '魔法',
+  tech: '科技',
+  cultivation: '修真 / 斗气',
+  mundane: '凡俗',
+  psychic: '异能',
+  myth: '神话',
+};
+const GENRE_TEXT: Record<string, string> = {
+  xuanhuan: '玄幻',
+  xianxia: '仙侠',
+  wuxia: '武侠',
+  urban: '都市',
+  romance: '言情',
+  history: '历史',
+  scifi: '科幻',
+  mystery: '悬疑',
+  other: '其他',
+};
+/** §6 原文三档：文斗 / 武斗 / 生死。 */
+const INTENSITY_TEXT: Record<string, { color: string; text: string }> = {
+  civil: { color: 'blue', text: '文斗' },
+  martial: { color: 'orange', text: '武斗' },
+  lethal: { color: 'red', text: '生死' },
+};
+
+/** 枚举值渲染：空 → `—`（留空是合法的，不是缺数据）；未知取值 → 原样回显并标红。 */
+function EnumText({ value, map, invalid }: { value: string; map: Record<string, string>; invalid?: boolean }) {
+  if (!value) return <Typography.Text type="secondary">—</Typography.Text>;
+  if (invalid) return <Tag color="red">{value}（非官方取值）</Tag>;
+  return <>{map[value] ?? value}</>;
+}
 
 /**
  * 状态语言七档 → 中文标签与语气（VALIDATION §0.3）。
@@ -233,8 +381,18 @@ const LAYER_STATE: Record<string, { text: string; tone: 'ok' | 'never' | 'missin
   },
 };
 
-const LAYER_LABEL: { key: keyof EffectScope; label: string }[] = [
+/** 身份池四层（§5）。 */
+const IDENTITY_LAYERS: { key: string; label: string }[] = [
   { key: 'assignmentLayer', label: '分配层' },
+  { key: 'narrativeLayer', label: '叙事感知层' },
+  { key: 'numericLayer', label: '数值层' },
+  { key: 'calibrationLoop', label: '校准闭环' },
+];
+
+/** 境界档五层（§6）。比身份池多一层，且**叙事感知层是缺的**——这正是要让运营看见的事。 */
+const REALM_LAYERS: { key: string; label: string }[] = [
+  { key: 'declarationLayer', label: '声明层' },
+  { key: 'pinningLayer', label: '钉住层' },
   { key: 'narrativeLayer', label: '叙事感知层' },
   { key: 'numericLayer', label: '数值层' },
   { key: 'calibrationLoop', label: '校准闭环' },
@@ -264,16 +422,25 @@ function ReadOnlyBanner({ editable, editPath }: { editable?: boolean; editPath?:
 }
 
 /**
- * 效力自述面板：身份池「哪一层已经生效、哪一层永不生效、哪一层根本没有」。
- * 🔴 这一段不是装饰——没有它，运营会把下面的分布图误读成「调了就会变强」的证据。
+ * 效力自述面板：这一维「哪一层已经生效、哪一层永不生效、哪一层根本没有」。
+ * 🔴 这一段不是装饰——没有它，运营会把下面的数据误读成「调了就会生效」的证据。
+ * 标题与层列表由调用方给（各维度的层不同名、也不同数），本组件只负责如实渲染后端下发的状态。
  */
-function EffectPanel({ effect }: { effect: EffectScope }) {
+function EffectPanel({
+  title,
+  effect,
+  layers,
+}: {
+  title: string;
+  effect: EffectScope;
+  layers: { key: string; label: string }[];
+}) {
   return (
     <div className="calibration__effect">
-      <h5>身份池现在到底有什么用</h5>
+      <h5>{title}</h5>
       <p>{effect.summary}</p>
       <dl className="calibration__layers">
-        {LAYER_LABEL.map(({ key, label }) => {
+        {layers.map(({ key, label }) => {
           const raw = String(effect[key] ?? '');
           const s = LAYER_STATE[raw];
           return (
@@ -613,6 +780,9 @@ function StageSplitting({ deepLink }: { deepLink?: string }) {
                                 身份池 {r.shape.identityPoolSize}（配额 {r.shape.identityQuotaTotal}）
                               </Tag>
                             )}
+                            {r.shape.hasRealmTier && (
+                              <Tag color="purple">境界档 {r.shape.realmTierLabel}</Tag>
+                            )}
                             {r.shape.hasPayoutTable && <Tag color="green">产出表</Tag>}
                             {r.shape.hasEndgame && <Tag color="green">终局策略</Tag>}
                           </Space>
@@ -804,7 +974,7 @@ function IdentityPools({ deepLink }: { deepLink?: string }) {
         {detail && d && (
           <>
             {/* 🔴 效力自述必须在分布图**之前**：先说清楚它有什么用，再给数。 */}
-            <EffectPanel effect={detail.effect} />
+            <EffectPanel title="身份池现在到底有什么用" effect={detail.effect} layers={IDENTITY_LAYERS} />
             <ReadOnlyBanner editable={detail.editable} editPath={detail.editPath} />
 
             {!detail.declared && (
@@ -1017,14 +1187,503 @@ function IdentityPools({ deepLink }: { deepLink?: string }) {
   );
 }
 
+// ================= 维度三：境界档 =================
+
+/**
+ * 戏服带：把「同一系列各阶段各发什么戏服」画成一条可扫视的带子。
+ * 这是境界档这一维的核心视图 —— §6「你选阶段，就是在选境界」，
+ * 若各阶同档（复用）或多阶缺档，这句话在那几阶之间就不成立，带子上一眼可见。
+ * 状态一律「文字 + 颜色」：缺档写「缺」，复用写「复用」（设计文档 §5，不用彩色圆点）。
+ */
+function RealmStrip({ stages, reused }: { stages: RealmStage[]; reused: { tierId: string }[] }) {
+  if (!stages.length) {
+    return <Typography.Text type="secondary">该模板不属于任何世界系列，没有同系列各阶可对照。</Typography.Text>;
+  }
+  const reusedSet = new Set(reused.map((r) => r.tierId));
+  return (
+    <div className="calibration__realm-strip">
+      {stages.map((s) => {
+        const missing = !s.declared || !s.tierId;
+        const isReused = !missing && reusedSet.has(s.tierId as string);
+        const cls = missing ? 'is-missing' : isReused ? 'is-duplicate' : '';
+        return (
+          <span
+            className={`calibration__realm-chip ${cls}${s.isSelf ? ' is-self' : ''}`}
+            key={s.templateId}
+            title={`${s.title}（阶段 ${s.stageNo}）`}
+          >
+            <b>阶段 {s.stageNo}</b>
+            <span>{missing ? '缺戏服' : s.label}</span>
+            {isReused && <small>与其他阶复用同一档</small>}
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
+function RealmTiers({ deepLink }: { deepLink?: string }) {
+  const [data, setData] = useState<RealmDirectoryRes | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [detailId, setDetailId] = useState<string | null>(null);
+  const [detail, setDetail] = useState<RealmDetailRes | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      setData(await adminFetch<RealmDirectoryRes>('/admin/realm-tiers'));
+    } catch (e) {
+      setError(friendlyError(e));
+      setData(null);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const openDetail = useCallback(async (templateId: string) => {
+    setDetailId(templateId);
+    setDetail(null);
+    setDetailError(null);
+    setDetailLoading(true);
+    try {
+      setDetail(
+        await adminFetch<RealmDetailRes>(`/admin/world-templates/${encodeURIComponent(templateId)}/realm-tier`),
+      );
+    } catch (e) {
+      setDetailError(friendlyError(e));
+    } finally {
+      setDetailLoading(false);
+    }
+  }, []);
+
+  // 深链 `?realm=tpl_xxx`（见 StageSplitting 同处说明）。
+  useEffect(() => {
+    if (deepLink) openDetail(deepLink);
+  }, [deepLink, openDetail]);
+
+  const columns: TableColumnsType<RealmRow> = [
+    { title: '模板', dataIndex: 'title', key: 'title' },
+    {
+      title: '系列 / 阶段',
+      key: 'saga',
+      width: 200,
+      render: (_, r) =>
+        r.sagaId ? (
+          <>
+            <Typography.Text code>{r.sagaId}</Typography.Text>
+            <Typography.Text type="secondary"> · 第 {r.stageNo} 阶</Typography.Text>
+          </>
+        ) : (
+          <Typography.Text type="secondary">独立模板</Typography.Text>
+        ),
+    },
+    {
+      title: '境界档',
+      key: 'tier',
+      width: 200,
+      render: (_, r) => (
+        <>
+          {r.label}
+          <div>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              {r.tierId || '（缺 id）'}
+            </Typography.Text>
+          </div>
+        </>
+      ),
+    },
+    {
+      title: '体系',
+      key: 'cosmology',
+      width: 120,
+      render: (_, r) => (
+        <EnumText value={r.cosmology} map={COSMOLOGY_TEXT} invalid={r.invalidEnumFields.includes('cosmology')} />
+      ),
+    },
+    {
+      title: '题材',
+      key: 'genre',
+      width: 100,
+      render: (_, r) => (
+        <EnumText value={r.genre} map={GENRE_TEXT} invalid={r.invalidEnumFields.includes('genre')} />
+      ),
+    },
+    {
+      title: '冲突烈度',
+      key: 'intensity',
+      width: 110,
+      render: (_, r) => {
+        if (!r.conflictIntensity) return <Typography.Text type="secondary">—</Typography.Text>;
+        if (r.invalidEnumFields.includes('conflictIntensity')) {
+          return <Tag color="red">{r.conflictIntensity}（非官方取值）</Tag>;
+        }
+        const t = INTENSITY_TEXT[r.conflictIntensity];
+        return <Tag color={t?.color ?? 'default'}>{t?.text ?? r.conflictIntensity}</Tag>;
+      },
+    },
+    {
+      title: '世界（在跑/总）',
+      key: 'worlds',
+      width: 130,
+      render: (_, r) => `${formatNumber(r.liveWorldCount)} / ${formatNumber(r.worldCount)}`,
+    },
+    {
+      title: '操作',
+      key: 'op',
+      width: 110,
+      fixed: 'right',
+      render: (_, r) => (
+        <Button size="small" onClick={() => openDetail(r.templateId)}>
+          查看戏服
+        </Button>
+      ),
+    },
+  ];
+
+  const dec = detail?.declaration;
+  const st = detail?.sagaStages;
+  const pin = detail?.pinning;
+
+  return (
+    <div>
+      {/* 🔴 效力自述放在最上面：这一维的叙事感知层是缺的，运营在列表页就该知道，
+          而不是点进详情才发现「配了半天玩家看不到」。 */}
+      {data && <EffectPanel title="境界档现在到底有什么用" effect={data.effect} layers={REALM_LAYERS} />}
+      <ReadOnlyBanner editable={data?.editable} editPath={data?.editPath} />
+
+      <dl className="calibration__stats">
+        <div className="calibration__stat">
+          <dt>已配戏服的模板</dt>
+          <dd>{data ? formatNumber(data.templates.length) : '—'}</dd>
+        </div>
+        <div className={`calibration__stat${data?.undeclaredInSagaCount ? ' is-attention' : ''}`}>
+          <dt>系列里缺戏服的阶段</dt>
+          <dd>
+            {data ? formatNumber(data.undeclaredInSagaCount) : '—'}
+            <small>校准缺口</small>
+          </dd>
+        </div>
+        <div className="calibration__stat">
+          <dt>没戏服的独立模板</dt>
+          <dd>
+            {data ? formatNumber(data.undeclaredStandaloneCount) : '—'}
+            <small>只作对照</small>
+          </dd>
+        </div>
+        <div className="calibration__stat">
+          <dt>已扫描模板</dt>
+          <dd>
+            {data ? formatNumber(data.scannedTemplates) : '—'}
+            {data?.truncated && <small>已截断</small>}
+          </dd>
+        </div>
+      </dl>
+
+      <Table
+        rowKey="templateId"
+        size="small"
+        columns={columns}
+        dataSource={data?.templates ?? []}
+        loading={loading}
+        pagination={false}
+        scroll={{ x: 1180 }}
+        title={() => (
+          <Space>
+            <Button size="small" onClick={load} loading={loading}>
+              刷新
+            </Button>
+            <Typography.Text type="secondary">
+              只列出声明了 realmTier 的模板。境界档全员统一，故本维没有「分布」可看。
+            </Typography.Text>
+          </Space>
+        )}
+        locale={{
+          emptyText: (
+            <Empty
+              description={
+                error
+                  ? '未能取到数据'
+                  : '没有任何模板声明了境界档。归属世界系列的阶段本应各有一件戏服（总规格 §6），独立模板没有则属正常。'
+              }
+            />
+          ),
+        }}
+      />
+
+      {error && <ErrorAlert message={error} onRetry={load} />}
+      <Notes notes={data?.notes} />
+
+      <Drawer
+        title={`境界档：${detail?.title ?? detailId ?? ''}`}
+        width={980}
+        open={!!detailId}
+        onClose={() => setDetailId(null)}
+        loading={detailLoading}
+      >
+        {detailError && <ErrorAlert message={detailError} onRetry={() => detailId && openDetail(detailId)} />}
+        {detail && st && pin && (
+          <>
+            <EffectPanel title="境界档现在到底有什么用" effect={detail.effect} layers={REALM_LAYERS} />
+            <ReadOnlyBanner editable={detail.editable} editPath={detail.editPath} />
+
+            {!detail.declared && (
+              <Alert
+                type="warning"
+                showIcon
+                style={{ marginBottom: 16 }}
+                title="该模板未声明 realmTier"
+                description={
+                  detail.sagaId
+                    ? '它是一个世界系列的阶段，按总规格 §6「阶段天然携带境界档」本应配一件戏服 —— 这是校准缺口。'
+                    : '独立模板（不属于任何世界系列）没有戏服是正常状态，不是缺数据。'
+                }
+              />
+            )}
+
+            {dec && (dec.blankTierId || dec.invalidEnumFields.length > 0) && (
+              <Alert
+                type="error"
+                showIcon
+                style={{ marginBottom: 16 }}
+                title="境界档存在脏数据"
+                description={
+                  <>
+                    {dec.blankTierId && <div>缺少档位 id：无法跨阶段对账与审计。</div>}
+                    {dec.invalidEnumFields.length > 0 && (
+                      <div>填了官方枚举外的自由文本：{dec.invalidEnumFields.join('、')}</div>
+                    )}
+                    <div>建模板端点会拦下这些取值，出现在此说明是历史数据或绕过端点直写库。</div>
+                  </>
+                }
+              />
+            )}
+
+            {dec?.stricterModerationHint && (
+              <Alert
+                type="info"
+                showIcon
+                style={{ marginBottom: 16 }}
+                title="历史题材：按总规格 §6 应走更严审核档（合规）"
+                description="这只是一条提示：本仓库尚未把题材接进任何审核链路，标了 history 不会自动改变审核档位，仍需人工按更严标准复核。"
+              />
+            )}
+
+            {dec && (
+              <>
+                <div className="calibration__section">这一阶发的戏服</div>
+                <dl className="calibration__kv">
+                  <div>
+                    <dt>档名</dt>
+                    <dd>
+                      {dec.label}
+                      <small>{dec.tierId || '（缺 id）'}</small>
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>体系</dt>
+                    <dd>
+                      <EnumText
+                        value={dec.cosmology}
+                        map={COSMOLOGY_TEXT}
+                        invalid={dec.invalidEnumFields.includes('cosmology')}
+                      />
+                      {!dec.cosmology && <small>留空 = 无战力体系题材，境界泛化为处境</small>}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>题材</dt>
+                    <dd>
+                      <EnumText
+                        value={dec.genre}
+                        map={GENRE_TEXT}
+                        invalid={dec.invalidEnumFields.includes('genre')}
+                      />
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>冲突烈度</dt>
+                    <dd>
+                      {dec.conflictIntensity ? (
+                        <Tag color={INTENSITY_TEXT[dec.conflictIntensity]?.color ?? 'default'}>
+                          {INTENSITY_TEXT[dec.conflictIntensity]?.text ?? dec.conflictIntensity}
+                        </Tag>
+                      ) : (
+                        <Typography.Text type="secondary">—</Typography.Text>
+                      )}
+                      <small>叙事标注，不是死亡开关（世界是否致命由建房参数决定）</small>
+                    </dd>
+                  </div>
+                </dl>
+                <p className="calibration__hint">
+                  入场导演统一设定：{dec.briefing || <Typography.Text type="secondary">（未填写）</Typography.Text>}
+                </p>
+                {dec.flavorNotes.length > 0 && (
+                  <p className="calibration__hint">
+                    跨体系风味翻译提示：
+                    <Space size={4} wrap>
+                      {dec.flavorNotes.map((n) => (
+                        <Tag key={n}>{n}</Tag>
+                      ))}
+                    </Space>
+                  </p>
+                )}
+              </>
+            )}
+
+            <div className="calibration__section">同系列各阶对照（你选阶段，就是在选境界）</div>
+            <RealmStrip stages={st.stages} reused={st.reusedTierIds} />
+            {st.reusedTierIds.length > 0 && (
+              <Alert
+                type="warning"
+                showIcon
+                style={{ marginTop: 8 }}
+                title="同一系列里有多个阶段发同一件戏服"
+                description={`${st.reusedTierIds
+                  .map((r) => `${r.tierId}（阶段 ${r.stageNos.join('、')}）`)
+                  .join('；')} —— 在这几阶之间「选阶段 = 选境界」不成立，值得复核是不是漏改。`}
+              />
+            )}
+            {st.stagesWithoutRealmTier.length > 0 && (
+              <Alert
+                type="warning"
+                showIcon
+                style={{ marginTop: 8 }}
+                title={`${st.stagesWithoutRealmTier.length} 个阶段没有戏服`}
+                description={`阶段 ${st.stagesWithoutRealmTier.join('、')} —— 按总规格 §6，系列的每一阶都应携带自己的境界档。`}
+              />
+            )}
+            {st.distinctCosmologies.length > 1 && (
+              <Alert
+                type="info"
+                showIcon
+                style={{ marginTop: 8 }}
+                title="同一系列跨了多个体系"
+                description={`${st.distinctCosmologies
+                  .map((c) => COSMOLOGY_TEXT[c] ?? c)
+                  .join('、')} —— 按 §6，跨体系应靠风味翻译而不是换一套数值，值得复核是不是标错。`}
+              />
+            )}
+
+            <div className="calibration__section">实例钉住情况</div>
+            <p className="calibration__hint">
+              境界档在装配那一刻就钉死在实例的 <code>assembled_json</code> 里，改模板<strong>不会</strong>回溯改写已开出的世界。
+              因此「已钉住」少于「已装配」是正常的 —— 那些实例是在这个模板声明戏服<strong>之前</strong>装配的。
+            </p>
+            <dl className="calibration__stats">
+              <div className="calibration__stat">
+                <dt>已扫描世界</dt>
+                <dd>
+                  {formatNumber(pin.worldsScanned)}
+                  {pin.worldsTruncated && <small>已截断</small>}
+                </dd>
+              </div>
+              <div className="calibration__stat">
+                <dt>已钉住戏服</dt>
+                <dd>
+                  {formatNumber(pin.worldsWithRealmTier)}
+                  <small>已装配 {formatNumber(pin.worldsAssembled)}</small>
+                </dd>
+              </div>
+              <div className={`calibration__stat${pin.staleTierIds.length ? ' is-attention' : ''}`}>
+                <dt>钉着旧档的实例</dt>
+                <dd>{formatNumber(pin.staleTierIds.reduce((a, b) => a + b.worldCount, 0))}</dd>
+              </div>
+              <div className="calibration__stat">
+                <dt>模板版本</dt>
+                <dd>v{detail.version}</dd>
+              </div>
+            </dl>
+            {pin.staleTierIds.length > 0 && (
+              <Alert
+                type="warning"
+                showIcon
+                style={{ marginBottom: 12 }}
+                title="有实例钉着与当前模板不一致的境界档"
+                description={`${pin.staleTierIds
+                  .map((s) => `${s.tierId}（${s.worldCount} 个世界）`)
+                  .join('、')} —— 模板改版后老实例保持原样，这不是故障，但复盘那几个世界时要按它们各自钉住的档来读。`}
+              />
+            )}
+            <Table
+              rowKey="id"
+              size="small"
+              pagination={false}
+              dataSource={pin.worlds}
+              locale={{ emptyText: <Empty description="该模板还没有开出任何世界" /> }}
+              columns={[
+                { title: '世界', dataIndex: 'title', key: 'title' },
+                {
+                  title: '状态',
+                  dataIndex: 'status',
+                  key: 'status',
+                  width: 90,
+                  render: (v: string) => WORLD_STATUS_TEXT[v] ?? v,
+                },
+                {
+                  title: '装配',
+                  dataIndex: 'assembled',
+                  key: 'assembled',
+                  width: 90,
+                  render: (v: boolean) => (v ? <Tag color="green">已装配</Tag> : <Tag>未装配</Tag>),
+                },
+                {
+                  title: '钉住的戏服',
+                  key: 'pinned',
+                  render: (_: unknown, r: RealmDetailRes['pinning']['worlds'][number]) =>
+                    r.pinnedTierId ? (
+                      <>
+                        {r.pinnedLabel}
+                        <Typography.Text type="secondary" style={{ fontSize: 12, marginLeft: 6 }}>
+                          {r.pinnedTierId}
+                        </Typography.Text>
+                      </>
+                    ) : (
+                      <Typography.Text type="secondary">未钉住</Typography.Text>
+                    ),
+                },
+                {
+                  title: '与模板一致',
+                  key: 'matches',
+                  width: 120,
+                  // null（模板未声明 / 实例未钉住）必须显示 —，不得当「不一致」渲染。
+                  render: (_: unknown, r: RealmDetailRes['pinning']['worlds'][number]) =>
+                    r.matchesTemplate == null ? (
+                      <Typography.Text type="secondary">—</Typography.Text>
+                    ) : r.matchesTemplate ? (
+                      <Tag color="green">一致</Tag>
+                    ) : (
+                      <Tag color="orange">钉着旧档</Tag>
+                    ),
+                },
+              ]}
+            />
+
+            <Notes notes={detail.notes} />
+          </>
+        )}
+      </Drawer>
+    </div>
+  );
+}
+
 // ================= 主页面 =================
 
 export default function Calibration() {
-  // 深链：`?saga=<sagaId>` 打开阶段结构抽屉，`?pool=<templateId>` 切到身份池并打开分布抽屉。
+  // 深链：`?saga=<sagaId>` 打开阶段结构抽屉，`?pool=<templateId>` 切到身份池并打开分布抽屉，
+  // `?realm=<templateId>` 切到境界档并打开戏服抽屉。
   // 运营排查时贴一条链接就能让对方落到同一屏，不必口述「点第几行的按钮」。
   const params = new URLSearchParams(useLocation().search);
   const saga = params.get('saga') ?? undefined;
   const pool = params.get('pool') ?? undefined;
+  const realm = params.get('realm') ?? undefined;
 
   return (
     <div className="calibration">
@@ -1032,16 +1691,18 @@ export default function Calibration() {
         <h4>人工校准面</h4>
         <span className="calibration__readonly">只读 · 不可调参</span>
         <small>
-          内容生产流水线第一环：人工校准 → 仿真试跑 → 世界质量回归。本期只做阶段切分与身份池两维；
-          境界档在世界骨架里尚无字段落点，需先补 schema，故本页不展示。
+          内容生产流水线第一环：人工校准 → 仿真试跑 → 世界质量回归。三维分别看三件事：
+          阶段切分看坐标是否齐整，身份池看站位分布是否失衡，境界档看这一阶有没有戏服、各阶是不是在换。
+          境界档目前只到「已声明 / 已钉住」，引擎尚未读取它 —— 详见各页顶部的效力自述。
         </small>
       </div>
 
       <Tabs
-        defaultActiveKey={pool ? 'identity' : 'stages'}
+        defaultActiveKey={realm ? 'realm' : pool ? 'identity' : 'stages'}
         items={[
           { key: 'stages', label: '阶段切分', children: <StageSplitting deepLink={saga} /> },
           { key: 'identity', label: '身份池', children: <IdentityPools deepLink={pool} /> },
+          { key: 'realm', label: '境界档', children: <RealmTiers deepLink={realm} /> },
         ]}
       />
     </div>

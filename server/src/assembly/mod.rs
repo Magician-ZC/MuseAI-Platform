@@ -76,6 +76,14 @@ pub struct AssembledInstance {
     /// `skip_serializing_if` 保证老实例 `assembled_json` 逐字节不变（同 `identity_assignments` 范式）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payout_table: Option<PayoutTable>,
+    /// 境界档快照（总规格 §6【拍板 3】戏服原则）：**全员统一的一件戏服**，装配时把模板声明原样钉住。
+    /// `None` = 模板未声明 → 本实例无境界维度（`skip_serializing_if` 保证老实例 / 未声明模板的
+    /// `assembled_json` **逐字节不变**，同 `payout_table` 范式）。
+    ///
+    /// 🔴 钉在这里只是"存下来了"：**runtime 目前不读它**，故它还没有任何叙事可见性
+    ///（见 `admin_api::calibration` 的效力自述 `narrativeLayer: Missing`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realm_tier: Option<RealmTier>,
 }
 
 /// 装配采样钉住结果（防刷第二环审计段）：种子 + 阵容指纹哈希 + 各维度被选子集 id。
@@ -188,6 +196,77 @@ fn default_collapse_worldline_factor() -> f64 {
     crate::progression::COLLAPSE_WORLDLINE_FACTOR
 }
 
+// ---------- 境界档（总规格 §6【拍板 3】：戏服原则——境界即布景） ----------
+
+/// 题材枚举（§6「副本补两个标注：**题材（genre）** + 冲突烈度」）。
+///
+/// ⚠️ **总规格没有枚举题材**——§6 只点名了「都市 / 言情 / 历史」三个无战力体系题材，
+/// 与斗破 / 斗罗那类玄幻作对照。下表是据此给的最小可用集，属**实现补白**而非规格原文；
+/// 新增题材在此续号，并同步 `admin/src/pages/Calibration.tsx` 的中文映射。
+/// 收白名单不收自由文本，口径同 `admission::KNOWN_COSMOLOGIES`。
+pub const KNOWN_GENRES: &[&str] =
+    &["xuanhuan", "xianxia", "wuxia", "urban", "romance", "history", "scifi", "mystery", "other"];
+
+/// 冲突烈度枚举（§6 原文「**文斗 / 武斗 / 生死**」三档，一一对应，无补白）。
+pub const KNOWN_CONFLICT_INTENSITIES: &[&str] = &["civil", "martial", "lethal"];
+
+/// 按 §6「历史题材涉真实人物走更严审核档（合规）」需要更严审核的题材。
+///
+/// 🔴 **当前只是运营提示，未接进任何审核链路**：`safety::` 的机审 / 人审档位不读本常量，
+/// 建模板期也不因题材改变 `moderation` 初值。校准面把它作为一条提示渲染（状态：Concept），
+/// 谁都不该以为"标了 history 就自动进严审"。
+pub const STRICTER_MODERATION_GENRES: &[&str] = &["history"];
+
+/// 境界档：**阶段模板发给全员的同一件戏服**（§6「境界跟着副本走，不跟着角色走」）。
+///
+/// 三条设计约束直接来自 §6，改本类型前先回去读那一节：
+///
+/// 1. **全员统一** ⇒ 落点是 `Option<RealmTier>` 而**不是**池 / 数组。进「黑角域篇」全员领斗王档，
+///    没有 per-character 差异，于是没有分配、没有配额、**没有抽样** —— 本维度因此
+///    **不占用任何 RNG 域常量**（域清单里下一个可用的仍是 `0x5C`），装配层只是把它原样钉住。
+///    这也是它与身份池（§5，有池有配额有种子分配）的根本区别：**身份各不相同，境界人人一样**。
+/// 2. **零数值** ⇒ 全字段是字符串 / 字符串数组，**一个数字都没有**。§6「跨体系靠风味翻译，
+///    不靠数值换算」+ §0.1 平权宪法：境界是布景不是战力。给它一个 `level: i64` 就等于开了
+///    「选阶段 = 选强度」的侧门，`realm_tier_carries_no_numeric_field` 把这条锁进测试。
+/// 3. **永不带走** ⇒ 只钉进实例 `assembled_json`，**绝不写回角色卡**（§6「角色带走道具与历练，
+///    永不带走境界——境界留在那个世界的那场戏里」）。本模块从不触碰 `cloud_characters`。
+///
+/// 全字段 `#[serde(default)]`：老模板无 `realmTier` → `None` → 零影响（同 `payoutTable` 哲学）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RealmTier {
+    /// 档位 id（跨阶段对账与审计的稳定键）。空 → 建模板期拒绝。
+    #[serde(default)]
+    pub id: String,
+    /// 公示档名："斗王档" / "六品京官" / "破产后的第三个月"。空 → 展示层回落 id。
+    #[serde(default)]
+    pub label: String,
+    /// 所属体系标签（∈ `admission::KNOWN_COSMOLOGIES`，与道具准入同一枚举，自由文本一律不收）。
+    /// **空 = 无战力体系题材**（§6「都市 / 言情 / 历史：境界泛化为处境——财富 / 人脉 / 官阶 /
+    /// 关系位置」），完全合法，不是缺数据。
+    #[serde(default)]
+    pub cosmology: String,
+    /// 题材（§6「副本补两个标注」之一），∈ `KNOWN_GENRES`。空 = 未标注。
+    #[serde(default)]
+    pub genre: String,
+    /// 冲突烈度（§6「副本补两个标注」之二），∈ `KNOWN_CONFLICT_INTENSITIES`：
+    /// `civil` 文斗 / `martial` 武斗 / `lethal` 生死。空 = 未标注。
+    ///
+    /// ⚠️ **它不是生死开关**：世界是否致命由建房参数 `lethality` 与 §11 死亡规则独立决定，
+    /// 本字段只是给入场导演与运营看的题材标注。两者互不读取、互不覆盖——
+    /// 把 `lethal` 接成"打开死亡"就等于让一个叙事标注改判定，属平权红线违规。
+    #[serde(default)]
+    pub conflict_intensity: String,
+    /// 入场导演的统一戏服说明（§6「入场导演统一设定」）：一句话交代"这一篇全员是什么水位"。
+    /// 🔴 目前**没有任何消费者**——runtime 不读 `realmTier`，这句话进不了引擎上下文。
+    #[serde(default)]
+    pub briefing: String,
+    /// 跨体系风味翻译提示（§6「唐三入斗破世界，魂技译为斗气招式风味，内核不变」）。
+    /// 同 `briefing`，当前只存不用。
+    #[serde(default)]
+    pub flavor_notes: Vec<String>,
+}
+
 impl Default for CollapsePolicy {
     fn default() -> Self {
         Self {
@@ -286,6 +365,16 @@ struct Skeleton {
     /// 缺省 `None` → ③ 层只累计贡献分、不发放（老模板零影响；开闸靠运营录入数据）。
     #[serde(default)]
     payout_table: Option<PayoutTable>,
+    /// 境界档（总规格 §6【拍板 3】「戏服原则——境界即布景」）：本阶段发给**全员的同一件戏服**
+    /// （进「黑角域篇」全员领斗王档）。「阶段天然携带境界档——你选阶段，就是在选境界」。
+    ///
+    /// 与 `identity_pool` 的分工：**身份各不相同（叙事层站位，有池有配额有种子分配），
+    /// 境界人人一样（布景，无池无配额无抽样）**。故此处是 `Option` 而不是 `Vec`，
+    /// 装配层对它**不掷一次骰子**，只是原样钉进 `assembled_json`。
+    ///
+    /// 缺省 `None` → 本模板无境界维度（老模板零影响；装配产物逐字节不变，有专项回归守护）。
+    #[serde(default)]
+    realm_tier: Option<RealmTier>,
     /// 副本采样计数提示（每维度每副本抽样量）。全空 = 走退化路径（不采样）。
     #[serde(default)]
     sampling: SamplingSpec,
@@ -656,6 +745,8 @@ const DOMAIN_IDENTITY: u64 = 0x57;
 // 它们与装配采样物理隔离（不同 seed、不同进程路径），登记只为让「域常量唯一」这条纪律有单一清单。
 // 0x5B：`ifline::runner`（if 线付费副本推进）的逐拍演员表抽样子流 `DOMAIN_IFLINE_CAST`。
 // 同样物理隔离（种子来自 `ifline_worlds.run_seed`，与实例装配 seed 无交集）。
+// 境界档（§6 拍板 3）**不占域**：它全员统一、无池无配额、装配层一次骰子都不掷，
+// 只把模板声明原样钉进 `assembled_json` —— 没有抽样就不该占号，取了号反而误导后来者。
 // **下一个可用域常量是 0x5C**；新增子流请在此续号并写明归属，不要跳号也不要复用。
 
 // ---------- 身份池分配权重（§5 拍板 4、5；纯叙事倾向常量，可调，禁止赋予任何数值含义） ----------
@@ -2289,6 +2380,11 @@ pub async fn assemble_instance(state: &AppState, world_id: &str) -> Result<Assem
         // 8) 公示产出表（§10 拍板 17）：骨架声明什么就钉什么（不做任何加权/挑选/随机），
         //    结算侧据此查表确定发放——"同贡献分必得同产出"的单一事实源。
         payout_table: skeleton.payout_table.clone(),
+        // 9) 境界档（§6 拍板 3 戏服原则）：同样是"声明什么就钉什么"——**全员统一的一件戏服**，
+        //    无分配、无抽样、无数值（见 `RealmTier` 三条设计约束）。
+        //    未声明 → None → `skip_serializing_if` 不写键 → assembled_json 逐字节不变。
+        //    🔴 钉住≠生效：runtime 目前不读这个键，境界档尚无任何叙事可见性。
+        realm_tier: skeleton.realm_tier.clone(),
     };
 
     // 持久化：assembly 段钉住（含派生的 templateVersion + 装配时模板星级快照），chapterState 段留给章节会话推进。
@@ -2422,6 +2518,9 @@ fn distribute_resident_items(
 /// `Skeleton`，校验目录引用无悬空——`reward_item_ref`（无内联 fallback 时）/`connections`/`residentItemIds`/
 /// `carried_item_ids`/`gate.requiredItemIds` 须能在对应目录（world_items / locations）解引用，
 /// `gate.requiredCosmologies` 须 ∈ KNOWN_COSMOLOGIES。返回首个悬空引用的中文说明（Err）或通过（Ok）。
+///
+/// 另含三段**取值域**校验（不是引用完整性，但同属"建模板期一次拦掉，不留到运行时静默降级"）：
+/// 身份池（§4 段）、公示产出表（§5 段）、境界档（§6 段：体系 / 题材 / 冲突烈度须在官方枚举内）。
 ///
 /// 宽松边界：解析失败（类型不符）→ Ok（沿用 load_skeleton 的防御式 unwrap_or_default 语义，不因无关字段拦截合法模板）；
 /// 只在结构成立时对「明确写了引用」的字段判悬空，避免误伤退化路径（空目录 / 无地点的老模板全部放行）。
@@ -2577,14 +2676,41 @@ pub(crate) fn validate_skeleton_refs(skeleton: &Value) -> Result<(), String> {
         }
     }
 
-    // 6) 容器形态（R2 自定义房，技术附录 §3）：副本卡引用 / 缝合边 / 锚点的**建房期硬门**。
+    // 6) 境界档（§6【拍板 3】戏服原则）：id 非空、体系 / 题材 / 冲突烈度三项取值落在官方枚举内
+    //    （**自由文本一律不收**，口径同 `gate.requiredCosmologies`）。三项都允许留空——
+    //    空体系正是 §6 说的"无战力体系题材（都市/言情/历史），境界泛化为处境"。
+    //    未声明 realmTier（老模板）直接放行，同 payoutTable 的「不填即零影响」。
+    if let Some(rt) = &sk.realm_tier {
+        if rt.id.trim().is_empty() {
+            return Err("realmTier 缺少 id：境界档没有稳定 id，无法跨阶段对账与审计".to_string());
+        }
+        let cos = rt.cosmology.trim();
+        if !cos.is_empty() && !crate::admission::KNOWN_COSMOLOGIES.contains(&cos) {
+            return Err(format!(
+                "realmTier.cosmology 非法：体系 `{cos}` 不在官方枚举内 {:?}（留空 = 无战力体系题材，是合法取值）",
+                crate::admission::KNOWN_COSMOLOGIES
+            ));
+        }
+        let genre = rt.genre.trim();
+        if !genre.is_empty() && !KNOWN_GENRES.contains(&genre) {
+            return Err(format!("realmTier.genre 非法：题材 `{genre}` 不在官方枚举内 {KNOWN_GENRES:?}"));
+        }
+        let ci = rt.conflict_intensity.trim();
+        if !ci.is_empty() && !KNOWN_CONFLICT_INTENSITIES.contains(&ci) {
+            return Err(format!(
+                "realmTier.conflictIntensity 非法：冲突烈度 `{ci}` 不在官方枚举内 {KNOWN_CONFLICT_INTENSITIES:?}（文斗 civil / 武斗 martial / 生死 lethal）"
+            ));
+        }
+    }
+
+    // 7) 容器形态（R2 自定义房，技术附录 §3）：副本卡引用 / 缝合边 / 锚点的**建房期硬门**。
     //    未声明 subplotCardRefs（普通模板）直接放行——本段一个字节都不影响它们。
     validate_container_refs(&sk)?;
 
     Ok(())
 }
 
-/// 容器声明的建房期校验（`validate_skeleton_refs` 第 6 段，技术附录 §3.1/§3.3/§5）。
+/// 容器声明的建房期校验（`validate_skeleton_refs` 第 7 段，技术附录 §3.1/§3.3/§5）。
 ///
 /// 这里只做**不依赖 DB 的静态门**（结构、格式、白名单、保留字）；需要卡内容才能判的
 /// （卡内 id 含分隔符 / 卡内引用悬空 / cosmology 不相容 / 地点图不连通）由装配期的
@@ -3780,6 +3906,160 @@ mod sampling_tests {
         assert!(validate_skeleton_refs(&sk).is_ok());
     }
 
+    // ---------- 境界档（总规格 §6【拍板 3】戏服原则）：schema 落点 + 零影响 + 平权红线 ----------
+
+    fn realm_json() -> serde_json::Value {
+        serde_json::json!({
+            "id": "tier-douwang",
+            "label": "斗王档",
+            "cosmology": "cultivation",
+            "genre": "xuanhuan",
+            "conflictIntensity": "martial",
+            "briefing": "本篇全员领斗王档戏服：能御空短距、能扛一记斗皇余威，仅此而已。",
+            "flavorNotes": ["魂技译为斗气招式风味，内核不变"]
+        })
+    }
+
+    fn with_realm(mut sk: Skeleton, v: serde_json::Value) -> Skeleton {
+        sk.realm_tier = serde_json::from_value(v).unwrap();
+        sk
+    }
+
+    /// 🔴 **零影响契约**：声明与不声明 `realmTier`，采样产物的**七个维度逐项相同**。
+    ///
+    /// 这是境界档能安全落地的全部依据——它不掷骰子、不占 RNG 域、不参与任何选取，
+    /// 所以加了这一维之后，storyline / mainline / hidden / ending / NPC / 地点 / 身份
+    /// 必须一字不差。这条一旦红，说明有人把境界接进了采样，黄金世界基线随即失效。
+    #[test]
+    fn realm_tier_does_not_disturb_any_sampling_dimension() {
+        let cards = roster(&["c1", "c2", "c3"]);
+        let bare = with_identities(superset(), standard_pool());
+        let dressed = with_realm(with_identities(superset(), standard_pool()), realm_json());
+
+        let a = plan_with_roster(&bare, "world_realm_zero", &cards);
+        let b = plan_with_roster(&dressed, "world_realm_zero", &cards);
+        let (sa, sb) = (a.audit.unwrap(), b.audit.unwrap());
+        assert_eq!(sa.selected_storylines, sb.selected_storylines);
+        assert_eq!(sa.selected_mainline, sb.selected_mainline);
+        assert_eq!(sa.selected_hidden, sb.selected_hidden);
+        assert_eq!(sa.selected_endings, sb.selected_endings);
+        assert_eq!(sa.selected_npcs, sb.selected_npcs);
+        assert_eq!(sa.selected_locations, sb.selected_locations);
+        assert_eq!(sa.identity_assignments, sb.identity_assignments);
+        assert_eq!(sa.seed, sb.seed, "境界档不进种子：同 world_id 同阵容必得同一颗种子");
+        assert_eq!(a.selected_ending, b.selected_ending, "结局定盘不受境界档影响");
+    }
+
+    /// 🔴 **未声明 → `assembled_json` 逐字节不变**：`skip_serializing_if` 必须让 `realmTier` 键
+    /// 整个消失（不是 `"realmTier": null`）。同时把 `assembly` 段的**键序列**钉死——
+    /// 加字段时若不小心插到中间、或忘了 skip，这条会立刻红，黄金世界快照就不会被悄悄改写。
+    #[test]
+    fn realm_tier_absent_keeps_assembled_json_byte_identical() {
+        let base = AssembledInstance {
+            per_character_hooks: vec![],
+            enabled_endings: vec![],
+            selected_ending: None,
+            lineup_params: serde_json::json!({}),
+            difficulty_notes: vec![],
+            home_advantages: vec![],
+            world_character_entries: vec![],
+            location_graph: vec![],
+            resident_items: vec![],
+            identity_assignments: vec![],
+            sampling: None,
+            payout_table: None,
+            realm_tier: None,
+        };
+        let raw = serde_json::to_string(&base).unwrap();
+        assert!(!raw.contains("realmTier"), "未声明境界档时不得写出任何 realmTier 键：{raw}");
+
+        // 🔴 直接钉死**原始字节串**（不能解析回 Map 再比——`serde_json::Map` 默认是 BTreeMap，
+        // 一解析就把顺序洗成字典序，恰好把这条测试要抓的"字段插到中间"洗没了）。
+        assert_eq!(
+            raw,
+            r#"{"perCharacterHooks":[],"enabledEndings":[],"lineupParams":{},"difficultyNotes":[],"homeAdvantages":[],"worldCharacterEntries":[],"locationGraph":[],"residentItems":[]}"#,
+            "assembly 段的字节形态被改动 = 既有实例的 assembled_json 不再逐字节可比"
+        );
+
+        // 声明了才多出这一个键，且它**追加在最后**：既有前缀一字节不动，
+        // 于是"声明境界档"对老字段是纯增量，不会挤动任何既有键的位置。
+        let dressed = AssembledInstance { realm_tier: Some(serde_json::from_value(realm_json()).unwrap()), ..base };
+        let dressed_raw = serde_json::to_string(&dressed).unwrap();
+        let prefix = &raw[..raw.len() - 1]; // 去掉收尾的 `}`
+        assert!(
+            dressed_raw.starts_with(prefix),
+            "境界档必须追加在末尾，既有字节前缀不得变动：\n{dressed_raw}"
+        );
+        assert!(
+            dressed_raw[prefix.len()..].starts_with(r#","realmTier":{"#),
+            "追加段应恰好是 realmTier：{}",
+            &dressed_raw[prefix.len()..]
+        );
+    }
+
+    /// 🔴 **平权红线锁**（§6「跨体系靠风味翻译，不靠数值换算」+ §0.1）：境界档序列化后
+    /// **一个数字 / 布尔都不许有**，全部是字符串或字符串数组。
+    ///
+    /// 谁要给它加 `level` / `powerTier` / `combatBonus`，这条测试会先红——那不是"补一个字段"，
+    /// 那是把「选阶段」变成「选强度」，等于用戏服开了数值侧门。
+    #[test]
+    fn realm_tier_carries_no_numeric_field() {
+        let rt: RealmTier = serde_json::from_value(realm_json()).unwrap();
+        let v = serde_json::to_value(&rt).unwrap();
+        for (k, val) in v.as_object().expect("境界档应序列化为对象") {
+            let ok = val.is_string()
+                || val.as_array().is_some_and(|a| a.iter().all(serde_json::Value::is_string));
+            assert!(ok, "境界档字段 `{k}` 不是字符串 / 字符串数组：{val} —— 数值化 = 平权红线违规");
+        }
+    }
+
+    /// 建模板期取值域校验：三项枚举各自拦得住自由文本；留空一律放行。
+    #[test]
+    fn validate_realm_tier_enums() {
+        let sk = |rt: serde_json::Value| serde_json::json!({ "realmTier": rt });
+
+        assert!(validate_skeleton_refs(&sk(realm_json())).is_ok(), "合法境界档不得被拦");
+
+        // 三项全留空 = 无战力体系题材（都市 / 言情 / 历史），§6 明说合法。
+        assert!(
+            validate_skeleton_refs(&sk(serde_json::json!({ "id": "tier-broke", "label": "破产后的第三个月" }))).is_ok(),
+            "空体系 / 空题材 / 空烈度是合法取值（境界泛化为处境）"
+        );
+
+        let err = validate_skeleton_refs(&sk(serde_json::json!({ "id": "  " }))).unwrap_err();
+        assert!(err.contains("realmTier 缺少 id"), "应报缺少 id，实得：{err}");
+
+        let err = validate_skeleton_refs(&sk(serde_json::json!({ "id": "t", "cosmology": "斗气" }))).unwrap_err();
+        assert!(err.contains("cosmology 非法"), "自由文本体系必须被拦，实得：{err}");
+
+        let err = validate_skeleton_refs(&sk(serde_json::json!({ "id": "t", "genre": "宫斗" }))).unwrap_err();
+        assert!(err.contains("genre 非法"), "自由文本题材必须被拦，实得：{err}");
+
+        let err =
+            validate_skeleton_refs(&sk(serde_json::json!({ "id": "t", "conflictIntensity": "很凶" }))).unwrap_err();
+        assert!(err.contains("conflictIntensity 非法"), "自由文本烈度必须被拦，实得：{err}");
+
+        // 老模板（无 realmTier）照旧放行。
+        assert!(validate_skeleton_refs(&serde_json::json!({ "hiddenContentPool": [] })).is_ok());
+    }
+
+    /// §6「角色带走道具与历练，**永不带走境界**」：境界档只存在于实例装配产物里，
+    /// 装配层从不因它写任何角色侧的表。本文件的生产代码段内不得出现对 `cloud_characters` 的写入。
+    #[test]
+    fn realm_tier_never_written_back_to_card() {
+        // 与 `red_line_assembly_never_writes_subplot_cards` 同款静态扫描：只扫生产代码段
+        //（首个 test-only 编译属性之前），避免测试里的字面量造成假红。
+        let src = include_str!("mod.rs");
+        let cut = src.find(&concat!("#[cfg", "(test)]").to_string()).unwrap_or(src.len());
+        let prod = &src[..cut];
+        for verb in ["UPDATE cloud_characters", "INSERT INTO cloud_characters", "DELETE FROM cloud_characters"] {
+            assert!(
+                !prod.contains(verb),
+                "装配层出现了对角色卡的写入（`{verb}`）：境界永不带走，卡侧一个字节都不该被装配改动"
+            );
+        }
+    }
+
     // 退化路径不读星级：非超集模板带高档奖励 + 1★ → 全量装配无剔除（与改造前行为完全一致）。
     #[test]
     fn degraded_path_ignores_star_cap() {
@@ -4268,13 +4548,16 @@ mod container_tests {
         }
     }
 
-    /// 🔴 卡只贡献「内容」，不贡献规则维度：产出表 / 身份池 / 装配规则 / 采样计数 / 超集标记
-    /// 一律只认容器本体（卡不得带来产出加成、准入豁免或规则特权）。
+    /// 🔴 卡只贡献「内容」，不贡献规则维度：产出表 / 身份池 / 境界档 / 装配规则 / 采样计数 /
+    /// 超集标记一律只认容器本体（卡不得带来产出加成、准入豁免或规则特权）。
     #[test]
     fn cards_never_contribute_rule_dimensions() {
         let mut frag = frag_json("甲", 1);
         frag["payoutTable"] = json!({ "worldlineTiers": [ { "label": "卡自带的产出表", "minScore": 0.0, "mileage": 9999 } ] });
         frag["identityPool"] = json!([ { "id": "card-lead", "quota": 9, "isLead": true } ]);
+        // 境界档是**容器发的戏服**（§6）：卡自带一件 = "装上这张卡全场换套更高的水位"，
+        // 与产出表同属规则维度的侧门，必须被合并器丢掉。
+        frag["realmTier"] = json!({ "id": "card-tier", "label": "卡自带的斗帝档", "cosmology": "cultivation" });
         frag["assemblyRules"] = json!({ "hiddenPerCharacter": 9 });
         frag["sampling"] = json!({ "instanceHiddenCount": 99 });
         frag["isSuperset"] = json!(false);
@@ -4286,6 +4569,7 @@ mod container_tests {
 
         assert!(m.payout_table.is_none(), "卡不得带来产出表（产出加成 = 加战力的侧门）");
         assert!(m.identity_pool.is_empty(), "卡不得带来身份池（站位与配额是容器的规则维度）");
+        assert!(m.realm_tier.is_none(), "卡不得带来境界档（戏服由容器发，§6「境界跟着副本走」）");
         assert_eq!(m.assembly_rules.hidden_per_character, 1, "装配规则只认容器本体");
         assert_eq!(m.sampling.instance_hidden_count, Some(2), "采样计数只认容器本体");
         assert!(m.is_superset, "超集标记只认容器本体");

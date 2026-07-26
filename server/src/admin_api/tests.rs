@@ -3374,6 +3374,168 @@ async fn identity_pool_surfaces_dirty_pool_entries() {
     assert_eq!(body["poolSize"], 4, "脏条目照样计入池大小（它们真的在骨架里）");
 }
 
+// ---------------- 维度三：境界档（总规格 §6【拍板 3】戏服原则） ----------------
+
+fn realm_json(id: &str, label: &str) -> Value {
+    json!({
+        "id": id, "label": label, "cosmology": "cultivation",
+        "genre": "xuanhuan", "conflictIntensity": "martial",
+        "briefing": "本篇全员领同一档戏服", "flavorNotes": ["魂技译为斗气招式风味"]
+    })
+}
+
+fn assembled_with_realm(id: &str, label: &str) -> Value {
+    json!({ "assembly": { "realmTier": { "id": id, "label": label } } })
+}
+
+/// 境界档目录：只列声明了 realmTier 的模板；**未声明的分两类计数**——
+/// 归属 Saga 的阶段没戏服是校准缺口（§6「阶段天然携带境界档」），独立模板没戏服只是对照。
+#[tokio::test]
+async fn realm_tier_directory_separates_saga_gap_from_standalone() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+
+    ins_template(&state, "tpl_rt1", "第一篇", "saga_rt", 1, "approved",
+        json!({ "realmTier": realm_json("tier-douzhe", "斗者档") })).await;
+    // 同系列第二阶没配戏服 → 校准缺口。
+    ins_template(&state, "tpl_rt2", "第二篇", "saga_rt", 2, "approved", json!({ "mainlineNodes": [] })).await;
+    // 独立模板没配 → 只作对照，不算缺口。
+    ins_template(&state, "tpl_solo_rt", "独立", "", 0, "approved", json!({})).await;
+    ins_world_of(&state, "w_rt", "tpl_rt1", "running", None).await;
+
+    let (st, body) = get(&app, "/api/admin/realm-tiers", Some(&admin)).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let items = body["templates"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "只列声明了境界档的模板: {body}");
+    assert_eq!(items[0]["templateId"], "tpl_rt1");
+    assert_eq!(items[0]["tierId"], "tier-douzhe");
+    assert_eq!(items[0]["label"], "斗者档");
+    assert_eq!(items[0]["cosmology"], "cultivation");
+    assert_eq!(items[0]["conflictIntensity"], "martial");
+    assert_eq!(items[0]["worldCount"], 1);
+    assert_eq!(items[0]["invalidEnumFields"], json!([]));
+    assert_eq!(body["undeclaredInSagaCount"], 1, "系列里缺戏服的阶段 = 真正的校准缺口");
+    assert_eq!(body["undeclaredStandaloneCount"], 1, "独立模板不算缺口，单列对照");
+    assert_eq!(body["editable"], false, "🔴 校准面只可视化，不可编辑");
+    // 🔴 效力自述必须随目录一起下发（运营在列表页就该知道这一维现在没有叙事可见性）。
+    assert_eq!(body["effect"]["narrativeLayer"], "Missing");
+}
+
+/// 境界档详情：同系列各阶对照（缺档 / 复用同一档 / 跨体系）+ 实例钉住情况（含钉着旧档）。
+#[tokio::test]
+async fn realm_tier_detail_reports_stage_progression_and_pinning() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+
+    // saga_prog：1 斗者 / 2 斗者（复用！）/ 3 无戏服 / 4 换了体系。
+    ins_template(&state, "tpl_p1", "第一篇", "saga_prog", 1, "approved",
+        json!({ "realmTier": realm_json("tier-douzhe", "斗者档") })).await;
+    ins_template(&state, "tpl_p2", "第二篇", "saga_prog", 2, "approved",
+        json!({ "realmTier": realm_json("tier-douzhe", "斗者档") })).await;
+    ins_template(&state, "tpl_p3", "第三篇", "saga_prog", 3, "approved", json!({})).await;
+    ins_template(&state, "tpl_p4", "第四篇", "saga_prog", 4, "approved",
+        json!({ "realmTier": { "id": "tier-tech", "label": "上校军衔", "cosmology": "tech" } })).await;
+
+    // tpl_p1 开出三个实例：钉当前档 / 钉旧档 / 装配时还没有境界档。
+    ins_world_of(&state, "w_p1", "tpl_p1", "running", Some(assembled_with_realm("tier-douzhe", "斗者档"))).await;
+    ins_world_of(&state, "w_p2", "tpl_p1", "ended", Some(assembled_with_realm("tier-old", "旧档"))).await;
+    ins_world_of(&state, "w_p3", "tpl_p1", "running", Some(json!({ "assembly": {} }))).await;
+    ins_world_of(&state, "w_p4", "tpl_p1", "open", None).await; // 未装配
+
+    let (st, body) = get(&app, "/api/admin/world-templates/tpl_p1/realm-tier", Some(&admin)).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(body["declared"], true);
+    let dec = &body["declaration"];
+    assert_eq!(dec["tierId"], "tier-douzhe");
+    assert_eq!(dec["invalidEnumFields"], json!([]));
+    assert_eq!(dec["blankTierId"], false);
+    assert_eq!(dec["stricterModerationHint"], false, "xuanhuan 不触发历史题材严审提示");
+    assert_eq!(dec["flavorNotes"].as_array().unwrap().len(), 1);
+
+    let s = &body["sagaStages"];
+    assert_eq!(s["stages"].as_array().unwrap().len(), 4, "同系列四阶全列出: {s}");
+    assert_eq!(s["stages"][0]["isSelf"], true, "自己那一阶要能被高亮出来");
+    assert_eq!(s["stagesWithoutRealmTier"], json!([3]), "第三阶没戏服");
+    let reused = s["reusedTierIds"].as_array().unwrap();
+    assert_eq!(reused.len(), 1, "1、2 两阶复用同一档: {s}");
+    assert_eq!(reused[0]["tierId"], "tier-douzhe");
+    assert_eq!(reused[0]["stageNos"], json!([1, 2]));
+    assert_eq!(s["distinctCosmologies"], json!(["cultivation", "tech"]), "同系列跨了体系，须被看见");
+
+    let p = &body["pinning"];
+    assert_eq!(p["worldsScanned"], 4);
+    assert_eq!(p["worldsAssembled"], 3, "未装配的 w_p4 不算");
+    assert_eq!(p["worldsWithRealmTier"], 2, "w_p3 装配了但没有 realmTier 键（声明前的存量）");
+    let stale = p["staleTierIds"].as_array().unwrap();
+    assert_eq!(stale.len(), 1, "钉着旧档的实例必须被看见: {p}");
+    assert_eq!(stale[0]["tierId"], "tier-old");
+    assert_eq!(stale[0]["worldCount"], 1);
+    let w: Vec<&Value> = p["worlds"].as_array().unwrap().iter().collect();
+    let w3 = w.iter().find(|x| x["id"] == "w_p3").unwrap();
+    assert!(w3["pinnedTierId"].is_null(), "没钉住 → null，不得编一个空串");
+    assert!(w3["matchesTemplate"].is_null(), "没钉住时「是否一致」不成立 → null，不得当 false 读");
+
+    // 🔴 效力自述五层：叙事感知层缺失、数值层永不生效。
+    let e = &body["effect"];
+    assert_eq!(e["declarationLayer"], "Implemented");
+    assert_eq!(e["pinningLayer"], "Implemented");
+    assert_eq!(e["narrativeLayer"], "Missing", "runtime 不读 realmTier → 境界档对玩家零可见");
+    assert_eq!(e["numericLayer"], "NeverByDesign", "§6 跨体系靠风味翻译，不靠数值换算");
+    assert_eq!(e["calibrationLoop"], "Missing");
+    assert_eq!(body["editable"], false);
+
+    // 模板不存在 → 404（同身份池维）。
+    let (st, _) = get(&app, "/api/admin/world-templates/tpl_nope/realm-tier", Some(&admin)).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+/// 未声明境界档的模板：`declaration` 为 null、stale 恒空、matchesTemplate 恒 null。
+/// 独立模板的 `sagaStages` 为空段 —— 都是正常状态，不是缺数据。
+#[tokio::test]
+async fn realm_tier_detail_handles_undeclared_and_standalone() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+
+    ins_template(&state, "tpl_bare", "没戏服", "", 0, "approved", json!({ "mainlineNodes": [] })).await;
+    // 模板没声明，实例却钉着一个档（模板改版把 realmTier 删了）→ 不得报成 stale。
+    ins_world_of(&state, "w_bare", "tpl_bare", "running", Some(assembled_with_realm("tier-x", "旧戏服"))).await;
+
+    let (st, body) = get(&app, "/api/admin/world-templates/tpl_bare/realm-tier", Some(&admin)).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(body["declared"], false);
+    assert!(body["declaration"].is_null(), "未声明 → declaration 为 null");
+    assert_eq!(body["sagaStages"]["stages"], json!([]), "独立模板无同系列对照，空段不是缺数据");
+    assert_eq!(body["pinning"]["worldsWithRealmTier"], 1, "实例确实钉着一个档");
+    assert_eq!(
+        body["pinning"]["staleTierIds"], json!([]),
+        "模板本就没声明，谈不上「钉的是旧档」，不得制造假问题"
+    );
+    assert!(body["pinning"]["worlds"][0]["matchesTemplate"].is_null());
+}
+
+/// 脏数据（空 id / 自由文本枚举）必须被摆到运营面前，而不是像建模板端点那样直接拒绝。
+/// 历史题材另给一条**只作提示、未接审核链路**的标注（§6 合规条款）。
+#[tokio::test]
+async fn realm_tier_surfaces_dirty_declaration_and_history_hint() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+
+    ins_template(&state, "tpl_dirty_rt", "脏戏服", "", 0, "approved",
+        json!({ "realmTier": { "label": "没有 id 的档", "cosmology": "斗气", "genre": "history" } })).await;
+
+    let (st, body) = get(&app, "/api/admin/world-templates/tpl_dirty_rt/realm-tier", Some(&admin)).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let dec = &body["declaration"];
+    assert_eq!(dec["blankTierId"], true, "空 id 必须被报出来（建模板端点拦得住，直写库拦不住）");
+    assert_eq!(dec["invalidEnumFields"], json!(["cosmology"]), "自由文本体系必须自曝");
+    assert_eq!(dec["stricterModerationHint"], true, "history 题材给出严审提示（§6 合规）");
+    assert_eq!(body["declared"], true, "脏归脏，它确实声明了一件戏服");
+}
+
 /// 校准面 RBAC：与世界运营同档（operator，admin 直通）；reviewer/support/finance 一律 403。
 #[tokio::test]
 async fn calibration_endpoints_are_operator_gated() {
@@ -3386,6 +3548,8 @@ async fn calibration_endpoints_are_operator_gated() {
         "/api/admin/sagas/saga_r",
         "/api/admin/identity-pools",
         "/api/admin/world-templates/tpl_r/identity-pool",
+        "/api/admin/realm-tiers",
+        "/api/admin/world-templates/tpl_r/realm-tier",
     ];
     for p in paths {
         let (st, _) = get(&app, p, None).await;
@@ -3422,6 +3586,8 @@ async fn calibration_endpoints_write_nothing() {
         "/api/admin/sagas/saga_ro",
         "/api/admin/identity-pools",
         "/api/admin/world-templates/tpl_ro/identity-pool",
+        "/api/admin/realm-tiers",
+        "/api/admin/world-templates/tpl_ro/realm-tier",
     ] {
         let (st, _) = get(&app, p, Some(&admin)).await;
         assert_eq!(st, StatusCode::OK, "{p}");
@@ -3462,6 +3628,8 @@ async fn calibration_payload_strings_are_plain_text() {
         "/api/admin/sagas/saga_txt",
         "/api/admin/identity-pools",
         "/api/admin/world-templates/tpl_txt/identity-pool",
+        "/api/admin/realm-tiers",
+        "/api/admin/world-templates/tpl_txt/realm-tier",
     ] {
         let (st, body) = get(&app, p, Some(&admin)).await;
         assert_eq!(st, StatusCode::OK, "{p}");

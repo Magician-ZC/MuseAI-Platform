@@ -417,6 +417,23 @@ pub(super) async fn metrics_overview(
         crate::slo::narrative_slo(db, &slo_cfg).await?
     };
 
+    // ============ 直播场转化（VALIDATION §2 T5 门槛「观众→玩家转化 ≥2%」） ============
+    // **为什么是新顶层键而不是塞进 narrativeSlo**：`slo` 模块的边界是**叙事质量**
+    // （演得好不好），而转化率是**商业漏斗**（来的人留没留下）。两者的分母、窗口语义与看板
+    // 读者都不同，混在一起会让「叙事质量 SLO」这个名字变得名不副实。
+    // 复用的是窗口口径（与 narrativeSlo 同一把尺，UTC 日界同源）与 `?slo=0` 的减负开关。
+    // 三态（entry_not_open / no_data_in_window / ok）见 `livestage::conversion_block`。
+    let live_stage = if q.slo == Some(0) {
+        crate::livestage::conversion_skipped()
+    } else {
+        crate::livestage::conversion_block(
+            db,
+            today_start - (slo_days - 1) * DAY_MS,
+            today_start + DAY_MS,
+        )
+        .await?
+    };
+
     // 审核积压 / 活跃世界 / 熔断世界 / 风控事件。
     let audit_backlog =
         count(db, "SELECT COUNT(*) AS n FROM audit_queue WHERE status = 'open'").await?;
@@ -483,6 +500,10 @@ pub(super) async fn metrics_overview(
         // 叙事质量 SLO（VALIDATION §4.2）。只读观测，七项：四项算得出来、
         // 🔴 三项显式标注 status="no_data_source" + value=null（后台必须显示 —，显示 0% 即误报）。
         "narrativeSlo": narrative_slo,
+        // 直播场（VALIDATION §2 T5）。只读聚合。🔴 三态：`entry_not_open`（入口没开过）/
+        // `no_data_in_window`（零样本）/ `ok`（真数，可以是 0%）——前两者 value=null，
+        // 后台必须显示 `—`。显示 0% 就是把"没测过"读成了"没人转化"。
+        "liveStage": live_stage,
         "auditBacklog": audit_backlog,
         "worlds": { "active": worlds_active, "fused": worlds_fused },
         "riskEvents": risk_total,

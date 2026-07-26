@@ -82,7 +82,7 @@ pub fn router() -> Router<AppState> {
         )
         // 模板星级 curation（波次 3）：运营定档 3-5★ 的唯一路径（自动定档封顶 2★）。
         .route("/admin/world-templates/{id}/star", post(worlds_ops::set_template_star))
-        // 人工校准面（总规格 §79/§83 流水线第一环）：阶段切分 + 身份池两维，**全只读**。
+        // 人工校准面（总规格 §79/§83 流水线第一环）：阶段切分 + 身份池 + 境界档三维，**全只读**。
         // 与 `{id}/star` 同为 `/admin/world-templates/{id}/…` 的静态子节点，matchit 各自匹配。
         .route("/admin/sagas", get(calibration::list_sagas))
         .route("/admin/sagas/{saga_id}", get(calibration::saga_detail))
@@ -90,6 +90,11 @@ pub fn router() -> Router<AppState> {
         .route(
             "/admin/world-templates/{id}/identity-pool",
             get(calibration::template_identity_pool),
+        )
+        .route("/admin/realm-tiers", get(calibration::list_realm_tiers))
+        .route(
+            "/admin/world-templates/{id}/realm-tier",
+            get(calibration::template_realm_tier),
         )
         // 经济运营（真实只读聚合）
         .route("/admin/economy/overview", get(dashboards::economy_overview))

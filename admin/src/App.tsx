@@ -10,6 +10,7 @@ import {
   DatabaseOutlined,
   DeploymentUnitOutlined,
   DownOutlined,
+  ExperimentOutlined,
   FileTextOutlined,
   GlobalOutlined,
   LogoutOutlined,
@@ -163,7 +164,11 @@ function Shell() {
           }))}
         />
 
-        {!collapsed && role !== 'admin' && (
+        {/* 「更多模块」收纳的是**子视图**（世界模板 / 人工校准），不是 RBAC 模块——它们不在
+            MODULES 里，因此不会出现在上面的主菜单。原先此块对 admin 隐藏，导致权限最高的角色
+            反而没有任何菜单路径进得去这两个页面；子视图与角色无关，故对全部角色显示，
+            访问权仍由后端 require_role(operator) 二次校验。 */}
+        {!collapsed && (
           <Dropdown
             trigger={['click']}
             menu={{
@@ -174,8 +179,18 @@ function Shell() {
                   label: '世界模板',
                   onClick: () => navigate(`/worlds?${designPreview ? 'design=preview&' : ''}view=templates`),
                 },
+                {
+                  key: 'calibration',
+                  icon: <ExperimentOutlined />,
+                  label: '人工校准（阶段 / 身份池）',
+                  onClick: () => navigate(`/worlds?${designPreview ? 'design=preview&' : ''}view=calibration`),
+                },
                 { type: 'divider' },
-                { key: 'hint', label: '其他模块随角色权限显示', disabled: true },
+                {
+                  key: 'hint',
+                  label: role === 'admin' ? '以上为世界运营的低频子视图' : '其他模块随角色权限显示',
+                  disabled: true,
+                },
               ],
             }}
           >

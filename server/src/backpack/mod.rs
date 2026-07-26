@@ -246,6 +246,9 @@ async fn last_interaction_by_pair(
 /// 另有硬约束：关系存在 `worlds.narrative_state_json` 整块 blob 内，列表接口逐世界拉回完整叙事状态
 /// 反序列化，载荷与 CPU 是 O(世界数 × 状态大小) 且随 tick 增长——不满足列表接口的有界取数要求。
 /// 待产品定义强度口径后，宜在**单世界**面（state-summary）上做，而非跨世界列表。
+/// 🔴 次级键 `wm.id` 不可省（同 `worlds::world_detail` 阵容、`assembly::load_active_cards`）：
+/// 一个用户可以在同一毫秒进多个世界（新手礼包建房 + 自动入场就是批量写），`joined_at` 单键
+/// 在 PG 上不定序；SQLite 恰好按 rowid 稳定，故这类顺序 bug 在只跑 SQLite 的测试里永远看不见。
 async fn my_memberships(State(state): State<AppState>, user: AuthUser) -> Result<Json<Value>, ApiError> {
     let rows = sqlx::query(
         "SELECT wm.cloud_character_id AS cid, wm.status AS mstatus, wm.joined_at AS joined_at, \
@@ -256,7 +259,7 @@ async fn my_memberships(State(state): State<AppState>, user: AuthUser) -> Result
          JOIN worlds w ON w.id = wm.world_id \
          JOIN cloud_characters cc ON cc.id = wm.cloud_character_id \
          WHERE wm.user_id = ? AND wm.status = 'active' \
-         ORDER BY wm.joined_at DESC",
+         ORDER BY wm.joined_at DESC, wm.id DESC",
     )
     .bind(&user.user_id)
     .fetch_all(&state.db)

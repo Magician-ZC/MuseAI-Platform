@@ -6,7 +6,6 @@ use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
-use sqlx::any::AnyPoolOptions;
 use sqlx::Row;
 use tower::ServiceExt;
 
@@ -16,11 +15,9 @@ use crate::db::{new_id, now_ms};
 
 use muse_engine::character::types::{CardLifecycle, CharacterCardV2, Identity};
 
-static INIT: std::sync::Once = std::sync::Once::new();
-
 fn test_config() -> ServerConfig {
     ServerConfig {
-        database_url: "sqlite::memory:".into(),
+        database_url: crate::testkit::test_database_url(),
         bind_addr: "127.0.0.1:0".into(),
         jwt_secret: "test-secret".into(),
         access_ttl_secs: 3600,
@@ -31,17 +28,7 @@ fn test_config() -> ServerConfig {
 }
 
 async fn test_state() -> AppState {
-    INIT.call_once(sqlx::any::install_default_drivers);
-    let pool = AnyPoolOptions::new()
-        .max_connections(1)
-        .min_connections(1)
-        .idle_timeout(None)
-        .max_lifetime(None)
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-    AppState::new(pool, test_config())
+    AppState::new(crate::testkit::test_pool().await, test_config())
 }
 
 fn admin_token(state: &AppState) -> String {
@@ -3031,4 +3018,460 @@ async fn diagnostics_series_visible_even_when_switch_off() {
     assert_eq!(st, StatusCode::OK);
     assert!(!diag["series"].is_null(), "关阀时后台仍须看得见系列: {diag}");
     assert_eq!(diag["series"]["autoscaleEnabled"], json!(false), "但要明示急停阀已拉下");
+}
+
+// ================= 人工校准面（总规格 §79/§83 流水线第一环） =================
+// 覆盖：阶段切分总览的连续性诊断 · 单系列逐阶段结构与骨架形状 · 身份池目录 ·
+//       身份池分配分布（填充率 / 从未分配 / 未知身份 / 无身份成员）· RBAC · **只读契约**。
+
+/// 直插模板行：校准面读的是 saga/stage/skeleton 三列，走建模板端点会被引用完整性校验挡住
+/// （测试要的是「脏数据也得能被校准面看见」，正是端点会拒绝的那些）。
+async fn ins_template(
+    state: &AppState,
+    id: &str,
+    title: &str,
+    saga: &str,
+    stage: i64,
+    moderation: &str,
+    skeleton: Value,
+) {
+    sqlx::query(
+        "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, \
+         official, version, moderation, saga_id, stage_no, created_at) \
+         VALUES (?, ?, 'chapter', ?, '{}', 1, 1, ?, ?, ?, ?)",
+    )
+    .bind(id)
+    .bind(title)
+    .bind(skeleton.to_string())
+    .bind(moderation)
+    .bind(saga)
+    .bind(stage)
+    .bind(now_ms())
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+/// 直插世界行（带 assembled_json，用于身份分配读回）。
+async fn ins_world_of(
+    state: &AppState,
+    id: &str,
+    template_id: &str,
+    status: &str,
+    assembled: Option<Value>,
+) {
+    sqlx::query(
+        "INSERT INTO worlds (id, template_id, template_version, engine_version, prompt_set_version, \
+         model_route_version, room_type, title, status, assembled_json, created_at, updated_at) \
+         VALUES (?, ?, 1, 'e1', 'p1', 'm1', 'chapter', '校准世界', ?, ?, ?, ?)",
+    )
+    .bind(id)
+    .bind(template_id)
+    .bind(status)
+    .bind(assembled.map(|v| v.to_string()))
+    .bind(now_ms())
+    .bind(now_ms())
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+/// 显式指定 `cloud_character_id` 的成员（既有 `ins_member` 由 id 派生 cid，
+/// 而身份分配是按 cid 对齐的，必须能自己定 cid）。
+async fn ins_member_cid(state: &AppState, world_id: &str, cid: &str, status: &str) {
+    sqlx::query(
+        "INSERT INTO world_members (id, world_id, user_id, cloud_character_id, status, joined_at) \
+         VALUES (?, ?, 'u1', ?, ?, ?)",
+    )
+    .bind(new_id("wm"))
+    .bind(world_id)
+    .bind(cid)
+    .bind(status)
+    .bind(now_ms())
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+fn assembled_with(assignments: Value) -> Value {
+    json!({ "assembly": { "identityAssignments": assignments } })
+}
+
+/// 阶段切分总览：缺号从 1 起算、重号与未编号各自成诊断、独立模板不混进系列。
+#[tokio::test]
+async fn sagas_overview_reports_stage_continuity() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+    let sk = json!({ "mainlineNodes": [] });
+
+    // saga_a：1-2-3 齐整。
+    for (i, stage) in [1i64, 2, 3].iter().enumerate() {
+        ins_template(&state, &format!("tpl_a{i}"), "齐整", "saga_a", *stage, "approved", sk.clone()).await;
+    }
+    // saga_b：缺 1、缺 2（只有 3-4），阶段 4 重号，另有一行未编号（直写库才可能出现）。
+    ins_template(&state, "tpl_b1", "第三篇", "saga_b", 3, "approved", sk.clone()).await;
+    ins_template(&state, "tpl_b2", "第四篇", "saga_b", 4, "pending", sk.clone()).await;
+    ins_template(&state, "tpl_b3", "第四篇(重)", "saga_b", 4, "pending", sk.clone()).await;
+    ins_template(&state, "tpl_b4", "没编号", "saga_b", 0, "approved", sk.clone()).await;
+    // 独立模板：不属于任何系列，只进 standaloneTemplateCount。
+    ins_template(&state, "tpl_solo", "独立", "", 0, "approved", sk.clone()).await;
+    // saga_a 的 1 号阶段开了两个世界（一个在跑）。
+    ins_world_of(&state, "w_a1", "tpl_a0", "running", None).await;
+    ins_world_of(&state, "w_a2", "tpl_a0", "ended", None).await;
+
+    let (st, body) = get(&app, "/api/admin/sagas", Some(&admin)).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let sagas = body["sagas"].as_array().unwrap();
+    assert_eq!(sagas.len(), 2, "只应有两个系列（独立模板不成系列）: {body}");
+
+    let a = sagas.iter().find(|s| s["sagaId"] == "saga_a").unwrap();
+    assert_eq!(a["stageCount"], 3);
+    assert_eq!(a["contiguous"], true, "1-2-3 应判为齐整");
+    assert_eq!(a["missingStageNos"].as_array().unwrap().len(), 0);
+    assert_eq!(a["worldCount"], 2, "该系列开出的世界总数");
+    assert_eq!(a["liveWorldCount"], 1, "ended 不算在跑");
+
+    let b = sagas.iter().find(|s| s["sagaId"] == "saga_b").unwrap();
+    assert_eq!(
+        b["missingStageNos"], json!([1, 2]),
+        "缺号必须从 1 起算——「缺开篇」正是最该被发现的: {b}"
+    );
+    assert_eq!(b["duplicateStageNos"], json!([4]), "阶段 4 有两个模板");
+    assert_eq!(b["unnumberedTemplateCount"], 1, "saga_id 非空却 stage_no=0 必须报出来");
+    assert_eq!(b["contiguous"], false);
+    assert_eq!(b["moderationCounts"]["pending"], 2);
+    assert_eq!(b["worldCount"], 0, "没开过世界就是真实的 0");
+
+    assert_eq!(body["standaloneTemplateCount"], 1, "未被切分的存量是校准工作的分母");
+    assert_eq!(body["truncated"], false);
+    // 🔴 只读契约：任何读到这份 JSON 的人都不该以为「这里能调」。
+    assert_eq!(body["editable"], false);
+    assert!(body["editPath"].as_str().unwrap().contains("POST /admin/world-templates"));
+}
+
+/// 单系列详情：阶段按剧情顺序（不是录入时间）、骨架形状可读、坏骨架不编 0、不存在的系列 404。
+#[tokio::test]
+async fn saga_detail_orders_stages_and_reports_shape() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+
+    // 故意逆序录入，验证排序不是按 created_at / 主键。
+    ins_template(
+        &state, "tpl_z", "第二篇", "saga_x", 2, "approved",
+        json!({ "mainlineNodes": [1, 2], "endingPool": [1],
+                "identityPool": [{ "id": "official", "quota": 3 }, { "id": "lead", "isLead": true }] }),
+    ).await;
+    ins_template(
+        &state, "tpl_y", "第一篇", "saga_x", 1, "approved",
+        json!({ "mainlineNodes": [1, 2, 3, 4, 5, 6], "payoutTable": { "tiers": [] } }),
+    ).await;
+    ins_world_of(&state, "w_x1", "tpl_y", "running", None).await;
+
+    // 坏骨架（合法行、非法 JSON）：直插才造得出来，端点会拒。
+    sqlx::query(
+        "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, \
+         official, version, moderation, saga_id, stage_no, created_at) \
+         VALUES ('tpl_bad', '坏骨架', 'chapter', '{{ 不是 JSON', '{}', 1, 1, 'pending', 'saga_x', 3, ?)",
+    )
+    .bind(now_ms())
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    let (st, body) = get(&app, "/api/admin/sagas/saga_x", Some(&admin)).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let stages = body["stages"].as_array().unwrap();
+    let nos: Vec<i64> = stages.iter().map(|s| s["stageNo"].as_i64().unwrap()).collect();
+    assert_eq!(nos, vec![1, 2, 3], "阶段必须按剧情顺序升序");
+    assert_eq!(stages[0]["templates"][0]["title"], "第一篇");
+
+    let s1 = &stages[0]["templates"][0]["shape"];
+    assert_eq!(s1["mainlineNodes"], 6);
+    assert_eq!(s1["hasPayoutTable"], true);
+    assert_eq!(s1["identityPoolSize"], 0, "没声明身份池 → 真实的 0");
+    assert_eq!(stages[0]["templates"][0]["worldCount"], 1);
+    assert_eq!(stages[0]["templates"][0]["liveWorldCount"], 1);
+
+    let s2 = &stages[1]["templates"][0]["shape"];
+    assert_eq!(s2["identityPoolSize"], 2);
+    assert_eq!(s2["identityQuotaTotal"], 4, "3 + 缺省 1");
+    assert_eq!(s2["identityLeadCount"], 1);
+
+    let s3 = &stages[2]["templates"][0]["shape"];
+    assert_eq!(s3["parsed"], false, "坏骨架必须自曝");
+    assert!(s3["mainlineNodes"].is_null(), "🔴 坏骨架的指标必须缺席，不得编 0");
+
+    assert_eq!(body["continuity"]["contiguous"], true);
+    assert_eq!(body["editable"], false);
+
+    // 不存在的系列 → 404（不是空列表：空列表会让运营以为「这个系列存在但还没切」）。
+    let (st, _) = get(&app, "/api/admin/sagas/saga_nope", Some(&admin)).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+/// 身份池目录：只列声明了非空 identityPool 的模板；世界数为 0 是真实答案。
+#[tokio::test]
+async fn identity_pool_directory_lists_only_declaring_templates() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+
+    ins_template(&state, "tpl_np", "无身份池", "", 0, "approved", json!({ "mainlineNodes": [] })).await;
+    ins_template(
+        &state, "tpl_ip", "有身份池", "saga_q", 1, "approved",
+        json!({ "identityPool": [
+            { "id": "official", "label": "户部主事", "quota": 3 },
+            { "id": "jilted", "label": "被退婚的嫡女", "quota": 1, "isLead": true }
+        ] }),
+    ).await;
+    ins_world_of(&state, "w_ip", "tpl_ip", "running", None).await;
+
+    let (st, body) = get(&app, "/api/admin/identity-pools", Some(&admin)).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let items = body["templates"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "未声明身份池的模板不占目录篇幅: {body}");
+    assert_eq!(items[0]["templateId"], "tpl_ip");
+    assert_eq!(items[0]["poolSize"], 2);
+    assert_eq!(items[0]["quotaTotal"], 4);
+    assert_eq!(items[0]["leadCount"], 1);
+    assert_eq!(items[0]["sagaId"], "saga_q");
+    assert_eq!(items[0]["worldCount"], 1);
+    assert_eq!(body["editable"], false);
+}
+
+/// 身份池分布：分配人次 / 覆盖世界 / 填充率 / 从未分配 / 未知身份 / 无身份成员，
+/// 以及 🔴 效力自述四层状态必须原样下发（运营不得据本页认为「调了就会变强」）。
+#[tokio::test]
+async fn identity_pool_distribution_reports_fill_and_effect_scope() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+
+    ins_template(
+        &state, "tpl_d", "分布模板", "", 0, "approved",
+        json!({ "identityPool": [
+            { "id": "official", "label": "户部主事", "quota": 2, "themes": ["朝堂"] },
+            { "id": "merchant", "label": "漕帮商贾", "quota": 2 },
+            { "id": "ghost", "label": "从没人站的位", "quota": 5 }
+        ] }),
+    ).await;
+
+    // 世界 1：两人拿到身份（official ×1、merchant ×1）+ 一个装配后才入场的成员（无身份）。
+    ins_world_of(
+        &state, "w_d1", "tpl_d", "running",
+        Some(assembled_with(json!([["chA", "official"], ["chB", "merchant"]]))),
+    ).await;
+    for cid in ["chA", "chB", "chLate"] {
+        ins_member_cid(&state, "w_d1", cid, "active").await;
+    }
+    ins_member_cid(&state, "w_d1", "chLeft", "left").await; // 已离场，不进 active 分母
+
+    // 世界 2：official ×2（吃满配额）+ 一个模板已删除的旧身份（unknown）。
+    ins_world_of(
+        &state, "w_d2", "tpl_d", "running",
+        Some(assembled_with(json!([["chC", "official"], ["chD", "official"], ["chE", "retired_id"]]))),
+    ).await;
+    for cid in ["chC", "chD", "chE"] {
+        ins_member_cid(&state, "w_d2", cid, "active").await;
+    }
+
+    // 世界 3：未装配（assembled_json 为 NULL）→ 不进任何分配分母。
+    ins_world_of(&state, "w_d3", "tpl_d", "open", None).await;
+    ins_member_cid(&state, "w_d3", "chF", "active").await;
+
+    let (st, body) = get(&app, "/api/admin/world-templates/tpl_d/identity-pool", Some(&admin)).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let d = &body["distribution"];
+    assert_eq!(d["worldsScanned"], 3);
+    assert_eq!(d["worldsAssembled"], 2);
+    assert_eq!(d["worldsWithAssignments"], 2, "未装配的世界不算参与过分配");
+    assert_eq!(d["assignmentTotal"], 5);
+    assert_eq!(d["activeMemberTotal"], 7, "left 状态不进 active 分母");
+    assert_eq!(
+        d["activeMembersWithoutIdentity"], 2,
+        "chLate（装配后入场）+ chF（未装配世界）: {d}"
+    );
+
+    let by: Vec<&Value> = d["byIdentity"].as_array().unwrap().iter().collect();
+    let official = by.iter().find(|x| x["identityId"] == "official").unwrap();
+    assert_eq!(official["assignedCount"], 3);
+    assert_eq!(official["worldCount"], 2);
+    // 填充率分母 = quota × 有分配的世界数 = 2 × 2 = 4 → 3/4。
+    assert_eq!(official["quotaCapacity"], 4);
+    assert!((official["fillRatio"].as_f64().unwrap() - 0.75).abs() < 1e-9, "{official}");
+    let ghost = by.iter().find(|x| x["identityId"] == "ghost").unwrap();
+    assert_eq!(ghost["assignedCount"], 0);
+    assert_eq!(ghost["fillRatio"].as_f64().unwrap(), 0.0, "有分母时 0 是真实的 0，不是缺数据");
+    assert_eq!(d["neverAssignedIdentityIds"], json!(["ghost"]));
+
+    let unknown = d["unknownIdentityIds"].as_array().unwrap();
+    assert_eq!(unknown.len(), 1, "老实例钉着模板已删除的身份必须被看见: {d}");
+    assert_eq!(unknown[0]["identityId"], "retired_id");
+    assert!(d["gini"].as_f64().unwrap() > 0.0, "3/2/0 的分配不是均分");
+
+    // 🔴 效力自述：四层状态原样下发，且明说没有校准闭环。
+    let e = &body["effect"];
+    assert_eq!(e["assignmentLayer"], "Implemented");
+    assert_eq!(e["narrativeLayer"], "Implemented");
+    assert_eq!(e["numericLayer"], "NeverByDesign", "平权红线：身份永不进数值层");
+    assert_eq!(e["calibrationLoop"], "Missing", "没有指标度量「调身份池 → 戏份变化」");
+    assert!(e["warning"].as_str().unwrap().contains("不构成效果验证"));
+    assert_eq!(body["editable"], false, "🔴 校准面只可视化，不可编辑");
+}
+
+/// 没有分配发生时，各比率必须是 null（"没开演" ≠ "很不均衡"），不得当 0% 渲染。
+#[tokio::test]
+async fn identity_pool_distribution_is_null_not_zero_without_assignments() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+
+    ins_template(
+        &state, "tpl_e", "还没跑过", "", 0, "approved",
+        json!({ "identityPool": [{ "id": "a", "quota": 2 }, { "id": "b", "quota": 2 }] }),
+    ).await;
+
+    let (st, body) = get(&app, "/api/admin/world-templates/tpl_e/identity-pool", Some(&admin)).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(body["declared"], true);
+    let d = &body["distribution"];
+    assert_eq!(d["worldsScanned"], 0);
+    assert!(d["gini"].is_null(), "一次分配都没发生 → 基尼必须是 null: {d}");
+    for entry in d["byIdentity"].as_array().unwrap() {
+        assert!(entry["fillRatio"].is_null(), "无分母的填充率必须 null，不得当 0% 读: {entry}");
+    }
+    assert_eq!(d["neverAssignedIdentityIds"], json!([]), "没跑过 ≠ 从没被分到过");
+
+    // 模板不存在 → 404。
+    let (st, _) = get(&app, "/api/admin/world-templates/tpl_nope/identity-pool", Some(&admin)).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+/// 池内脏数据（重复 id / 空 id / 非正配额）必须被摆到运营面前，而不是像装配层那样直接拒绝或丢弃。
+#[tokio::test]
+async fn identity_pool_surfaces_dirty_pool_entries() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+
+    ins_template(
+        &state, "tpl_dirty", "脏池", "", 0, "approved",
+        json!({ "identityPool": [
+            { "id": "dup", "quota": 1 },
+            { "id": "dup", "quota": 1 },
+            { "label": "没有 id" },
+            { "id": "zero", "quota": 0 }
+        ] }),
+    ).await;
+
+    let (st, body) = get(&app, "/api/admin/world-templates/tpl_dirty/identity-pool", Some(&admin)).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(body["poolIssues"]["duplicateIds"], json!(["dup"]));
+    assert_eq!(body["poolIssues"]["blankIdCount"], 1);
+    assert_eq!(body["poolIssues"]["nonPositiveQuotaIds"], json!(["zero"]));
+    assert_eq!(body["poolSize"], 4, "脏条目照样计入池大小（它们真的在骨架里）");
+}
+
+/// 校准面 RBAC：与世界运营同档（operator，admin 直通）；reviewer/support/finance 一律 403。
+#[tokio::test]
+async fn calibration_endpoints_are_operator_gated() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    ins_template(&state, "tpl_r", "权限", "saga_r", 1, "approved", json!({})).await;
+
+    let paths = [
+        "/api/admin/sagas",
+        "/api/admin/sagas/saga_r",
+        "/api/admin/identity-pools",
+        "/api/admin/world-templates/tpl_r/identity-pool",
+    ];
+    for p in paths {
+        let (st, _) = get(&app, p, None).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "{p} 无 token 应 401");
+        let (st, _) = get(&app, p, Some(&user_token(&state))).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{p} 普通用户应 403");
+        for role in ["reviewer", "support", "finance"] {
+            let (st, _) = get(&app, p, Some(&role_token(&state, role))).await;
+            assert_eq!(st, StatusCode::FORBIDDEN, "{p} 角色 {role} 应 403");
+        }
+        let (st, _) = get(&app, p, Some(&role_token(&state, "operator"))).await;
+        assert_eq!(st, StatusCode::OK, "{p} operator 应放行");
+        let (st, _) = get(&app, p, Some(&admin_token(&state))).await;
+        assert_eq!(st, StatusCode::OK, "{p} admin 直通");
+    }
+}
+
+/// 🔴 只读契约：校准面不得留下任何审计写入 —— 它一条数据都没改，写 audit_logs 反而是噪声。
+#[tokio::test]
+async fn calibration_endpoints_write_nothing() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+    ins_template(&state, "tpl_ro", "只读", "saga_ro", 1, "approved",
+        json!({ "identityPool": [{ "id": "a" }] })).await;
+    ins_world_of(&state, "w_ro", "tpl_ro", "running", Some(assembled_with(json!([["c1", "a"]])))).await;
+
+    let before_audit = count(&state, "SELECT COUNT(*) AS n FROM audit_logs").await;
+    let before_worlds = count(&state, "SELECT COUNT(*) AS n FROM worlds").await;
+    let before_tpl = count(&state, "SELECT COUNT(*) AS n FROM world_templates").await;
+
+    for p in [
+        "/api/admin/sagas",
+        "/api/admin/sagas/saga_ro",
+        "/api/admin/identity-pools",
+        "/api/admin/world-templates/tpl_ro/identity-pool",
+    ] {
+        let (st, _) = get(&app, p, Some(&admin)).await;
+        assert_eq!(st, StatusCode::OK, "{p}");
+    }
+
+    assert_eq!(count(&state, "SELECT COUNT(*) AS n FROM audit_logs").await, before_audit);
+    assert_eq!(count(&state, "SELECT COUNT(*) AS n FROM worlds").await, before_worlds);
+    assert_eq!(count(&state, "SELECT COUNT(*) AS n FROM world_templates").await, before_tpl);
+}
+
+/// 🔴 下发文案必须是**纯文本**：校准面把 `notes` / `editPath` / `effect.*` 原样渲染成界面文字，
+/// 字符串里写 Markdown 星号只会在页面上露出两个字面的 `**`（验收时真出现过一次）。
+/// 强调一律用中文引号「」。本用例递归扫全部响应字符串，防同类回归。
+#[tokio::test]
+async fn calibration_payload_strings_are_plain_text() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+    ins_template(
+        &state, "tpl_txt", "文案", "saga_txt", 1, "approved",
+        json!({ "identityPool": [{ "id": "a", "label": "甲", "quota": 2 }] }),
+    ).await;
+    ins_world_of(&state, "w_txt", "tpl_txt", "running", Some(assembled_with(json!([["c1", "a"]])))).await;
+    ins_member_cid(&state, "w_txt", "c1", "active").await;
+
+    /// 递归收集 JSON 里所有字符串（键与值都算：键会作为 i18n/展示用不到，但值一定会）。
+    fn collect(v: &Value, out: &mut Vec<String>) {
+        match v {
+            Value::String(s) => out.push(s.clone()),
+            Value::Array(a) => a.iter().for_each(|x| collect(x, out)),
+            Value::Object(o) => o.values().for_each(|x| collect(x, out)),
+            _ => {}
+        }
+    }
+
+    for p in [
+        "/api/admin/sagas",
+        "/api/admin/sagas/saga_txt",
+        "/api/admin/identity-pools",
+        "/api/admin/world-templates/tpl_txt/identity-pool",
+    ] {
+        let (st, body) = get(&app, p, Some(&admin)).await;
+        assert_eq!(st, StatusCode::OK, "{p}");
+        let mut strings = Vec::new();
+        collect(&body, &mut strings);
+        for s in &strings {
+            assert!(
+                !s.contains("**"),
+                "{p} 下发的文案含 Markdown 星号，会在后台界面上原样显示：{s}"
+            );
+        }
+    }
 }

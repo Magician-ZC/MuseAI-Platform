@@ -108,6 +108,29 @@
 | 人设保险三级出口（事前底线 / 事中注解权 / 事后 if 线） | 事前 engine Implemented · 事中 **Implemented**（0037）· 事后 **Implemented（开局 + 推进）**（0039/0041） | T1 起（注解权是 T1 门槛的测量手段）/ if 线 T3 待测 | 三级**全部默认关闭** |
 | 内容中台工业线 | Concept | — | — |
 
+> 🔴 **平台生产数据库（Postgres）当前不可用 —— 2026-07-27 本地实测（PostgreSQL 17.5）**
+>
+> `CLAUDE.md` 与 `docs/STARTUP.md` 写的「SQLite dev / Postgres prod」**在查询层不成立**。
+> 根因：`sqlx` 的 `Any` 驱动**原样透传 SQL 字符串、不做 `?` → `$N` 方言改写**
+> （`sqlx-core-0.8.6/src/any/connection/executor.rs` 把 `query.sql()` 直接交给 `PgConnection`），
+> 而全仓 900+ 条语句写的是 `?`。于是 PG 上**每一条带参数的查询**都是 `42601` 语法错。
+> 实测 525/599 条用例失败，数据库错误码分布 **100% 是 `42601`**，无第二种。
+>
+> - **schema 层是通的**：39 份迁移（`0001-0041`，`0023`/`0028` 是有意空号）在 PG 上逐条通过、
+>   建出 66 张表——「双库可移植 SQL 子集」在建表这一层零发现，且已由 CI 阻塞门禁锁住。
+> - **查询层是 broken 的**：`MUSE_DATABASE_URL=postgres://...` 从未真正跑通过一次。
+>   那 251 个 PASS 全是不碰 DB 的纯函数用例。
+> - ⚠️ **这个 bug 遮住了其余所有可移植性问题**——类型强制、布尔/整数混用、`CAST`、
+>   排序稳定性，一个都还没机会暴露，因为执行根本走不到那一步。占位符改完后 PG 全量再跑，
+>   **预期会暴露第二批真问题**，不要把「改完占位符」当作「PG 可用」。
+>
+> 修法已实证：`$N` 两个库都认（PG 原生；SQLite 把 `$1` 当具名参数、按首次出现顺序派号），
+> 约束是**严格顺序编号且不复用编号**，`.bind()` 的位置绑定即对得上——这条钉在
+> `testkit::tests::numbered_placeholders_are_portable_but_question_marks_are_not`，两库都绿。
+>
+> **在收口之前，平台轨不具备 Postgres 上线条件。** 按 §0.3 状态语言，
+> 「Postgres prod」目前是 `Specified`，**不是** `Implemented`。
+
 ### 3.1 R1 批次台账（总规格 §19 地基批，**校验于 2026-07-26**）
 
 上表按产品能力分组，漏掉了 R1 的多数工程项。以下按路线图批次补齐——**每项都标了代码锚点，
@@ -125,7 +148,7 @@
 | 生死契约三档（join 签署 + 引擎分派） | **engine Implemented / server 未接线** | 引擎 `narrative/types.rs` `Lethality` + `mod.rs` `apply_lethality`（写作前降级，保证正文与事件同口径）+ `gate_consents` 生死状放行。**server 侧 `worlds.lethality` 列、join 签署、未成年门、runtime 回灌全部未做**，runtime 恒传默认档 | **关闭**（恒为同意制，生死状档不对任何世界生效） |
 | 身份池进采样域 | **Implemented（分配层）/ 叙事未接线** | `assembly/mod.rs` `IdentitySpec` + `DOMAIN_IDENTITY=0x57` + `assign_identities`，结果钉进 `assembled_json` 的 `/assembly/identityAssignments`。**runtime 尚未读回**，身份目前只存不用、叙事层无效果 | 未启用（模板不声明 identityPool 即零影响） |
 | 确定性产出表 + ③世界线层贡献归因 | 见本表下方补记 | 迁移 `0025`；贡献归因表独立于 `narrative_state_json`（回灌引擎会违反平权红线） | — |
-| 成本仪表 | **Implemented** | `admin_api/dashboards.rs` `cost.*`（今日/趋势/每局/每玩家）；`/admin/worlds` 补 `participantCount`·`successRate`·`todayCostCny`；diagnostics 补金额与用量比。**分摊口径为人均等分**（world_ticks 是整拍口径，无 per-member 分解），局限已写进接口 `notes`。**2026-07-26 补记（R3 成本工程杠杆①）**：迁移 `0038` 给 `world_ticks` 加 `off_peak`·`price_ratio_pct`·`defer_ms` 三列，由 `runtime/mod.rs` 的错峰调度器逐拍写入——成本从此可按「折扣时段 / 原价时段」拆桶，「省了多少」= `Σ cost_tokens × (100-price_ratio_pct)/100 × 单价`，「错峰生效了多少」= `off_peak=1` 占比与 `Σ defer_ms`。**2026-07-26 再补记**：`dashboards.rs` **已接这三列**——`cost.offPeak`（拍/token 占比、估算折让、延后时长、按名义档位分桶）挂在成本趋势那条已有的窗口查询上，未新开路由、未新增迁移、未多发一次 SQL；`cost.trend[]` 逐日拆出 `offPeakTokens`。🔴 单位陷阱已锁进用例：`priceRatioPct` 是**百分数整数**（100=原价）、`priceRatio` 是 0..1 小数，两者同时下发且不得互串。⚠️ **if 线开销尚未并入**（`ifline_beats.cost_tokens` 走独立端点 `GET /api/admin/iflines/cost`，接入 SQL 与索引均已就绪） | 恒开（只读聚合）；错峰写入侧**默认关闭** |
+| 成本仪表 | **Implemented** | `admin_api/dashboards.rs` `cost.*`（今日/趋势/每局/每玩家）；`/admin/worlds` 补 `participantCount`·`successRate`·`todayCostCny`；diagnostics 补金额与用量比。**分摊口径为人均等分**（world_ticks 是整拍口径，无 per-member 分解），局限已写进接口 `notes`。**2026-07-26 补记（R3 成本工程杠杆①）**：迁移 `0038` 给 `world_ticks` 加 `off_peak`·`price_ratio_pct`·`defer_ms` 三列，由 `runtime/mod.rs` 的错峰调度器逐拍写入——成本从此可按「折扣时段 / 原价时段」拆桶，「省了多少」= `Σ cost_tokens × (100-price_ratio_pct)/100 × 单价`，「错峰生效了多少」= `off_peak=1` 占比与 `Σ defer_ms`。**2026-07-26 再补记**：`dashboards.rs` **已接这三列**——`cost.offPeak`（拍/token 占比、估算折让、延后时长、按名义档位分桶）挂在成本趋势那条已有的窗口查询上，未新开路由、未新增迁移、未多发一次 SQL；`cost.trend[]` 逐日拆出 `offPeakTokens`。🔴 单位陷阱已锁进用例：`priceRatioPct` 是**百分数整数**（100=原价）、`priceRatio` 是 0..1 小数，两者同时下发且不得互串。⚠️ **if 线开销尚未并入**（`ifline_beats.cost_tokens` 走独立端点 `GET /api/admin/iflines/cost`，接入 SQL 与索引均已就绪）。**2026-07-27 口径修正（#42）**：被内容安全闸/硬约束**阻断的那一拍此前记 `cost_tokens=0`**，而引擎当时已跑完整个回合（导演/决策/仲裁全部烧过 token）——成本因此系统性低估，且越是阻断多的世界低估越重，T3/T5 会在最危险的地方最乐观。现由 `runtime::finish_tick_blocked` 记实测 token 并累计进 `world_budgets`（口径与提交拍、if 线逐字一致）；一次模型都没调过的空转拍仍记 0。叙事 SLO 的拍域另加 `error IS NULL`（`slo::TICK_DOMAIN`）与成本口径分家，阻断拍进成本、不进「无戏份」分母 | 恒开（只读聚合）；错峰写入侧**默认关闭** |
 | 错峰调度（成本工程杠杆①） | **Implemented** | 总规格 §17【拍板 16】。`runtime/mod.rs` 的 `offpeak` 模块 + `schedule_due_ticks` 接入：连载/慢炖场的 tick 优先排进折扣时段，窗口内按窗口占全天比例**压缩间隔以保住每日拍数**（不是节奏降档）；🔴 直播场（`room_type='arena'` ∨ `tick_per_day ≥ MUSE_OFFPEAK_LIVE_TICK_PER_DAY`）永不延后；🔴 防饿死兜底 `interval + min(interval×200%, 6h)` 恒有限、首拍绝不延后；折扣时段内按「被压最久」优先入队。时区口径与 `dashboards::utc_day_start_ms` 同源（UTC，窗口字面量解析期一次性折算）。参数与列口径见 `docs/API.md` §3「错峰调度」 | **关闭**（`MUSE_OFFPEAK_SCHEDULING` 默认 0）。**2026-07-26 补记**：已登记进 `KNOWN_FLAGS`，成为**首个由纯 env 迁入开关体系的存量开关**——解析链升为 user > world > global > env > 默认，错峰从「全局一刀切」变为可按世界灰度。`runtime` 侧一行未改（`offpeak::enabled_for_world` 早已写好「已登记走体系、未登记退 env」的分支） |
 | Batch API（成本工程杠杆③） | **Specified（未实现）** | 约 5 折，但与现有同步 tick 管线结构性冲突：`run_round` 是**串行**五环节 + 同事务 `commit_tick`，而 Batch 是分钟~小时级异步；一拍需 5 次批往返、`CLAIM_STALE_MS=300000` 会把等批 worker 判成崩溃重排、中间态无持久化（批途中重启 = 半通管线，违反 §5「宁可停拍」）。改造路径：`crates/muse-engine` 把 `run_round` 改成可挂起/可恢复的分步状态机 + `ModelClient` 增 `submit_batch`/`poll_batch`（默认实现回落同步 `complete`，桌面轨零改动），server 侧加中间态表 + 批次协调器 + 降级回落。完整分析见 `server/src/runtime/mod.rs` 的 `offpeak` 模块头 | — （未实现，无开关） |
 | 运行时敏感词库 + 语义分类钩 | **第 2 层 Implemented / 第 3 层仅接口位** | `safety/lexicon.rs`（复用 `inject.rs` 归一化管线，零宽/同形/全角绕过均被拦）+ `runtime` commit 事务内闸 + `events`/`reports`/`clips`/`arena` 全部读取面过滤。**第 3 层语义分类未实装**（不能进事务，见 `safety/mod.rs` TODO） | 恒开（审核链） |
@@ -174,6 +197,45 @@
 **仍缺的接线（不在上表，单独跟踪）**：生死契约 server 侧全部 · 身份池叙事回灌 ·
 第 3 层语义分类 · 机审耗时打点（`moderationLatency` 全仓无数据源，后台该列恒为 `—`）·
 **其余 8 个 env 开关接入运行时开关体系**（清单与注意事项见上）。
+
+> **2026-07-27 订正（读上表前必看）**：上表「身份池进采样域」一行与紧邻的「仍缺的接线」句
+> 都写着**身份池叙事未接线 / runtime 尚未读回**，这两处**已过时**——`a962e9a`（R1 收尾）
+> 落地了 `runtime::load_identity_display_names`，读回路径现为
+> `assembled_json./assembly/identityAssignments` → 他人 brief `唐三（户部主事）` +
+> 本人 `RoundInput.self_identities` → 引擎 prompt 上下文，**无开关、恒生效**
+> （`runtime/mod.rs:2096` 与 `:2330` 两个调用点）。
+> 同理「生死契约三档」一行的「server 未接线」也已过时：`worlds.lethality` 列、join 签署、
+> 未成年门、runtime 回灌均已落地（见 `worlds::tests::lethality::*`），**仍关闭的是开关
+> `MUSE_LETHALITY_DEATHMATCH`，不是代码**。
+>
+> 身份池现在的准确分层（人工校准面 `effect` 段以此为准，见 `docs/API.md` §7「人工校准面」）：
+> **分配层 Implemented · 叙事感知层 Implemented · 数值层设计上永不生效（§0.1 平权红线）·
+> 校准闭环缺失**。最后一项是真缺口：全仓没有任何指标度量「身份池调整 → 戏份分布变化」——
+> SLO 的叙事注意力基尼按 `character_id` 聚合，与身份 id 无关，所以运营调完身份池
+> **看不到因果**，只能看到分配结果本身。把身份维接进 `slo/` 是独立一步，本批次未做。
+
+### 3.1.1 人工校准面（阶段切分 + 身份池两维，**落地于 2026-07-27**）
+
+§4 末尾登记的「仍未做：人工校准面」中，**阶段切分与身份池两维已落地为只读运营视图**；
+**境界档仍未做**，原因不变（`Skeleton` 无字段落点，须先补 schema，会改动装配产物与黄金世界快照）。
+
+| 项 | 开发状态 | 代码锚点 | 默认开关 |
+|---|---|---|---|
+| 阶段切分校准视图 | **Implemented（只可视化，不可编辑）** | `server/src/admin_api/calibration.rs` `list_sagas` / `saga_detail`；页面 `admin/src/pages/Calibration.tsx`。诊断项：缺号（**从 1 起算**，故「缺开篇」也报）/ 重号 / 未编号 / 审核态分布 / 星级跨度 / 骨架形状指标 / 世界实例数 | 恒开（只读聚合，同 dashboards） |
+| 身份池校准视图 | **Implemented（只可视化，不可编辑）** | 同文件 `list_identity_pools` / `template_identity_pool`。给出池声明、逐身份分配人次 / 覆盖世界 / 填充率、从未被分配的站位、模板已删除的残留身份、在场无站位角色数、集中度基尼（复用 `slo::gini_coefficient`） | 恒开（只读聚合） |
+| 境界档校准视图 | **Concept** | 无。`Skeleton` 里没有境界档字段，无数据可展示 | — |
+
+🔴 三条必须一起读的限定：
+
+1. **只可视化，不可编辑**。四个端点无写入、无副作用、不落 `audit_logs`；校准参数的唯一写入路径
+   仍是建模板（`POST /admin/world-templates` 的 `sagaId`/`stageNo`/`skeletonJson.identityPool`）。
+   响应恒带 `editable:false` + `editPath`，页面直接渲染该字段而非写死文案。
+   **本批次不含任何在线调参**，故不需要新开关（§0.1 约束的是写入面）。
+2. **身份池视图不构成效果验证**。它回答「分配成了什么样、是否失衡」，**不回答「这样分配更好」**——
+   见上方订正框的「校准闭环缺失」。页面把这四层状态放在分布图**之前**显式渲染，正是为了防止
+   运营把分布图误读成调参有效的证据。
+3. **`Implemented` ≠ 可上线**。视图口径未经真实运营数据检验；缺号/失衡的**阈值**目前没有产品定义
+   （页面只呈现事实，不给「合格/不合格」判语）。
 
 ### 3.2 R3 批次台账 —— 人设保险三级出口（总规格 §7，**校验于 2026-07-26**）
 
@@ -275,8 +337,14 @@ if 线现在是「可开、可跑、可读、可审、可查成本」，但仍**
    - ✅ **mock 注入的 tick 联编**（已有）：`process_tick_with_model` + `runtime/tests.rs`
      的全套播种助手与环节感知假模型，40+ 测试已验证
    - ✅ **逐字节比对范式**（已有）：`degradation_is_deterministic_across_runs`、`run_confluence_scenario`
-   - ❌ **回放式 ModelClient**（待建，唯一真新建件）：全仓无任何 record-and-replay 设施；
-     现有三个 mock 都不能回放真实响应（`RecordingModel` 录的是 prompt 输入，不是 response）
+   - 🟡 **回放式 ModelClient**（唯一真新建件，2026-07-26 建成，状态 `Implemented`）：
+     `crates/muse-engine/src/replay/`——`RecordingClient`（包装任意 `ModelClient`，入参/出参落盘，
+     凭据不入录）· `ReplayClient`（**结构上没有 inner 字段**，未命中返回 `NotFound` 而非静默回落真实模型）·
+     `diff_recordings`（两份录制对齐到「哪一拍 · 哪个角色 · 哪个环节」再给字段级差异）。
+     `ModelClient` trait **零改动**（纯包装，两个宿主无需同步）。
+     🔴 交付的是**能回答「换了模型角色还是不是它自己」的工具**，不是那个问题的**答案**——
+     它至今**未接线**到黄金世界回归/仿真工装（要动 `runtime/mod.rs`），也**没有**任何真实模型录制入库，
+     故本条**不得**被读作「角色一致性已验证」
    - ⚠️ **落点受限**：`server` 是 binary-only crate（无 `lib.rs`），`server/tests/` 与独立 bin
      都访问不到 `pub(crate)` 的 runtime/assembly API——回归只能建成 `#[cfg(test)]` 子模块，
      好处是自动进现有 `platform-test` CI job，CI 改动为零
@@ -294,7 +362,8 @@ if 线现在是「可开、可跑、可读、可审、可查成本」，但仍**
      三条终局判定与三层结算（含崩塌折算与产出封顶）。同一世界两遍跑出的结构化产物**逐字节相等**。
    - ❌ **测不了「叙事质量」**：OOC（决策来自人写的剧本，按定义永不 OOC）· 剧情重复率与文本质量
      （prose 从未落库 + 写作温度硬编码 0.8）· 换模型的真实成本变化（token 是剧本常数，
-     只反映调用构成变化）。补这一栏的前提是 record-and-replay 的 `ModelClient`，**仍未建**。
+     只反映调用构成变化）。补这一栏的前提件 record-and-replay `ModelClient` **已建**
+     （`muse_engine::replay`，`Implemented`），但**尚未接进本回归**：黄金世界至今仍只跑人写的剧本。
 
    **首次运行即抓到一个真问题**：`load_active_cards` 的 `ORDER BY joined_at` 缺次级排序键，
    两成员撞同一毫秒时装配产物顺序在重放间漂移（生产并发 join 同样可能撞）。回归侧已用固定
@@ -352,12 +421,14 @@ if 线现在是「可开、可跑、可读、可审、可查成本」，但仍**
 - 内容安全扣留率在桩下**恒为 0**：桩文本永不命中词库 —— 该通道**只是被计算了，并没有被测试**。
 
 这段话不只在文档里：`slo::quality::QualitySource::SimulatedStub` 让它作为 `honesty` 字段随每一份
-报告 JSON 一起走（**数会被复制进评审材料，文档不会**）。补齐内容质量成分的前置件仍是 §4.1 标注的
-record-and-replay `ModelClient`，**至今未建**。
+报告 JSON 一起走（**数会被复制进评审材料，文档不会**）。补齐内容质量成分的前置件是 §4.1 标注的
+record-and-replay `ModelClient`：**工具已建**（`muse_engine::replay`，2026-07-26，`Implemented`），
+**但仿真仍全程跑桩**——本节的三指标口径与「诚实划界」一字未变，接线之前不得据此谈内容质量。
 
 **当前基线**（`museai-sim-2026-07-26` 种子 · 4 场景 · 10 个世界 · 引擎 0.1.0）：
 完读 6 / 强制收尾 2（`time_limit`）/ 未收尾 2 ⇒ 完读率 60%；阻断 8 拍 / 引擎拍 57 ⇒ 阻断率 14%；
-结局落桶 `e_alliance` × 8 + `(unfinished)` × 2。四个场景刻意各压一个失败面
+结局落桶 `e_purge` × 4 + `e_alliance` × 2 + `e_silence` × 2 + `(unfinished)` × 2（distinctEndings = 3）。
+四个场景刻意各压一个失败面
 （`cordial` 完读正样本 · `volatile` 高冲突 · `attrition` 强制收尾正样本 · `deadlock` 阻断正样本），
 以保证三个指标**都不会恒定**——一个恒为 100% 的完读率和恒为 0 的阻断率测不出任何回归。
 
@@ -365,18 +436,29 @@ record-and-replay `ModelClient`，**至今未建**。
 `MUSEAI_SIM_UPDATE_BASELINE=1 cargo test --manifest-path server/Cargo.toml simulation_` 重写基线，
 **必须与改动同一提交**，且提交信息写清「为什么这三个数应该变」——无解释就被刷新的基线等于没有基线。
 
-**本件首次运行即抓到一个生产缺陷**（已登记，未修）：**结局选择不进实例采样**。
-`assembly::weight_endings` 完全无 RNG（按权重过阈值筛，返回池声明序子集），
-`runtime::select_ending` 取 `enabledEndings` 的**第一个元素**、不掷点、不看 `instance_seed`。
-主线/隐藏池/NPC/地点/身份池各有一条 `Rng(seed ^ DOMAIN_*)` 子流，唯独结局这一维在
-`DOMAIN_ENDING` 之后只用于变体分组，选谁上场那一步把种子丢了 ⇒ 同模板同阵容下**所有实例落同一个结局**，
-总规格 §5「一个模板，千个平行世界」在结局维上不成立。本次刻意不修：会改变已有世界落到哪个结局、
-终局产出与黄金世界快照字节，属破坏性产品变更，须单独评审。已钉成
-`ending_selection_ignores_instance_seed_registered_finding`，修好后该用例会红（那是好消息）。
+**本件首次运行即抓到一个生产缺陷，现已修复**（任务 #41，状态 `Implemented`）：**结局选择不进实例采样**。
+旧行为：`weight_endings` 无 RNG（按权重过阈值筛，返回池声明序子集），`runtime::select_ending` 取
+`enabledEndings` 的**第一个元素**、不掷点、不看 `instance_seed` ⇒ 同模板同阵容下所有实例落同一个结局，
+总规格 §5「一个模板，千个平行世界」在结局维上不成立（首版基线 `e_alliance` × 8、distinctEndings = 1
+即此缺陷的读数）。修法：掷点收在**装配层**——`assembly::weight_endings_scored` 把权重连同名单一起交出，
+`assembly::pick_ending` 在既有 `Rng(instance_seed ^ DOMAIN_ENDING)` 子流（不新开域，`0x5C` 仍空）上
+按权重抽一个，钉进 `/assembly/selectedEnding` 随实例不变；`runtime::select_ending` 只读它，
+缺该键才回退旧口径首个（**已钉住的老实例不因一次代码变更改写结局**）。权重语义不变：未启用、
+零权（含负 / NaN）的结局永不被选中，有 `assembly` 层专项用例锁。守护用例
+`runtime::simulation::ending_selection_varies_with_instance_seed` +
+`standard_suite_metrics_have_discriminating_power` 的 `distinctEndings >= 2` 断言。
+🔴 状态止于 `Implemented`：分布形状出自种子驱动的假模型，**不度量内容质量**，
+「玩家会不会觉得结局分得开」仍未验证。
 
 **仍未做**：人工校准面（阶段切分/身份池/境界档的 admin 可视化与调参）。
 其中**境界档在 `Skeleton` 里没有任何字段落点**（`identity_pool` 有、`payout_table` 有、境界档没有），
 故校准面在补上 schema 之前无数据可展示——这是它的真前置件，不是 UI 工作量问题。
+
+> **2026-07-27 更新**：上段「仍未做」已部分兑现——**阶段切分与身份池两维**的只读校准视图已落地
+> （`server/src/admin_api/calibration.rs` + `admin/src/pages/Calibration.tsx`，台账见 §3.1.1）。
+> **境界档仍未做，原因与上段完全一致**（无 schema 落点）。
+> 另注意上段说的是「可视化**与调参**」，本次**只做了可视化，没做调参**：四个端点全只读，
+> 校准参数的写入路径仍是建模板。
 
 ## 5. AI 失败安全降级（写入门槛，因公共事实不可回滚）
 

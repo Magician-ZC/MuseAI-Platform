@@ -1,0 +1,241 @@
+//! 全局测试建池 helper（仅 `#[cfg(test)]` 构建）。
+//!
+//! 生产跑 Postgres（`MUSE_DATABASE_URL=postgres://...`），而测试历来只跑 SQLite——
+//! 「双数据库可移植 SQL 子集」（`db.rs` 头注释那条约定）因此长期零自动化验证。
+//! 本模块把 11 处各自 `connect("sqlite::memory:")` 收敛成一个入口，由环境变量
+//! `MUSE_TEST_DATABASE_URL` 决定连哪个库。
+//!
+//! 🔴 **默认值就是 `sqlite::memory:`**：不设该变量时，建池参数与收敛前逐字等价
+//! （单连接 + 永不回收），本地 `cargo test` 的行为和耗时不变，也不依赖任何外部服务。
+//! Postgres 是 CI 上**增量的第二遍**。
+//!
+//! ## Postgres 下的测试隔离
+//!
+//! `sqlite::memory:` 每个连接天然是一个独立空库，PG 没有这回事——并行跑的用例会共享
+//! 同一个数据库互相污染。这里的方案是**每个池一个独立 schema**：
+//!
+//! 1. 用原子计数器取号 → schema 名 `{prefix}_{n}`（`MUSE_TEST_SCHEMA_PREFIX`，默认 `muse_test`）。
+//!    ⚠️ 计数器而非随机数/时间戳：确定性契约（`docs/VALIDATION.md` §4「禁三样」——
+//!    不用系统随机、不用浮点 RNG、不依赖 map 迭代序）要求同一份用例集每次跑出同一批 schema 名，
+//!    这样「第 7 个池上挂了」才是可复现、可直接 `psql` 进去看的线索。
+//! 2. `DROP SCHEMA IF EXISTS ... CASCADE` + `CREATE SCHEMA`——因为计数器每个进程从 0 起，
+//!    schema 名跨轮复用，建之前先清掉上一轮的同名残留。故**清理发生在建池时而不是析构时**：
+//!    不需要给 `AppState` 挂 `Drop`（异步析构在 Rust 里做不干净），残留 schema 数量上界 =
+//!    历史最大并发用例数，恒定不增长。
+//! 3. 池上挂 `after_connect`，每条连接一开就 `SET search_path`——迁移建的 `_sqlx_migrations`
+//!    和 66 张业务表全部落进该 schema。
+//!
+//! ⚠️ 同一个 PG 库上**不要并行跑两个测试进程**（如 default 与 `--features billing,arena`
+//! 同时开跑）：计数器是进程内的，两个进程会取到同一批号。CI 里两遍是串行的；确要并行请用
+//! `MUSE_TEST_SCHEMA_PREFIX` 给它们各自的前缀。
+
+use sqlx::any::AnyPoolOptions;
+use sqlx::AnyPool;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static INIT: std::sync::Once = std::sync::Once::new();
+/// schema 取号器。确定性：进程内从 0 单调递增，不掺随机数/时间戳。
+static SCHEMA_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// 本轮测试连哪个库。默认 `sqlite::memory:`。
+pub fn test_database_url() -> String {
+    std::env::var("MUSE_TEST_DATABASE_URL").unwrap_or_else(|_| "sqlite::memory:".to_string())
+}
+
+fn is_postgres(url: &str) -> bool {
+    url.starts_with("postgres://") || url.starts_with("postgresql://")
+}
+
+/// 当前是否跑在 Postgres 那遍上。
+///
+/// 提供给「同一断言在两个库上都成立、但**准备数据**的方式必须不同」的场景（例如 SQLite
+/// 允许往 INTEGER 列塞字符串而 PG 不允许）。
+/// 🔴 **不可用来跳过用例或放宽断言**——那样等于把可移植性 bug 藏起来，正是本模块要堵的东西。
+pub fn on_postgres() -> bool {
+    is_postgres(&test_database_url())
+}
+
+/// 建一个跑完全部迁移的空库。SQLite → 进程内独立内存库；PG → 独立 schema。
+pub async fn test_pool() -> AnyPool {
+    INIT.call_once(sqlx::any::install_default_drivers);
+    let url = test_database_url();
+    if is_postgres(&url) {
+        postgres_pool(&url).await
+    } else {
+        sqlite_pool(&url).await
+    }
+}
+
+/// 单连接 + 永不回收：`:memory:` 每连接一个独立库，换连接 = 换成空库。
+async fn sqlite_pool(url: &str) -> AnyPool {
+    let pool = AnyPoolOptions::new()
+        .max_connections(1)
+        .min_connections(1)
+        .idle_timeout(None)
+        .max_lifetime(None)
+        .connect(url)
+        .await
+        .expect("connect sqlite memory");
+    sqlx::migrate!("./migrations").run(&pool).await.expect("run migrations");
+    pool
+}
+
+async fn postgres_pool(url: &str) -> AnyPool {
+    let n = SCHEMA_SEQ.fetch_add(1, Ordering::SeqCst);
+    let prefix =
+        std::env::var("MUSE_TEST_SCHEMA_PREFIX").unwrap_or_else(|_| "muse_test".to_string());
+    // 前缀只允许 [A-Za-z0-9_]：schema 名无法参数化绑定，只能拼串。
+    assert!(
+        prefix.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+        "MUSE_TEST_SCHEMA_PREFIX 只允许字母/数字/下划线，实际为 {prefix:?}"
+    );
+    let schema = format!("{prefix}_{n}");
+
+    // 建 schema 用一条临时连接，建完即关——不占用测试池的连接额度。
+    let admin = AnyPoolOptions::new()
+        .max_connections(1)
+        .connect(url)
+        .await
+        .expect("connect postgres (admin)");
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .execute(&admin)
+        .await
+        .expect("drop stale test schema");
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&admin)
+        .await
+        .expect("create test schema");
+    admin.close().await;
+
+    // 连接数与 SQLite 那遍对齐（1）：不是性能取舍，是为了两遍的**可见性语义一致**——
+    // 多连接时「A 连接未提交的写 B 连接看不见」会让用例以与 SQL 方言无关的理由失败，
+    // 把真正的可移植性问题淹掉。
+    let hook_schema = schema.clone();
+    let pool = AnyPoolOptions::new()
+        .max_connections(1)
+        .min_connections(1)
+        .idle_timeout(None)
+        .max_lifetime(None)
+        .after_connect(move |conn, _meta| {
+            let schema = hook_schema.clone();
+            Box::pin(async move {
+                sqlx::query(&format!("SET search_path TO {schema}")).execute(&mut *conn).await?;
+                Ok(())
+            })
+        })
+        .connect(url)
+        .await
+        .expect("connect postgres (test schema)");
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("run migrations on postgres schema {schema}: {e}"));
+    pool
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::Row;
+
+    /// 建池 helper 自身的契约：迁移在**本轮配置的库**上一条不落地跑完，且两个池互不可见。
+    ///
+    /// 这是 Postgres 那遍今天唯一**全绿**的部分，它锁住的东西不小：
+    /// `migrations/0001-0041` 39 份 DDL（`0023`/`0028` 是有意空号）在 PG 上逐条通过，
+    /// 即 `db.rs` 头注释那条「双库可移植 SQL 子集」在 **schema 层**成立。
+    #[tokio::test]
+    async fn migrations_apply_and_pools_are_isolated() {
+        let expected = sqlx::migrate!("./migrations").migrations.len() as i64;
+        let a = test_pool().await;
+        let applied: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
+            .fetch_one(&a)
+            .await
+            .expect("read _sqlx_migrations");
+        assert_eq!(applied, expected, "嵌入的迁移应全部落地");
+
+        // 隔离：a 写的行，b 一行都看不到（SQLite 靠独立内存库，PG 靠独立 schema）。
+        sqlx::query(
+            "INSERT INTO users (id, nickname, age_declared, status, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind("u_isolation_probe")
+        .bind("")
+        .bind(1_i64)
+        .bind("active")
+        .bind(0_i64)
+        .bind(0_i64)
+        .execute(&a)
+        .await
+        .expect("seed into pool a");
+
+        let b = test_pool().await;
+        let leaked: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM users").fetch_one(&b).await.expect("count b");
+        assert_eq!(leaked, 0, "新池必须是空库；PG 下这条挂掉说明 schema 隔离失效");
+    }
+
+    /// 🔴 **本仓库当前不可移植的根因，钉在这里。**
+    ///
+    /// sqlx 的 `Any` 驱动**原样透传 SQL 字符串**，不做 `?` → `$N` 的方言改写
+    /// （见 `sqlx-core-0.8.6/src/any/connection/executor.rs`：`self.backend.fetch_many(query.sql(), ..)`）。
+    /// 于是全仓 900+ 条写成 `?` 的语句在 SQLite 上正常、到 PG 一律 42601 语法错——
+    /// 也就是说 `MUSE_DATABASE_URL=postgres://...` 这条生产路径从未真正跑通过。
+    ///
+    /// 位置占位符 `$N` 则**两个库都认**：PG 原生；SQLite 把 `$1` 当具名参数，按首次出现
+    /// 顺序分配序号，故只要**严格顺序编号且不复用**，`.bind()` 的位置绑定就对得上。
+    /// 这就是迁移路径——但那是 900+ 处调用点的改写，不在本任务范围内。
+    ///
+    /// ⚠️ 这里按库分支断言的是**驱动层的既成事实**（两条都为真），不是拿分支跳过用例、
+    /// 也不是放宽断言——把差异藏起来正是本模块要堵的东西。
+    #[tokio::test]
+    async fn numbered_placeholders_are_portable_but_question_marks_are_not() {
+        let pool = test_pool().await;
+        let insert = |ph: &str| {
+            format!(
+                "INSERT INTO users (id, nickname, age_declared, status, created_at, updated_at) \
+                 VALUES ({ph})"
+            )
+        };
+
+        // `$N`：两个库都必须通过。
+        sqlx::query(&insert("$1, $2, $3, $4, $5, $6"))
+            .bind("u_numbered")
+            .bind("")
+            .bind(1_i64)
+            .bind("active")
+            .bind(0_i64)
+            .bind(0_i64)
+            .execute(&pool)
+            .await
+            .expect("$N 占位符必须在两个库上都可用——它是唯一的可移植写法");
+        let got: String = sqlx::query("SELECT status FROM users WHERE id = $1")
+            .bind("u_numbered")
+            .fetch_one(&pool)
+            .await
+            .expect("$N 也必须能用在 WHERE 上")
+            .get("status");
+        assert_eq!(got, "active");
+
+        // `?`：SQLite 认，PG 不认。
+        let question = sqlx::query(&insert("?, ?, ?, ?, ?, ?"))
+            .bind("u_question")
+            .bind("")
+            .bind(1_i64)
+            .bind("active")
+            .bind(0_i64)
+            .bind(0_i64)
+            .execute(&pool)
+            .await;
+        if on_postgres() {
+            let err = question.expect_err(
+                "若这条开始通过，说明 sqlx 已支持 ? → $N 改写，本注释与 CI 的非阻塞标记应一并撤掉",
+            );
+            assert!(
+                err.to_string().contains("syntax error"),
+                "PG 上 `?` 应报语法错，实际：{err}"
+            );
+        } else {
+            question.expect("SQLite 上 `?` 是正常写法");
+        }
+    }
+}

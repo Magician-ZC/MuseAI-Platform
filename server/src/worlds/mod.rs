@@ -582,11 +582,16 @@ async fn world_detail(
     ensure_world_readable(&state.db, &world, &user).await?;
 
     // 公开阵容：active 成员 + 角色公开名（AI 标识）+ 头像（仅过审才带）。
+    // 🔴 次级键 `cloud_character_id` 不可省：`joined_at` 是毫秒，同毫秒入场的两名成员
+    // 在 PG 上没有任何顺序保证（SQLite 恰好按 rowid 稳定，于是这类 bug 在本仓测试里
+    // 一向是全绿的——`assembly::load_active_cards` 就是这么漏过去的）。
+    // 阵容顺序是用户可见的展示序，抖动即前端列表乱跳。口径与 assembly/runtime 同名查询逐字一致。
     let member_rows = sqlx::query(
         "SELECT wm.cloud_character_id AS cid, cc.card_json AS card, \
          cc.avatar_url AS avatar_url, cc.avatar_moderation AS avatar_moderation \
          FROM world_members wm JOIN cloud_characters cc ON cc.id = wm.cloud_character_id \
-         WHERE wm.world_id = ? AND wm.status='active' ORDER BY wm.joined_at ASC",
+         WHERE wm.world_id = ? AND wm.status='active' \
+         ORDER BY wm.joined_at ASC, wm.cloud_character_id ASC",
     )
     .bind(&id)
     .fetch_all(&state.db)

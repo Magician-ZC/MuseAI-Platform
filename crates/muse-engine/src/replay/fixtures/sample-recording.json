@@ -1,0 +1,67 @@
+{
+  "meta": {
+    "formatVersion": 1,
+    "recordingId": "sample-changan@model-x",
+    "engineVersion": "0.1.0",
+    "models": [
+      "model-x"
+    ],
+    "promptVersions": [
+      "prompts-v1"
+    ],
+    "labels": {
+      "__doc": "样例录制（格式说明用）：录制-回放 ModelClient 的产物长这样",
+      "world": "wld-sample"
+    },
+    "recordedAtMs": 0,
+    "warnings": []
+  },
+  "calls": [
+    {
+      "seq": 0,
+      "beat": 0,
+      "character": "",
+      "agent": "director",
+      "occurrence": 0,
+      "runId": "wld-replay-test",
+      "promptVersion": "prompts-v1",
+      "model": "model-x",
+      "interface": "OpenAI-compatible",
+      "baseUrl": "https://api.example.com/v1",
+      "temperatureMilli": 0,
+      "maxOutputTokens": 512,
+      "system": "你是 director 环节。",
+      "user": "【拍 0】当前局面。",
+      "promptDigest": "a39dba889ef4f7c58fa33755a4de5675",
+      "outcome": {
+        "status": "ok",
+        "content": "{\"situation\":\"拍 0：灯烛初上\"}",
+        "inputTokens": 100,
+        "outputTokens": 20
+      }
+    },
+    {
+      "seq": 1,
+      "beat": 0,
+      "character": "shenyan",
+      "agent": "roleDecide",
+      "occurrence": 0,
+      "runId": "wld-replay-test",
+      "promptVersion": "prompts-v1",
+      "model": "model-x",
+      "interface": "OpenAI-compatible",
+      "baseUrl": "https://api.example.com/v1",
+      "temperatureMilli": 0,
+      "maxOutputTokens": 512,
+      "system": "你是 roleDecide 环节。",
+      "user": "以下是【仅你（shenyan）可见】的信息：【拍 0】席上众人各怀心事。",
+      "promptDigest": "8a01ed348ecb58a16a0a72c0e7944e59",
+      "outcome": {
+        "status": "ok",
+        "content": "{\"action\":\"shenyan 在拍 0 端起酒盏\",\"duration\":60,\"intent\":\"按兵不动\",\"speak\":{\"purpose\":\"叙旧\",\"willSpeak\":true},\"targets\":[\"peizhao\"]}",
+        "inputTokens": 100,
+        "outputTokens": 20
+      }
+    }
+  ]
+}

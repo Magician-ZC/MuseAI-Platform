@@ -1,0 +1,224 @@
+/* 人工校准面样式。颜色一律取自设计文档 §5 视觉系统唯一权威表，不得出现表外近似值：
+   页面 #fbfaf7 · 面板 #fffdfa · 主文字 #292724/#38342f · 分隔线 #e4ded6/#e7e1da ·
+   品牌 #c96845/#d37a57 · 正常 #5d8750/#749b63 · 需关注 #bb7623/#d99535 · 高风险 #c64d40/#ca5547 ·
+   面板圆角 8px。状态一律「文字 + 颜色」，不得只用彩色圆点（设计文档 §5 末段）。 */
+
+.calibration {
+  padding: 24px 24px 32px;
+}
+
+.calibration__head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  margin-bottom: 12px;
+}
+
+/* 标题与只读徽标都必须整块不折行——「人工校准/面」「只读 · 不可调/参」这类断字读起来像两个词。
+   可折行的只有末尾那段说明文字。 */
+.calibration__head h4 {
+  flex: 0 0 auto;
+  margin: 0;
+  color: #292724;
+  font-size: 20px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.calibration__head small {
+  flex: 1 1 420px;
+  min-width: 320px;
+  color: #6d665e;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+/* 只读徽标：校准面全程不可编辑，这个徽标要一眼可见，不能藏在正文里。 */
+.calibration__readonly {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 10px;
+  white-space: nowrap;
+  border: 1px solid #e4ded6;
+  border-radius: 999px;
+  background: #fffdfa;
+  color: #bb7623;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+/* 汇总指标条 */
+.calibration__stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(140px, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.calibration__stat {
+  padding: 12px 16px;
+  border: 1px solid #e7e1da;
+  border-radius: 8px;
+  background: #fffdfa;
+}
+
+.calibration__stat dt {
+  margin: 0 0 4px;
+  color: #6d665e;
+  font-size: 12px;
+}
+
+.calibration__stat dd {
+  margin: 0;
+  color: #292724;
+  font-size: 22px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.calibration__stat dd small {
+  margin-left: 6px;
+  color: #6d665e;
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.calibration__stat.is-attention dd {
+  color: #bb7623;
+}
+
+/* 效力自述面板：身份池「只存不用 / 存了也只进叙事」这件事必须在页面上说清楚，
+   不能只画分布图让运营自行推断。 */
+.calibration__effect {
+  margin-bottom: 16px;
+  padding: 14px 16px;
+  border: 1px solid #e4ded6;
+  border-left: 4px solid #bb7623;
+  border-radius: 8px;
+  background: #fffdfa;
+}
+
+.calibration__effect h5 {
+  margin: 0 0 4px;
+  color: #292724;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.calibration__effect p {
+  margin: 0 0 10px;
+  color: #38342f;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.calibration__effect p.is-warning {
+  color: #c64d40;
+}
+
+.calibration__layers {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(260px, 1fr));
+  gap: 8px 20px;
+  margin: 0;
+}
+
+.calibration__layer {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 0;
+  border-top: 1px solid #e7e1da;
+}
+
+.calibration__layer dt {
+  flex: 0 0 88px;
+  color: #6d665e;
+  font-size: 12px;
+}
+
+.calibration__layer dd {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.calibration__layer dd small {
+  display: block;
+  color: #6d665e;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.5;
+}
+
+.calibration__layer dd.is-ok {
+  color: #5d8750;
+}
+
+.calibration__layer dd.is-never {
+  color: #38342f;
+}
+
+.calibration__layer dd.is-missing {
+  color: #c64d40;
+}
+
+/* 章节小标题 */
+.calibration__section {
+  margin: 20px 0 10px;
+  color: #292724;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.calibration__hint {
+  margin: 0 0 12px;
+  color: #6d665e;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.calibration__notes {
+  margin: 16px 0 0;
+  padding: 12px 16px 12px 32px;
+  border: 1px solid #e7e1da;
+  border-radius: 8px;
+  background: #fffdfa;
+  color: #6d665e;
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+/* 阶段条：把「切成了几段、哪一段缺」画成一条可扫视的带子 */
+.calibration__stage-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 0 12px;
+}
+
+.calibration__stage-chip {
+  min-width: 34px;
+  padding: 4px 8px;
+  border: 1px solid #e4ded6;
+  border-radius: 6px;
+  background: #fffdfa;
+  color: #38342f;
+  font-size: 12px;
+  text-align: center;
+}
+
+.calibration__stage-chip.is-missing {
+  border-color: #ca5547;
+  background: #fdf1ef;
+  color: #c64d40;
+}
+
+.calibration__stage-chip.is-duplicate {
+  border-color: #d99535;
+  background: #fdf5e9;
+  color: #bb7623;
+}

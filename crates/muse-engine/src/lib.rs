@@ -10,6 +10,7 @@ pub mod host;
 pub mod knowledge;
 pub mod model;
 pub mod narrative;
+pub mod replay;
 pub mod store;
 pub mod world;
 

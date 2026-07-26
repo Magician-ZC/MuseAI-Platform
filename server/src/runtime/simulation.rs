@@ -1041,10 +1041,15 @@ async fn standard_suite_metrics_have_discriminating_power() {
     assert!(e.by_ending.len() >= 2, "结局分布只有一个桶 —— 分布形状没有信息量：{:?}", e.by_ending);
     assert!(e.by_kind.len() >= 2, "收尾类型只有一种 —— 自然/强制没有同时出现：{:?}", e.by_kind);
     assert!(e.with_ending > 0, "没有任何世界落到真实结局上：{:?}", e.by_ending);
-    // ⚠️ 这里**刻意不**断言 `distinct_endings >= 2`。首次跑就发现它恒为 1，
-    // 原因是生产侧的结局选择根本没有进采样——见下面的
-    // `ending_selection_ignores_instance_seed_registered_finding`。断言 ≥2 会把一个
-    // **已存在的生产缺陷**伪装成本工装的失败；缺陷本身由那条专用用例登记并守护。
+    // ---- 结局这一维必须真的随实例种子分叉（总规格 §5「一个模板，千个平行世界」）----
+    // 本套件所有世界共用同一模板 + 同一阵容，唯一变量是实例种子。若这里塌回 1，说明结局选择又一次
+    // 把种子丢了（历史缺陷：`select_ending` 取 `enabledEndings` 首个，任务 #41 已修：装配层
+    // `pick_ending` 按权重掷点定盘 → `/assembly/selectedEnding`）。
+    assert!(
+        e.distinct_endings >= 2,
+        "同模板同阵容的一批世界只落到一个结局 —— 结局选择丢了实例种子（§5 在结局维不成立）：{:?}",
+        e.by_ending
+    );
 
     // ---- 完读率与强制收尾率的分母差异必须实际发生（口径纪律的端到端证据）----
     if c.unfinished > 0 {
@@ -1060,34 +1065,25 @@ async fn standard_suite_metrics_have_discriminating_power() {
 }
 
 // ============================================================================
-// §10.1 已登记发现 —— 结局选择不进实例采样（本工装第一次跑就抓到的生产缺陷）
+// §10.1 结局随实例种子分叉（原「已登记发现」，任务 #41 已修，本节改为守护用例）
 // ============================================================================
 
-/// 🔴 **登记在案的生产缺陷，不是本工装的期望行为。**
+/// **端到端守护：同模板 + 同阵容下，结局必须随实例种子分叉**（总规格 §5「一个模板，千个平行世界」）。
 ///
-/// 现象：同一模板 + 同一阵容下，**无论换多少个实例种子，所有世界都落到同一个结局**。
-/// 于是「结局分布」这个指标在生产上恒为单峰，总规格 §5「一个模板，千个平行世界」
-/// 在结局这一维上并不成立。
+/// 本用例的前身是一条**登记在案的生产缺陷**（`ending_selection_ignores_instance_seed_registered_finding`）：
+/// 那时 `runtime::select_ending` 取 `enabledEndings` 的第一个元素，不掷点、不看 `instance_seed`，
+/// 于是无论换多少个种子，所有世界都落到同一个结局，结局分布恒为单峰。
 ///
-/// 根因（两处，缺一不可）：
-/// 1. `assembly::weight_endings` **完全没有 RNG**：它按 `base_weight × (1 + 阵容亲和 boost)`
-///    过阈值筛选，返回的是**池声明序**的一个子集（`enabledEndings`）。同一批卡 ⇒ 同一份名单。
-/// 2. `runtime::select_ending` 取的是 `enabledEndings` 的**第一个元素**
-///    （`arr.iter().find_map(...)`），不掷点、不看 `instance_seed`。
+/// 修法（任务 #41）：掷点收在**装配层**——`assembly::weight_endings_scored` 把权重连同名单一起交出，
+/// `assembly::pick_ending` 在 `Rng(instance_seed ^ DOMAIN_ENDING)` 子流上按权重抽一个，钉进
+/// `/assembly/selectedEnding`；`runtime::select_ending` 只读它（缺失才回退到旧口径的首个，
+/// 服务修复前已钉住的老实例）。
 ///
-/// 对照：主线 / 隐藏池 / NPC / 地点 / 身份池**都**各有一条 `Rng(seed ^ DOMAIN_*)` 子流
-/// （`DOMAIN_MAINLINE` … `DOMAIN_IDENTITY`），唯独结局这一维在 `DOMAIN_ENDING` 之后
-/// 只用于 `resolve_variant_groups`（变体分组），选谁上场那一步把种子丢掉了。
-///
-/// **本次刻意不修**：修它会改变已有世界落到哪个结局 ⇒ 改变 `world.ended` 审计、终局产出与
-/// 黄金世界快照字节，属破坏性产品变更，须单独评审（同 golden 文件末「ORDER BY joined_at
-/// 缺次级键」的处理方式）。这里只把它**钉成一条会说话的测试**。
-///
-/// **修好之后这条用例会红**——那是好消息。届时请：删掉本用例、把
-/// `standard_suite_metrics_have_discriminating_power` 里那段"刻意不断言 distinct_endings"
-/// 的注释换成真正的 `>= 2` 断言、并连同基线一起更新。
+/// 本用例守两件事，缺一不可：
+/// 1. 装配确实筛出了 ≥2 个候选（否则"能不能选出花样"根本无从观察，是模板问题不是选择器问题）；
+/// 2. 4 个只有种子不同的世界，落到的结局**不止一个**。
 #[tokio::test]
-async fn ending_selection_ignores_instance_seed_registered_finding() {
+async fn ending_selection_varies_with_instance_seed() {
     let state = test_state().await;
     seed_sim_shared(&state).await;
     let sc = standard_suite()[0].clone();
@@ -1100,8 +1096,6 @@ async fn ending_selection_ignores_instance_seed_registered_finding() {
         assert_eq!(record.facts.status, "ended", "探针世界必须跑到收尾才能观察结局");
         *endings.entry(record.facts.ending_id.clone()).or_insert(0) += 1;
 
-        // 装配阶段**确实**筛出了多于一个候选结局 —— 缺陷不在"池子里只有一个"，
-        // 而在"选的时候没掷点"。这一条把根因钉死在 `select_ending` 而不是模板内容上。
         let assembled: Option<String> =
             sqlx::query_scalar("SELECT assembled_json FROM worlds WHERE id = ?")
                 .bind(&record.world_id)
@@ -1109,21 +1103,147 @@ async fn ending_selection_ignores_instance_seed_registered_finding() {
                 .await
                 .unwrap();
         let v: Value = serde_json::from_str(&assembled.expect("已跑过的世界必有装配产物")).unwrap();
-        let enabled = v.pointer("/assembly/enabledEndings").and_then(Value::as_array).cloned().unwrap_or_default();
+        let enabled: Vec<String> = v
+            .pointer("/assembly/enabledEndings")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
         enabled_counts.push(enabled.len());
+
+        // 掷点只能在**已启用**的结局里选 —— 权重语义（未启用者永不上场）的端到端证据。
+        let selected = v
+            .pointer("/assembly/selectedEnding")
+            .and_then(Value::as_str)
+            .expect("装配层必须钉住 selectedEnding");
+        assert!(
+            enabled.iter().any(|e| e == selected),
+            "定盘结局不在已启用名单内：selected={selected} enabled={enabled:?}"
+        );
+        assert_eq!(record.facts.ending_id, selected, "世界落定的结局 = 装配层定盘的那一个");
     }
 
     assert!(
         enabled_counts.iter().all(|n| *n >= 2),
-        "装配筛出的候选结局不足 2 个，本用例观察不到「有得选却不选」：{enabled_counts:?}"
+        "装配筛出的候选结局不足 2 个，本用例观察不到「有得选」：{enabled_counts:?}"
     );
-    assert_eq!(
-        endings.len(),
-        1,
-        "结局选择已经会随实例种子变化了 —— 这是好消息！
-         请按本用例文档头的三步收尾：删本用例、恢复 distinct_endings >= 2 断言、更新基线。
+    assert!(
+        endings.len() >= 2,
+        "只有种子不同的一批世界全落到同一个结局 —— 结局选择又把 instance_seed 丢了（§5 在结局维不成立）。\
          实测分布：{endings:?}"
     );
+}
+
+// ============================================================================
+// §10.2 阻断拍的成本必须记真（任务 #42）
+// ============================================================================
+
+/// **端到端守护：被阻断的那一拍照样烧了 token，账上必须有它**（任务 #42）。
+///
+/// 前身也是一条生产缺陷：`finish_tick_noop` 无条件写 `cost_tokens=0`，而 `blocked` 拍
+/// 走的正是它。可这一拍引擎已经跑完了整个回合——导演、逐角色决策、仲裁、可能的底线重生成
+/// 全都发出去了；被拦下的是**提交**，不是**计算**。于是 `deadlock` 场景 8 个阻断拍
+/// 在账上一分钱不花，`world_budgets.spent_tokens_today` 恒为 0。
+///
+/// 这不是一个内部指标的小数点问题：低估是**结构性偏向**的——越是被阻断多的世界
+///（往往正是内容风险高、审核成本也高的那些）低估得越厉害，于是 `docs/VALIDATION.md`
+/// 的 T3 / T5 两道商业门槛会在最危险的地方最乐观。
+///
+/// 本用例守四件事：
+/// 1. `deadlock` 世界一拍都没提交（`committed_ticks == 0`）——保证下面看到的钱**只可能**来自阻断拍；
+/// 2. 每个阻断拍的 `cost_tokens > 0`；
+/// 3. `world_budgets.spent_tokens_today` == 逐拍成本之和（tick 账与预算账不许分叉，熔断读的是后者）；
+/// 4. 🔴 **叙事 SLO 的拍域不许被这笔钱污染**：阻断拍进了成本，但绝不能进「无戏份」的分母
+///    （见 `slo::TICK_DOMAIN` 的第三个条件）。一次改动同时推动成本上行、叙事指标不动，才是对的。
+#[tokio::test]
+async fn blocked_ticks_record_real_token_cost_without_polluting_narrative_slo() {
+    let state = test_state().await;
+    seed_sim_shared(&state).await;
+    let sc = standard_suite()
+        .into_iter()
+        .find(|s| s.name == "deadlock")
+        .expect("标准套件必须保留 deadlock 场景（阻断率与本用例的正样本）");
+    let seed = world_seed("blocked-cost-probe", sc.name, 0);
+    let record = run_world(&state, &sc, seed).await;
+
+    // 1) 一拍都没提交 —— 后面看到的所有成本都只能来自阻断拍。
+    assert!(record.facts.blocked_ticks > 0, "deadlock 场景必须真的产生阻断拍：{:?}", record.tick_outcomes);
+    assert_eq!(
+        record.facts.committed_ticks, 0,
+        "deadlock 世界不该有任何提交拍，否则本用例分不清成本来自哪一类拍：{:?}",
+        record.tick_outcomes
+    );
+    assert_eq!(record.facts.events_total, 0, "阻断拍不提交状态，也就不该落任何 world_events");
+
+    // 2) 逐拍成本：阻断拍 > 0，其余（空转拍）恒 0。
+    use sqlx::Row as _;
+    let rows: Vec<(i64, i64, String)> = sqlx::query(
+        "SELECT tick_no, cost_tokens, COALESCE(error, '') AS err FROM world_ticks \
+         WHERE world_id = ? ORDER BY tick_no ASC",
+    )
+    .bind(&record.world_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap()
+    .iter()
+    .map(|r| {
+        (
+            r.try_get::<i64, _>("tick_no").unwrap(),
+            r.try_get::<i64, _>("cost_tokens").unwrap(),
+            r.try_get::<String, _>("err").unwrap(),
+        )
+    })
+    .collect();
+    let blocked: Vec<&(i64, i64, String)> = rows.iter().filter(|(_, _, e)| e == "blocked").collect();
+    assert_eq!(blocked.len() as i64, record.facts.blocked_ticks);
+    for (tick_no, cost, _) in &blocked {
+        assert!(
+            *cost > 0,
+            "阻断拍 {tick_no} 的成本记成了 {cost} —— 引擎跑完了整个回合，这一拍真的烧了 token（#42）"
+        );
+    }
+    for (tick_no, cost, err) in rows.iter().filter(|(_, _, e)| e != "blocked") {
+        assert_eq!(*cost, 0, "没跑过模型的拍 {tick_no}（{err}）必须记 0，记非 0 就是反方向的虚报");
+    }
+
+    // 3) tick 账 == 预算账（熔断读的是预算账；两者分叉 = 熔断器对阻断世界失效）。
+    let total: i64 = rows.iter().map(|(_, c, _)| *c).sum();
+    assert!(total > 0, "整个世界的账上一分钱都没有 —— 这正是 #42 的现场");
+    assert_eq!(record.spent_tokens, total, "world_budgets.spent_tokens_today 必须等于逐拍成本之和");
+
+    // 4) 叙事 SLO 拍域不被污染：这些拍有成本、但没演出来，不该进「无戏份」的分母。
+    let streaks = crate::slo::world_silent_streaks(&state.db, &record.world_id).await.unwrap();
+    assert!(
+        streaks.values().all(|v| *v == 0),
+        "阻断拍进了叙事 SLO 拍域 —— 成本口径与叙事口径必须分家，\
+         否则「全员被晾着」会随阻断率一起虚涨：{streaks:?}"
+    );
+
+    // 5) 反方向的守卫：**没跑过模型的拍必须仍记 0**，一刀切改成非 0 就是反方向的虚报。
+    //    这里用同一个世界现造一个空转拍（把世界置 paused → 下一拍命中 `world_not_running`，
+    //    在引擎构建之前就返回），断言它既不记成本、也不动预算。
+    sqlx::query("UPDATE worlds SET status='paused' WHERE id = ?")
+        .bind(&record.world_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let noop_tick = sc.max_drive_ticks;
+    let status = drive_tick(&state, &SimModel::new(seed, sc.temper).into(), &record.world_id, noop_tick).await;
+    assert_eq!(status, TickStatus::Skipped("world_not_running"), "paused 世界的拍应命中空转分支");
+    let noop_cost: i64 =
+        sqlx::query_scalar("SELECT cost_tokens FROM world_ticks WHERE world_id = ? AND tick_no = ?")
+            .bind(&record.world_id)
+            .bind(noop_tick)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(noop_cost, 0, "一次模型都没调过的拍必须记 0（#42 的反向边界）");
+    let spent_after: i64 =
+        sqlx::query_scalar("SELECT spent_tokens_today FROM world_budgets WHERE world_id = ?")
+            .bind(&record.world_id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(spent_after, total, "空转拍不该动日预算");
 }
 
 // ============================================================================

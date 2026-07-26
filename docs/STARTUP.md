@@ -186,8 +186,34 @@ npx tsc --noEmit                                                   # 0 错误
 ```
 
 > CI(`.github/workflows/test.yml`)三个 job 覆盖上述全部:`frontend-test`(前端 test + build)、
-> `rust-test`(桌面轨 `src-tauri`)、`platform-test`(引擎 + server 双 feature 组合 + admin 构建)。
+> `rust-test`(桌面轨 `src-tauri`)、`platform-test`(引擎 + server 双 feature 组合 + admin 构建 + Postgres 那遍)。
 > **`billing`/`arena` 虽默认不进构建,但 CI 单独跑一遍其测试**——feature-gated 代码不进 CI 会在无人察觉中腐化。
+
+### 7.1 Postgres 那遍(生产库形态)
+
+上面的 server 测试全部跑 `sqlite::memory:`,而**生产跑 Postgres**(`MUSE_DATABASE_URL=postgres://...`)。
+建池统一走 `server/src/testkit.rs`,`MUSE_TEST_DATABASE_URL` 决定连哪个库,**不设 = SQLite**,
+故上面的命令行为与耗时不变。PG 下每个测试池独占一个 schema(原子计数器取号)实现隔离。
+
+```bash
+createdb muse_test
+# ✅ 全绿:39 份迁移在 PG 上逐条通过 + schema 隔离有效
+MUSE_TEST_DATABASE_URL=postgres://$USER@localhost:5432/muse_test \
+  cargo test --manifest-path server/Cargo.toml 'testkit::'
+# ⚠️ 已知红(251 passed / 525 failed):见下
+MUSE_TEST_DATABASE_URL=postgres://$USER@localhost:5432/muse_test \
+  cargo test --manifest-path server/Cargo.toml
+```
+
+> 🔴 **全量那遍现在是红的,根因在生产代码不在测试**:sqlx 的 `Any` 驱动**原样透传 SQL**、
+> 不做 `?` → `$N` 方言改写,而全仓 900+ 条语句写的是 `?`,于是 PG 上每条带参数的查询都是
+> 42601 语法错。**即 `MUSE_DATABASE_URL=postgres://...` 这条生产路径从未真正跑通过。**
+> `$N` 是两个库都认的可移植写法(SQLite 按首次出现顺序给具名参数派号),迁移路径即把调用点
+> 逐个改成 `$N`;完成后删掉 CI 里那步的 `continue-on-error`。
+> 事实依据钉在 `testkit::tests::numbered_placeholders_are_portable_but_question_marks_are_not`。
+>
+> ⚠️ 同一个 PG 库上不要并行跑两个测试进程(取号器是进程内的,会撞名);需要并行时用
+> `MUSE_TEST_SCHEMA_PREFIX` 给各自不同的前缀。
 
 后端进程端到端冒烟(dev):
 

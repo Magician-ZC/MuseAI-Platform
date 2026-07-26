@@ -11,29 +11,16 @@
 //! 与本文件的"聚合查询正确性"是两层，不重复。
 
 use serde_json::Value;
-use sqlx::any::AnyPoolOptions;
 use sqlx::AnyPool;
 
 use super::*;
-
-static INIT: std::sync::Once = std::sync::Once::new();
 
 const DAY_MS: i64 = 86_400_000;
 /// 固定的窗口基准时刻（不取 now，避免跨日抖动）：2026-07-01T00:00:00Z。
 const T0: i64 = 1_782_950_400_000;
 
 async fn test_db() -> AnyPool {
-    INIT.call_once(sqlx::any::install_default_drivers);
-    let pool = AnyPoolOptions::new()
-        .max_connections(1)
-        .min_connections(1)
-        .idle_timeout(None)
-        .max_lifetime(None)
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-    pool
+    crate::testkit::test_pool().await
 }
 
 /// 窗口 = [T0, T0+7天)，所有播种时刻取 T0+1天，恒落窗内。

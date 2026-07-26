@@ -56,6 +56,26 @@ jobs:
   platform-test:
     name: Platform Tests (引擎 + 后端 + 后台)
     runs-on: ubuntu-22.04
+
+    # 生产跑 Postgres（`MUSE_DATABASE_URL=postgres://...`），而 server 测试历来只跑
+    # `sqlite::memory:`——`db.rs` 头注释那条「双库可移植 SQL 子集」长期零自动化验证。
+    # 这个 service 就是把它接上自动化用的，只有显式设了 `MUSE_TEST_DATABASE_URL` 的步骤
+    # 会连它；SQLite 那两遍不读该变量，行为与耗时一个字不变。
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: muse
+          POSTGRES_PASSWORD: muse
+          POSTGRES_DB: muse_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -80,6 +100,39 @@ jobs:
       # 否则 feature-gated 代码会在无人察觉中腐化。
       - name: Server tests (billing + arena)
         run: cargo test --manifest-path server/Cargo.toml --features billing,arena
+
+      # ---- Postgres 兼容性：上面两遍的**增量第二遍**，不替代它们 ----
+      #
+      # 建池统一走 `server/src/testkit.rs`：`MUSE_TEST_DATABASE_URL` 决定连哪个库，
+      # 不设 = `sqlite::memory:`。PG 下每个池独占一个 schema（原子计数器取号，无随机/时间戳），
+      # 故并行用例互不污染。
+      #
+      # ⚠️ 两遍不可同时开跑：取号器是进程内的，同库并行的两个测试进程会撞名。
+      # 下面每步各给一个 `MUSE_TEST_SCHEMA_PREFIX`，步骤本身也是串行的。
+      # 引号不可省：行尾的 `testkit::` 会被 YAML 当成映射键分隔符，整个 workflow 解析失败。
+      - name: Server tests on Postgres (schema 层可移植性)
+        run: "cargo test --manifest-path server/Cargo.toml testkit::"
+        env:
+          MUSE_TEST_DATABASE_URL: postgres://muse:muse@localhost:5432/muse_test
+          MUSE_TEST_SCHEMA_PREFIX: muse_schema
+
+      # 🔴 **已知红，故暂不阻塞。** 根因不是测试写法，是生产代码：sqlx 的 `Any` 驱动
+      # 原样透传 SQL、不做 `?` → `$N` 改写，而全仓 900+ 条语句用的是 `?`——
+      # 于是 PG 上每条带参数的查询都是 42601 语法错。详见
+      # `testkit::tests::numbered_placeholders_are_portable_but_question_marks_are_not`。
+      #
+      # 这一步现在的作用是**把这个缺口摆在明面上、并让它的数字随迁移进度可见地缩小**。
+      # 收口条件（两件事一起做，缺一不可）：
+      #   ① 900+ 处调用点的 `?` 改成 `$N`；
+      #   ② 删掉 `continue-on-error`，并把 `--features billing,arena` 那一遍也加回来
+      #      （现在只跑 default：两个 feature 组合的失败根因完全相同，多跑一遍只是重复
+      #       同一堵红墙，白烧 ~4 分钟 CI）。
+      - name: Server tests on Postgres (全量 · 诊断 · 见注释，暂不阻塞)
+        continue-on-error: true
+        run: cargo test --manifest-path server/Cargo.toml
+        env:
+          MUSE_TEST_DATABASE_URL: postgres://muse:muse@localhost:5432/muse_test
+          MUSE_TEST_SCHEMA_PREFIX: muse_full
 
       - name: Setup Node
         uses: actions/setup-node@v4

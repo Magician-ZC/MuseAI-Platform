@@ -78,7 +78,9 @@
       "endings": {
         "byEnding": {
           "(unfinished)": 2,
-          "e_alliance": 8
+          "e_alliance": 2,
+          "e_purge": 4,
+          "e_silence": 2
         },
         "byKind": {
           "forced": 2,
@@ -88,7 +90,7 @@
           "mainline_complete": 6,
           "time_limit": 2
         },
-        "distinctEndings": 1,
+        "distinctEndings": 3,
         "worldsWithEnding": 8
       }
     },

@@ -9,6 +9,10 @@
 //!   世界运营：GET /admin/worlds?status=、GET /admin/worlds/{id}/diagnostics（脱敏诊断）、
 //!            POST /admin/worlds/{id}/pause|resume、POST /admin/worlds（官方建房）、GET/POST /admin/world-templates、
 //!            POST /admin/world-templates/{id}/star（星级 curation：3-5★ 唯一晋升路径）
+//!   人工校准：GET /admin/sagas（阶段切分总览）、GET /admin/sagas/{sagaId}（逐阶段结构）、
+//!            GET /admin/identity-pools（声明身份池的模板目录）、
+//!            GET /admin/world-templates/{id}/identity-pool（身份池声明 + 实际分配分布）
+//!            —— 四个端点**全只读**，不提供在线调参（响应恒带 editable:false）
 //!   经济运营：GET /admin/economy/overview（真实只读聚合：充值/退款/余额/礼物/订单状态，不建结算）
 //!            GET /admin/ledger/reconcile（P4：全账复式恒等 SUM=0 + 账户物化余额对账，finance 只读，无提现）
 //!   数据看板：GET /admin/metrics/overview（SQL 聚合）、GET /admin/metrics/trends?days=（按天趋势，UTC 日界）
@@ -32,6 +36,7 @@ use crate::db::{new_id, now_ms};
 use crate::error::ApiError;
 
 mod audit;
+mod calibration;
 mod dashboards;
 mod flags;
 mod governance;
@@ -77,6 +82,15 @@ pub fn router() -> Router<AppState> {
         )
         // 模板星级 curation（波次 3）：运营定档 3-5★ 的唯一路径（自动定档封顶 2★）。
         .route("/admin/world-templates/{id}/star", post(worlds_ops::set_template_star))
+        // 人工校准面（总规格 §79/§83 流水线第一环）：阶段切分 + 身份池两维，**全只读**。
+        // 与 `{id}/star` 同为 `/admin/world-templates/{id}/…` 的静态子节点，matchit 各自匹配。
+        .route("/admin/sagas", get(calibration::list_sagas))
+        .route("/admin/sagas/{saga_id}", get(calibration::saga_detail))
+        .route("/admin/identity-pools", get(calibration::list_identity_pools))
+        .route(
+            "/admin/world-templates/{id}/identity-pool",
+            get(calibration::template_identity_pool),
+        )
         // 经济运营（真实只读聚合）
         .route("/admin/economy/overview", get(dashboards::economy_overview))
         // 财务对账（P4 合规增强）：全账复式恒等 + 账户物化余额对账（finance/admin 只读，无提现）

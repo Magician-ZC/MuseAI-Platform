@@ -31,6 +31,16 @@ use muse_engine::narrative::types::{IntensityWeights, LocationDef, LocationGate}
 pub struct AssembledInstance {
     pub per_character_hooks: Vec<CharacterHook>,
     pub enabled_endings: Vec<String>,
+    /// 本实例**定盘**的结局 id（总规格 §5「一个模板，千个平行世界」）：在 `enabled_endings` 之内
+    /// 按加权权重、由 `DOMAIN_ENDING` 子流掷点选定，随实例钉住。`runtime::select_ending` 读它。
+    ///
+    /// 🔴 `enabled_endings` 回答的是「这局**有哪些**结局在台上」（叙事投影 / 章节接口口径不变），
+    /// 本字段回答「最终**落到哪一个**」——两者语义分离，谁也不改谁。
+    ///
+    /// `None` = 结局池为空（无结局可落）。老实例的 `assembled_json` 无此键
+    /// （`skip_serializing_if` 保证不写空键），`select_ending` 对它们保持既有回退口径。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_ending: Option<String>,
     pub lineup_params: Value,
     pub difficulty_notes: Vec<String>,
     /// §2.5 主场优劣势：本书角色挂原作预知知识包 + 原作宿命作硬节点（引擎 P1/P2 机制，装配层只标注）。
@@ -827,7 +837,7 @@ fn resolve_instance_seed(
     }
 }
 
-/// storyline 阵容加权 boost（复用 weight_endings 的阵容画像口径）。
+/// storyline 阵容加权 boost（复用 weight_endings_scored 的阵容画像口径）。
 fn affinity_boost(affinity: &Option<String>, profile: &(u32, u32, u32)) -> f32 {
     let total = (profile.0 + profile.1 + profile.2).max(1) as f32;
     match affinity.as_deref() {
@@ -933,8 +943,10 @@ struct Selection {
     audit: Option<InstanceSampling>,
     /// per-character 钩子可用的隐藏内容 id 子集（退化 = 全体，模板序）。
     hidden_ids: Vec<String>,
-    /// 最终阵容加权启用的结局 id（对被选候选跑 weight_endings 的结果；退化 = 全体池加权）。
+    /// 最终阵容加权启用的结局 id（对被选候选跑 weight_endings_scored 的结果；退化 = 全体池加权）。
     enabled_endings: Vec<String>,
+    /// 在 `enabled_endings` 中按权重掷点定盘的那一个（`DOMAIN_ENDING` 子流）。池空 → None。
+    selected_ending: Option<String>,
     /// 被选世界固有角色 id 子集（退化 = 全体）。
     npc_ids: Vec<String>,
     /// 被选地点 id 子集（退化 = 全体）。
@@ -1045,6 +1057,7 @@ fn plan_sampling(
         // 身份池是**独立维度**（不搭超集判据的车）：模板声明了 identityPool 才分配；未声明 → 空 Vec
         // → 老模板零行为变化（assemble 侧 skip_serializing_if 保证 assembled_json 也逐字节不变）。
         // 退化路径无采样，故"在演内容" = 全部 storyline / 隐藏 / 支线钩子。
+        let degraded_seed = resolve_instance_seed(skeleton, world_id, fingerprint, template_version);
         let identity_assignments = if skeleton.identity_pool.is_empty() {
             Vec::new()
         } else {
@@ -1052,17 +1065,19 @@ fn plan_sampling(
                 skeleton.storylines.iter().map(|s| s.id.as_str()).collect();
             in_play.extend(skeleton.hidden_content_pool.iter().map(|p| p.id.as_str()));
             in_play.extend(skeleton.side_hook_pool.iter().map(|p| p.id.as_str()));
-            assign_identities(
-                &skeleton.identity_pool,
-                cards,
-                &in_play,
-                resolve_instance_seed(skeleton, world_id, fingerprint, template_version),
-            )
+            assign_identities(&skeleton.identity_pool, cards, &in_play, degraded_seed)
         };
+        // 结局：退化路径同样要**定盘**（否则同模板同阵容的所有实例都落同一个结局，§5 不成立）。
+        // 独立子流 `Rng(seed ^ DOMAIN_ENDING)`：本路径此前没有任何结局侧 RNG，新开这一次消费
+        // 不与任何既有子流共享状态 → 其余维度（身份/隐藏/NPC/地点）逐字段不变。
+        let scored = weight_endings_scored(&skeleton.ending_pool, profile, ending_threshold);
+        let mut rng_end = Rng(degraded_seed ^ DOMAIN_ENDING);
+        let selected_ending = pick_ending(&mut rng_end, &sorted_for_pick(&scored));
         return Selection {
             audit: None,
             hidden_ids: skeleton.hidden_content_pool.iter().map(|p| p.id.clone()).collect(),
-            enabled_endings: weight_endings(&skeleton.ending_pool, profile, ending_threshold),
+            enabled_endings: scored.into_iter().map(|(id, _)| id).collect(),
+            selected_ending,
             npc_ids: skeleton.world_characters.iter().map(|w| w.card.id.clone()).collect(),
             loc_ids: skeleton.locations.iter().map(|l| l.id.clone()).collect(),
             identity_assignments,
@@ -1193,7 +1208,7 @@ fn plan_sampling(
         hidden_ids.push(p.id.clone());
     }
 
-    // 4) Endings（storyline 约束 + 变体组互斥 → 现有 weight_endings 阵容加权）。
+    // 4) Endings（storyline 约束 + 变体组互斥 → weight_endings_scored 阵容加权 → pick_ending 掷点定盘）。
     let mut ending_candidates: Vec<&EndingCandidate> = skeleton
         .ending_pool
         .iter()
@@ -1205,7 +1220,12 @@ fn plan_sampling(
     let mut rng_end = Rng(seed ^ DOMAIN_ENDING);
     let resolved_endings = resolve_variant_groups(&mut rng_end, &ending_candidates, |e| e.variant_group.as_deref());
     let resolved_owned: Vec<EndingCandidate> = resolved_endings.iter().map(|&e| e.clone()).collect();
-    let enabled_endings = weight_endings(&resolved_owned, profile, ending_threshold);
+    let scored_endings = weight_endings_scored(&resolved_owned, profile, ending_threshold);
+    let enabled_endings: Vec<String> = scored_endings.iter().map(|(id, _)| id.clone()).collect();
+    // 结局定盘：**续用同一条 `DOMAIN_ENDING` 子流**（不新开域，0x5C 仍空着）。这次消费**排在
+    // `resolve_variant_groups` 之后**，故变体分组与其后所有子流（NPC/地点/身份，各自独立域）
+    // 的取数逐字节不变——新增的只是这条子流末尾多抽一个数。
+    let selected_ending = pick_ending(&mut rng_end, &sorted_for_pick(&scored_endings));
 
     // 5) World characters（NPC）：议程命中被选主线者加权。
     let sel_ml_set: std::collections::BTreeSet<&str> = selected_mainline.iter().map(String::as_str).collect();
@@ -1289,7 +1309,15 @@ fn plan_sampling(
             .map(|p| p.card_ids.clone())
             .unwrap_or_default(),
     };
-    Selection { audit: Some(audit), hidden_ids, enabled_endings, npc_ids, loc_ids, identity_assignments }
+    Selection {
+        audit: Some(audit),
+        hidden_ids,
+        enabled_endings,
+        selected_ending,
+        npc_ids,
+        loc_ids,
+        identity_assignments,
+    }
 }
 
 // ============================================================================
@@ -2203,8 +2231,11 @@ pub async fn assemble_instance(state: &AppState, world_id: &str) -> Result<Assem
         }
     }
 
-    // 3) 结局：采样已按 storyline 约束 + 变体组互斥 + 阵容加权算出 enabled_endings（退化 = 全池加权）。
+    // 3) 结局：采样已按 storyline 约束 + 变体组互斥 + 阵容加权算出 enabled_endings（退化 = 全池加权），
+    //    并在其中按权重掷点**定盘**一个 selected_ending（`DOMAIN_ENDING` 子流，随实例钉住）。
+    //    两者语义分离：enabled = 台上有哪些；selected = 最终落到哪一个（`runtime::select_ending` 读后者）。
     let enabled_endings = selection.enabled_endings.clone();
+    let selected_ending = selection.selected_ending.clone();
 
     // 4) 阵容级参数：支线权重 / 冲突密度 / 资源稀缺度。
     let roster_size = cards.len();
@@ -2244,6 +2275,7 @@ pub async fn assemble_instance(state: &AppState, world_id: &str) -> Result<Assem
     let assembled = AssembledInstance {
         per_character_hooks: hooks,
         enabled_endings,
+        selected_ending,
         lineup_params,
         difficulty_notes,
         home_advantages,
@@ -2873,8 +2905,14 @@ fn roster_profile(cards: &[(String, CharacterCardV2)]) -> (u32, u32, u32) {
     acc
 }
 
-/// 结局池按阵容加权：weight = base_weight * (1 + 该倾向占比)；≥ 阈值则启用，保底至少启用权重最高者。
-fn weight_endings(pool: &[EndingCandidate], profile: &(u32, u32, u32), threshold: f32) -> Vec<String> {
+/// 结局池按阵容加权（打分版）：weight = base_weight * (1 + 该倾向占比)；≥ 阈值则启用，
+/// 保底至少启用权重最高者。输出 `(id, weight)` 并保持**模板池声明序**——
+/// 权重跟着名单一起交出去，供下游 `pick_ending` 掷点定盘（筛与选的权重口径同一份，不可能漂移）。
+fn weight_endings_scored(
+    pool: &[EndingCandidate],
+    profile: &(u32, u32, u32),
+    threshold: f32,
+) -> Vec<(String, f32)> {
     if pool.is_empty() {
         return Vec::new();
     }
@@ -2889,14 +2927,71 @@ fn weight_endings(pool: &[EndingCandidate], profile: &(u32, u32, u32), threshold
     };
     let mut weighted: Vec<(&EndingCandidate, f32)> =
         pool.iter().map(|e| (e, e.base_weight * (1.0 + boost(&e.affinity)))).collect();
-    let enabled: Vec<String> =
-        weighted.iter().filter(|(_, w)| *w >= threshold).map(|(e, _)| e.id.clone()).collect();
+    let enabled: Vec<(String, f32)> =
+        weighted.iter().filter(|(_, w)| *w >= threshold).map(|(e, w)| (e.id.clone(), *w)).collect();
     if !enabled.is_empty() {
         return enabled;
     }
     // 保底：无一过阈值时启用权重最高的单个结局（副本必须可结束）。
     weighted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    weighted.first().map(|(e, _)| vec![e.id.clone()]).unwrap_or_default()
+    weighted.first().map(|(e, w)| vec![(e.id.clone(), *w)]).unwrap_or_default()
+}
+
+/// 权重整数化（**精确档**，与 `scale_weight` 的差别是**不加保底 +1**）：
+/// 用于「谁能被选中」的语义必须严格守住的场合——权重为 0 ⇒ 缩放后为 0 ⇒ 概率恒为 0。
+/// 非正数 / NaN 一律归 0（一次比较即完成，掷点全程纯整数，无浮点 RNG）。
+fn scale_weight_exact(w: f32) -> u64 {
+    if !(w > 0.0) {
+        return 0;
+    }
+    ((w as f64) * 1_000_000.0) as u64
+}
+
+/// 结局定盘（总规格 §5「一个模板，千个平行世界」）：在**已启用**的结局中按权重掷点选定一个。
+///
+/// 确定性契约：
+/// - 入参 `sorted` 必须是**按 id 升序排好的切片**（debug_assert 守着）——掷点绝不吃迭代序；
+/// - 全程整数权重（`scale_weight_exact`）+ `Rng::next_u64() % total`，无系统随机、无浮点 RNG；
+/// - 同 seed 同输入恒等同输出（黄金世界重放的前提）。
+///
+/// 权重语义（不可被悄悄改掉，有专项用例锁）：
+/// - **未启用**的结局根本不在 `sorted` 里 ⇒ 永不被选中；
+/// - **权重为 0**（或负 / NaN）的结局缩放后为 0 ⇒ 累加区间长度为 0 ⇒ 永不被选中；
+/// - 全部候选权重都为 0 的退化局面：不掷点，取排序后首个——「副本必须可结束」优先于零权语义，
+///   否则世界将无结局可落。这是唯一的例外，也只在模板把整池权重配成 0 时才可能发生。
+fn pick_ending(rng: &mut Rng, sorted: &[(String, f32)]) -> Option<String> {
+    if sorted.is_empty() {
+        return None;
+    }
+    debug_assert!(
+        sorted.windows(2).all(|w| w[0].0 <= w[1].0),
+        "pick_ending 入参必须按 id 升序：掷点不得依赖迭代序/声明序"
+    );
+    let scaled: Vec<u64> = sorted.iter().map(|(_, w)| scale_weight_exact(*w)).collect();
+    let total: u64 = scaled.iter().copied().sum();
+    if total == 0 {
+        return sorted.first().map(|(id, _)| id.clone()); // 全零退化：副本必须可结束。
+    }
+    let mut r = rng.next_u64() % total;
+    for (i, s) in scaled.iter().enumerate() {
+        if *s == 0 {
+            continue; // 零权项区间长度为 0，跳过（不消耗 r）。
+        }
+        if r < *s {
+            return Some(sorted[i].0.clone());
+        }
+        r -= *s;
+    }
+    // 理论不可达（区间和 = total）；防御性回退到最后一个**正权**项，绝不回退到零权项。
+    sorted.iter().rev().find(|(_, w)| scale_weight_exact(*w) > 0).map(|(id, _)| id.clone())
+}
+
+/// 掷点入参规范化：拷贝一份**按 id 升序**的候选切片（`enabled_endings` 输出仍保持模板池序）。
+/// id 唯一性由模板引用完整性校验前置保证；万一重复，`sort_by` 稳定排序保留声明序 → 仍确定性。
+fn sorted_for_pick(scored: &[(String, f32)]) -> Vec<(String, f32)> {
+    let mut v = scored.to_vec();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
 }
 
 /// 支线权重：随支线钩子池容量与阵容剧情种子密度上调。
@@ -2934,7 +3029,7 @@ pub(crate) fn build_offline_gain(character_id: &str, kind: &str, summary: &str) 
 #[cfg(test)]
 mod sampling_tests {
     use super::*;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     const PROFILE: (u32, u32, u32) = (1, 1, 1);
 
@@ -3143,6 +3238,155 @@ mod sampling_tests {
         sk.sampling = SamplingSpec::default();
         let s = plan(&sk, "world_nosampling", "cidA");
         assert!(s.audit.is_none(), "sampling 全空 → 退化");
+    }
+
+    // ================================================================
+    // 结局定盘（任务 #41）：掷点消费 instance_seed + 权重语义不可被悄悄改掉
+    // ================================================================
+
+    /// 结局专用骨架（**非超集** → 走退化路径，即绝大多数存量模板所在的那条路）。
+    /// 三个候选，权重拉开（3.0 / 1.0 / 0.5）且都 ≥ 默认阈值 0.5 ⇒ 三个都启用，有得选。
+    /// 无 affinity ⇒ 阵容 boost = 0 ⇒ 权重就是 baseWeight，断言不必跟着阵容画像走。
+    fn ending_pool_skeleton(pool: serde_json::Value) -> Skeleton {
+        serde_json::from_value(serde_json::json!({
+            "mainlineNodes": [ { "id": "n1" } ],
+            "endingPool": pool,
+        }))
+        .unwrap()
+    }
+
+    fn three_weight_skeleton() -> Skeleton {
+        ending_pool_skeleton(serde_json::json!([
+            { "id": "e-hi",  "baseWeight": 3.0 },
+            { "id": "e-mid", "baseWeight": 1.0 },
+            { "id": "e-lo",  "baseWeight": 0.5 }
+        ]))
+    }
+
+    /// 按给定阈值规划（`plan` 把阈值写死成 0.5，零权/未启用语义需要自定阈值）。
+    fn plan_with_threshold(sk: &Skeleton, world_id: &str, threshold: f32) -> Selection {
+        plan_sampling(sk, "cidA\ncidB", world_id, 1, &PROFILE, &[], &[], threshold, 5)
+    }
+
+    /// 同实例（同 world_id / 同阵容 / 同模板版本）反复规划 → 定盘结局逐字相同。
+    /// 这是黄金世界重放能成立的前提：掷点只吃 instance_seed，不吃调用次数/时间/迭代序。
+    #[test]
+    fn ending_pick_is_deterministic_for_same_instance() {
+        let sk = three_weight_skeleton();
+        let a = plan(&sk, "world_end_fixed", "cidA\ncidB");
+        let b = plan(&sk, "world_end_fixed", "cidA\ncidB");
+        assert!(a.selected_ending.is_some(), "非空结局池必须定盘出一个结局");
+        assert_eq!(a.selected_ending, b.selected_ending, "同实例两次规划必须落同一个结局");
+        assert_eq!(a.enabled_endings, b.enabled_endings);
+
+        // `pick_ending` 本身也是纯函数：同 Rng 状态 + 同输入 → 同输出。
+        let scored = vec![("a".to_string(), 1.0f32), ("b".to_string(), 2.0f32)];
+        assert_eq!(pick_ending(&mut Rng(0xdead_beef), &scored), pick_ending(&mut Rng(0xdead_beef), &scored));
+        assert_eq!(pick_ending(&mut Rng(1), &[]), None, "空池 → None（世界仍可停机，只是无结局产出）");
+    }
+
+    /// 🔴 缺陷本体的回归锁：**只有 world_id 不同**的一批实例必须落到不止一个结局。
+    /// 旧行为（取 enabledEndings 首个）在这里会得到 distinct == 1。
+    #[test]
+    fn ending_pick_varies_across_instances() {
+        let sk = three_weight_skeleton();
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        for i in 0..32 {
+            let s = plan(&sk, &format!("world_end_{i}"), "cidA\ncidB");
+            let picked = s.selected_ending.expect("必须定盘");
+            assert!(
+                s.enabled_endings.contains(&picked),
+                "掷点选出了未启用的结局 {picked}（enabled={:?}）",
+                s.enabled_endings
+            );
+            seen.insert(picked);
+        }
+        assert!(seen.len() >= 2, "同模板同阵容的一批实例只落到一个结局 —— 掷点没吃到 instance_seed：{seen:?}");
+    }
+
+    /// 权重语义（一）：**未启用**（权重低于阈值被筛掉）的结局永不被选中。
+    #[test]
+    fn disabled_ending_is_never_selected() {
+        let sk = ending_pool_skeleton(serde_json::json!([
+            { "id": "e-weak", "baseWeight": 0.1 },
+            { "id": "e-ok",   "baseWeight": 1.0 }
+        ]));
+        for i in 0..64 {
+            let s = plan(&sk, &format!("world_disabled_{i}"), "cidA\ncidB");
+            assert_eq!(s.enabled_endings, vec!["e-ok".to_string()], "低于阈值者不该启用");
+            assert_eq!(s.selected_ending.as_deref(), Some("e-ok"), "未启用的 e-weak 绝不可被选中");
+        }
+    }
+
+    /// 权重语义（二）：权重为 0 的结局**即使被启用**（阈值 0 时 0.0 >= 0.0 仍进名单）也永不被选中。
+    /// 这条锁的是「筛的口径」和「选的口径」各管各的：进名单 ≠ 能上场。
+    #[test]
+    fn zero_weight_ending_is_never_selected() {
+        let sk = ending_pool_skeleton(serde_json::json!([
+            { "id": "e-zero", "baseWeight": 0.0 },
+            { "id": "e-pos",  "baseWeight": 1.0 }
+        ]));
+        for i in 0..64 {
+            let s = plan_with_threshold(&sk, &format!("world_zero_{i}"), 0.0);
+            assert!(s.enabled_endings.contains(&"e-zero".to_string()), "阈值 0 时零权结局仍在启用名单里");
+            assert_eq!(s.selected_ending.as_deref(), Some("e-pos"), "零权结局绝不可被选中");
+        }
+        // 直接对 pick_ending 施压：负权 / NaN 与 0 同档，一律出局。
+        let scored = vec![
+            ("e-nan".to_string(), f32::NAN),
+            ("e-neg".to_string(), -5.0f32),
+            ("e-pos".to_string(), 1.0f32),
+        ];
+        for seed in 0..256u64 {
+            assert_eq!(pick_ending(&mut Rng(seed), &scored).as_deref(), Some("e-pos"));
+        }
+        // 全零退化：不掷点，取排序后首个 —— 「副本必须可结束」优先，且仍是确定性的。
+        let all_zero = vec![("z-a".to_string(), 0.0f32), ("z-b".to_string(), 0.0f32)];
+        assert_eq!(pick_ending(&mut Rng(7), &all_zero).as_deref(), Some("z-a"));
+    }
+
+    /// 权重语义（三）：掷点**按权重**，不是等概率——权重 3.0 的结局必须显著多于权重 0.5 的。
+    /// 固定种子集合 ⇒ 这组计数是确定值，不存在 flaky。
+    #[test]
+    fn ending_pick_follows_weights() {
+        let sk = three_weight_skeleton();
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        for i in 0..300 {
+            let s = plan(&sk, &format!("world_w_{i}"), "cidA\ncidB");
+            *counts.entry(s.selected_ending.expect("必须定盘")).or_insert(0) += 1;
+        }
+        let hi = *counts.get("e-hi").unwrap_or(&0);
+        let mid = *counts.get("e-mid").unwrap_or(&0);
+        let lo = *counts.get("e-lo").unwrap_or(&0);
+        assert!(hi > mid && mid > lo, "命中次数应随权重单调（3.0 / 1.0 / 0.5）：{counts:?}");
+        assert!(lo > 0, "权重最低但已启用的结局仍须有机会上场：{counts:?}");
+    }
+
+    /// 超集路径同样定盘，且定盘结果落在该实例**已启用**的名单内（变体组互斥后的名单）。
+    #[test]
+    fn superset_path_pins_selected_ending_within_enabled() {
+        let sk = superset();
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        for i in 0..32 {
+            let s = plan(&sk, &format!("world_ss_end_{i}"), "cidA\ncidB");
+            let picked = s.selected_ending.expect("超集路径同样必须定盘");
+            assert!(
+                s.enabled_endings.contains(&picked),
+                "掷点越过了 storyline 约束 / 变体组互斥：{picked} ∉ {:?}",
+                s.enabled_endings
+            );
+            seen.insert(picked);
+        }
+        assert!(seen.len() >= 2, "超集路径的结局也必须随实例种子分叉：{seen:?}");
+    }
+
+    /// 结局池为空 → 定盘为 None（世界仍可停机，只是无结局产出与荣誉奖励）。
+    #[test]
+    fn empty_ending_pool_pins_nothing() {
+        let sk = ending_pool_skeleton(serde_json::json!([]));
+        let s = plan(&sk, "world_no_ending", "cidA\ncidB");
+        assert!(s.enabled_endings.is_empty());
+        assert_eq!(s.selected_ending, None);
     }
 
     // ---------- 波次 3 产出封顶：星级封顶 + 稀有预算（确定性可重放） ----------

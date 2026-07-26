@@ -48,6 +48,29 @@ use crate::error::ApiError;
 /// `gini_coefficient` / `rate`，不另立第二套。
 pub(crate) mod quality;
 
+/// **拍域谓词**（本模块所有「以拍为分母」的指标共用的一把尺，写死成一处避免各写各的漂移）。
+///
+/// 语义 = **真正演出来、并把事件落进 `world_events` 的拍**。三个条件缺一不可：
+/// - `status='done'` —— 排掉 failed / 还没跑完的 pending·running；
+/// - `cost_tokens > 0` —— 排掉一个模型都没调过的空转拍（`world_not_running` / `superseded` /
+///   `no_model_config` / `insufficient_members` / 终局短路），它们**根本没有回合**，
+///   把它们算作「没戏份」是噪声；
+/// - `error IS NULL` —— 排掉**跑了但没提交**的拍，当前只有一种：`blocked`
+///   （硬节点/不变量/底线拦下，`runtime::finish_tick_blocked`）。
+///
+/// 🔴 第三个条件是 #42 的连带项，**不是可选的**。在 #42 之前阻断拍被错记成 `cost_tokens=0`，
+/// 于是恰好被第二个条件挡在拍域之外；#42 把它改成记真实成本之后，若不补这一条，
+/// 一批「引擎跑了但一个事件都没落」的拍会突然涌进无戏份/申诉率的分母，
+/// 让「全员被晾着」的假信号随阻断率一起上涨——而阻断本身已有 `quality::blocked_ticks` 在专门盯。
+/// 换句话说：**成本口径与叙事口径必须在这里分家**，一个问"花了多少钱"，一个问"演出来没有"。
+///
+/// 用法：把 `world_ticks` **一律别名为 `wt`**，再把本谓词拼进 `WHERE`，如
+/// `format!("... FROM world_ticks wt WHERE {TICK_DOMAIN} AND wt.created_at >= ?")`。
+/// 列名带 `wt.` 前缀是必需的：`ooc_appeal_block` 里它跑在以 `world_members` 为外层的相关子查询中，
+/// 而 `world_members` 也有 `status` 列——不加前缀就靠 SQL 的作用域优先级"碰巧对"，两库一致性不值得赌。
+/// 只用可移植 SQL 子集（`db.rs`）：无方言函数、无 JSON 运算。
+const TICK_DOMAIN: &str = "wt.status = 'done' AND wt.cost_tokens > 0 AND wt.error IS NULL";
+
 // ============================================================================
 // §1 指标口径纯函数（从 `runtime::golden` 提升为生产代码；口径注释原样保留）
 // ============================================================================
@@ -195,7 +218,8 @@ pub(crate) async fn world_attention_gini(
 
 /// 读库算无戏份拍数（单世界全生命周期）。
 ///
-/// **拍域口径** = 真正跑了回合并计费的拍（`world_ticks.status='done' AND cost_tokens > 0`）。
+/// **拍域口径** = 真正演出来并落了事件的拍
+/// （`world_ticks.status='done' AND cost_tokens > 0 AND error IS NULL`，见 [`TICK_DOMAIN`]）。
 /// 终局短路拍 / `insufficient_members` 跳过拍根本没有回合，把它们算作「没戏份」是噪声。
 #[allow(dead_code)]
 pub(crate) async fn world_silent_streaks(
@@ -214,13 +238,11 @@ pub(crate) async fn world_silent_streaks(
         members.push(r.try_get::<String, _>("c")?);
     }
 
-    let rows = sqlx::query(
-        "SELECT tick_no FROM world_ticks WHERE world_id = ? AND status = 'done' AND cost_tokens > 0 \
-         ORDER BY tick_no ASC",
-    )
-    .bind(world_id)
-    .fetch_all(db)
-    .await?;
+    let sql = format!(
+        "SELECT wt.tick_no AS tick_no FROM world_ticks wt WHERE wt.world_id = ? AND {TICK_DOMAIN} \
+         ORDER BY wt.tick_no ASC"
+    );
+    let rows = sqlx::query(&sql).bind(world_id).fetch_all(db).await?;
     let mut ticks: Vec<i64> = Vec::with_capacity(rows.len());
     for r in &rows {
         ticks.push(r.try_get::<i64, _>("tick_no")?);
@@ -504,7 +526,7 @@ async fn attention_gini_block(db: &AnyPool, cfg: &SloConfig) -> Result<Value, Ap
 /// 角色最长连续无有效戏份拍数。
 ///
 /// **三条窗口内范围扫描**（拍域 / 成员 / 出场），Rust 侧按世界分组后套 `max_silent_streaks`：
-/// ① 拍域 = `world_ticks.status='done' AND cost_tokens>0`（真跑了回合的拍；跳过拍不是"没戏份"）；
+/// ① 拍域 = [`TICK_DOMAIN`]（真演出来的拍；空转跳过拍与阻断拍都不是"没戏份"）；
 /// ② 成员 = 拍域涉及世界的 `world_members` 全集（差集的被减数）；
 /// ③ 出场 = `event_type ∈ NARRATIVE_EVENT_TYPES` 的事件，`actors_json` **规范化解析**
 ///    （不用 `LIKE '%cid%'`：`li` 会被 `lixia` 蹭到戏份）。
@@ -518,9 +540,9 @@ async fn silent_streak_block(db: &AnyPool, cfg: &SloConfig) -> Result<Value, Api
 
     // ① 拍域。
     let sql = format!(
-        "SELECT world_id, tick_no FROM world_ticks \
-         WHERE status = 'done' AND cost_tokens > 0 AND created_at >= ? AND created_at < ? \
-         ORDER BY world_id ASC, tick_no ASC LIMIT {}",
+        "SELECT wt.world_id AS world_id, wt.tick_no AS tick_no FROM world_ticks wt \
+         WHERE {TICK_DOMAIN} AND wt.created_at >= ? AND wt.created_at < ? \
+         ORDER BY wt.world_id ASC, wt.tick_no ASC LIMIT {}",
         cap + 1
     );
     let tick_rows =
@@ -539,8 +561,8 @@ async fn silent_streak_block(db: &AnyPool, cfg: &SloConfig) -> Result<Value, Api
     // ② 成员全集（只取拍域涉及的世界，子查询与 ① 同条件，避免把全平台成员表拖进来）。
     let sql = format!(
         "SELECT world_id, cloud_character_id FROM world_members WHERE world_id IN ( \
-             SELECT world_id FROM world_ticks \
-             WHERE status = 'done' AND cost_tokens > 0 AND created_at >= ? AND created_at < ? \
+             SELECT wt.world_id FROM world_ticks wt \
+             WHERE {TICK_DOMAIN} AND wt.created_at >= ? AND wt.created_at < ? \
          ) ORDER BY world_id ASC, cloud_character_id ASC LIMIT {}",
         cap + 1
     );
@@ -835,8 +857,9 @@ async fn contradiction_block(db: &AnyPool, cfg: &SloConfig) -> Result<Value, Api
 /// （`interventions::dream_quota_per_stage` 上方注释）。本指标沿用同一口径，于是：
 ///
 /// - **分母** = 窗口内**真正演过戏的**世界里的「角色 × 世界(阶段)」对数。
-///   「演过戏」= 该世界在窗口内有 `world_ticks.status='done' AND cost_tokens > 0` 的拍
-///   （与 `world_silent_streaks` 的拍域口径一致：终局短路拍 / 跳过拍没有回合，不构成可申诉的对象）。
+///   「演过戏」= 该世界在窗口内有落在 [`TICK_DOMAIN`] 里的拍
+///   （与 `world_silent_streaks` 的拍域口径一致：终局短路拍 / 跳过拍没有回合，阻断拍跑了但什么也没演成，
+///   都不构成可申诉的对象）。
 ///   没演过戏的世界里没有可申诉的东西，把它们算进分母只会**稀释**申诉率，
 ///   让一个本该报警的数看起来很安全。
 ///   `world_members` 的行即「玩家角色 × 世界」（NPC 不入该表，与 `world_contributions` 不同，
@@ -884,14 +907,15 @@ async fn ooc_appeal_block(db: &AnyPool, cfg: &SloConfig) -> Result<Value, ApiErr
     }
 
     // 分母：窗口内真正演过戏的世界里的「角色 × 世界(阶段)」对。
-    let member_stages: i64 = sqlx::query(
+    let sql = format!(
         "SELECT CAST(COUNT(*) AS BIGINT) AS n FROM world_members wm \
          WHERE EXISTS ( \
              SELECT 1 FROM world_ticks wt WHERE wt.world_id = wm.world_id \
-               AND wt.status = 'done' AND wt.cost_tokens > 0 \
+               AND {TICK_DOMAIN} \
                AND wt.created_at >= ? AND wt.created_at < ? \
-         )",
-    )
+         )"
+    );
+    let member_stages: i64 = sqlx::query(&sql)
     .bind(cfg.window_start)
     .bind(cfg.window_end)
     .fetch_one(db)
@@ -899,7 +923,7 @@ async fn ooc_appeal_block(db: &AnyPool, cfg: &SloConfig) -> Result<Value, ApiErr
     .try_get("n")?;
 
     // 分子：窗口内申诉去重到 (world_id, character_id)，并施加与分母同样的两个 EXISTS。
-    let pairs_appealed: i64 = sqlx::query(
+    let sql = format!(
         "SELECT CAST(COUNT(*) AS BIGINT) AS n FROM ( \
              SELECT a.world_id, a.character_id FROM ooc_appeals a \
              WHERE a.created_at >= ? AND a.created_at < ? \
@@ -909,12 +933,13 @@ async fn ooc_appeal_block(db: &AnyPool, cfg: &SloConfig) -> Result<Value, ApiErr
                ) \
                AND EXISTS ( \
                    SELECT 1 FROM world_ticks wt WHERE wt.world_id = a.world_id \
-                     AND wt.status = 'done' AND wt.cost_tokens > 0 \
+                     AND {TICK_DOMAIN} \
                      AND wt.created_at >= ? AND wt.created_at < ? \
                ) \
              GROUP BY a.world_id, a.character_id \
-         ) t",
-    )
+         ) t"
+    );
+    let pairs_appealed: i64 = sqlx::query(&sql)
     .bind(cfg.window_start)
     .bind(cfg.window_end)
     .bind(cfg.window_start)
@@ -986,7 +1011,7 @@ async fn ooc_appeal_block(db: &AnyPool, cfg: &SloConfig) -> Result<Value, ApiErr
             "appealsTotal": appeals_total,
             "notes": [
                 "窗口内没有任何世界跑过计费拍 —— 分母为零样本，「没测过」不是「申诉率 0」。",
-                "分母口径 = 窗口内有 done 且 cost_tokens>0 的拍的世界 × 其 world_members 行。",
+                "分母口径 = 窗口内有 done 且 cost_tokens>0 且 error IS NULL 的拍的世界 × 其 world_members 行。",
             ],
         }));
     }
@@ -1008,7 +1033,7 @@ async fn ooc_appeal_block(db: &AnyPool, cfg: &SloConfig) -> Result<Value, ApiErr
         "compensationWhispersGranted": comp_grants,
         "notes": [
             "T1 门槛「OOC/裁决不公申诉 <10%/阶段」的直接实现；阶段口径 = 一个 world 实例（同托梦配额）。",
-            "分母 = 窗口内演过戏（done 且 cost_tokens>0）的世界 × 其 world_members 行（NPC 不入该表，无需取交集）。",
+            "分母 = 窗口内演过戏（done 且 cost_tokens>0 且 error IS NULL）的世界 × 其 world_members 行（NPC 不入该表，无需取交集）。",
             "分子 = 窗口内申诉按 (worldId, characterId) 去重后的对数 —— 同一角色对多拍申诉算一次「这个角色不满意」。",
             "分子施加与分母相同的两个 EXISTS 过滤，故 分子 ≤ 分母 恒成立，不会出现 >100% 的申诉率。",
             "🔴 申诉率 ≠ 坐实率：value 是「多少人不满」（T1 门槛盯的），confirmedRate 是「其中多少确实是模型的错」。",

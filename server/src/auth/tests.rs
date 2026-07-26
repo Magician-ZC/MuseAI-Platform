@@ -13,20 +13,10 @@ use crate::config::ServerConfig;
 
 /// 构建一个隔离的内存态 app（每个测试独立库）。返回 (router, state) 以便直接种数据。
 pub(crate) async fn build_app() -> (Router, AppState) {
-    use std::sync::Once;
-    static INIT: Once = Once::new();
-    INIT.call_once(sqlx::any::install_default_drivers);
-
-    let pool = sqlx::any::AnyPoolOptions::new()
-        .max_connections(1)
-        .min_connections(1) // 保活单个内存连接，避免 :memory: 库被回收
-        .connect("sqlite::memory:")
-        .await
-        .expect("connect sqlite memory");
-    sqlx::migrate!("./migrations").run(&pool).await.expect("run migrations");
+    let pool = crate::testkit::test_pool().await;
 
     let config = ServerConfig {
-        database_url: "sqlite::memory:".into(),
+        database_url: crate::testkit::test_database_url(),
         bind_addr: "127.0.0.1:0".into(),
         jwt_secret: "test-secret".into(),
         access_ttl_secs: 3600,

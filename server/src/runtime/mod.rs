@@ -10,6 +10,9 @@
 //!   **仅本 tick 实际喂入的干预 applied(Q-3)**/预算累计 → 广播增量(未过审事件不广播)。
 //! - CAS 冲突 = 终态化(C-2)，不再无限 re-enqueue；worker Err = 退避重试 + 上限终态化(C-9)。
 //! - dev 态：世界无模型配置 → tick 跳过并 warn，不 panic。
+//! - **成本记账只有一条判据：这一拍有没有调过模型**（#42）。调过 → 记实测 token（提交拍走
+//!   `commit_tick`，阻断拍走 `finish_tick_blocked`）；没调过 → `finish_tick_noop` 记 0。
+//!   「提交没提交」与「花没花钱」是两件独立的事，不可互相代替。
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1400,6 +1403,28 @@ fn brief_with_identity(name: &str, display: Option<&String>) -> String {
 
 // ---------- tick 收尾工具 ----------
 
+/// **空转拍**收尾：置 done + note，成本恒 0。
+///
+/// 🔴 恒 0 是**语义**不是省事，本函数只服务「一次模型都没调过」的拍。判据只有一条：
+/// 调用点是否在 `engine.run_round` / `run_event_step` **真正跑出模型调用之前**返回。
+/// 逐一对照（改动此表前请先确认调用点仍满足该判据）：
+///
+/// | note | 调用点 | 为什么 0 是对的 |
+/// |---|---|---|
+/// | `world_not_running` | 认领后第 3 步 | 世界不 running，直接返回，未构建引擎 |
+/// | `superseded` | 第 3 步陈旧门 | base_revision 不匹配即返回，未构建引擎 |
+/// | `budget_fused` | 第 4 步预算预检 / `fuse_and_pause` | 熔断在跑之前，未构建引擎 |
+/// | `no_model_config` | 第 5 步 | 连模型路由都没解析出来，不可能有调用 |
+/// | `insufficient_members` | 第 6 步门槛 | 成员不足即返回，未构建引擎 |
+/// | `terminal` | `run_event_step` 返回 `outcome: None` | 见下 |
+///
+/// `terminal` 这一条是唯一需要读引擎才能确认的：`run_event_step`（`narrative/mod.rs`）里
+/// `outcome: None` 只有两个出口——① 开头 `is_terminal(&state)` 命中；② `select_cohort` 空
+/// （`Starved`）。两者都在调用 `run_round` **之前** `return`，而 `is_terminal` / `select_cohort`
+/// 都是对 `NarrativeState` 的纯读函数，不碰 `host.model`。故这一拍确实一个 token 都没烧。
+///
+/// **反例在下面**：`blocked` 拍走 `finish_tick_blocked`，因为引擎已经跑完整个回合。
+/// 把两者混在同一个「noop」里，正是 #42 的成因。
 async fn finish_tick_noop(
     db: &AnyPool,
     world_id: &str,
@@ -1418,6 +1443,58 @@ async fn finish_tick_noop(
     .bind(tick_no)
     .execute(db)
     .await?;
+    Ok(())
+}
+
+/// **阻断拍**收尾：置 `done` + `error='blocked'`，并记**真实实测 token** + 累计进日预算。
+///
+/// 与 `finish_tick_noop` 的差别只有一处，但它是本函数存在的全部理由：**这一拍引擎跑完了**。
+/// 被内容安全闸 / 硬节点 / 不变量拦下的是**提交**，不是**计算**——导演、逐角色决策、仲裁、
+/// 可能的底线重生成全都已经发出去了，账单已经产生。把它记 0 会让成本**结构性**偏低：
+/// 越是被阻断多的世界（往往正是内容风险高、审核成本也高的那些）低估得越厉害，
+/// 于是 `docs/VALIDATION.md` 的 T3（ARPPU ≥ 3× 单用户月度模型成本）与 T5（审核成本 ≤ 生成
+/// 成本 5%、毛利为正）会**在最危险的地方最乐观**。
+///
+/// 口径与 `commit_tick` 逐字一致（同一个 `TokenMeter` 汇总 input+output，模型未回报 token 时
+/// 同样回退引擎预估），也与单人平行线（if 线）里那条 `commit_blocked` 一致——
+/// 三条跑引擎的路径记同一种成本，成本看板才可比。事实上平行线那边一开始就是对的，
+/// 是世界线这边落后了：`TokenMeter` 的 `pub(crate)` 注释要求的正是「成本口径全平台唯一」。
+///
+/// 两条 UPDATE 同事务：`world_ticks.cost_tokens`（看板/SLO 读）与
+/// `world_budgets.spent_tokens_today`（熔断读）绝不允许一个记上、另一个没记。
+/// 顺带修好熔断：在此之前，一个陷入连续 blocked 的世界可以无限烧 token 而日预算永远不涨，
+/// B-2 熔断器对它完全失效。
+async fn finish_tick_blocked(
+    db: &AnyPool,
+    world_id: &str,
+    tick_no: i64,
+    cost_tokens: u64,
+) -> Result<(), ApiError> {
+    let now = now_ms();
+    let cost = cost_tokens as i64;
+    let mut tx = db.begin().await?;
+    sqlx::query(
+        "UPDATE world_ticks SET status='done', cost_tokens=?, error='blocked', \
+         started_at=COALESCE(started_at, ?), finished_at=? WHERE world_id=? AND tick_no=?",
+    )
+    .bind(cost)
+    .bind(now)
+    .bind(now)
+    .bind(world_id)
+    .bind(tick_no)
+    .execute(&mut *tx)
+    .await?;
+    // 预算累计：与 commit_tick 的那条 UPDATE 逐字同形（含 budget_day 刷新），保证熔断口径唯一。
+    sqlx::query(
+        "UPDATE world_budgets SET spent_tokens_today = spent_tokens_today + ?, budget_day=?, updated_at=? WHERE world_id=?",
+    )
+    .bind(cost)
+    .bind(day_string(now))
+    .bind(now)
+    .bind(world_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -1583,12 +1660,27 @@ async fn key_character_exited(
     Ok(false)
 }
 
-/// 从装配层 `enabled_endings` 选定终局结局（P1 Phase 3）。装配 `weight_endings` 已保底至少启用一个结局并
-/// 按权重定序 → 取首个即最高权重结局（**确定性**，纯读实例钉住的 assembled_json，不发模型）。
-/// assembled_json 缺失 / 无 `enabledEndings` / 空池 → `None`（世界仍可停机，仅无结局产出与荣誉奖励）。
+/// 读回装配层**定盘**的终局结局（P1 Phase 3）。**确定性**：纯读实例钉住的 assembled_json，不发模型、
+/// 不掷点——掷点发生在装配层（`assembly::pick_ending`，`Rng(instance_seed ^ DOMAIN_ENDING)` 子流按权重抽），
+/// 结果随实例一次性钉死在 `/assembly/selectedEnding`。同模板同阵容的不同实例 world_id 不同 ⇒ 实例种子不同
+/// ⇒ 落到的结局不同（总规格 §5「一个模板，千个平行世界」）。
+///
+/// 回退口径（`selectedEnding` 缺失时取 `enabledEndings` 首个）只服务两类 assembled_json：
+/// ① 本次修复**之前**已钉住的老实例——它们的权重在运行期已不可复原，且**已钉住的实例不因一次代码
+///    变更改写结局**；② 测试/边角路径手写的最小包装。二者都不该走掷点。
+///
+/// assembled_json 缺失 / 两个键都无 / 空池 → `None`（世界仍可停机，仅无结局产出与荣誉奖励）。
 fn select_ending(world: &WorldRow) -> Option<String> {
     let raw = world.assembled_json.as_ref()?;
     let v: Value = serde_json::from_str(raw).ok()?;
+    let pinned = v
+        .pointer("/assembly/selectedEnding")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(id) = pinned {
+        return Some(id.to_string());
+    }
     v.pointer("/assembly/enabledEndings")
         .and_then(Value::as_array)
         .and_then(|arr| arr.iter().find_map(|e| e.as_str().map(str::to_string)))
@@ -1678,6 +1770,11 @@ async fn end_world_tx(
 /// 终局产出(finalize_ending_tx)」原子结算，提交后补生成终局日报（复用 reports::generate_report，
 /// 幂等 per world+character+day）。返回 Concluded（真正结算）或 Skipped("terminal")（已被并发结算，
 /// rows=0，幂等）。
+///
+/// `cost_tokens=0` 在这里是**对的**（判据同 `finish_tick_noop`）：两条路径都在模型调用之前返回——
+/// (a) `run_event_step` 的 `outcome==None` 出口在 `run_round` 之前 `return`；
+/// (b) 关键角色退场判定（6a.1）排在引擎构建之前，读的是 DB 里已提交的事实。
+/// 与之相对，`blocked` 拍已经跑完整个回合，走 `finish_tick_blocked` 记真实成本（#42）。
 async fn conclude_world_no_round(
     state: &AppState,
     world_id: &str,
@@ -2118,7 +2215,8 @@ async fn process_tick_inner(
 
     // 6a) 放置房终局策略（P1 Phase 0/3）：room_type + skeleton endgame（含 key_character_ids）。严格门
     //     room_type=='idle'（非 idle 房 enabled=false，终局逻辑全跳过）。装配层选定结局（enabled_endings 保底
-    //     ≥1，确定性取首个；非 idle / 未装配 → None）。供早期关键角色退场终局 + 终局短路 + commit_tick 复用。
+    //     ≥1，装配层按权重掷点定盘 selectedEnding，runtime 只读不掷点；非 idle / 未装配 → None）。
+    //     供早期关键角色退场终局 + 终局短路 + commit_tick 复用。
     let endgame_policy = load_endgame_policy(db, &world).await?;
     let selected_ending = if endgame_policy.enabled { select_ending(&world) } else { None };
 
@@ -2401,17 +2499,23 @@ async fn process_tick_inner(
         };
         match run_result {
             Ok((outcome, terminal)) => {
-                if let Some(reason) = &outcome.blocked {
-                    tracing::warn!(world_id, tick_no, reason = %reason, "tick blocked（硬节点/不变量不可满足），不提交状态");
-                    // 僵局账 +1 并记原因（B. stall hint）：streak ≥ 阈值时下一 tick 携带 stall_hint。
-                    // 「Blocked 不提交」不变量不动——仅在内存记账，不写任何状态。
-                    stall_tracker().record_blocked(world_id, reason);
-                    finish_tick_noop(db, world_id, tick_no, Some("blocked")).await?;
-                    return Ok(TickStatus::Skipped("blocked"));
-                }
                 // 实测 token（B-1）；模型未回报 token 时回退到引擎预估，保证预算仍累计。
+                // 🔴 必须算在 blocked 分支**之前**：阻断拍与提交拍烧的是同一批调用，
+                //    成本口径不能因为「这一拍提交没提交」而分叉（#42）。
                 let metered = meter.total_tokens();
                 let cost = if metered > 0 { metered } else { outcome.budget.spent_tokens };
+                if let Some(reason) = &outcome.blocked {
+                    tracing::warn!(
+                        world_id, tick_no, cost, reason = %reason,
+                        "tick blocked（硬节点/不变量不可满足），不提交状态但照记成本"
+                    );
+                    // 僵局账 +1 并记原因（B. stall hint）：streak ≥ 阈值时下一 tick 携带 stall_hint。
+                    // 「Blocked 不提交」不变量不动——**叙事状态**一个字节都不写；
+                    // 记的是账（tick 成本 + 日预算），不是状态。
+                    stall_tracker().record_blocked(world_id, reason);
+                    finish_tick_blocked(db, world_id, tick_no, cost).await?;
+                    return Ok(TickStatus::Skipped("blocked"));
+                }
                 let status = commit_tick(
                     state,
                     world_id,

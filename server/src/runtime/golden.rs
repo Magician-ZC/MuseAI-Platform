@@ -856,6 +856,27 @@ async fn golden_world_reaches_natural_ending_and_settles() {
     assert!(!is_forced_conclusion(&reason), "自然收尾不计入强制收尾率");
     assert!(!ending.is_empty() && ending != "none", "装配层应确定性选出一个结局：{ending}");
 
+    // 结局定盘链路（任务 #41）：终局落定的结局 = 装配层 `selectedEnding`（`DOMAIN_ENDING` 子流按权重
+    // 掷点），且必须落在 `enabledEndings` 之内 —— 掷点不得选出未启用的结局。不钉具体 id：钉了就等于
+    // 把「掷点结果」写死成常量，换种子/换阵容都得改测试，反而掩盖分布变化。
+    let assembled: Value = serde_json::from_str(
+        &load_world(&state.db, WORLD_MAIN).await.unwrap().assembled_json.expect("黄金世界必有装配产物"),
+    )
+    .unwrap();
+    let enabled: Vec<String> = assembled
+        .pointer("/assembly/enabledEndings")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    let selected = assembled
+        .pointer("/assembly/selectedEnding")
+        .and_then(Value::as_str)
+        .expect("装配层必须钉住 selectedEnding")
+        .to_string();
+    assert!(enabled.len() >= 2, "黄金骨架结局池应有多于一个候选，否则这条断言观察不到「有得选」：{enabled:?}");
+    assert!(enabled.contains(&selected), "掷点只能在已启用结局中选：selected={selected} enabled={enabled:?}");
+    assert_eq!(ending, selected, "终局落定的结局 = 装配层定盘的结局（runtime 只读不掷点）");
+
     // 里程碑确实被推过阈值（不是靠时间上限蒙混过关）。
     let st = narrative_state_of(&state.db, WORLD_MAIN).await;
     let m1 = st.narrative.outline_nodes.iter().find(|n| n.id == "m1").expect("m1 应随冷启动种子入状态");

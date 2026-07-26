@@ -17,7 +17,6 @@ use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
-use sqlx::any::AnyPoolOptions;
 use sqlx::AnyPool;
 use tower::ServiceExt;
 
@@ -36,11 +35,9 @@ use super::{microworld, presets, OnboardingSwitch};
 
 // ---------- 脚手架 ----------
 
-static INIT: std::sync::Once = std::sync::Once::new();
-
 fn test_config() -> ServerConfig {
     ServerConfig {
-        database_url: "sqlite::memory:".into(),
+        database_url: crate::testkit::test_database_url(),
         bind_addr: "127.0.0.1:0".into(),
         jwt_secret: "test-secret".into(),
         access_ttl_secs: 3600,
@@ -51,10 +48,7 @@ fn test_config() -> ServerConfig {
 }
 
 async fn test_state() -> AppState {
-    INIT.call_once(sqlx::any::install_default_drivers);
-    let pool = AnyPoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
-    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-    AppState::new(pool, test_config())
+    AppState::new(crate::testkit::test_pool().await, test_config())
 }
 
 fn token(state: &AppState, user_id: &str) -> String {

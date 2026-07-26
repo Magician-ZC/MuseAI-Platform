@@ -1,20 +1,13 @@
-//! 测试脚手架（仅 test 构建）：内存库 + 播种助手，供 S3 各模块集成测试复用。
-//! 注意：`sqlite::memory:` 每连接一个独立库，故 max_connections(1) 保证全程共享同一内存库。
+//! 测试脚手架（仅 test 构建）：空库 + 播种助手，供 S3 各模块集成测试复用。
+//! 建池统一走 `crate::testkit`（默认 `sqlite::memory:`，`MUSE_TEST_DATABASE_URL` 可切 PG）。
 
-use sqlx::any::AnyPoolOptions;
 use sqlx::AnyPool;
 
 use crate::app::AppState;
 use crate::config::ServerConfig;
 
 pub async fn test_state() -> AppState {
-    sqlx::any::install_default_drivers();
-    let pool = AnyPoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("connect memory sqlite");
-    sqlx::migrate!("./migrations").run(&pool).await.expect("migrate");
+    let pool = crate::testkit::test_pool().await;
     let cfg = ServerConfig::from_env();
     AppState::new(pool, cfg)
 }

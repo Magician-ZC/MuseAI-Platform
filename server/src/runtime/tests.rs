@@ -8,7 +8,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::json;
-use sqlx::any::AnyPoolOptions;
 use sqlx::{AnyPool, Row};
 
 use crate::app::AppState;
@@ -54,11 +53,9 @@ impl ModelClient for MockModel {
 
 // ---------- 脚手架 ----------
 
-static INIT: std::sync::Once = std::sync::Once::new();
-
 fn test_config() -> ServerConfig {
     ServerConfig {
-        database_url: "sqlite::memory:".into(),
+        database_url: crate::testkit::test_database_url(),
         bind_addr: "127.0.0.1:0".into(),
         jwt_secret: "test-secret".into(),
         access_ttl_secs: 3600,
@@ -72,10 +69,7 @@ fn test_config() -> ServerConfig {
 }
 
 pub(super) async fn test_state() -> AppState {
-    INIT.call_once(|| sqlx::any::install_default_drivers());
-    let pool = AnyPoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
-    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-    AppState::new(pool, test_config())
+    AppState::new(crate::testkit::test_pool().await, test_config())
 }
 
 fn sample_card_json(id: &str, name: &str) -> String {
@@ -1225,11 +1219,27 @@ async fn non_idle_world_ignores_endgame() {
 
 // ---------- P1 Phase 3：关键角色退场 + 终局产出（select_ending / 荣誉奖励红线） ----------
 
-/// 钉住实例装配层 enabled_endings（select_ending 的读取源）。最小 assembled_json 包装（其余段缺省，
-/// runtime 读均为 guarded pointer，缺失即退化）。
+/// 钉住实例装配层 enabled_endings，**不写 selectedEnding** —— 即修复（任务 #41）之前钉住的老实例
+/// 形态，`select_ending` 对它们走**回退口径**（取名单首个）。最小 assembled_json 包装（其余段缺省，
+/// runtime 读均为 guarded pointer，缺失即退化）。新实例的正路见 `set_pinned_ending`。
 async fn set_enabled_endings(db: &AnyPool, wid: &str, endings: &[&str]) {
     let assembled = json!({
         "assembly": { "enabledEndings": endings },
+        "chapterState": {},
+    });
+    sqlx::query("UPDATE worlds SET assembled_json=? WHERE id=?")
+        .bind(assembled.to_string())
+        .bind(wid)
+        .execute(db)
+        .await
+        .unwrap();
+}
+
+/// 钉住装配层**定盘**结局（任务 #41 后的正路形态）：`selectedEnding` = 装配层按权重掷点的结果，
+/// `enabledEndings` = 台上有哪些。故意让二者首项不同，才能验出 runtime 读的是前者而非后者。
+async fn set_pinned_ending(db: &AnyPool, wid: &str, selected: &str, enabled: &[&str]) {
+    let assembled = json!({
+        "assembly": { "enabledEndings": enabled, "selectedEnding": selected },
         "chapterState": {},
     });
     sqlx::query("UPDATE worlds SET assembled_json=? WHERE id=?")
@@ -1357,7 +1367,8 @@ async fn idle_world_concludes_on_full_mainline_with_ending_report() {
     let reports = i64_one(&state.db, "SELECT COUNT(*) FROM daily_reports WHERE world_id=?", &wid).await;
     assert!(reports >= 1, "全里程碑 Done 的终局 tick 应产出终局日报");
 
-    // 终局产出：审计留痕 + select_ending 取 enabled_endings 首个（golden_reunion）落成每成员一枚荣誉。
+    // 终局产出：审计留痕 + select_ending 落成每成员一枚荣誉。本例 assembled_json 无 selectedEnding
+    //（老实例形态）→ 走回退口径取名单首个（golden_reunion）；定盘口径另见 ending_reward_uses_pinned_selected_ending。
     let audits =
         i64_one(&state.db, "SELECT COUNT(*) FROM audit_logs WHERE action='world.ended' AND subject=?", &wid)
             .await;
@@ -1368,7 +1379,7 @@ async fn idle_world_concludes_on_full_mainline_with_ending_report() {
         &wid,
     )
     .await;
-    assert_eq!(ending_rewards, 2, "select_ending 取首个结局 → 每成员一枚终局荣誉");
+    assert_eq!(ending_rewards, 2, "select_ending 回退口径取名单首个 → 每成员一枚终局荣誉");
 }
 
 /// 终局奖励红线（§2.5）：终局若发奖，只入 arena_rewards 荣誉旁路——荣誉非战力、无买判定、幂等只发一次。
@@ -1425,6 +1436,50 @@ async fn ending_reward_respects_arena_redline() {
     );
     let after = i64_one(&state.db, "SELECT COUNT(*) FROM arena_rewards WHERE world_id=?", &wid).await;
     assert_eq!(after, 2, "遗留 tick 不重复发奖（幂等）");
+}
+
+/// 任务 #41：runtime 读的是装配层**定盘**的 `selectedEnding`，不是 `enabledEndings` 首个。
+/// 故意把定盘结局放在名单**末位** —— 旧行为会发 `first_listed` 的荣誉，新行为发 `pinned_by_dice`。
+/// 掷点本身在装配层（有 `assembly::sampling_tests` 专项守），这里只锁 runtime 侧的读取口径。
+#[tokio::test]
+async fn ending_reward_uses_pinned_selected_ending() {
+    let state = test_state().await;
+    seed_template_with_endgame(
+        &state.db,
+        "tpl-pin",
+        "idle",
+        json!([{ "id": "n1", "summary": "寒暄", "constraint": "soft" }]),
+        json!({ "minWorldTicks": 0, "maxWorldTicks": 1 }), // 到时间上限即终局，快速收敛
+    )
+    .await;
+    let wid = running_world_for_endgame(&state, "pin", "tpl-pin", "event", "idle").await;
+    set_pinned_ending(&state.db, &wid, "pinned_by_dice", &["first_listed", "pinned_by_dice"]).await;
+    let model: Arc<dyn ModelClient> = Arc::new(MockModel { input_tokens: 10, output_tokens: 20 });
+
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 0, model.clone()).await.unwrap(), TickStatus::Done);
+    insert_tick(&state.db, &wid, 1, 1).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 1, model.clone()).await.unwrap(), TickStatus::Concluded);
+
+    let labels: Vec<(String,)> = sqlx::query_as("SELECT label FROM arena_rewards WHERE world_id=?")
+        .bind(&wid)
+        .fetch_all(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(labels.len(), 2, "两名成员各获一枚终局荣誉");
+    for (label,) in &labels {
+        assert_eq!(label, "pinned_by_dice", "荣誉 label = 装配层定盘结局（非名单首个）");
+    }
+
+    // 终局审计的 reason 串里也带定盘结局（运营侧看到的同样是定盘那个）。
+    let reason = text_one(
+        &state.db,
+        "SELECT reason FROM audit_logs WHERE action='world.ended' AND subject=?",
+        &wid,
+    )
+    .await;
+    assert!(reason.contains("pinned_by_dice"), "终局审计应记录定盘结局：{reason}");
+    assert!(!reason.contains("first_listed"), "审计不应记录名单首个：{reason}");
 }
 
 /// 文档样例自检：放置房软主线示例 skeleton（6 里程碑 + advanceWhen + endgame keyCharacterIds）能被

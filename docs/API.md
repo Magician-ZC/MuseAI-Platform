@@ -640,6 +640,10 @@ if 线：   从终局那一拍岔出去的、只属于你的一条平行线   �
 | GET | `/api/admin/world-templates?sagaId=` | operator, reviewer | 模板列表。带 `sagaId` 时切换为**阶段列表**语义：只返回该世界系列，按 `stage_no` 升序（剧情顺序）且不分页 |
 | POST | `/api/admin/world-templates` | operator | 建模板。可选 `sagaId` + `stageNo`（总规格 §3 Saga 归组），二者必须成对，`stageNo` ∈ 1-999；都不传 = 独立模板 |
 | POST | `/api/admin/world-templates/{id}/star` | operator | 星级 curation（**3-5★ 唯一晋升路径**） |
+| GET | `/api/admin/sagas` | operator | 人工校准：阶段切分总览（每系列的阶段数 / 缺号 / 重号 / 未编号 / 审核态 / 星级跨度 / 世界数）。见下方「人工校准面」 |
+| GET | `/api/admin/sagas/{sagaId}` | operator | 人工校准：单系列逐阶段结构（按 `stage_no` 升序 = 剧情顺序）+ 每阶段骨架形状指标。系列不存在 → 404 |
+| GET | `/api/admin/identity-pools` | operator | 人工校准：声明了 `identityPool` 的模板目录（未声明者不列出） |
+| GET | `/api/admin/world-templates/{id}/identity-pool?limit=` | operator | 人工校准：身份池声明 + 实际分配分布（`limit` 为扫描世界数，默认 100，clamp [1,500]） |
 | GET | `/api/admin/economy/overview` | finance | 经济只读聚合 |
 | GET | `/api/admin/ledger/reconcile` | finance | 全账复式恒等 SUM=0 + 物化余额对账（只读，无提现） |
 | GET | `/api/admin/metrics/overview?costDays=` | operator, finance | 数据看板。含 `cost` 对象：`today`（今日 token/分/元）、`trend[]`（近 N 日，默认 7，clamp [1,60]，每项另含 `offPeakTokens`）、`byWorld[]`（每局 Top10 含 `tokensPerPlayer`）、`total`、`centsPer1kTokens`、**`offPeak`**（错峰调度仪表：占比 / 估算折让 / 延后时长 / 档位分桶，字段与单位见 §3「错峰调度」小节）。**每玩家成本口径为人均等分**（`world_ticks` 是整拍口径、无 per-member 分解），局限见响应 `notes` |
@@ -659,6 +663,46 @@ if 线：   从终局那一拍岔出去的、只属于你的一条平行线   �
 | GET | `/api/admin/risk-events` | operator, reviewer, support | 风控事件 |
 | GET | `/api/admin/data-requests` | support | 数据主体请求 |
 | POST | `/api/admin/data-requests/{id}/run` | support | 执行数据请求 |
+
+### 人工校准面（无迁移；总规格 §79/§83「人工校准 → 仿真试跑 → 世界质量回归」的第一环）
+
+四个端点读的都是**已有数据**（`world_templates.saga_id`/`stage_no` 来自迁移 0024，
+身份分配来自 `worlds.assembled_json` 的 `/assembly/identityAssignments`），**不新增迁移、不新增列**。
+实现在 `server/src/admin_api/calibration.rs`；后台页面在 `admin/src/pages/Calibration.tsx`
+（世界运营 → 更多模块 → 人工校准，或 `/worlds?view=calibration`）。
+
+🔴 **本期只做阶段切分与身份池两维，不含境界档**：境界档在 `assembly::Skeleton` 里没有任何字段落点
+（`identity_pool` 有、`payout_table` 有、境界档没有），补 schema 会改动装配产物与黄金世界快照字节，
+属独立评审项。
+
+🔴 **四个端点全只读，只可视化、不可编辑**：无写入、无副作用、不落 `audit_logs`（没改数据，
+写审计只会制造噪声），因此**不挂运营开关**（同 dashboards：VALIDATION §0.1 约束的是写入面）。
+每个响应恒带 `editable: false` + `editPath`（说明唯一写入路径仍是 `POST /api/admin/world-templates`），
+后台页面把这两个字段直接渲染出来，而不是自己写死「只读」二字。
+
+| 字段 | 口径 |
+|---|---|
+| `missingStageNos` | 缺号，口径为 `1..=maxStageNo` 内没有模板的阶段号——**从 1 起算**，故「缺开篇」也会被报出来。超过 50 个即截断并置 `missingStageNosTruncated` |
+| `duplicateStageNos` / `unnumberedTemplateCount` | 同一 `stage_no` 挂了多个模板 / `saga_id` 非空却 `stage_no ≤ 0`（建模板端点拦得住，直写库与历史数据拦不住） |
+| `contiguous` | 无缺号 ∧ 无重号 ∧ 无未编号。**只说明阶段坐标齐整，不代表内容质量合格** |
+| `shape.parsed` | `false` = 该模板 `skeleton_json` 不是合法 JSON，此时各形状指标**字段缺席**（不是 0）——「骨架坏了」与「骨架里真的一个主线节点都没有」是两件事 |
+| `fillRatio` | **0..1 小数**（渲染须 ×100）。分母 = `quota × worldsWithAssignments`（只算真的参与过分配的世界）。分母为 0 → `null`，显示 `—`，**不得当 0% 读** |
+| `gini` | 声明池内各身份**原始分配人次**的集中度（复用 `slo::gini_coefficient`，与叙事注意力基尼同一实现）。**未按 quota 归一化**，配额不等的池须配合 `fillRatio` 一起读。身份 < 2 或一次分配都没发生 → `null` |
+| `activeMembersWithoutIdentity` | 在场却没有站位的角色数，**含「装配之后才入场」的成员**——他们本就不在那次分配的名单里，不是分配失败 |
+| `unknownIdentityIds` | 分配里出现、当前池里查不到的身份 id = 老实例钉着模板已删除的身份；叙事层对这些角色退化为只显示名字 |
+| `truncated` / `worldsTruncated` | 扫描达上限。阶段总览截断时，**末尾那个可能被切断的系列已整组丢弃**（半个系列的连续性诊断是错的） |
+
+🔴 **身份池的真实效力（响应的 `effect` 段原样下发，后台必须显式渲染，不得只画分布图）**：
+
+| 层 | 状态（§0.3 七档） | 事实 |
+|---|---|---|
+| 分配层 `assignmentLayer` | `Implemented` | `assembly::assign_identities`（内核匹配 + `DOMAIN_IDENTITY` 种子），结果钉进 `assembled_json` |
+| 叙事感知层 `narrativeLayer` | `Implemented` | `runtime::load_identity_display_names` 读回 → 他人 brief `唐三（户部主事）` + 本人 `self_identities` 进引擎上下文 |
+| 数值层 `numericLayer` | `NeverByDesign` | 平权红线：不改判定 / 不改发奖 / 不开权限 / 不调难度 / 不改准入 |
+| 校准闭环 `calibrationLoop` | `Missing` | **全仓没有任何指标度量「身份池调整 → 戏份分布变化」**（SLO 的叙事注意力基尼按 `character_id` 聚合，与身份 id 无关） |
+
+因此本页能回答「分配结果长什么样、是否失衡」，**不能**回答「这样分配是不是更好」——
+后者要先把身份维接进 `slo/`，属独立工作。
 
 ### 运行时开关（flags，migration 0036；VALIDATION.md §0.1 的 R1 补齐项）
 

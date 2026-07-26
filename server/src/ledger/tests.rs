@@ -2,22 +2,16 @@
 //! 覆盖资金红线：SUM(postings)==0 硬约束；账户余额 == SUM(postings)；user_wallet == billing_balances 恒等；
 //! 余额不足拒付零副作用；分成拆分 + 取整余数归平台；自打赏归零；未成年 owner 分成挂平台；免费 no-op。
 
-use sqlx::any::AnyPoolOptions;
 use sqlx::AnyPool;
 
 use super::{charge, post_journal, AccountRef, Posting};
 use crate::db::now_ms;
 use crate::error::ApiError;
 
-static INIT: std::sync::Once = std::sync::Once::new();
-
 // ---------- 脚手架 ----------
 
 async fn test_pool() -> AnyPool {
-    INIT.call_once(sqlx::any::install_default_drivers);
-    let pool = AnyPoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
-    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-    pool
+    crate::testkit::test_pool().await
 }
 
 /// 造用户（age_declared：0 未声明 / 1 成年 / 2 未成年）。

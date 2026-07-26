@@ -22,6 +22,7 @@ import { useLocation, useNavigate } from 'react-router-dom';
 import { adminFetch, AdminApiError } from '../api';
 import { ErrorAlert, formatNumber, formatTime, friendlyError, ReasonModal, usePagedList } from '../components/shared';
 import WorldsMonitorConsole from './WorldsMonitorConsole';
+import Calibration from './Calibration';
 
 // ---------------- 类型 ----------------
 
@@ -750,11 +751,19 @@ function Templates() {
 
 // ================= 主页面 =================
 
+/** 世界运营下的低频子视图（设计文档 §3「更多模块：世界模板及低频管理入口」）。 */
+type WorldsView = 'monitor' | 'templates' | 'calibration';
+
+function parseView(search: string): WorldsView {
+  const v = new URLSearchParams(search).get('view');
+  return v === 'templates' || v === 'calibration' ? v : 'monitor';
+}
+
 export default function WorldsOps() {
   const location = useLocation();
   const navigate = useNavigate();
-  const requestedView = new URLSearchParams(location.search).get('view') === 'templates' ? 'templates' : 'monitor';
-  const [activeView, setActiveView] = useState<'monitor' | 'templates'>(requestedView);
+  const requestedView = parseView(location.search);
+  const [activeView, setActiveView] = useState<WorldsView>(requestedView);
 
   useEffect(() => setActiveView(requestedView), [requestedView]);
 
@@ -762,21 +771,41 @@ export default function WorldsOps() {
     return <WorldsMonitorConsole />;
   }
 
-  const backToMonitor = () => {
+  /** 切换子视图（`view` 为空即回监控页），其余 query（如 design=preview）原样保留。 */
+  const goView = (view: WorldsView) => {
     const query = new URLSearchParams(location.search);
-    query.delete('view');
+    if (view === 'monitor') query.delete('view');
+    else query.set('view', view);
     const suffix = query.toString();
     navigate(`/worlds${suffix ? `?${suffix}` : ''}`);
-    setActiveView('monitor');
+    setActiveView(view);
   };
 
   return (
-    <div style={{ padding: 24 }}>
-      <Space style={{ marginBottom: 16 }}>
-        <Button onClick={backToMonitor}>返回世界监控</Button>
-        <Typography.Title level={4} style={{ margin: 0 }}>世界模板</Typography.Title>
+    <div style={{ padding: activeView === 'calibration' ? 0 : 24 }}>
+      <Space style={{ margin: activeView === 'calibration' ? '24px 24px 0' : '0 0 16px' }} wrap>
+        <Button onClick={() => goView('monitor')}>返回世界监控</Button>
+        <Button
+          type={activeView === 'templates' ? 'primary' : 'default'}
+          onClick={() => goView('templates')}
+        >
+          世界模板
+        </Button>
+        <Button
+          type={activeView === 'calibration' ? 'primary' : 'default'}
+          onClick={() => goView('calibration')}
+        >
+          人工校准
+        </Button>
       </Space>
-      <Templates />
+      {activeView === 'calibration' ? (
+        <Calibration />
+      ) : (
+        <>
+          <Typography.Title level={4} style={{ margin: '0 0 16px' }}>世界模板</Typography.Title>
+          <Templates />
+        </>
+      )}
     </div>
   );
 }

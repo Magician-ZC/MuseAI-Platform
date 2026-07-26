@@ -63,6 +63,10 @@ mod social;
 // R2 副本卡（总规格 §10【拍板 1、6、7、11、17】）：结算产出的剧情结晶 + 同星合成回收口。
 // 默认关闭的运营开关 `MUSE_SUBPLOT_CARDS`；零 RNG（查公示产出表）、无任何交易/转让路径、永不加战力。
 mod subplot;
+// 全局测试建池 helper（只在 test 构建里存在）：`MUSE_TEST_DATABASE_URL` 决定这遍跑 SQLite
+// 还是 Postgres，默认 `sqlite::memory:`。见 `testkit.rs` 头注释。
+#[cfg(test)]
+mod testkit;
 mod worlds;
 
 #[cfg(feature = "arena")]

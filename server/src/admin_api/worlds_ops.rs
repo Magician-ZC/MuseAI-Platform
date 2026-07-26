@@ -13,8 +13,9 @@ use crate::auth::{AdminUser, AuthUser};
 use crate::db::{new_id, now_ms};
 use crate::error::ApiError;
 use crate::worlds::{
-    create_world as create_world_inner, deathmatch_enabled, is_valid_lethality, load_world,
-    upload_cover, CoverReq, CreateWorldParams, LETHALITY_DEATHMATCH,
+    create_world as create_world_inner, deathmatch_enabled, enroll_series, is_valid_lethality,
+    load_world, series_autoscale_enabled, series_max_instances_cap, upload_cover, CoverReq,
+    CreateWorldParams, LETHALITY_DEATHMATCH,
 };
 
 use super::dashboards::{cents_to_cny, tokens_to_cents, utc_day_start_ms, DAY_MS};
@@ -333,6 +334,29 @@ pub(super) async fn diagnostics(
         }));
     }
 
+    // 世界系列（§5 自动扩容）：这是第几号 / 队列多长 / 生效上限多少 / 急停阀开着吗。
+    // **不受 env 开关门控**（见 `worlds::series_admin_view`）：关阀时运营更需要看得见这条队列。
+    // 未登记进任何系列 → null（绝大多数世界，含全部玩家自建房）。
+    let series_json = crate::worlds::series_admin_view(&state.db, &id).await?.unwrap_or(Value::Null);
+
+    // BE 结局传记（§9）：崩塌世界的封卷是否已产出。只回**元信息**，正文另走玩家读取面
+    // `GET /worlds/{id}/biography`——诊断视图是脱敏面，不在这里塞叙事汇总。
+    let biography_json = match sqlx::query(
+        "SELECT kind, terminal_reason, ending_id, sealed_at FROM world_biographies WHERE world_id = ?",
+    )
+    .bind(&id)
+    .fetch_optional(&state.db)
+    .await?
+    {
+        Some(b) => json!({
+            "kind": b.try_get::<String, _>("kind")?,
+            "terminalReason": b.try_get::<String, _>("terminal_reason")?,
+            "endingId": b.try_get::<String, _>("ending_id")?,
+            "sealedAt": b.try_get::<i64, _>("sealed_at")?,
+        }),
+        None => Value::Null,
+    };
+
     Ok(Json(json!({
         "world": {
             "id": world.id,
@@ -353,6 +377,8 @@ pub(super) async fn diagnostics(
         },
         "ticks": ticks,
         "budget": budget_json,
+        "series": series_json,
+        "beBiography": biography_json,
         "riskEventCounts": risk_counts,
         "eventStats": { "total": ev_total, "byModeration": ev_by_moderation },
         "redactionNote": "诊断视图脱敏：不含私密叙事/投影内容；查看必要内容需另行授权（§10）。",
@@ -446,6 +472,24 @@ pub(super) struct CreateWorldReq {
     /// 未过审不回传 URL，全部由那一个函数负责，此处不复制任何一条。
     #[serde(default)]
     cover: Option<CoverReq>,
+    /// 世界系列自动扩容（总规格 §5「世界系列自动扩容【新增】」）。
+    ///
+    /// 带上本段 = 把这个新世界登记为**系列的 1 号实例**：此后它满员时，服务端会按**它的建房参数**
+    /// 自动开 2 号、3 号……直到上限。不带 = 普通世界，永不扩容（默认，行为与本字段落地前一致）。
+    ///
+    /// 🔴 这是「未验证功能默认关闭」的**数据侧那一层**（VALIDATION.md §0.1）：
+    /// 打开 env 总开关并不会让全站满员世界都开始扩容，只有**在这里显式登记过**的世界才会。
+    #[serde(default)]
+    series: Option<SeriesReq>,
+}
+
+/// 建房时的系列登记入参。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct SeriesReq {
+    /// 该系列最多开到几号（**含 1 号**）。§0.2 参数化：逐系列可设，不写死在代码里。
+    /// 另有全局硬顶 env `MUSE_WORLD_SERIES_MAX_INSTANCES`（默认 10），生效上限取二者较小值。
+    max_instances: i64,
 }
 
 fn default_template_version() -> i64 {
@@ -551,6 +595,30 @@ pub(super) async fn create_world(
             "赛事房（arena）必须指定 hostUserId（平台指派主播）".into(),
         ));
     }
+    // 🔴 系列登记的**前门校验**（未验证功能默认关闭，VALIDATION.md §0.1）：
+    // 开关未开时连"登记"都不允许——否则会攒下一堆一开阀就同时开始扩容的世界。
+    // 读取侧另有一道降级（`worlds::ensure_next_series_instance` 第一行：关阀即停扩容），
+    // 两道都在，开关才是真的急停阀（口径与生死状档逐字一致）。
+    let series_req = match &req.series {
+        None => None,
+        Some(s) => {
+            if !series_autoscale_enabled() {
+                return Err(ApiError::BadRequest(
+                    "世界系列自动扩容尚未开启：该能力属未验证功能，需运营先显式打开开关（MUSE_WORLD_SERIES_AUTOSCALE）后方可登记系列"
+                        .into(),
+                ));
+            }
+            let cap = series_max_instances_cap();
+            if !(1..=cap).contains(&s.max_instances) {
+                return Err(ApiError::BadRequest(format!(
+                    "series.maxInstances 非法：须在 1-{cap} 之间（上界为全局硬顶 MUSE_WORLD_SERIES_MAX_INSTANCES）"
+                )));
+            }
+            Some(s.max_instances)
+        }
+    };
+    // 系列登记需要模板 id，而 p 随后被 create_world_inner 消耗，故先留一份。
+    let series_template_id = p.template_id.clone();
     // 建房留痕带上契约档：生死场是高风险配置，"谁在什么时候把哪个世界建成生死场"必须可溯。
     let host_note = match &p.host_user_id {
         Some(h) => format!("official world, host={h}, lethality={}", p.lethality),
@@ -561,6 +629,18 @@ pub(super) async fn create_world(
     let world_id = create_world_inner(&state.db, p).await?;
 
     let mut out = json!({ "worldId": &world_id, "lethality": lethality });
+
+    // 系列登记（§5）：把新世界登记为 1 号实例。**幂等**（同一世界重复登记命中既有系列，不新建）。
+    // 位置在建房之后：系列的参数复制源是这个已落库的世界行本身。
+    let mut series_note = String::new();
+    if let Some(max_instances) = series_req {
+        let series_id =
+            enroll_series(&state.db, &world_id, &series_template_id, max_instances).await?;
+        out["seriesId"] = json!(&series_id);
+        out["seriesInstanceNo"] = json!(1);
+        out["seriesMaxInstances"] = json!(max_instances);
+        series_note = format!(", series={series_id}(maxInstances={max_instances})");
+    }
     // 封面（可选）：**世界已落库**，故封面环节一律不把整个请求判失败——
     // 建房已写 worlds + world_budgets 且不可回滚，若此处返回 4xx，运营多半会重试建房，
     // 结果是留下一个又一个无人认领的重复世界（比"房建好了但图没上"糟得多）。
@@ -593,7 +673,14 @@ pub(super) async fn create_world(
             }
         }
     }
-    audit(&state.db, &admin.0, "world.create", &world_id, &format!("{host_note}{cover_note}")).await?;
+    audit(
+        &state.db,
+        &admin.0,
+        "world.create",
+        &world_id,
+        &format!("{host_note}{cover_note}{series_note}"),
+    )
+    .await?;
     Ok(Json(out))
 }
 

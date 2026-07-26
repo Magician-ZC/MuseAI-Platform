@@ -510,8 +510,458 @@ pub(crate) async fn settle_idle_world_ending_tx(
 
     // ③ 世界线层：里程碑推动者按贡献分查公示产出表确定发放（崩塌归零）。
     settle_worldline_with_ctx_tx(tx, world_id, participants, collapsed, &ctx).await?;
+
+    // 崩塌 → 封卷出一份「BE 结局传记」（§9「坏结局也是内容，封卷收藏」）。与结算同事务：
+    // 结算回滚则传记同滚，绝不出现"奖罚没落地但墓志铭已刻好"。正常终局不产出（有输才有痛）。
+    seal_be_biography_tx(tx, world_id, collapsed, &ctx).await?;
     Ok(())
 }
+
+// ===== BE-BIOGRAPHY-READONLY-REGION-BEGIN =====
+//
+// ============ BE 结局传记（总规格 §9「世界线崩塌」）：**只读汇总区** ============
+//
+// 规格原文：世界线崩塌（关键 NPC 退场等终局条件）→ ③归零 + ①减半 + ②已锁定保留 +
+// 产出「BE 结局传记」（坏结局也是内容，封卷收藏）+ 崩塌责任仲裁公开可溯。
+// **有输、有痛、有纪念、无冤案、无武器化。**
+//
+// 本区只做**内容产出侧**：把"世界崩了"这件事变成一件可收藏的东西。奖罚折算（①减半 ③归零
+// ②保留）早在上面的 `settle_*` 里完成了，本区一个数值都不改。
+//
+// ── 🔴 三条硬约束（改本区前先读完） ────────────────────────────────────────
+//
+// ① **公共事实不可回滚（§0.3）：传记是只读汇总。**
+//    本区对 `worlds` / `world_events` / `world_ticks` / `world_contributions` / `world_members`
+//    **只有 SELECT**，唯一的写入是往 `world_biographies` INSERT 一行 + 一条 audit_logs 留痕。
+//    由两道断言守死：源码级（`be_biography_region_is_read_only`，扫本区文本里的 UPDATE/DELETE）
+//    + 运行时级（`be_biography_never_mutates_worldline`，封卷前后五张表全量快照逐字节相等）。
+//
+// ② **无冤案：崩塌原因不许模型现编。**
+//    崩塌原因的唯一来源是两处**既有确定性数据**：`runtime::terminal_reason()` 产的 reason 串，
+//    与它写进 `audit_logs(action='world.ended')` 的那一行（格式 `{reason}|ending={ending}`）。
+//    责任文案取自代码里的**固定字典** `collapse_reason_label`——不是模型写的句子，
+//    因此不会出现"AI 觉得是你害死了这个世界"这种无法对质的指控。
+//    本区源码级不含任何模型/provider 调用（`be_biography_is_model_free` 断言）。
+//    双重确认：不但结算侧说这是崩塌（`collapsed` 参数），审计痕里的 reason 也必须在
+//    `COLLAPSE_TERMINAL_REASONS` 白名单里，两处不一致就**不产出**——宁可没有墓志铭，
+//    也不刻一句来源不明的死因。
+//    「蓄意毁世界者进风控」是既有 `risk_events` 的事，本区不做任何判定、不点任何人的名。
+//
+// ③ **不复制叙事正文，也不下发真人身份。**
+//    摘要里只有**计量与结构**（拍数、事件按类型计数、里程碑推进量、成员足迹的时刻与贡献分），
+//    没有一个字的 public/private projection——正文的读取面有受众投影隔离与机审门
+//    （`world_events.visibility` / `.moderation`），复制进传记等于给正文开第二条不过闸的读路径。
+//    足迹只记角色 id 与角色面具名，**不记 `user_id`**（§14 恨隔面具原则：传记是角色的墓志铭，
+//    不是真人的花名册）。
+//
+// ── 未验证功能默认关闭（VALIDATION.md §0.1） ────────────────────────────────
+// env 开关 `MUSE_WORLD_BE_BIOGRAPHY`，**默认关闭**。范式抄 `worlds::deathmatch_enabled`：
+// 产出侧不产出（本区第一行）+ 读取侧 `GET /worlds/{id}/biography` 恒 404（`worlds` 模块）。
+// 可逆急停阀——关阀期间崩塌的世界不产传记，再打开也不会追溯补写（传记是**封卷那一刻**的快照，
+// 补写会把"当时的事实"换成"今天重算的事实"，那才是真的改写历史）。
+
+/// BE 结局传记运营开关环境变量。
+const ENV_BE_BIOGRAPHY: &str = "MUSE_WORLD_BE_BIOGRAPHY";
+/// BE 结局传记默认值 = **关闭**。
+const DEFAULT_BE_BIOGRAPHY_ENABLED: bool = false;
+
+/// 足迹条数上限的 env 名（§0.2 参数化：摘要长度一律可配）。
+const ENV_BE_BIO_MAX_FOOTPRINTS: &str = "MUSE_BE_BIO_MAX_FOOTPRINTS";
+/// 足迹条数默认上限：200 位角色。超出部分不写进传记，但 `total` 如实给出（截断可见，不装作没有）。
+const DEFAULT_BE_BIO_MAX_FOOTPRINTS: i64 = 200;
+const MIN_BE_BIO_MAX_FOOTPRINTS: i64 = 1;
+const HARD_BE_BIO_MAX_FOOTPRINTS: i64 = 2_000;
+
+/// 事件类型分档条数上限的 env 名。
+const ENV_BE_BIO_MAX_EVENT_KINDS: &str = "MUSE_BE_BIO_MAX_EVENT_KINDS";
+/// 事件类型分档默认上限：20 类（按出现次数降序取前 N 类）。
+const DEFAULT_BE_BIO_MAX_EVENT_KINDS: i64 = 20;
+const MIN_BE_BIO_MAX_EVENT_KINDS: i64 = 1;
+const HARD_BE_BIO_MAX_EVENT_KINDS: i64 = 200;
+
+/// 传记种类：崩塌封卷。正常终局不产出本类传记。
+const BIOGRAPHY_KIND_BE: &str = "be";
+/// 摘要结构版本（结构演进时 +1，读取面据此兼容旧封卷）。
+const BIOGRAPHY_SCHEMA_VERSION: i64 = 1;
+
+/// BE 结局传记是否已由运营开启（env 覆盖 + 默认常量，范式同 `worlds::deathmatch_enabled`）。
+pub fn be_biography_enabled() -> bool {
+    match std::env::var(ENV_BE_BIOGRAPHY) {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "on" | "yes" => true,
+            "0" | "false" | "off" | "no" => false,
+            // 配错不静默开启：回落默认（关闭）。
+            _ => DEFAULT_BE_BIOGRAPHY_ENABLED,
+        },
+        Err(_) => DEFAULT_BE_BIOGRAPHY_ENABLED,
+    }
+}
+
+/// 测试专用：BE 传记相关 env 的 RAII 夹具（范式同 `worlds::DeathmatchSwitch` / `subplot::SubplotSwitch`）。
+///
+/// 这些 env 是**进程级**的，本模块用例与其它模块同属一个测试二进制、默认并发跑，
+/// 故对开关敏感的用例共用**同一把锁**串行化，并在 Drop 时把 env 恢复原状。
+/// 跨模块可见（`worlds` 的传记读取面用例也要它），故 `pub(crate)`。
+#[cfg(test)]
+pub(crate) struct BiographySwitch {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    prev: Vec<(&'static str, Option<String>)>,
+}
+
+#[cfg(test)]
+impl BiographySwitch {
+    /// 只置总开关。
+    pub(crate) fn set(on: bool) -> Self {
+        Self::with(on, &[])
+    }
+
+    /// 置总开关 + 若干额外 env（如 `MUSE_BE_BIO_MAX_FOOTPRINTS`）。
+    /// ⚠️ `extra` 里不要再放总开关键，否则 Drop 时同键恢复两次会把状态留给下一个用例。
+    pub(crate) fn with(on: bool, extra: &[(&'static str, &str)]) -> Self {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut prev = vec![(ENV_BE_BIOGRAPHY, std::env::var(ENV_BE_BIOGRAPHY).ok())];
+        std::env::set_var(ENV_BE_BIOGRAPHY, if on { "1" } else { "0" });
+        for (k, v) in extra {
+            prev.push((k, std::env::var(k).ok()));
+            std::env::set_var(k, v);
+        }
+        Self { _guard: guard, prev }
+    }
+}
+
+#[cfg(test)]
+impl Drop for BiographySwitch {
+    fn drop(&mut self) {
+        for (k, v) in &self.prev {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+}
+
+/// 读整数 env（缺失/非法 → 默认值，再 clamp 进安全区间；范式同 `subplot::read_i64_env`）。
+fn read_clamped_env(key: &str, default: i64, min: i64, max: i64) -> i64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(default)
+        .clamp(min, max)
+}
+
+/// 传记里保留的参与者足迹条数上限（运营可调）。
+fn be_bio_max_footprints() -> i64 {
+    read_clamped_env(
+        ENV_BE_BIO_MAX_FOOTPRINTS,
+        DEFAULT_BE_BIO_MAX_FOOTPRINTS,
+        MIN_BE_BIO_MAX_FOOTPRINTS,
+        HARD_BE_BIO_MAX_FOOTPRINTS,
+    )
+}
+
+/// 传记里保留的事件类型分档数上限（运营可调）。
+fn be_bio_max_event_kinds() -> i64 {
+    read_clamped_env(
+        ENV_BE_BIO_MAX_EVENT_KINDS,
+        DEFAULT_BE_BIO_MAX_EVENT_KINDS,
+        MIN_BE_BIO_MAX_EVENT_KINDS,
+        HARD_BE_BIO_MAX_EVENT_KINDS,
+    )
+}
+
+/// 🔴 崩塌原因的**固定文案字典**（不是模型生成的句子）。
+///
+/// 入参恒为 `runtime::terminal_reason()` 词表内的串。未知串走兜底文案，且**只复述 reason 本身**，
+/// 绝不编造归因——"无冤案"的具体落地就是这一行：字典没有的死因，宁可说不清楚，不许现编。
+fn collapse_reason_label(reason: &str) -> &'static str {
+    match reason {
+        "key_character_exit" => "关键角色永久退场，世界线失去支点而崩塌",
+        _ => "世界线崩塌（原因串见 terminalReason，未在文案字典内）",
+    }
+}
+
+/// 拆 `audit_logs('world.ended').reason` 的写入格式 `{reason}|ending={ending}`。
+///
+/// 口径与 `runtime::finalize_ending_tx` 的写入格式、`slo` 的读取解析**必须一致**：
+/// 无 `|` 分隔（防御，历史/异常数据）→ 整串当 reason、结局空；`ending=none` 视同无结局。
+fn split_world_ended_reason(raw: &str) -> (String, String) {
+    let (reason, rest) = match raw.split_once('|') {
+        Some((r, rest)) => (r, rest),
+        None => (raw, ""),
+    };
+    let ending = rest.strip_prefix("ending=").unwrap_or("");
+    let ending = if ending == "none" { "" } else { ending };
+    (reason.trim().to_string(), ending.trim().to_string())
+}
+
+/// 角色卡的公开面具名（`card_json.identity.name`）。取不到 → 空串，绝不因取名失败中断封卷。
+fn card_display_name(card_json: Option<&str>) -> String {
+    card_json
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .and_then(|v| v.pointer("/identity/name").and_then(|n| n.as_str()).map(str::to_string))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// 崩塌终局 → 封卷一份 BE 结局传记（**在调用方结算事务内**）。
+///
+/// 不产出的全部情形（每一种都是正当理由，一律静默返回 Ok，绝不拖垮整笔结算）：
+/// - `collapsed == false`：**正常终局不产出**（主线走完 / 时间上限 / 无可调度角色都不是 BE）；
+/// - 运营开关未开（§0.1 未验证功能默认关闭）；
+/// - 本世界已有传记（幂等，见下）；
+/// - 找不到 `audit_logs('world.ended')` 那条痕，或痕里的 reason 不在崩塌白名单里
+///   （🔴 无冤案：崩塌原因必须有确定性出处，两处口径不一致就不刻墓志铭）。
+///
+/// **幂等两道**：① 先查 `world_biographies` 有无本世界的行（同一事务内可见）；
+/// ② `world_biographies.world_id` 主键兜底。不用 `ON CONFLICT`（双库方言禁用，见 db.rs）——
+/// 同一世界的终局由 `end_world_tx` 的 `WHERE status='running'` CAS 串行化，本就只可能走一次。
+async fn seal_be_biography_tx(
+    tx: &mut Transaction<'_, Any>,
+    world_id: &str,
+    collapsed: bool,
+    ctx: &PayoutContext,
+) -> Result<(), ApiError> {
+    if !collapsed || !be_biography_enabled() {
+        return Ok(());
+    }
+    // 幂等①：已封卷 → 不重复产出（重复触发不重复产传记）。
+    let existed: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM world_biographies WHERE world_id = ?")
+            .bind(world_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    if existed.is_some() {
+        return Ok(());
+    }
+
+    // ---- 崩塌原因：唯一来源 = audit_logs('world.ended')（runtime 在本事务内、本函数之前写入） ----
+    let audit_row = sqlx::query(
+        "SELECT reason, created_at FROM audit_logs \
+         WHERE action = 'world.ended' AND subject = ? ORDER BY created_at ASC LIMIT 1",
+    )
+    .bind(world_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(audit_row) = audit_row else {
+        // 🔴 没有审计痕 = 崩塌原因没有确定性出处 → 不产出（不许靠推断补一个死因）。
+        tracing::warn!(world_id, "崩塌世界缺 world.ended 审计痕，跳过 BE 传记产出");
+        return Ok(());
+    };
+    let audit_reason: String = audit_row.try_get("reason")?;
+    let ended_at: i64 = audit_row.try_get("created_at")?;
+    let (terminal_reason, ending_id) = split_world_ended_reason(&audit_reason);
+    if !is_collapse_reason(&terminal_reason) {
+        // 结算侧说崩塌、审计痕说不是 —— 两处口径不一致，不刻墓志铭（无冤案）。
+        tracing::warn!(world_id, %terminal_reason, "审计痕 reason 不在崩塌白名单，跳过 BE 传记产出");
+        return Ok(());
+    }
+
+    // ---- 世界元信息（只读） ----
+    let w = sqlx::query(
+        "SELECT title, room_type, template_id, template_version, lethality, tick_per_day, \
+         member_limit, created_at FROM worlds WHERE id = ?",
+    )
+    .bind(world_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(ApiError::NotFound)?;
+    let template_id: String = w.try_get("template_id")?;
+    let star_rating: i64 =
+        sqlx::query_scalar("SELECT star_rating FROM world_templates WHERE id = ?")
+            .bind(&template_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .unwrap_or(ctx.star_rating);
+
+    // ---- 世界线摘要：拍数（按 tick 状态分档）+ 末拍号 ----
+    let tick_rows = sqlx::query("SELECT status, COUNT(*) AS n FROM world_ticks WHERE world_id = ? GROUP BY status")
+        .bind(world_id)
+        .fetch_all(&mut **tx)
+        .await?;
+    let mut ticks_by_status: BTreeMap<String, i64> = BTreeMap::new();
+    for r in &tick_rows {
+        ticks_by_status.insert(r.try_get("status")?, r.try_get("n")?);
+    }
+    let total_ticks: i64 = ticks_by_status.values().sum();
+    let last_tick_no: Option<i64> = sqlx::query_scalar(
+        "SELECT tick_no FROM world_ticks WHERE world_id = ? ORDER BY tick_no DESC LIMIT 1",
+    )
+    .bind(world_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    // ---- 世界线摘要：事件计量（只计数，不复制正文） ----
+    let total_events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_events WHERE world_id = ?")
+        .bind(world_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    let event_kind_total: i64 =
+        sqlx::query_scalar("SELECT COUNT(DISTINCT event_type) FROM world_events WHERE world_id = ?")
+            .bind(world_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    let kind_limit = be_bio_max_event_kinds();
+    // 次序确定性：先按次数降序，同次数再按类型名升序 —— 两次封卷必得同一份 JSON。
+    let event_rows = sqlx::query(
+        "SELECT event_type, COUNT(*) AS n FROM world_events WHERE world_id = ? \
+         GROUP BY event_type ORDER BY COUNT(*) DESC, event_type ASC LIMIT ?",
+    )
+    .bind(world_id)
+    .bind(kind_limit)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut events_by_type = Vec::new();
+    for r in &event_rows {
+        events_by_type.push(json!({
+            "eventType": r.try_get::<String, _>("event_type")?,
+            "count": r.try_get::<i64, _>("n")?,
+        }));
+    }
+
+    // ---- 参与者足迹：成员行（时刻与状态）× 贡献账本（确定性分值） ----
+    let contrib_rows = sqlx::query(
+        "SELECT character_id, score_milli, milestone_score_milli FROM world_contributions WHERE world_id = ?",
+    )
+    .bind(world_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut contributions: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+    let mut milestone_total: i64 = 0;
+    let mut contribution_total: i64 = 0;
+    for r in &contrib_rows {
+        let cid: String = r.try_get("character_id")?;
+        let score: i64 = r.try_get("score_milli")?;
+        let milestone: i64 = r.try_get("milestone_score_milli")?;
+        contribution_total += score;
+        milestone_total += milestone;
+        contributions.insert(cid, (score, milestone));
+    }
+
+    let member_total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_members WHERE world_id = ?")
+        .bind(world_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    let footprint_limit = be_bio_max_footprints();
+    // 次序确定性：入场时刻升序，同刻按成员行 id 升序。
+    let member_rows = sqlx::query(
+        "SELECT m.cloud_character_id AS cid, m.status, m.joined_at, m.left_at, cc.card_json AS card \
+         FROM world_members m LEFT JOIN cloud_characters cc ON cc.id = m.cloud_character_id \
+         WHERE m.world_id = ? ORDER BY m.joined_at ASC, m.id ASC LIMIT ?",
+    )
+    .bind(world_id)
+    .bind(footprint_limit)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut footprints = Vec::new();
+    for r in &member_rows {
+        let cid: String = r.try_get("cid")?;
+        let card: Option<String> = r.try_get("card")?;
+        let (score, milestone) = contributions.get(&cid).copied().unwrap_or((0, 0));
+        footprints.push(json!({
+            "characterId": cid,
+            // 🔴 只有角色面具名，没有 user_id（§14）。
+            "name": card_display_name(card.as_deref()),
+            "status": r.try_get::<String, _>("status")?,
+            "joinedAt": r.try_get::<i64, _>("joined_at")?,
+            "leftAt": r.try_get::<Option<i64>, _>("left_at")?,
+            "contributionMilli": score,
+            "milestoneMilli": milestone,
+        }));
+    }
+
+    // ---- 组装摘要（纯确定性数据；无随机、无模型） ----
+    let summary = json!({
+        "schemaVersion": BIOGRAPHY_SCHEMA_VERSION,
+        "world": {
+            "id": world_id,
+            "title": w.try_get::<String, _>("title")?,
+            "roomType": w.try_get::<String, _>("room_type")?,
+            "templateId": template_id,
+            "templateVersion": w.try_get::<i64, _>("template_version")?,
+            "starRating": star_rating,
+            // 落库原值（建房方意图）：传记是"当时那场戏是什么契约"的事实快照。
+            "lethality": w.try_get::<String, _>("lethality")?,
+            "tickPerDay": w.try_get::<i64, _>("tick_per_day")?,
+            "memberLimit": w.try_get::<i64, _>("member_limit")?,
+            "createdAt": w.try_get::<i64, _>("created_at")?,
+            "endedAt": ended_at,
+        },
+        "collapse": {
+            "terminalReason": &terminal_reason,
+            // 固定字典文案（见 collapse_reason_label）——不是模型写的。
+            "reasonLabel": collapse_reason_label(&terminal_reason),
+            "endingId": &ending_id,
+            // 原始审计痕原样附上：任何人都能拿它回 audit_logs 对质（崩塌责任仲裁公开可溯）。
+            "auditReason": &audit_reason,
+            "auditedAt": ended_at,
+            "source": "runtime::terminal_reason + audit_logs(action='world.ended')",
+            // 🔴 显式声明：本段不含任何模型生成内容，也不含任何责任归属判定。
+            "modelGenerated": false,
+            "blameAssigned": false,
+        },
+        "worldline": {
+            "totalTicks": total_ticks,
+            "ticksByStatus": ticks_by_status.iter().map(|(k, v)| json!({ "status": k, "count": v })).collect::<Vec<_>>(),
+            "lastTickNo": last_tick_no,
+            "totalEvents": total_events,
+            "eventTypeTotal": event_kind_total,
+            "eventsByType": events_by_type,
+            "eventsTruncated": event_kind_total > kind_limit,
+            // 贡献账本合计（定点 ×1000，口径同 world_contributions）。
+            "contributionMilliTotal": contribution_total,
+            "milestoneMilliTotal": milestone_total,
+        },
+        "footprints": {
+            "total": member_total,
+            "truncated": member_total > footprint_limit,
+            "items": footprints,
+        },
+        // 三层结算在崩塌下的实际折算系数（§9：①减半 ③归零 ②已锁定保留），与本次结算所用的完全同源。
+        "settlement": {
+            "baselineFactor": ctx.baseline_factor(true),
+            "worldlineFactor": ctx.worldline_factor(true),
+            "achievementNote": "② 成就层已锁定产出原样保留（结算时即由 DB 唯一键锁定，崩塌不回收）",
+        },
+        "notes": [
+            "本传记是对既有确定性数据的只读汇总，不改写任何世界线事实（§0.3 公共事实不可回滚）。",
+            "崩塌原因取自 runtime 终局判定与 audit_logs('world.ended')，非模型生成；本传记不做任何责任归属判定。",
+            "不复制叙事正文：正文的唯一事实源仍是 world_events，其受众投影与审核门不变。",
+            "足迹只含角色面具名，不含真人身份（§14）。",
+        ],
+    });
+
+    // ---- 唯一写入：封卷一行 ----
+    let now = crate::db::now_ms();
+    sqlx::query(
+        "INSERT INTO world_biographies (world_id, kind, terminal_reason, ending_id, summary_json, sealed_at) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(world_id)
+    .bind(BIOGRAPHY_KIND_BE)
+    .bind(&terminal_reason)
+    .bind(&ending_id)
+    .bind(summary.to_string())
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+
+    // 全链审计（§0.2）：封卷这件事本身也留痕。
+    sqlx::query(
+        "INSERT INTO audit_logs (id, actor_id, actor_role, action, subject, reason, created_at) \
+         VALUES (?, 'system', 'system', 'world.be_biography_sealed', ?, ?, ?)",
+    )
+    .bind(crate::db::new_id("aud"))
+    .bind(world_id)
+    .bind(format!("terminalReason={terminal_reason}|ending={ending_id}|footprints={}", footprints.len()))
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
+}
+// ===== BE-BIOGRAPHY-READONLY-REGION-END =====
 
 // ---------------- 读侧辅助（卡位校验 / 进度查询共用） ----------------
 

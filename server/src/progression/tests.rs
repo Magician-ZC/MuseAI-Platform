@@ -575,3 +575,508 @@ fn payout_table_integrity_is_enforced_at_template_build_time() {
     // 老模板（无 payoutTable）一律放行，零影响。
     assert!(crate::assembly::validate_skeleton_refs(&json!({ "mainlineNodes": [] })).is_ok());
 }
+
+// ==================== BE 结局传记（总规格 §9「世界线崩塌」） ====================
+//
+// 覆盖：开关关闭不产出 · 崩塌终局产出 · **正常终局不产出** ·
+// **内容全部来自确定性数据（无模型现编的责任归属，红线）** · 幂等 ·
+// **不改写任何世界线数据（红线）** · 摘要长度参数化。
+
+/// 造一张 4★ 模板（星级投影的来源）。
+async fn seed_be_template(state: &AppState, id: &str) {
+    sqlx::query(
+        "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, official, \
+         version, moderation, star_rating, created_at) \
+         VALUES (?, '黑角域篇', 'idle', '{}', '{}', 1, 3, 'approved', 4, ?)",
+    )
+    .bind(id)
+    .bind(now_ms())
+    .execute(&state.db)
+    .await
+    .expect("seed template");
+}
+
+/// 造一枚带名字的云端角色（足迹里的「角色面具名」来源）。
+async fn seed_named_char(state: &AppState, id: &str, owner: &str, name: &str) {
+    sqlx::query(
+        "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, \
+         rights_declaration, moderation, withdrawn, created_at, mileage) \
+         VALUES (?, ?, 'local', 1, ?, 'original', 'approved', 0, ?, 0)",
+    )
+    .bind(id)
+    .bind(owner)
+    .bind(json!({ "identity": { "name": name } }).to_string())
+    .bind(now_ms())
+    .execute(&state.db)
+    .await
+    .expect("seed named char");
+}
+
+/// 造一个「跑过一段、然后终局」的世界：世界行 + 两位成员 + 贡献账本 + 三拍 + 三条事件。
+/// 全是既有确定性数据，传记只对它们做只读汇总。**不含** `world.ended` 审计痕（由各用例自行写入）。
+async fn seed_played_world(state: &AppState) -> String {
+    seed_be_template(state, "tpl_be").await;
+    let wid = crate::worlds::create_world(
+        &state.db,
+        crate::worlds::CreateWorldParams::official("tpl_be", 3, "黑角域篇"),
+    )
+    .await
+    .expect("create world");
+
+    seed_user(&state.db, "u_be1").await;
+    seed_user(&state.db, "u_be2").await;
+    seed_named_char(state, "c_be1", "u_be1", "唐三").await;
+    seed_named_char(state, "c_be2", "u_be2", "小舞").await;
+    for (mid, uid, cid, status, joined, left) in [
+        ("wm_be1", "u_be1", "c_be1", "active", 1_000i64, None::<i64>),
+        ("wm_be2", "u_be2", "c_be2", "left", 2_000i64, Some(9_000i64)),
+    ] {
+        sqlx::query(
+            "INSERT INTO world_members (id, world_id, user_id, cloud_character_id, boundary_json, \
+             status, joined_at, left_at) VALUES (?, ?, ?, ?, '{}', ?, ?, ?)",
+        )
+        .bind(mid)
+        .bind(&wid)
+        .bind(uid)
+        .bind(cid)
+        .bind(status)
+        .bind(joined)
+        .bind(left)
+        .execute(&state.db)
+        .await
+        .expect("seed member");
+    }
+    for (cid, score, milestone) in [("c_be1", 4_500i64, 3_000i64), ("c_be2", 1_500i64, 0i64)] {
+        sqlx::query(
+            "INSERT INTO world_contributions (world_id, character_id, score_milli, \
+             milestone_score_milli, settled_at, updated_at) VALUES (?, ?, ?, ?, 0, ?)",
+        )
+        .bind(&wid)
+        .bind(cid)
+        .bind(score)
+        .bind(milestone)
+        .bind(now_ms())
+        .execute(&state.db)
+        .await
+        .expect("seed contribution");
+    }
+    for (tid, no, status) in [("tk1", 1i64, "done"), ("tk2", 2i64, "done"), ("tk3", 3i64, "failed")] {
+        sqlx::query(
+            "INSERT INTO world_ticks (id, world_id, tick_no, base_revision, status, cost_tokens, created_at) \
+             VALUES (?, ?, ?, 0, ?, 10, ?)",
+        )
+        .bind(tid)
+        .bind(&wid)
+        .bind(no)
+        .bind(status)
+        .bind(now_ms())
+        .execute(&state.db)
+        .await
+        .expect("seed tick");
+    }
+    for (eid, seq, kind) in [("ev1", 1i64, "dialogue"), ("ev2", 2i64, "dialogue"), ("ev3", 3i64, "action")] {
+        sqlx::query(
+            "INSERT INTO world_events (id, world_id, tick_no, sequence, domain_event_id, event_type, \
+             actors_json, visibility, occurred_at) VALUES (?, ?, 1, ?, ?, ?, '[]', 'public', ?)",
+        )
+        .bind(eid)
+        .bind(&wid)
+        .bind(seq)
+        .bind(eid)
+        .bind(kind)
+        .bind(now_ms())
+        .execute(&state.db)
+        .await
+        .expect("seed event");
+    }
+    wid
+}
+
+/// 写一条 runtime 口径的终局审计痕（格式 `{reason}|ending={ending}`）。
+async fn seed_world_ended_audit(state: &AppState, world_id: &str, reason: &str, ending: &str) {
+    sqlx::query(
+        "INSERT INTO audit_logs (id, actor_id, actor_role, action, subject, reason, created_at) \
+         VALUES (?, 'system', 'system', 'world.ended', ?, ?, ?)",
+    )
+    .bind(crate::db::new_id("aud"))
+    .bind(world_id)
+    .bind(format!("{reason}|ending={ending}"))
+    .bind(now_ms())
+    .execute(&state.db)
+    .await
+    .expect("seed world.ended audit");
+}
+
+/// 走一次封卷（独立事务，模拟结算事务内的调用）。
+async fn seal(state: &AppState, world_id: &str, collapsed: bool) {
+    let ctx = payout_context_from_wrapper(None);
+    let mut tx = state.db.begin().await.unwrap();
+    seal_be_biography_tx(&mut tx, world_id, collapsed, &ctx).await.expect("seal");
+    tx.commit().await.unwrap();
+}
+
+async fn biography_rows(state: &AppState, world_id: &str) -> Vec<(String, String, String, String, i64)> {
+    sqlx::query_as("SELECT kind, terminal_reason, ending_id, summary_json, sealed_at FROM world_biographies WHERE world_id = ?")
+        .bind(world_id)
+        .fetch_all(&state.db)
+        .await
+        .expect("read biography")
+}
+
+async fn biography_summary(state: &AppState, world_id: &str) -> Value {
+    let rows = biography_rows(state, world_id).await;
+    assert_eq!(rows.len(), 1, "应恰有一份传记");
+    serde_json::from_str(&rows[0].3).expect("summary 应为合法 JSON")
+}
+
+/// 世界线数据的全量快照（红线断言用）：五张世界线表 + 角色卡的资产列。
+async fn worldline_snapshot(state: &AppState, world_id: &str) -> String {
+    let world: Vec<(i64, String, String, Option<String>, String, i64)> = sqlx::query_as(
+        "SELECT state_revision, status, narrative_state_json, assembled_json, title, updated_at \
+         FROM worlds WHERE id = ?",
+    )
+    .bind(world_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap();
+    let events: Vec<(String, String, String, String, i64)> = sqlx::query_as(
+        "SELECT id, event_type, visibility, moderation, occurred_at FROM world_events \
+         WHERE world_id = ? ORDER BY id ASC",
+    )
+    .bind(world_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap();
+    let ticks: Vec<(String, i64, String, i64)> = sqlx::query_as(
+        "SELECT id, tick_no, status, cost_tokens FROM world_ticks WHERE world_id = ? ORDER BY id ASC",
+    )
+    .bind(world_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap();
+    let contributions: Vec<(String, i64, i64, i64)> = sqlx::query_as(
+        "SELECT character_id, score_milli, milestone_score_milli, settled_at FROM world_contributions \
+         WHERE world_id = ? ORDER BY character_id ASC",
+    )
+    .bind(world_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap();
+    let members: Vec<(String, String, String, i64, Option<i64>)> = sqlx::query_as(
+        "SELECT id, cloud_character_id, status, joined_at, left_at FROM world_members \
+         WHERE world_id = ? ORDER BY id ASC",
+    )
+    .bind(world_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap();
+    let chars: Vec<(String, i64, i64)> =
+        sqlx::query_as("SELECT id, mileage, withdrawn FROM cloud_characters ORDER BY id ASC")
+            .fetch_all(&state.db)
+            .await
+            .unwrap();
+    format!("{world:?}|{events:?}|{ticks:?}|{contributions:?}|{members:?}|{chars:?}")
+}
+
+/// 🔴 开关关闭 → 崩塌也不产出传记（VALIDATION.md §0.1 未验证功能默认关闭）。
+#[tokio::test]
+async fn be_biography_not_produced_when_switch_off() {
+    let _sw = BiographySwitch::set(false);
+    let state = test_state().await;
+    let wid = seed_played_world(&state).await;
+    seed_world_ended_audit(&state, &wid, "key_character_exit", "none").await;
+
+    seal(&state, &wid, true).await;
+    assert!(biography_rows(&state, &wid).await.is_empty(), "关阀期间不得产出传记");
+}
+
+/// 崩塌终局 → 产出传记，且内容是对既有数据的**只读汇总**（世界线摘要 + 崩塌原因 + 参与者足迹）。
+#[tokio::test]
+async fn be_biography_sealed_on_collapse() {
+    let _sw = BiographySwitch::set(true);
+    let state = test_state().await;
+    let wid = seed_played_world(&state).await;
+    seed_world_ended_audit(&state, &wid, "key_character_exit", "ending_dark").await;
+
+    seal(&state, &wid, true).await;
+    let rows = biography_rows(&state, &wid).await;
+    assert_eq!(rows.len(), 1, "崩塌应封卷出一份传记");
+    assert_eq!(rows[0].0, "be");
+    assert_eq!(rows[0].1, "key_character_exit");
+    assert_eq!(rows[0].2, "ending_dark");
+
+    let s = biography_summary(&state, &wid).await;
+    // 世界元信息
+    assert_eq!(s["world"]["id"], json!(wid));
+    assert_eq!(s["world"]["templateId"], json!("tpl_be"));
+    assert_eq!(s["world"]["starRating"], json!(4), "星级取自模板（确定性）");
+    // 世界线摘要（计量口径）
+    assert_eq!(s["worldline"]["totalTicks"], json!(3));
+    assert_eq!(s["worldline"]["lastTickNo"], json!(3));
+    assert_eq!(s["worldline"]["totalEvents"], json!(3));
+    assert_eq!(s["worldline"]["eventTypeTotal"], json!(2));
+    assert_eq!(s["worldline"]["eventsByType"][0]["eventType"], json!("dialogue"), "按次数降序");
+    assert_eq!(s["worldline"]["eventsByType"][0]["count"], json!(2));
+    assert_eq!(s["worldline"]["contributionMilliTotal"], json!(6_000));
+    assert_eq!(s["worldline"]["milestoneMilliTotal"], json!(3_000));
+    // 参与者足迹（含离场者——足迹是履历的一部分）
+    assert_eq!(s["footprints"]["total"], json!(2));
+    assert_eq!(s["footprints"]["truncated"], json!(false));
+    assert_eq!(s["footprints"]["items"][0]["characterId"], json!("c_be1"));
+    assert_eq!(s["footprints"]["items"][0]["name"], json!("唐三"));
+    assert_eq!(s["footprints"]["items"][0]["milestoneMilli"], json!(3_000));
+    assert_eq!(s["footprints"]["items"][1]["status"], json!("left"));
+    assert_eq!(s["footprints"]["items"][1]["leftAt"], json!(9_000));
+    // 🔴 不下发真人身份（§14 恨隔面具原则）
+    let raw = serde_json::to_string(&s).unwrap();
+    assert!(!raw.contains("u_be1") && !raw.contains("u_be2"), "传记不得含真人 user_id: {raw}");
+    // 三层结算的崩塌系数（§9：①减半 ③归零 ②已锁定保留）
+    assert_eq!(s["settlement"]["baselineFactor"], json!(COLLAPSE_BASELINE_FACTOR));
+    assert_eq!(s["settlement"]["worldlineFactor"], json!(COLLAPSE_WORLDLINE_FACTOR));
+    // 封卷本身留痕（§0.2 全链审计）
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_logs WHERE action = 'world.be_biography_sealed' AND subject = ?",
+    )
+    .bind(&wid)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(audited, 1);
+}
+
+/// 🔴 **正常终局不产出**：主线走完 / 时间上限 / 无可调度角色都不是 BE——只有崩塌才有 BE 传记。
+#[tokio::test]
+async fn be_biography_not_produced_on_normal_ending() {
+    let _sw = BiographySwitch::set(true);
+    let state = test_state().await;
+    for reason in ["mainline_complete", "time_cap", "starved", "time_limit"] {
+        let wid = crate::worlds::create_world(
+            &state.db,
+            crate::worlds::CreateWorldParams::official("tpl_x", 1, "正常收束"),
+        )
+        .await
+        .unwrap();
+        seed_world_ended_audit(&state, &wid, reason, "ending_ok").await;
+        // 调用方按 is_collapse_reason 判定，正常收束传 false。
+        assert!(!is_collapse_reason(reason), "{reason} 不是崩塌");
+        seal(&state, &wid, false).await;
+        assert!(biography_rows(&state, &wid).await.is_empty(), "{reason} 不得产出 BE 传记");
+    }
+}
+
+/// 🔴 无冤案：崩塌原因必须有**确定性出处**。
+/// (a) 没有 `world.ended` 审计痕 → 不产出（不许靠推断补一个死因）；
+/// (b) 审计痕说的是正常收束（与结算侧口径不一致）→ 不产出。
+#[tokio::test]
+async fn be_biography_requires_deterministic_collapse_evidence() {
+    let _sw = BiographySwitch::set(true);
+    let state = test_state().await;
+
+    // (a) 无审计痕
+    let w1 = seed_played_world(&state).await;
+    seal(&state, &w1, true).await;
+    assert!(biography_rows(&state, &w1).await.is_empty(), "无 world.ended 痕不得封卷");
+
+    // (b) 审计痕 reason 不在崩塌白名单
+    let w2 = crate::worlds::create_world(
+        &state.db,
+        crate::worlds::CreateWorldParams::official("tpl_be", 3, "口径不一致"),
+    )
+    .await
+    .unwrap();
+    seed_world_ended_audit(&state, &w2, "mainline_complete", "none").await;
+    seal(&state, &w2, true).await;
+    assert!(biography_rows(&state, &w2).await.is_empty(), "审计痕与结算口径不一致时不得封卷");
+}
+
+/// 🔴 传记内容全部来自确定性数据：崩塌原因文案取自**固定字典**，不含模型现编的责任归属；
+/// 同一份数据两次封卷得到**逐字节相同**的摘要（零随机、零模型的直接证明）。
+#[tokio::test]
+async fn be_biography_content_is_deterministic_and_blame_free() {
+    let _sw = BiographySwitch::set(true);
+    let state = test_state().await;
+    let wid = seed_played_world(&state).await;
+    seed_world_ended_audit(&state, &wid, "key_character_exit", "ending_dark").await;
+
+    seal(&state, &wid, true).await;
+    let first = biography_rows(&state, &wid).await[0].3.clone();
+    let s: Value = serde_json::from_str(&first).unwrap();
+    assert_eq!(
+        s["collapse"]["reasonLabel"],
+        json!(collapse_reason_label("key_character_exit")),
+        "崩塌文案必须是代码里的固定字典串"
+    );
+    assert_eq!(s["collapse"]["modelGenerated"], json!(false), "🔴 传记不得含模型生成内容");
+    assert_eq!(s["collapse"]["blameAssigned"], json!(false), "🔴 传记不做责任归属判定");
+    assert_eq!(
+        s["collapse"]["auditReason"],
+        json!("key_character_exit|ending=ending_dark"),
+        "原始审计痕原样附上，任何人可回 audit_logs 对质"
+    );
+    assert_eq!(
+        s["collapse"]["source"],
+        json!("runtime::terminal_reason + audit_logs(action='world.ended')")
+    );
+
+    // 重算一次：删掉封卷行再封一次，摘要必须逐字节相同。
+    sqlx::query("DELETE FROM world_biographies WHERE world_id = ?")
+        .bind(&wid)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    seal(&state, &wid, true).await;
+    let second = biography_rows(&state, &wid).await[0].3.clone();
+    assert_eq!(first, second, "同一份数据两次封卷必须得到逐字节相同的摘要");
+}
+
+/// 幂等：重复触发不重复产传记（内容与封卷时刻都不变）。
+#[tokio::test]
+async fn be_biography_is_idempotent() {
+    let _sw = BiographySwitch::set(true);
+    let state = test_state().await;
+    let wid = seed_played_world(&state).await;
+    seed_world_ended_audit(&state, &wid, "key_character_exit", "none").await;
+
+    seal(&state, &wid, true).await;
+    let first = biography_rows(&state, &wid).await;
+    seal(&state, &wid, true).await;
+    seal(&state, &wid, true).await;
+    let again = biography_rows(&state, &wid).await;
+    assert_eq!(again.len(), 1, "重复触发不得重复产传记");
+    assert_eq!(first[0].4, again[0].4, "封卷时刻不得被后续调用改写");
+    assert_eq!(first[0].3, again[0].3, "封卷内容不得被后续调用改写");
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_logs WHERE action = 'world.be_biography_sealed' AND subject = ?",
+    )
+    .bind(&wid)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(audited, 1, "封卷留痕也只应有一条");
+}
+
+/// 🔴 **公共事实不可回滚（§0.3）**：封卷是只读汇总——前后对五张世界线表 + 角色资产列做全量快照，
+/// 必须逐字节相等（传记不改写任何既有事实）。
+#[tokio::test]
+async fn be_biography_never_mutates_worldline() {
+    let _sw = BiographySwitch::set(true);
+    let state = test_state().await;
+    let wid = seed_played_world(&state).await;
+    seed_world_ended_audit(&state, &wid, "key_character_exit", "ending_dark").await;
+
+    let before = worldline_snapshot(&state, &wid).await;
+    seal(&state, &wid, true).await;
+    let after = worldline_snapshot(&state, &wid).await;
+    assert_eq!(before, after, "🔴 封卷不得改写任何世界线数据（公共事实不可回滚）");
+    assert_eq!(biography_rows(&state, &wid).await.len(), 1, "但传记确实产出了");
+}
+
+/// 摘要长度参数化（§0.2 禁写死）：足迹条数上限可配，超出部分截断且 `truncated` 如实标注。
+#[tokio::test]
+async fn be_biography_footprint_limit_is_configurable() {
+    let _sw = BiographySwitch::with(true, &[("MUSE_BE_BIO_MAX_FOOTPRINTS", "1")]);
+    let state = test_state().await;
+    let wid = seed_played_world(&state).await;
+    seed_world_ended_audit(&state, &wid, "key_character_exit", "none").await;
+
+    seal(&state, &wid, true).await;
+    let s = biography_summary(&state, &wid).await;
+    assert_eq!(s["footprints"]["items"].as_array().unwrap().len(), 1, "上限=1 时只留一条足迹");
+    assert_eq!(s["footprints"]["total"], json!(2), "总数如实给出");
+    assert_eq!(s["footprints"]["truncated"], json!(true), "截断必须可见，不装作没有");
+}
+
+/// 🔴 源码级红线（只读区）：BE 传记区对世界线表只有 SELECT，没有任何 UPDATE/DELETE；
+/// 也不含任何模型/provider 调用（崩塌原因不许模型现编）。
+#[test]
+fn be_biography_region_is_read_only_and_model_free() {
+    let src = include_str!("mod.rs");
+    let begin = src.find("// ===== BE-BIOGRAPHY-READONLY-REGION-BEGIN =====").expect("缺少只读区起始标记");
+    let end = src.find("// ===== BE-BIOGRAPHY-READONLY-REGION-END =====").expect("缺少只读区结束标记");
+    let region = &src[begin..end];
+
+    for table in ["worlds", "world_events", "world_ticks", "world_contributions", "world_members", "cloud_characters"] {
+        for verb in ["UPDATE", "DELETE FROM"] {
+            let needle = format!("{verb} {table}");
+            assert!(
+                !region.contains(&needle),
+                "🔴 BE 传记只读区出现「{needle}」：传记是对既有事实的只读汇总，不得改写世界线（§0.3）"
+            );
+        }
+    }
+    // 唯一允许的写入是传记自己那一行 + 审计痕。
+    assert!(region.contains("INSERT INTO world_biographies"), "封卷应写 world_biographies");
+    assert!(region.contains("INSERT INTO audit_logs"), "封卷应留审计痕");
+
+    for forbidden in [
+        "ModelClient",
+        "providers::",
+        "state.models",
+        "moderation.check",
+        "complete_json",
+        "muse_engine::narrative::run",
+    ] {
+        assert!(
+            !region.contains(forbidden),
+            "🔴 BE 传记只读区出现模型/provider 调用「{forbidden}」：崩塌原因必须来自确定性数据，不许模型现编"
+        );
+    }
+}
+
+/// 产出接点确实**接在结算路径上**：走 `settle_idle_world_ending_tx`（runtime 终局真正调用的那一个），
+/// 而不是只有单测直接调封卷函数。崩塌时 ① 保底减半发放与传记封卷在**同一笔结算**里发生；
+/// 正常终局走同一个函数则不封卷。
+#[tokio::test]
+async fn settlement_path_seals_biography_only_on_collapse() {
+    let _sw = BiographySwitch::set(true);
+    let state = test_state().await;
+    let collapsed_world = seed_played_world(&state).await;
+    seed_world_ended_audit(&state, &collapsed_world, "key_character_exit", "ending_dark").await;
+    let participants =
+        vec![("c_be1".to_string(), "u_be1".to_string()), ("c_be2".to_string(), "u_be2".to_string())];
+
+    let mut tx = state.db.begin().await.unwrap();
+    settle_idle_world_ending_tx(&mut tx, &collapsed_world, &participants, true).await.unwrap();
+    tx.commit().await.unwrap();
+
+    // ① 保底层减半（§9 崩塌：③归零 + ①减半 + ②已锁定保留）。
+    let halved = (MILEAGE_IDLE_ENDING as f64 * COLLAPSE_BASELINE_FACTOR).round() as i64;
+    assert_eq!(mileage_of(&state, "c_be1").await, halved, "崩塌时保底层减半");
+    assert_eq!(biography_rows(&state, &collapsed_world).await.len(), 1, "结算路径应封出 BE 传记");
+
+    // 正常终局：同一个结算函数，不封卷。
+    let normal_world = crate::worlds::create_world(
+        &state.db,
+        crate::worlds::CreateWorldParams::official("tpl_be", 3, "正常收束"),
+    )
+    .await
+    .unwrap();
+    seed_world_ended_audit(&state, &normal_world, "mainline_complete", "ending_ok").await;
+    let mut tx = state.db.begin().await.unwrap();
+    settle_idle_world_ending_tx(&mut tx, &normal_world, &participants, false).await.unwrap();
+    tx.commit().await.unwrap();
+    assert!(biography_rows(&state, &normal_world).await.is_empty(), "正常终局不产出 BE 传记");
+}
+
+/// 与结算同事务：结算回滚则传记同滚——绝不出现「奖罚没落地但墓志铭已刻好」。
+#[tokio::test]
+async fn be_biography_rolls_back_with_failed_settlement() {
+    let _sw = BiographySwitch::set(true);
+    let state = test_state().await;
+    let wid = seed_played_world(&state).await;
+    seed_world_ended_audit(&state, &wid, "key_character_exit", "none").await;
+
+    let mut tx = state.db.begin().await.unwrap();
+    settle_idle_world_ending_tx(
+        &mut tx,
+        &wid,
+        &[("c_be1".to_string(), "u_be1".to_string())],
+        true,
+    )
+    .await
+    .unwrap();
+    tx.rollback().await.unwrap(); // 模拟结算失败
+
+    assert!(biography_rows(&state, &wid).await.is_empty(), "结算回滚后传记不得残留");
+    assert_eq!(mileage_of(&state, "c_be1").await, 0, "结算回滚后历练不得残留");
+}

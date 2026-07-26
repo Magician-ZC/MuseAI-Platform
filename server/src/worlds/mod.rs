@@ -548,27 +548,38 @@ async fn list_worlds_hot(
 
 // ---------- 世界详情 ----------
 
+/// 世界读取面的可见性闸：私有世界仅房主 / active 成员可读，其余一律 403。
+/// 详情页与 BE 传记页共用**这一个**判定——两处一旦各写一套，私有房的读权限口径必然漂移。
+async fn ensure_world_readable(
+    db: &AnyPool,
+    world: &WorldRow,
+    user: &AuthUser,
+) -> Result<(), ApiError> {
+    if world.visibility != "private" {
+        return Ok(());
+    }
+    let is_host = world.host_user_id.as_deref() == Some(user.user_id.as_str());
+    let is_member = sqlx::query(
+        "SELECT 1 AS x FROM world_members WHERE world_id = ? AND user_id = ? AND status='active' LIMIT 1",
+    )
+    .bind(&world.id)
+    .bind(&user.user_id)
+    .fetch_optional(db)
+    .await?
+    .is_some();
+    if !is_host && !is_member {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(())
+}
+
 async fn world_detail(
     State(state): State<AppState>,
     user: AuthUser,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let world = load_world(&state.db, &id).await?;
-    // 私有世界仅成员/房主可见详情。
-    if world.visibility == "private" {
-        let is_host = world.host_user_id.as_deref() == Some(user.user_id.as_str());
-        let is_member = sqlx::query(
-            "SELECT 1 AS x FROM world_members WHERE world_id = ? AND user_id = ? AND status='active' LIMIT 1",
-        )
-        .bind(&id)
-        .bind(&user.user_id)
-        .fetch_optional(&state.db)
-        .await?
-        .is_some();
-        if !is_host && !is_member {
-            return Err(ApiError::Forbidden);
-        }
-    }
+    ensure_world_readable(&state.db, &world, &user).await?;
 
     // 公开阵容：active 成员 + 角色公开名（AI 标识）+ 头像（仅过审才带）。
     let member_rows = sqlx::query(
@@ -656,6 +667,11 @@ async fn world_detail(
         now_ms(),
     ) {
         detail["nextTickEstimatedAt"] = json!(at);
+    }
+    // 世界系列（§5 自动扩容）：属于已登记系列且开关开启时给出排队指路（第几号 / 还有哪号能进）。
+    // 纯读，绝不建房（见 series_view 注释）；开关关闭或未登记 → **不写该键**，前端零感知。
+    if let Some(view) = series_view(&state.db, &world).await? {
+        detail["series"] = view;
     }
     Ok(Json(detail))
 }
@@ -1018,7 +1034,9 @@ async fn join_world(
             .execute(&state.db)
             .await?;
             if res.rows_affected() == 0 {
-                return Err(ApiError::Conflict("world_full".into()));
+                // 满员 → 排队分房（§5）：确保下一号可入实例存在，把它附在错误码后。资格校验一条不少
+                // 地留在本函数里——扩容只回答"去哪个实例"。
+                return Err(world_full_conflict(&state.db, &world).await);
             }
             entered_now = true;
         }
@@ -1043,7 +1061,10 @@ async fn join_world(
         .execute(&state.db)
         .await;
         match res {
-            Ok(r) if r.rows_affected() == 0 => return Err(ApiError::Conflict("world_full".into())),
+            // 满员 → 排队分房（§5），同上：只指路，不代投放。
+            Ok(r) if r.rows_affected() == 0 => {
+                return Err(world_full_conflict(&state.db, &world).await)
+            }
             Ok(_) => entered_now = true,
             // 并发下同角色抢插：唯一索引兜底 → 视为已在场（幂等成功），非本次入场，不留痕。
             Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {}
@@ -1284,6 +1305,525 @@ pub async fn create_world(db: &AnyPool, p: CreateWorldParams) -> Result<String, 
     Ok(id)
 }
 
+// ===== WORLD-SERIES-REGION-BEGIN =====
+// ======================= 世界系列自动扩容（总规格 §5「世界系列自动扩容【新增】」） =======================
+//
+// 规格原文：**series 排队分房层——1 号实例满员自动开 2 号。运营基建，建房参数复制 + 排队队列。**
+//
+// ── 触发条件 ─────────────────────────────────────────────────────────────────
+// 唯一触发点是 `join_world` 的**满员分支**（`world_full`，人数上限原子守卫返回 0 行的那一刻）。
+// 不在 tick/定时任务里预扩容：没人来敲门就不该多开一个烧预算的世界。
+//
+// ── 排队队列的形态：**指路，不占座** ────────────────────────────────────────
+// 满员时服务端做两件事，然后仍然返回 409：
+//   ① 确保「下一号可入实例」存在（已有可入的就指向它，没有才开新号）；
+//   ② 把它的 id 附在错误码后：`world_full|next={worldId}`（老客户端按 `contains("world_full")`
+//      匹配，行为零变化；新客户端可一键跳转）。同一信息也在 `GET /worlds/{id}` 的 `series` 段。
+//
+// 🔴 **为什么绝不替玩家把卡投进 2 号**（这是本模块最重要的一条）：
+// 扩容只解决"去哪个实例"，不解决"能不能进"。join 的资格校验有一半是**按世界**判定的——
+// 同源唯一（这个世界里已经有一个唐三了吗）、生死契约签署留痕（在**哪个**世界签的）、
+// 人数上限、防自刷（同世界一人一卡）。要在扩容路径上代投放，就必须把这些校验复制一份；
+// 复制一份必然与 join 漂移，漂移即红线破口。因此扩容路径**对 `world_members` 零写入**
+// （源码断言 `series_expansion_never_writes_world_members`），玩家带着同一张卡对新实例
+// 重新 join，全套服务端权威校验原封不动再跑一遍。
+//
+// ── 两道默认关闭闸（VALIDATION.md §0.1） ────────────────────────────────────
+//   闸一：env 开关 `MUSE_WORLD_SERIES_AUTOSCALE`，**默认关闭**，全局急停阀，作用在**读取侧**——
+//         关掉之后既有系列立即停止扩容（已开出的实例不受影响，那是世界不是功能），再打开原样恢复。
+//   闸二：系列**必须显式登记**（`world_series` 表，运营建 1 号房时带 `series` 参数）。
+//         未登记的世界——含全部历史世界与全部玩家自建房——永不扩容，行为零变化。
+// ⚠️ 沿用现有 env 范式（同 `deathmatch_enabled` / `subplot_cards_enabled`）：本仓库尚无配置表，
+//    做不到按世界灰度，这是已知缺口；将来配置表落地只改本节函数内部，调用点与降级语义不变。
+
+/// 世界系列自动扩容的运营开关环境变量。
+const ENV_SERIES_AUTOSCALE: &str = "MUSE_WORLD_SERIES_AUTOSCALE";
+/// 自动扩容默认值 = **关闭**。
+const DEFAULT_SERIES_AUTOSCALE_ENABLED: bool = false;
+
+/// 系列实例数**全局硬顶**的 env 名（§0.2 参数化，禁写死）。
+const ENV_SERIES_MAX_INSTANCES: &str = "MUSE_WORLD_SERIES_MAX_INSTANCES";
+/// 全局硬顶默认值：一个系列最多 10 个实例（含 1 号）。
+const DEFAULT_SERIES_MAX_INSTANCES: i64 = 10;
+/// 硬顶的合法区间：至少 1（= 只有 1 号、等于不扩容），最多 200（再多调度器与成本盘都不该扛）。
+const MIN_SERIES_MAX_INSTANCES: i64 = 1;
+const HARD_SERIES_MAX_INSTANCES: i64 = 200;
+
+/// 系列状态：可继续扩容。
+const SERIES_STATUS_ACTIVE: &str = "active";
+
+/// 自动扩容是否已由运营开启（env 覆盖 + 默认常量，范式同 `deathmatch_enabled`）。
+///
+/// 开关是**全局急停阀**，生效在读取侧（`ensure_next_series_instance` / `series_view` 第一行）：
+/// 关掉即刻停止一切扩容与排队指路，再打开则原样恢复——可逆，不是一次性阉割。
+pub fn series_autoscale_enabled() -> bool {
+    match std::env::var(ENV_SERIES_AUTOSCALE) {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "on" | "yes" => true,
+            "0" | "false" | "off" | "no" => false,
+            // 配错不静默开启会自动建世界的能力：回落默认（关闭）。
+            _ => DEFAULT_SERIES_AUTOSCALE_ENABLED,
+        },
+        Err(_) => DEFAULT_SERIES_AUTOSCALE_ENABLED,
+    }
+}
+
+/// 系列实例数的全局硬顶（运营可调；缺失/非法回落默认，再 clamp 进安全区间）。
+pub(crate) fn series_max_instances_cap() -> i64 {
+    std::env::var(ENV_SERIES_MAX_INSTANCES)
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(DEFAULT_SERIES_MAX_INSTANCES)
+        .clamp(MIN_SERIES_MAX_INSTANCES, HARD_SERIES_MAX_INSTANCES)
+}
+
+/// 测试专用：扩容相关 env 的 RAII 夹具（范式与 `DeathmatchSwitch` 逐字一致，见其注释）。
+/// 跨模块可见（admin_api 的建系列用例同样需要它），故定义在这里。
+#[cfg(test)]
+pub(crate) struct SeriesSwitch {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    prev: Vec<(&'static str, Option<String>)>,
+}
+
+#[cfg(test)]
+impl SeriesSwitch {
+    /// 只置总开关。
+    pub(crate) fn set(on: bool) -> Self {
+        Self::with(on, &[])
+    }
+
+    /// 置总开关 + 若干额外 env（如 `MUSE_WORLD_SERIES_MAX_INSTANCES`）。
+    /// ⚠️ `extra` 里不要再放总开关键，否则 Drop 时同键恢复两次会把状态留给下一个用例。
+    pub(crate) fn with(on: bool, extra: &[(&'static str, &str)]) -> Self {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut prev = vec![(ENV_SERIES_AUTOSCALE, std::env::var(ENV_SERIES_AUTOSCALE).ok())];
+        std::env::set_var(ENV_SERIES_AUTOSCALE, if on { "1" } else { "0" });
+        for (k, v) in extra {
+            prev.push((k, std::env::var(k).ok()));
+            std::env::set_var(k, v);
+        }
+        Self { _guard: guard, prev }
+    }
+}
+
+#[cfg(test)]
+impl Drop for SeriesSwitch {
+    fn drop(&mut self) {
+        for (k, v) in &self.prev {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+}
+
+/// 世界系列行（`world_series` 投影）。
+#[derive(Debug, Clone)]
+pub(crate) struct SeriesRow {
+    pub(crate) id: String,
+    /// 1 号实例——**建房参数的唯一复制源**（见迁移 0035 注释：锚死 1 号，队列多长都不漂）。
+    pub(crate) origin_world_id: String,
+    /// 该系列自带的实例数上限（运营建系列时设）。
+    pub(crate) max_instances: i64,
+    pub(crate) status: String,
+}
+
+impl SeriesRow {
+    /// 生效上限 = 系列自带上限 ∧ 全局 env 硬顶，**取小**。两道都可调，任一收紧立即生效。
+    fn effective_max_instances(&self) -> i64 {
+        self.max_instances.clamp(0, series_max_instances_cap())
+    }
+}
+
+/// 把一个世界登记为**系列源头（1 号实例）**。幂等：已登记 → 原样返回既有系列 id，不新建、不改参数。
+///
+/// 由 admin 官方建房（`admin_api::worlds_ops::create_world` 的可选 `series` 入参）调用。
+/// 这是「逐系列显式开闸」那一道闸：没走过这个函数的世界，永远不会长出下一号实例。
+pub(crate) async fn enroll_series(
+    db: &AnyPool,
+    world_id: &str,
+    template_id: &str,
+    max_instances: i64,
+) -> Result<String, ApiError> {
+    // 已登记（作为任一系列的任一号）→ 幂等返回它所属系列。
+    if let Some((series, _)) = load_series_of_world(db, world_id).await? {
+        return Ok(series.id);
+    }
+    let now = now_ms();
+    let series_id = new_id("wsr");
+    let mut tx = db.begin().await?;
+    sqlx::query(
+        "INSERT INTO world_series (id, origin_world_id, template_id, max_instances, status, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&series_id)
+    .bind(world_id)
+    .bind(template_id)
+    .bind(max_instances)
+    .bind(SERIES_STATUS_ACTIVE)
+    .bind(now)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO world_series_instances (series_id, instance_no, world_id, created_at) VALUES (?, 1, ?, ?)",
+    )
+    .bind(&series_id)
+    .bind(world_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(series_id)
+}
+
+/// 按世界反查它所属的系列与号数；未登记 → `None`（绝大多数世界走这一支，零成本）。
+pub(crate) async fn load_series_of_world(
+    db: &AnyPool,
+    world_id: &str,
+) -> Result<Option<(SeriesRow, i64)>, ApiError> {
+    let row = sqlx::query(
+        "SELECT s.id AS sid, s.origin_world_id, s.max_instances, s.status, i.instance_no \
+         FROM world_series_instances i JOIN world_series s ON s.id = i.series_id \
+         WHERE i.world_id = ?",
+    )
+    .bind(world_id)
+    .fetch_optional(db)
+    .await?;
+    let Some(r) = row else {
+        return Ok(None);
+    };
+    Ok(Some((
+        SeriesRow {
+            id: r.try_get("sid")?,
+            origin_world_id: r.try_get("origin_world_id")?,
+            max_instances: r.try_get("max_instances")?,
+            status: r.try_get("status")?,
+        },
+        r.try_get("instance_no")?,
+    )))
+}
+
+/// 系列里「还能进人」的实例（号数升序取第一个），排除 `exclude_world_id`。
+///
+/// 判据 = `status IN ('open','running')` 且 active 成员数 < member_limit——与 join 的人数守卫
+/// **同一个口径**（成员计数条件逐字相同），故这里说"能进"与 join 真的能进不会打架。
+/// 号数升序 = 队列语义：低号先填满，不会让人散在一堆半空的房里。
+async fn find_open_instance(
+    db: &AnyPool,
+    series_id: &str,
+    exclude_world_id: &str,
+) -> Result<Option<(String, i64)>, ApiError> {
+    let rows = sqlx::query(
+        "SELECT i.instance_no, w.id AS wid, w.member_limit, \
+         (SELECT COUNT(*) FROM world_members m WHERE m.world_id = w.id AND m.status='active') AS member_count \
+         FROM world_series_instances i JOIN worlds w ON w.id = i.world_id \
+         WHERE i.series_id = ? AND w.status IN ('open','running') \
+         ORDER BY i.instance_no ASC",
+    )
+    .bind(series_id)
+    .fetch_all(db)
+    .await?;
+    for r in &rows {
+        let wid: String = r.try_get("wid")?;
+        if wid == exclude_world_id {
+            continue;
+        }
+        let limit: i64 = r.try_get("member_limit")?;
+        let count: i64 = r.try_get("member_count")?;
+        if count < limit {
+            return Ok(Some((wid, r.try_get("instance_no")?)));
+        }
+    }
+    Ok(None)
+}
+
+/// 系列当前最大号数（空系列 → 0）。
+async fn max_instance_no(db: &AnyPool, series_id: &str) -> Result<i64, ApiError> {
+    let n: Option<i64> = sqlx::query_scalar(
+        "SELECT instance_no FROM world_series_instances WHERE series_id = ? ORDER BY instance_no DESC LIMIT 1",
+    )
+    .bind(series_id)
+    .fetch_optional(db)
+    .await?;
+    Ok(n.unwrap_or(0))
+}
+
+/// 开出系列的第 `next_no` 号实例：**逐字段复制 1 号实例的建房参数**。
+///
+/// 复制的东西（= "建房参数"的全集，与 `CreateWorldParams` 一一对应）：
+/// 模板 id 与钉住的模板版本 · 房型 · 可见性 · 主播 · 人数上限 · tick 节奏 · 时间线模式 ·
+/// **生死契约档** · 日 token 预算与日 cny 熔断额（读 `world_budgets`）·
+/// **钉住的 engine / prompt_set / model_route 三版本**。
+///
+/// 🔴 三版本为什么也照抄而不重新解析当前 active 版本：一个系列是**同一批可比的场次**，
+/// 2 号若跑在新引擎/新 prompt 上，玩家在"同一个世界"里会得到两种体验，运营也没法把两号的
+/// 数据放在一起看。要换版本就新建一个系列（新 1 号），而不是让队列在中途悄悄换轨。
+///
+/// 🔴 **不复制 `assembled_json`**：这不是参数，是**采样结果**。规格 §5 明写「实例 = 剧情超集的
+/// 一次确定性采样，种子 = H(world_id‖阵容指纹‖template_version)」「1 号世界 10 个官员、
+/// 2 号世界 1 个，皆由实例种子决定」——照抄采样等于把"一个模板，千个平行世界"抄成千个同一个世界，
+/// 也抄掉了身份分布这重防刷。新实例留空，首次使用时由装配层按它自己的种子装配。
+///
+/// 状态：照抄 1 号的 status（`open`/`running`），1 号已不在这两态（paused/ended）时回落 `open`
+/// ——新号不该一出生就是不可调度的僵尸房。标题在 1 号标题后缀号数以便大厅区分（**唯一有意为之的差异**）。
+///
+/// 幂等：世界与号数登记在**同一事务**内落库。并发者撞 `(series_id, instance_no)` 主键 → 整笔回滚
+/// （新世界一并消失，不留孤儿房）→ 返回 `Ok(None)`，由调用方重查队列拿赢家开的那一号。
+async fn spawn_next_instance(
+    db: &AnyPool,
+    series: &SeriesRow,
+    next_no: i64,
+) -> Result<Option<String>, ApiError> {
+    let origin = load_world(db, &series.origin_world_id).await?;
+    // 预算两列不在 worlds 表里，单独读一次（缺行 → 用 official() 的保守默认，绝不落 0：
+    // daily_token_budget=0 会被 runtime 当作"无上限"，那是成本失控）。
+    let budget = sqlx::query(
+        "SELECT daily_token_budget, daily_cny_budget_cents FROM world_budgets WHERE world_id = ?",
+    )
+    .bind(&series.origin_world_id)
+    .fetch_optional(db)
+    .await?;
+    let (daily_token_budget, daily_cny_budget_cents) = match &budget {
+        Some(b) => (b.try_get::<i64, _>("daily_token_budget")?, b.try_get::<i64, _>("daily_cny_budget_cents")?),
+        None => (200_000, 2_000),
+    };
+    let status = if matches!(origin.status.as_str(), "open" | "running") {
+        origin.status.clone()
+    } else {
+        "open".to_string()
+    };
+
+    let params = CreateWorldParams {
+        template_id: origin.template_id.clone(),
+        template_version: origin.template_version,
+        room_type: origin.room_type.clone(),
+        title: format!("{} #{next_no}", origin.title),
+        visibility: origin.visibility.clone(),
+        host_user_id: origin.host_user_id.clone(),
+        member_limit: origin.member_limit,
+        tick_per_day: origin.tick_per_day,
+        daily_token_budget,
+        daily_cny_budget_cents,
+        status: Some(status),
+        timeline_mode: origin.timeline_mode.clone(),
+        // 落库原值照抄（不是 effective_lethality）：生效档由读取侧的运营开关裁定，
+        // 抄生效档会让"开关关着时扩容出来的房"永久丢掉建房方的生死状意图。
+        lethality: origin.lethality.clone(),
+        engine_version: Some(origin.engine_version.clone()),
+        prompt_set_version: Some(origin.prompt_set_version.clone()),
+        model_route_version: Some(origin.model_route_version.clone()),
+        // 采样结果不复制（见上）。
+        assembled_json: None,
+        initial_state_json: None,
+    };
+
+    let now = now_ms();
+    let mut tx = db.begin().await?;
+    let new_world_id = create_world_tx(&mut tx, params).await?;
+    let res = sqlx::query(
+        "INSERT INTO world_series_instances (series_id, instance_no, world_id, created_at) VALUES (?, ?, ?, ?)",
+    )
+    .bind(&series.id)
+    .bind(next_no)
+    .bind(&new_world_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await;
+    match res {
+        Ok(_) => {}
+        // 并发抢号：整笔回滚（世界一并消失），调用方重查队列。
+        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        Err(e) => return Err(e.into()),
+    }
+    tx.commit().await?;
+
+    // 全链审计（§0.2）："哪个系列在什么时候自动开了第几号、复制自哪一号"。actor 记 system——
+    // 这是系统按规则开的房，不是某个运营点的按钮，责任链指向系列登记那次运营动作。
+    sqlx::query(
+        "INSERT INTO audit_logs (id, actor_id, actor_role, action, subject, reason, created_at) \
+         VALUES (?, 'system', 'system', 'world.series_expanded', ?, ?, ?)",
+    )
+    .bind(new_id("aud"))
+    .bind(&new_world_id)
+    .bind(format!(
+        "series={}|instanceNo={next_no}|clonedFrom={}",
+        series.id, series.origin_world_id
+    ))
+    .bind(now)
+    .execute(db)
+    .await?;
+
+    Ok(Some(new_world_id))
+}
+
+/// 排队分房：确保 `world` 所属系列存在「下一号可入实例」，返回它的 `(worldId, instanceNo)`。
+///
+/// 返回 `None` 的全部情形（每一种都是"不扩容"的正当理由，调用方一律照常回 `world_full`）：
+/// 开关关闭 · 世界未登记进任何系列 · 系列已 `closed` · **已达生效上限** · 并发抢号失败且队列仍无空位。
+///
+/// 🔴 本函数**不写 `world_members`**，也**不做任何资格判定**——见本节顶部的红线说明。
+pub(crate) async fn ensure_next_series_instance(
+    db: &AnyPool,
+    world: &WorldRow,
+) -> Result<Option<(String, i64)>, ApiError> {
+    if !series_autoscale_enabled() {
+        return Ok(None);
+    }
+    let Some((series, _self_no)) = load_series_of_world(db, &world.id).await? else {
+        return Ok(None);
+    };
+    if series.status != SERIES_STATUS_ACTIVE {
+        return Ok(None);
+    }
+    // ① 队列里已有可入实例 → 直接指路，**不建新号**（这就是"不重复建"的主路径：
+    //    并发满员的 N 个请求里，第一个开出 2 号，其余 N-1 个在这里就命中它了）。
+    if let Some(found) = find_open_instance(db, &series.id, &world.id).await? {
+        return Ok(Some(found));
+    }
+    // ② 没有空位 → 开下一号，但先过上限。
+    let next_no = max_instance_no(db, &series.id).await? + 1;
+    if next_no > series.effective_max_instances() {
+        tracing::info!(
+            series = %series.id,
+            next_no,
+            max = series.effective_max_instances(),
+            "世界系列已达实例数上限，不再扩容"
+        );
+        return Ok(None);
+    }
+    match spawn_next_instance(db, &series, next_no).await? {
+        Some(wid) => Ok(Some((wid, next_no))),
+        // 抢号失败 = 别人刚开出这一号 → 重查队列（此时它一定是空的，必然命中）。
+        None => find_open_instance(db, &series.id, &world.id).await,
+    }
+}
+
+/// 满员 → 409 `world_full`，并顺带做排队分房（见本节顶部）。
+///
+/// 错误码保持 `world_full` **前缀**不变：既有客户端按 `contains("world_full")` 匹配（见
+/// `src/stores/usePlatformStore.ts`），追加的 `|next={worldId}` 对它们透明。
+/// 扩容出任何差错都**不改变"满员"这个事实**：吞掉错误、照回原样 409，绝不把一次分房失败
+/// 升级成 500 让玩家连"人满了"都看不到。
+async fn world_full_conflict(db: &AnyPool, world: &WorldRow) -> ApiError {
+    match ensure_next_series_instance(db, world).await {
+        Ok(Some((next_id, _no))) => ApiError::Conflict(format!("world_full|next={next_id}")),
+        Ok(None) => ApiError::Conflict("world_full".into()),
+        Err(e) => {
+            tracing::warn!(world_id = %world.id, error = %e, "世界系列扩容失败，按普通满员返回");
+            ApiError::Conflict("world_full".into())
+        }
+    }
+}
+
+/// 世界详情里的 `series` 段（**纯读**）：告诉玩家这是系列的第几号、还有没有别的号可以进。
+///
+/// 🔴 与 `ensure_next_series_instance` 的关键差别：**本函数绝不建世界**。
+/// GET 是幂等读，一次刷新详情页就自动开一个新世界是不可接受的副作用；
+/// 新号只在真的有人撞满员（POST join）时才开。
+async fn series_view(db: &AnyPool, world: &WorldRow) -> Result<Option<Value>, ApiError> {
+    if !series_autoscale_enabled() {
+        return Ok(None);
+    }
+    let Some((series, instance_no)) = load_series_of_world(db, &world.id).await? else {
+        return Ok(None);
+    };
+    let instance_count = max_instance_no(db, &series.id).await?;
+    let next_open = find_open_instance(db, &series.id, &world.id).await?;
+    let mut view = json!({
+        "seriesId": series.id,
+        "instanceNo": instance_no,
+        "instanceCount": instance_count,
+        "maxInstances": series.effective_max_instances(),
+        "status": series.status,
+    });
+    if let Some((wid, no)) = next_open {
+        view["nextOpenWorldId"] = json!(wid);
+        view["nextOpenInstanceNo"] = json!(no);
+    }
+    Ok(Some(view))
+}
+
+/// 运营诊断用的系列视图（`GET /admin/worlds/{id}/diagnostics` 的 `series` 段）。
+///
+/// 与玩家侧 `series_view` 的两处差别，都是刻意的：
+/// - **不受 env 开关门控**：开关关着时运营更需要看见"这个世界登记在哪个系列、队列多长"，
+///   否则急停阀一拉，整条队列在后台就凭空消失了。开关状态另作 `autoscaleEnabled` 字段明示。
+/// - 给出 `maxInstancesConfigured`（系列自带上限）与 `maxInstancesEffective`（∧ 全局硬顶后的生效值）
+///   两个数：二者不一致即"全局硬顶正在压着这条队列"，运营一眼可辨。
+///
+/// 纯读，同样绝不建房。
+pub(crate) async fn series_admin_view(
+    db: &AnyPool,
+    world_id: &str,
+) -> Result<Option<Value>, ApiError> {
+    let Some((series, instance_no)) = load_series_of_world(db, world_id).await? else {
+        return Ok(None);
+    };
+    Ok(Some(json!({
+        "seriesId": series.id,
+        "originWorldId": series.origin_world_id,
+        "instanceNo": instance_no,
+        "instanceCount": max_instance_no(db, &series.id).await?,
+        "maxInstancesConfigured": series.max_instances,
+        "maxInstancesEffective": series.effective_max_instances(),
+        "globalCap": series_max_instances_cap(),
+        "status": series.status,
+        "autoscaleEnabled": series_autoscale_enabled(),
+    })))
+}
+
+// ===== WORLD-SERIES-REGION-END =====
+
+// ---------- BE 结局传记读取面（总规格 §9；产出侧在 `progression::seal_be_biography_tx`） ----------
+
+/// GET /worlds/{id}/biography：读一个世界的 **BE 结局传记**（崩塌封卷）。
+///
+/// 「坏结局也是内容，封卷收藏」需要一个读取面，就是这里。传记是**只读汇总**，本端点也只有 SELECT。
+///
+/// 两层降级（口径同 subplot 的 `ensure_enabled`）：
+/// - 运营开关 `MUSE_WORLD_BE_BIOGRAPHY` 未开 → 404（功能不存在，不泄露"平台有这个未开放功能"）；
+/// - 世界没有传记（正常终局 / 尚未终局 / 关阀期间崩塌的）→ 404。
+///
+/// 可见性沿用世界详情那一套：私有世界仅房主/成员可读（`ensure_world_readable`），
+/// 官方/公开世界任何登录用户可读——BE 传记本就是给人看的封卷。
+async fn world_biography(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    if !crate::progression::be_biography_enabled() {
+        return Err(ApiError::NotFound);
+    }
+    let world = load_world(&state.db, &id).await?;
+    ensure_world_readable(&state.db, &world, &user).await?;
+
+    let row = sqlx::query(
+        "SELECT kind, terminal_reason, ending_id, summary_json, sealed_at FROM world_biographies WHERE world_id = ?",
+    )
+    .bind(&id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or(ApiError::NotFound)?;
+
+    let summary_raw: String = row.try_get("summary_json")?;
+    Ok(Json(json!({
+        "worldId": id,
+        "kind": row.try_get::<String, _>("kind")?,
+        "terminalReason": row.try_get::<String, _>("terminal_reason")?,
+        "endingId": row.try_get::<String, _>("ending_id")?,
+        "sealedAt": row.try_get::<i64, _>("sealed_at")?,
+        // 解析失败（理论上不可能：写入即 serde 序列化）→ 原样给字符串，绝不吞掉封卷内容。
+        "summary": serde_json::from_str::<Value>(&summary_raw).unwrap_or(json!(summary_raw)),
+        "aiLabel": { "visible": true },
+    })))
+}
+
 pub fn router() -> Router<AppState> {
     // 房主建房 POST /worlds 携开房费 charge（P4b），依赖 `ledger`（feature=billing/arena 才装配）；
     // 无经济 feature 时不暴露该端点（GET /worlds 大厅列表恒在）。feature 一致，见 app.rs / ledger 门控。
@@ -1299,6 +1839,8 @@ pub fn router() -> Router<AppState> {
         .route("/worlds/{id}/leave", post(leave_world))
         // 封面上传恒在（不随经济 feature 门控）：封面是展示层资产，与账本无关。
         .route("/worlds/{id}/cover", post(upload_cover))
+        // BE 结局传记读取面（§9）。开关默认关闭时恒 404。
+        .route("/worlds/{id}/biography", get(world_biography))
 }
 
 // ---------- 房主建房（POST /worlds）+ 开房费 charge（P4b/P2，feature=billing/arena） ----------

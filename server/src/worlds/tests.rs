@@ -2478,3 +2478,464 @@ mod room_open {
         assert_eq!(count_sql(&state.db, "SELECT COUNT(*) FROM worlds WHERE host_user_id='host'").await, 1, "幂等重投只建一个世界");
     }
 }
+
+// ================= 世界系列自动扩容（总规格 §5「世界系列自动扩容【新增】」） =================
+//
+// 覆盖：开关关闭不扩容 · 满员触发开下一号 · **新实例参数与 1 号一致** ·
+// **扩容不绕过 join 校验（红线）** · 上限生效 · 并发/重复触发幂等（不重复建） ·
+// 详情页的 series 段是纯读（不建房）。
+mod series_autoscale {
+    use super::*;
+    use crate::worlds::{enroll_series, SeriesSwitch, LETHALITY_SANCTUARY};
+
+    async fn count_sql(state: &AppState, sql: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>(sql).fetch_one(&state.db).await.unwrap()
+    }
+
+    /// 建一个**参数刻意全非默认**的 1 号实例并登记为系列源头 —— 参数越不像默认值，
+    /// 「复制」和「用默认值重建」的差别越藏不住。
+    async fn seed_series_origin(
+        state: &AppState,
+        member_limit: i64,
+        max_instances: i64,
+    ) -> (String, String) {
+        let mut p = CreateWorldParams::official("tpl_series", 7, "黑角域篇·连载场");
+        p.member_limit = member_limit;
+        p.tick_per_day = 11;
+        p.timeline_mode = "event".into();
+        p.lethality = LETHALITY_SANCTUARY.into();
+        p.daily_token_budget = 123_456;
+        p.daily_cny_budget_cents = 789;
+        p.status = Some("running".into());
+        p.engine_version = Some("engine-pinned-1".into());
+        p.prompt_set_version = Some("prompt-pinned-1".into());
+        p.model_route_version = Some("route-pinned-1".into());
+        let wid = create_world(&state.db, p).await.unwrap();
+        let sid = enroll_series(&state.db, &wid, "tpl_series", max_instances).await.unwrap();
+        (wid, sid)
+    }
+
+    async fn join(app: &axum::Router, state: &AppState, wid: &str, user: &str, ch: &str) -> (StatusCode, Value) {
+        post_json(
+            app,
+            &format!("/api/worlds/{wid}/join"),
+            &token(state, user),
+            None,
+            json!({ "cloudCharacterId": ch }),
+        )
+        .await
+    }
+
+    async fn seed_player(state: &AppState, user: &str, ch: &str) {
+        seed_user(state, user).await;
+        seed_char(state, ch, user, "approved", 0).await;
+    }
+
+    /// 从 `world_full|next={id}` 里取出下一号世界 id；没有指路则 None。
+    fn next_world_id(body: &Value) -> Option<String> {
+        body["error"]["message"]
+            .as_str()?
+            .split("next=")
+            .nth(1)
+            .map(|s| s.trim().to_string())
+    }
+
+    /// 🔴 开关关闭 → 不扩容（VALIDATION.md §0.1 未验证功能默认关闭）。
+    /// 即便世界**已登记进系列**，关阀期间也只回普通 `world_full`，一个新世界都不许建。
+    #[tokio::test]
+    async fn disabled_switch_never_expands() {
+        let _sw = SeriesSwitch::set(false);
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_player(&state, "uA", "cA").await;
+        seed_player(&state, "uB", "cB").await;
+        let (wid, _sid) = seed_series_origin(&state, 1, 5).await;
+
+        assert_eq!(join(&app, &state, &wid, "uA", "cA").await.0, StatusCode::OK);
+        let (st, body) = join(&app, &state, &wid, "uB", "cB").await;
+        assert_eq!(st, StatusCode::CONFLICT, "满员应 409: {body}");
+        let msg = body["error"]["message"].as_str().unwrap_or("");
+        assert!(msg.contains("world_full"), "错误码前缀不得变: {body}");
+        assert!(!msg.contains("next="), "开关关闭时不得指路: {body}");
+        assert_eq!(count_sql(&state, "SELECT COUNT(*) FROM worlds").await, 1, "关阀期间不得新建世界");
+        assert_eq!(
+            count_sql(&state, "SELECT COUNT(*) FROM world_series_instances").await,
+            1,
+            "关阀期间队列不得增长"
+        );
+    }
+
+    /// 未登记进系列的世界（= 全部历史世界 + 全部玩家自建房）满员时行为零变化：
+    /// 开关开着也不扩容——「逐系列显式登记」是第二道闸。
+    #[tokio::test]
+    async fn unenrolled_world_never_expands() {
+        let _sw = SeriesSwitch::set(true);
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_player(&state, "uA", "cA").await;
+        seed_player(&state, "uB", "cB").await;
+        let mut p = CreateWorldParams::official("tpl_plain", 1, "普通世界");
+        p.member_limit = 1;
+        let wid = create_world(&state.db, p).await.unwrap();
+
+        assert_eq!(join(&app, &state, &wid, "uA", "cA").await.0, StatusCode::OK);
+        let (st, body) = join(&app, &state, &wid, "uB", "cB").await;
+        assert_eq!(st, StatusCode::CONFLICT);
+        assert!(!body["error"]["message"].as_str().unwrap_or("").contains("next="), "{body}");
+        assert_eq!(count_sql(&state, "SELECT COUNT(*) FROM worlds").await, 1);
+    }
+
+    /// 满员 → 自动开 2 号，并在 409 里指路。
+    #[tokio::test]
+    async fn full_world_spawns_next_instance() {
+        let _sw = SeriesSwitch::set(true);
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_player(&state, "uA", "cA").await;
+        seed_player(&state, "uB", "cB").await;
+        let (wid, sid) = seed_series_origin(&state, 1, 5).await;
+
+        assert_eq!(join(&app, &state, &wid, "uA", "cA").await.0, StatusCode::OK);
+        let (st, body) = join(&app, &state, &wid, "uB", "cB").await;
+        assert_eq!(st, StatusCode::CONFLICT, "满员仍是 409（扩容不改变「这一号进不去」的事实）: {body}");
+        let next = next_world_id(&body).expect(&format!("应指路下一号实例: {body}"));
+        assert_ne!(next, wid);
+
+        // 2 号真的落库并登记为第 2 号。
+        let no: i64 = sqlx::query_scalar(
+            "SELECT instance_no FROM world_series_instances WHERE series_id = ? AND world_id = ?",
+        )
+        .bind(&sid)
+        .bind(&next)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(no, 2, "自动开出的应是 2 号");
+        assert_eq!(count_sql(&state, "SELECT COUNT(*) FROM worlds").await, 2);
+
+        // 扩容留痕（§0.2 全链审计）。
+        assert_eq!(
+            count_sql(
+                &state,
+                "SELECT COUNT(*) FROM audit_logs WHERE action='world.series_expanded'"
+            )
+            .await,
+            1
+        );
+
+        // 玩家带同一张卡对 2 号重新 join → 成功（这才是入场，扩容只是指路）。
+        assert_eq!(join(&app, &state, &next, "uB", "cB").await.0, StatusCode::OK);
+    }
+
+    /// 🔴 **新实例参数与 1 号逐字段一致**（建房参数复制不漂移）。
+    /// 唯一有意为之的差异是标题后缀（大厅要能区分号数）与 `assembled_json`
+    /// （那是**采样结果**不是参数，规格 §5 要求每个实例自采样）。
+    #[tokio::test]
+    async fn next_instance_copies_origin_params() {
+        let _sw = SeriesSwitch::set(true);
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_player(&state, "uA", "cA").await;
+        seed_player(&state, "uB", "cB").await;
+        let (wid, _sid) = seed_series_origin(&state, 1, 5).await;
+
+        assert_eq!(join(&app, &state, &wid, "uA", "cA").await.0, StatusCode::OK);
+        let (_st, body) = join(&app, &state, &wid, "uB", "cB").await;
+        let next = next_world_id(&body).expect(&format!("{body}"));
+
+        let a = load_world(&state.db, &wid).await.unwrap();
+        let b = load_world(&state.db, &next).await.unwrap();
+        assert_eq!(b.template_id, a.template_id, "模板不得漂移");
+        assert_eq!(b.template_version, a.template_version, "钉住的模板版本不得漂移");
+        assert_eq!(b.room_type, a.room_type);
+        assert_eq!(b.visibility, a.visibility);
+        assert_eq!(b.host_user_id, a.host_user_id);
+        assert_eq!(b.member_limit, a.member_limit, "人数上限不得漂移");
+        assert_eq!(b.tick_per_day, a.tick_per_day, "节奏不得漂移");
+        assert_eq!(b.timeline_mode, a.timeline_mode);
+        assert_eq!(b.lethality, a.lethality, "生死契约档不得漂移");
+        assert_eq!(b.status, a.status);
+        assert_eq!(b.engine_version, a.engine_version, "钉住的引擎版本不得漂移");
+        assert_eq!(b.prompt_set_version, a.prompt_set_version, "钉住的 prompt 版本不得漂移");
+        assert_eq!(b.model_route_version, a.model_route_version, "钉住的模型路由不得漂移");
+
+        // 预算两列（B-2：非零 token/cny 上限，避免扩容出的房无上限烧钱）。
+        let budgets: Vec<(i64, i64)> = sqlx::query_as(
+            "SELECT daily_token_budget, daily_cny_budget_cents FROM world_budgets WHERE world_id = ?",
+        )
+        .bind(&next)
+        .fetch_all(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(budgets, vec![(123_456, 789)], "日预算与熔断额不得漂移");
+
+        // 采样不复制：新实例留空，首次使用时按它自己的种子装配（§5「一个模板，千个平行世界」）。
+        assert!(b.assembled_json.is_none(), "assembled_json 是采样结果，不得复制");
+        // 标题带号数后缀（唯一有意为之的差异）。
+        assert!(b.title.contains("#2"), "标题应带号数以便大厅区分: {}", b.title);
+    }
+
+    /// 🔴 **扩容不绕过 join 的任何资格校验**（红线）：
+    /// 扩容只回答"去哪个实例"，不回答"能不能进"。新实例上，未过审卡 / 已撤回卡 / 别人的卡
+    /// 一律照旧被拒；且扩容本身对 `world_members` 零写入（新实例在场人数恒为 0）。
+    #[tokio::test]
+    async fn expansion_never_bypasses_join_checks() {
+        let _sw = SeriesSwitch::set(true);
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_player(&state, "uA", "cA").await;
+        seed_player(&state, "uB", "cB").await;
+        seed_char(&state, "cPending", "uB", "pending", 0).await;
+        seed_char(&state, "cWithdrawn", "uB", "approved", 1).await;
+        let (wid, _sid) = seed_series_origin(&state, 1, 5).await;
+
+        assert_eq!(join(&app, &state, &wid, "uA", "cA").await.0, StatusCode::OK);
+        let (_st, body) = join(&app, &state, &wid, "uB", "cB").await;
+        let next = next_world_id(&body).expect(&format!("{body}"));
+
+        // ① 扩容没有替任何人占座。
+        let seated: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_members WHERE world_id = ?")
+            .bind(&next)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(seated, 0, "🔴 扩容不得写 world_members（不代投放）");
+
+        // ② 资格校验在新实例上原封不动地跑：未过审 / 已撤回 → 409；别人的卡 → 403。
+        let (st_p, _) = join(&app, &state, &next, "uB", "cPending").await;
+        assert_eq!(st_p, StatusCode::CONFLICT, "未过审卡不得因扩容而放行");
+        let (st_w, _) = join(&app, &state, &next, "uB", "cWithdrawn").await;
+        assert_eq!(st_w, StatusCode::CONFLICT, "已撤回卡不得因扩容而放行");
+        let (st_o, _) = join(&app, &state, &next, "uB", "cA").await;
+        assert_eq!(st_o, StatusCode::FORBIDDEN, "别人的卡不得因扩容而放行");
+
+        // ③ 人数上限在新实例上同样生效（复制来的 member_limit=1）。
+        assert_eq!(join(&app, &state, &next, "uB", "cB").await.0, StatusCode::OK);
+        seed_player(&state, "uC", "cC").await;
+        let (st_full, body_full) = join(&app, &state, &next, "uC", "cC").await;
+        assert_eq!(st_full, StatusCode::CONFLICT, "复制来的人数上限必须真的挡人: {body_full}");
+    }
+
+    /// 🔴 上限生效：达到系列上限后不再扩容（世界数膨胀可控）。
+    #[tokio::test]
+    async fn max_instances_cap_stops_expansion() {
+        let _sw = SeriesSwitch::set(true);
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        for (u, c) in [("u1", "c1"), ("u2", "c2"), ("u3", "c3")] {
+            seed_player(&state, u, c).await;
+        }
+        // 上限 2：1 号满 → 开 2 号；2 号也满 → 不再开 3 号。
+        let (wid, _sid) = seed_series_origin(&state, 1, 2).await;
+
+        assert_eq!(join(&app, &state, &wid, "u1", "c1").await.0, StatusCode::OK);
+        let (_s, body) = join(&app, &state, &wid, "u2", "c2").await;
+        let second = next_world_id(&body).expect(&format!("{body}"));
+        assert_eq!(join(&app, &state, &second, "u2", "c2").await.0, StatusCode::OK);
+
+        // 两号都满 → 第三个玩家撞满员：仍是 409，但**没有指路**，也没有第 3 个世界。
+        let (st, body3) = join(&app, &state, &wid, "u3", "c3").await;
+        assert_eq!(st, StatusCode::CONFLICT);
+        assert!(body3["error"]["message"].as_str().unwrap_or("").contains("world_full"), "{body3}");
+        assert!(next_world_id(&body3).is_none(), "达上限后不得再指路: {body3}");
+        assert_eq!(count_sql(&state, "SELECT COUNT(*) FROM worlds").await, 2, "达上限后不得再建世界");
+    }
+
+    /// 全局 env 硬顶与系列自带上限**取小**：系列写 5、env 写 1 → 生效 1 → 永不扩容。
+    #[tokio::test]
+    async fn global_env_cap_overrides_series_setting() {
+        let _sw = SeriesSwitch::with(true, &[("MUSE_WORLD_SERIES_MAX_INSTANCES", "1")]);
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_player(&state, "uA", "cA").await;
+        seed_player(&state, "uB", "cB").await;
+        let (wid, _sid) = seed_series_origin(&state, 1, 5).await;
+
+        assert_eq!(join(&app, &state, &wid, "uA", "cA").await.0, StatusCode::OK);
+        let (_st, body) = join(&app, &state, &wid, "uB", "cB").await;
+        assert!(next_world_id(&body).is_none(), "全局硬顶=1 时不得扩容: {body}");
+        assert_eq!(count_sql(&state, "SELECT COUNT(*) FROM worlds").await, 1);
+    }
+
+    /// 幂等：多次撞满员只开出**一个** 2 号——后来者命中已开的那一号，不重复建。
+    /// （数据库侧的最终防线是 `world_series_instances` 的 `(series_id, instance_no)` 主键：
+    /// 并发抢号者整笔事务回滚，连世界带登记一起消失，不留孤儿房。）
+    #[tokio::test]
+    async fn repeated_full_joins_expand_only_once() {
+        let _sw = SeriesSwitch::set(true);
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        for (u, c) in [("u1", "c1"), ("u2", "c2"), ("u3", "c3"), ("u4", "c4")] {
+            seed_player(&state, u, c).await;
+        }
+        let (wid, _sid) = seed_series_origin(&state, 1, 5).await;
+        assert_eq!(join(&app, &state, &wid, "u1", "c1").await.0, StatusCode::OK);
+
+        let (_s2, b2) = join(&app, &state, &wid, "u2", "c2").await;
+        let (_s3, b3) = join(&app, &state, &wid, "u3", "c3").await;
+        let (_s4, b4) = join(&app, &state, &wid, "u4", "c4").await;
+        let n2 = next_world_id(&b2).expect(&format!("{b2}"));
+        let n3 = next_world_id(&b3).expect(&format!("{b3}"));
+        let n4 = next_world_id(&b4).expect(&format!("{b4}"));
+        assert_eq!(n2, n3, "第二、三个撞满员的玩家应被指向同一号");
+        assert_eq!(n3, n4, "第四个同理");
+        assert_eq!(count_sql(&state, "SELECT COUNT(*) FROM worlds").await, 2, "重复触发不得重复建世界");
+        assert_eq!(
+            count_sql(&state, "SELECT COUNT(*) FROM world_series_instances").await,
+            2,
+            "队列长度不得因重复触发增长"
+        );
+        assert_eq!(
+            count_sql(&state, "SELECT COUNT(*) FROM audit_logs WHERE action='world.series_expanded'").await,
+            1,
+            "扩容留痕只应有一条"
+        );
+    }
+
+    /// 系列登记幂等：对同一个世界重复 `enroll_series` 命中既有系列，不新建、不改参数。
+    #[tokio::test]
+    async fn enroll_series_is_idempotent() {
+        let state = test_state().await;
+        let (wid, sid) = seed_series_origin(&state, 3, 4).await;
+        let again = enroll_series(&state.db, &wid, "tpl_other", 99).await.unwrap();
+        assert_eq!(again, sid, "重复登记应返回既有系列");
+        assert_eq!(count_sql(&state, "SELECT COUNT(*) FROM world_series").await, 1);
+        let max: i64 = sqlx::query_scalar("SELECT max_instances FROM world_series WHERE id = ?")
+            .bind(&sid)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(max, 4, "重复登记不得改写既有系列参数");
+    }
+
+    /// 世界详情的 `series` 段是**纯读**：刷详情页不许凭空长出一个世界。
+    #[tokio::test]
+    async fn detail_series_view_is_read_only() {
+        let _sw = SeriesSwitch::set(true);
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_player(&state, "uA", "cA").await;
+        let (wid, sid) = seed_series_origin(&state, 1, 5).await;
+        assert_eq!(join(&app, &state, &wid, "uA", "cA").await.0, StatusCode::OK); // 坐满
+
+        let (st, body) = get_json(&app, &format!("/api/worlds/{wid}"), &token(&state, "uA")).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert_eq!(body["series"]["seriesId"], json!(sid));
+        assert_eq!(body["series"]["instanceNo"], json!(1));
+        assert_eq!(body["series"]["instanceCount"], json!(1));
+        assert!(body["series"]["nextOpenWorldId"].is_null(), "满员且未扩容时不该有下一号: {body}");
+        assert_eq!(count_sql(&state, "SELECT COUNT(*) FROM worlds").await, 1, "🔴 GET 详情不得建房");
+    }
+
+    /// 开关关闭时详情页**不下发** series 段（读取侧降级，前端零感知）。
+    #[tokio::test]
+    async fn detail_hides_series_when_switch_off() {
+        let _sw = SeriesSwitch::set(false);
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_player(&state, "uA", "cA").await;
+        let (wid, _sid) = seed_series_origin(&state, 3, 5).await;
+        let (st, body) = get_json(&app, &format!("/api/worlds/{wid}"), &token(&state, "uA")).await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(body.get("series").is_none(), "关阀时不得下发 series 段: {body}");
+    }
+
+    /// 🔴 源码级红线：扩容区（WORLD-SERIES-REGION）对 `world_members` **零写入**。
+    /// 一旦有人在扩容路径上"顺手把玩家挪进新房"，这条断言立刻变红——那正是绕过 join 资格校验的入口。
+    #[test]
+    fn series_region_never_writes_world_members() {
+        let src = include_str!("mod.rs");
+        let begin = src.find("// ===== WORLD-SERIES-REGION-BEGIN =====").expect("缺少扩容区起始标记");
+        let end = src.find("// ===== WORLD-SERIES-REGION-END =====").expect("缺少扩容区结束标记");
+        let region = &src[begin..end];
+        for forbidden in ["INSERT INTO world_members", "UPDATE world_members", "DELETE FROM world_members"] {
+            assert!(
+                !region.contains(forbidden),
+                "🔴 扩容区出现「{forbidden}」：扩容只解决去哪个实例，绝不代替 join 投放（资格校验不得被绕过）"
+            );
+        }
+        // 扩容区也不许自己判资格（那必然与 join 漂移）。
+        for forbidden in ["source_fingerprint", "accept_death_contract", "age_declared", "star_mileage_gate"] {
+            assert!(
+                !region.contains(forbidden),
+                "🔴 扩容区出现资格判定符号「{forbidden}」：资格校验的唯一现场是 join_world"
+            );
+        }
+    }
+}
+
+// ================= BE 结局传记读取面（总规格 §9；产出侧在 progression） =================
+mod be_biography_read {
+    use super::*;
+    use crate::progression::BiographySwitch;
+
+    async fn seed_biography(state: &AppState, world_id: &str) {
+        sqlx::query(
+            "INSERT INTO world_biographies (world_id, kind, terminal_reason, ending_id, summary_json, sealed_at) \
+             VALUES (?, 'be', 'key_character_exit', 'ending_x', ?, ?)",
+        )
+        .bind(world_id)
+        .bind(json!({ "schemaVersion": 1, "collapse": { "modelGenerated": false } }).to_string())
+        .bind(now_ms())
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+
+    /// 开关关闭 → 端点 404（功能不存在，不泄露「平台有这个未开放功能」），即便传记行已存在。
+    #[tokio::test]
+    async fn read_face_404_when_switch_off() {
+        let _sw = BiographySwitch::set(false);
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_user(&state, "u1").await;
+        let wid = create_world(&state.db, CreateWorldParams::official("tpl", 1, "崩塌世界")).await.unwrap();
+        seed_biography(&state, &wid).await;
+        let (st, _) = get_json(&app, &format!("/api/worlds/{wid}/biography"), &token(&state, "u1")).await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "关阀时读取面必须 404");
+    }
+
+    /// 开关开启 + 有传记 → 200 并原样回封卷内容；没有传记的世界 → 404。
+    #[tokio::test]
+    async fn read_face_returns_sealed_biography() {
+        let _sw = BiographySwitch::set(true);
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_user(&state, "u1").await;
+        let sealed = create_world(&state.db, CreateWorldParams::official("tpl", 1, "崩塌世界")).await.unwrap();
+        let normal = create_world(&state.db, CreateWorldParams::official("tpl", 1, "正常世界")).await.unwrap();
+        seed_biography(&state, &sealed).await;
+
+        let (st, body) = get_json(&app, &format!("/api/worlds/{sealed}/biography"), &token(&state, "u1")).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert_eq!(body["kind"], "be");
+        assert_eq!(body["terminalReason"], "key_character_exit");
+        assert_eq!(body["endingId"], "ending_x");
+        assert_eq!(body["summary"]["collapse"]["modelGenerated"], json!(false));
+        assert_eq!(body["aiLabel"]["visible"], json!(true));
+
+        let (st2, _) = get_json(&app, &format!("/api/worlds/{normal}/biography"), &token(&state, "u1")).await;
+        assert_eq!(st2, StatusCode::NOT_FOUND, "没有传记的世界应 404");
+    }
+
+    /// 私有世界的传记沿用详情页那一套可见性闸：非成员 403。
+    #[tokio::test]
+    async fn private_world_biography_requires_membership() {
+        let _sw = BiographySwitch::set(true);
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_user(&state, "host").await;
+        seed_user(&state, "outsider").await;
+        let mut p = CreateWorldParams::official("tpl", 1, "私密崩塌世界");
+        p.visibility = "private".into();
+        p.host_user_id = Some("host".into());
+        let wid = create_world(&state.db, p).await.unwrap();
+        seed_biography(&state, &wid).await;
+
+        let (st_host, _) = get_json(&app, &format!("/api/worlds/{wid}/biography"), &token(&state, "host")).await;
+        assert_eq!(st_host, StatusCode::OK, "房主可读");
+        let (st_out, _) =
+            get_json(&app, &format!("/api/worlds/{wid}/biography"), &token(&state, "outsider")).await;
+        assert_eq!(st_out, StatusCode::FORBIDDEN, "非成员不得读私有世界的传记");
+    }
+}

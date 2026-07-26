@@ -2694,3 +2694,133 @@ async fn admin_cover_paths_keep_existing_rbac() {
     assert_eq!(st, StatusCode::OK, "{ok}");
     assert_eq!(ok["coverModeration"], "approved");
 }
+
+// ---------------- 世界系列自动扩容：建房时登记（总规格 §5「世界系列自动扩容【新增】」） ----------------
+
+/// 🔴 前门拒绝 + 参数校验 + 幂等登记（口径与生死状档的建房前门逐字一致）。
+///
+/// 「前门拒绝（登记不了）+ 读取侧降级（关阀即停扩容，见 worlds::tests）」两道都在，
+/// `MUSE_WORLD_SERIES_AUTOSCALE` 才是真的急停阀而非一次性阉割。
+#[tokio::test]
+async fn world_create_series_enrollment() {
+    use crate::worlds::SeriesSwitch;
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+    let base =
+        json!({ "templateId": "tpl_series", "templateVersion": 2, "title": "黑角域篇", "roomType": "idle" });
+
+    // 🔴 开关未开 → 连登记都不允许（否则会攒下一堆"一开阀就同时开始扩容"的世界）。
+    {
+        let _sw = SeriesSwitch::set(false);
+        let mut body = base.clone();
+        body["series"] = json!({ "maxInstances": 3 });
+        let (st, err) = post(&app, "/api/admin/worlds", Some(&admin), body).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "开关未开不得登记系列: {err}");
+        assert!(
+            err["error"]["message"].as_str().unwrap_or("").contains("世界系列自动扩容尚未开启"),
+            "文案须说明是运营开关未开: {err}"
+        );
+        assert_eq!(count(&state, "SELECT COUNT(*) AS n FROM world_series").await, 0);
+        // 不带 series 段的建房不受影响（默认行为零变化）。
+        let (st_plain, plain) = post(&app, "/api/admin/worlds", Some(&admin), base.clone()).await;
+        assert_eq!(st_plain, StatusCode::OK, "{plain}");
+        assert!(plain.get("seriesId").is_none(), "不带 series 段就不该有系列: {plain}");
+    }
+
+    let _sw = SeriesSwitch::with(true, &[("MUSE_WORLD_SERIES_MAX_INSTANCES", "5")]);
+
+    // 上限越界（0 / 超全局硬顶）→ 400，且不建出世界系列。
+    for bad in [0, 6] {
+        let mut body = base.clone();
+        body["series"] = json!({ "maxInstances": bad });
+        let (st, err) = post(&app, "/api/admin/worlds", Some(&admin), body).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "maxInstances={bad} 应拒: {err}");
+        assert!(err["error"]["message"].as_str().unwrap_or("").contains("maxInstances"), "{err}");
+    }
+    assert_eq!(count(&state, "SELECT COUNT(*) AS n FROM world_series").await, 0);
+
+    // 合法登记：建房 + 登记为 1 号实例，回执带系列信息，audit 留痕含系列。
+    let mut body = base.clone();
+    body["series"] = json!({ "maxInstances": 3 });
+    let (st, ok) = post(&app, "/api/admin/worlds", Some(&admin), body).await;
+    assert_eq!(st, StatusCode::OK, "{ok}");
+    let wid = ok["worldId"].as_str().unwrap().to_string();
+    let sid = ok["seriesId"].as_str().expect("回执须带 seriesId").to_string();
+    assert_eq!(ok["seriesInstanceNo"], json!(1));
+    assert_eq!(ok["seriesMaxInstances"], json!(3));
+
+    let origin: String = sqlx::query("SELECT origin_world_id FROM world_series WHERE id = ?")
+        .bind(&sid)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+        .try_get("origin_world_id")
+        .unwrap();
+    assert_eq!(origin, wid, "1 号实例即建房参数的复制源");
+    let no: i64 = sqlx::query("SELECT instance_no FROM world_series_instances WHERE world_id = ?")
+        .bind(&wid)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+        .try_get("instance_no")
+        .unwrap();
+    assert_eq!(no, 1);
+    let reason: String = sqlx::query("SELECT reason FROM audit_logs WHERE action='world.create' AND subject=?")
+        .bind(&wid)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+        .try_get("reason")
+        .unwrap();
+    assert!(reason.contains("series="), "建房留痕须带系列信息: {reason}");
+
+    // 运营诊断能看见系列（生效上限 = 系列自带 ∧ 全局硬顶，取小）。
+    let (st_d, diag) = get(&app, &format!("/api/admin/worlds/{wid}/diagnostics"), Some(&admin)).await;
+    assert_eq!(st_d, StatusCode::OK, "{diag}");
+    assert_eq!(diag["series"]["seriesId"], json!(sid));
+    assert_eq!(diag["series"]["instanceNo"], json!(1));
+    assert_eq!(diag["series"]["instanceCount"], json!(1));
+    assert_eq!(diag["series"]["maxInstancesConfigured"], json!(3));
+    assert_eq!(diag["series"]["maxInstancesEffective"], json!(3));
+    assert_eq!(diag["series"]["globalCap"], json!(5));
+    assert_eq!(diag["series"]["autoscaleEnabled"], json!(true));
+    assert_eq!(diag["series"]["status"], json!("active"));
+    // 未崩塌 → 无 BE 传记。
+    assert!(diag["beBiography"].is_null(), "未崩塌世界不应有传记: {diag}");
+
+    // 普通世界（未登记）的诊断里 series 为 null。
+    let (_st, plain) = post(&app, "/api/admin/worlds", Some(&admin), base.clone()).await;
+    let plain_id = plain["worldId"].as_str().unwrap();
+    let (_st2, diag2) = get(&app, &format!("/api/admin/worlds/{plain_id}/diagnostics"), Some(&admin)).await;
+    assert!(diag2["series"].is_null(), "未登记世界的 series 段应为 null: {diag2}");
+}
+
+/// 运营诊断的 `series` 段**不受 env 开关门控**：急停阀一拉，运营更需要看得见这条队列
+/// （开关状态另作 `autoscaleEnabled` 明示），否则整条队列在后台凭空消失。
+#[tokio::test]
+async fn diagnostics_series_visible_even_when_switch_off() {
+    use crate::worlds::SeriesSwitch;
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+
+    let wid = {
+        let _sw = SeriesSwitch::set(true);
+        let (st, ok) = post(
+            &app,
+            "/api/admin/worlds",
+            Some(&admin),
+            json!({ "templateId": "tpl_s", "title": "系列 1 号", "series": { "maxInstances": 2 } }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{ok}");
+        ok["worldId"].as_str().unwrap().to_string()
+    };
+
+    let _off = SeriesSwitch::set(false);
+    let (st, diag) = get(&app, &format!("/api/admin/worlds/{wid}/diagnostics"), Some(&admin)).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(!diag["series"].is_null(), "关阀时后台仍须看得见系列: {diag}");
+    assert_eq!(diag["series"]["autoscaleEnabled"], json!(false), "但要明示急停阀已拉下");
+}

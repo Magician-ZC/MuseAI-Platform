@@ -87,6 +87,7 @@
 | GET | `/api/worlds/{id}/invitations` | JWT | 我在该世界**发出**的邀请（只出自己发的） |
 | GET | `/api/me/invitations?status=` | JWT | 我**收到**的邀请（默认 pending） |
 | POST | `/api/me/invitations/{iid}/respond` | JWT | 接受/拒绝 `{accept}`（幂等）。非收件人 404 |
+| GET | `/api/worlds/{id}/biography` | JWT | **BE 结局传记**（世界崩塌后的封卷，migration 0035）。**开关默认关闭**时恒 404；正常终局的世界无传记 → 404；私有房仅房主/成员可读 |
 
 ### 房间邀请（invitations，migration 0029）
 
@@ -104,6 +105,66 @@
 > `invitations::tests::module_never_writes_world_members` 锁死。
 > 未成年保护另有**前门拒绝 + 接受时复查**双保险：生效档为生死状的世界，未声明成年者既收不到邀请、
 > 也接受不了（拒绝文案统一为通用句，不得让端点变成年龄探测器）。
+
+### 世界系列自动扩容（migration 0035；总规格 §5「世界系列自动扩容【新增】」）
+
+**1 号实例满员自动开 2 号**的排队分房层：运营基建，建房参数复制 + 排队队列。无新增端点——
+触发点在既有 `POST /api/worlds/{id}/join` 的满员分支，登记入口在既有 `POST /api/admin/worlds`。
+
+| 项 | 取值 |
+|---|---|
+| 运营开关 | `MUSE_WORLD_SERIES_AUTOSCALE`，**默认关闭**（VALIDATION.md §0.1）。前门拒绝（关阀时 admin 建房不允许登记系列）+ 读取侧降级（关阀时既有系列立即停止扩容与排队指路，再打开原样恢复）|
+| 第二道闸（数据侧） | 世界须**显式登记**为系列源头（建房时带 `series` 段）。未登记的世界——全部历史世界 + 全部玩家自建房——永不扩容，行为零变化 |
+| 触发条件 | 仅 `POST /worlds/{id}/join` 撞人数上限（`world_full`）那一刻。无定时/预扩容：没人敲门就不多开烧预算的世界 |
+| 排队队列 | **先指路、再开号**：队列里已有可入实例（`status IN (open,running)` 且 active 成员数 < `member_limit`，按号数升序）→ 直接指向它；没有才开下一号 |
+| 满员回执 | 仍是 409，错误码 `world_full`；有下一号时追加 `world_full\|next={worldId}`。老客户端按 `contains("world_full")` 匹配，完全透明 |
+| 世界详情 | `GET /worlds/{id}` 增 `series` 段：`seriesId` / `instanceNo` / `instanceCount` / `maxInstances` / `status` / `nextOpenWorldId`(可选)。**纯读，绝不建房**；开关关闭或未登记 → 不下发该键 |
+| 上限（§0.2 参数化） | 逐系列 `series.maxInstances`（建房时设，含 1 号）∧ 全局硬顶 env `MUSE_WORLD_SERIES_MAX_INSTANCES`（默认 10，clamp 1-200），**取小**。达上限即不再扩容（每个 running 实例都进调度器并各持日预算，膨胀必须可控）|
+| 幂等键 | `world_series_instances(series_id, instance_no)` 复合主键。开新号 = 同一事务内 `INSERT worlds` + 号数登记；并发抢号者整笔回滚（世界一并消失，不留孤儿房），回头重查队列命中赢家 |
+| 参数复制 | 复制源恒为**1 号实例**（不是"上一号"，避免误差沿队列累积）：模板 id / 钉住的模板版本 / 房型 / 可见性 / 主播 / 人数上限 / tick 节奏 / 时间线模式 / **生死契约档** / 日 token 与 cny 预算 / **钉住的 engine·prompt·model 三版本** 全部逐字段照抄 |
+| 不复制的两样 | `assembled_json`（那是**采样结果**不是参数——§5 要求每个实例按自己的种子采样，"一个模板，千个平行世界"，身份分布本身还是第二重防刷）；标题（后缀 ` #N` 以便大厅区分）|
+| 审计 | 每次开号落 `audit_logs(action='world.series_expanded')`，reason 记 `series/instanceNo/clonedFrom` |
+
+> 🔴 **扩容只解决"去哪个实例"，不解决"能不能进"**：扩容路径对 `world_members` **零写入**，
+> 绝不替玩家把卡投进新实例。玩家须对新实例重新调 `POST /worlds/{id}/join`，于是**同源唯一 ·
+> 一人一卡防自刷 · 人数上限 · 星级历练准入 · 生死契约二次签署 · 未成年禁入生死状**一条不少地重跑。
+> 理由是硬的：这些校验有一半是**按世界**判定的，在扩容路径上复制一份必然与 join 漂移，漂移即破口。
+> 该性质由源码断言 `worlds::tests::series_autoscale::series_region_never_writes_world_members`
+> （扩容区不得出现 `world_members` 写入，也不得出现任何资格判定符号）+ 集成用例
+> `expansion_never_bypasses_join_checks` 双重锁死。
+
+### BE 结局传记（migration 0035；总规格 §9「世界线崩塌」）
+
+世界线崩塌（关键角色永久退场等终局条件）→ ③归零 + ①减半 + ②已锁定保留 + **产出「BE 结局传记」**
+（坏结局也是内容，封卷收藏）。**有输、有痛、有纪念、无冤案、无武器化。**
+
+| 项 | 取值 |
+|---|---|
+| 运营开关 | `MUSE_WORLD_BE_BIOGRAPHY`，**默认关闭**。产出侧不产出 + 读取面 `GET /worlds/{id}/biography` 恒 404。关阀期间崩塌的世界不产传记，**再打开也不追溯补写**（传记是封卷那一刻的快照，补写等于把"当时的事实"换成"今天重算的事实"）|
+| 产出接点 | `progression::settle_idle_world_ending_tx`（runtime 终局结算调用的那一个）。与结算**同事务**：结算回滚则传记同滚 |
+| 触发条件 | **仅崩塌**（`is_collapse_reason`，当前白名单 `key_character_exit`）。`mainline_complete` / `time_cap` / `starved` / `time_limit` 等正常终局**不产出** |
+| 幂等键 | `world_biographies.world_id` 主键 + 事务内先查后写。重复/并发触发不重复产传记、不改写封卷时刻与内容 |
+| 内容 | 世界元信息（标题/模板/星级/契约档/起止时刻）· 世界线摘要（拍数分档、末拍号、事件按类型计数、贡献与里程碑合计）· 崩塌原因 · 参与者足迹（角色 id、面具名、在场状态、入离场时刻、贡献分）· 崩塌折算系数 |
+| 摘要长度（§0.2 参数化） | `MUSE_BE_BIO_MAX_FOOTPRINTS`（默认 200，clamp 1-2000）· `MUSE_BE_BIO_MAX_EVENT_KINDS`（默认 20，clamp 1-200）。截断时 `truncated=true` + `total` 如实给出 |
+| 审计 | 封卷落 `audit_logs(action='world.be_biography_sealed')` |
+
+> 🔴 **公共事实不可回滚（§0.3）**：传记是对既有事实的**只读汇总**。产出路径对
+> `worlds`/`world_events`/`world_ticks`/`world_contributions`/`world_members` 只有 SELECT，
+> 唯一写入是传记那一行 + 一条审计痕。由源码级断言（只读区内零 UPDATE/DELETE）+ 运行时断言
+> （封卷前后五张表全量快照逐字节相等）双重锁死。
+>
+> 🔴 **无冤案：崩塌原因不许模型现编**。原因的唯一来源是 `runtime::terminal_reason()` 与
+> `audit_logs(action='world.ended')` 的既有确定性数据（原始痕原样附在 `collapse.auditReason`，
+> 任何人可回 `audit_logs` 对质）；责任文案取自代码内**固定字典**。摘要显式声明
+> `collapse.modelGenerated=false` 与 `collapse.blameAssigned=false`——本传记**不做任何责任归属判定**，
+> 「蓄意毁世界者进风控」仍是既有 `risk_events` 的事。只读区源码级不含任何模型/provider 调用。
+>
+> 🔴 **不复制叙事正文、不下发真人身份**：摘要只有计量与结构，正文的唯一事实源仍是 `world_events`
+> （其受众投影隔离与机审门不变，绝不给正文开第二条不过闸的读路径）；足迹只记角色 id 与面具名，
+> 不记 `user_id`（§14 恨隔面具原则——传记是角色的墓志铭，不是真人的花名册）。
+>
+> 与**传世卡**（§12，migration 0034，`memorial/`）是两件事：那是**角色**死后的封卷（遗作馆陈列），
+> 这是**世界**崩塌后的封卷。两者各自独立建表、互不读写。
 
 ## 4. 玩家账户（me / backpack / progression / subplot / memorial / onboarding / reports / notifications）
 
@@ -304,8 +365,8 @@
 | GET | `/api/admin/appeals` | reviewer | 申诉列表 |
 | POST | `/api/admin/appeals/{id}/resolve` | reviewer | 申诉复审（overturn/uphold，**唯一改判路径**） |
 | GET | `/api/admin/worlds` | operator | 世界列表。含 `participantCount`、`successRate`（**0..1 小数**，无已终结 tick 时为 null）、`todayTokens`/`todayCostCents`/`todayCostCny` |
-| POST | `/api/admin/worlds` | operator | 官方建房 |
-| GET | `/api/admin/worlds/{id}/diagnostics` | operator | 脱敏诊断（采样种子不外泄）。`budget` 含金额换算与用量比：`spentCny`/`dailyCnyBudget`/`usageRatio`（**0..1**，取 token 与 cny 两维较大者）/`spentTokensTodayEffective`（跨日已归零） |
+| POST | `/api/admin/worlds` | operator | 官方建房。可选 `cover`（一次建完带图）· 可选 `series: {maxInstances}`（**登记为世界系列 1 号实例**，migration 0035；开关未开时 400，见 §3「世界系列自动扩容」）|
+| GET | `/api/admin/worlds/{id}/diagnostics` | operator | 脱敏诊断（采样种子不外泄）。`budget` 含金额换算与用量比：`spentCny`/`dailyCnyBudget`/`usageRatio`（**0..1**，取 token 与 cny 两维较大者）/`spentTokensTodayEffective`（跨日已归零）。另含 `series`（系列队列态；**不受 env 开关门控**——关阀时运营更需要看得见队列，开关状态另作 `autoscaleEnabled` 明示）与 `beBiography`（崩塌封卷元信息，正文另走玩家读取面）|
 | POST | `/api/admin/worlds/{id}/pause`·`/resume` | operator | 暂停/恢复（需审计理由） |
 | GET | `/api/admin/world-templates?sagaId=` | operator, reviewer | 模板列表。带 `sagaId` 时切换为**阶段列表**语义：只返回该世界系列，按 `stage_no` 升序（剧情顺序）且不分页 |
 | POST | `/api/admin/world-templates` | operator | 建模板。可选 `sagaId` + `stageNo`（总规格 §3 Saga 归组），二者必须成对，`stageNo` ∈ 1-999；都不传 = 独立模板 |
@@ -333,8 +394,8 @@
 ## 8. 本清单的生成与校验
 
 ```bash
-# 路由与方法（应得 104 个方法-路径）
-grep -rhoE '\.route\("[^"]+"' server/src | wc -l           # 95 条 route 声明
+# 路由与方法
+grep -rhoE '\.route\("[^"]+"' server/src | wc -l           # 100 条 route 声明（0035 后）
 # admin 角色矩阵
 grep -rn "require_role" server/src/admin_api/*.rs
 ```

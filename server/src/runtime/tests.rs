@@ -71,7 +71,7 @@ fn test_config() -> ServerConfig {
     }
 }
 
-async fn test_state() -> AppState {
+pub(super) async fn test_state() -> AppState {
     INIT.call_once(|| sqlx::any::install_default_drivers());
     let pool = AnyPoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
@@ -101,7 +101,7 @@ fn sample_card_json(id: &str, name: &str) -> String {
     serde_json::to_string(&card).unwrap()
 }
 
-async fn seed_user(db: &AnyPool, id: &str) {
+pub(super) async fn seed_user(db: &AnyPool, id: &str) {
     sqlx::query(
         "INSERT INTO users (id, nickname, age_declared, status, created_at, updated_at) \
          VALUES (?, '', 0, 'active', ?, ?)",
@@ -165,7 +165,7 @@ async fn seed_template(db: &AnyPool, id: &str) {
 }
 
 /// 钉住的模型路由版本：default profile 指向 mock（runtime 只用它判定「有模型配置」，真实调用走注入的 mock）。
-async fn seed_model_routes(db: &AnyPool, version: &str) {
+pub(super) async fn seed_model_routes(db: &AnyPool, version: &str) {
     let routes = json!({
         "default": { "interface": "OpenAI-compatible", "baseUrl": "http://mock", "apiKey": "k", "model": "mock-model" }
     });
@@ -179,7 +179,7 @@ async fn seed_model_routes(db: &AnyPool, version: &str) {
         .unwrap();
 }
 
-async fn seed_whisper(db: &AnyPool, id: &str, world_id: &str, user_id: &str, cid: &str, text: &str) {
+pub(super) async fn seed_whisper(db: &AnyPool, id: &str, world_id: &str, user_id: &str, cid: &str, text: &str) {
     sqlx::query(
         "INSERT INTO interventions (id, world_id, user_id, character_id, kind, payload_json, expected_revision, status, created_at) \
          VALUES (?, ?, ?, ?, 'whisper', ?, 0, 'accepted', ?)",
@@ -195,11 +195,11 @@ async fn seed_whisper(db: &AnyPool, id: &str, world_id: &str, user_id: &str, cid
     .unwrap();
 }
 
-async fn i64_one(db: &AnyPool, sql: &str, bind: &str) -> i64 {
+pub(super) async fn i64_one(db: &AnyPool, sql: &str, bind: &str) -> i64 {
     sqlx::query_scalar::<_, i64>(sql).bind(bind).fetch_one(db).await.unwrap()
 }
 
-async fn text_one(db: &AnyPool, sql: &str, bind: &str) -> String {
+pub(super) async fn text_one(db: &AnyPool, sql: &str, bind: &str) -> String {
     sqlx::query_scalar::<_, String>(sql).bind(bind).fetch_one(db).await.unwrap()
 }
 

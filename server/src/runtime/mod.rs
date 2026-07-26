@@ -1982,5 +1982,10 @@ pub fn spawn_workers(state: AppState) {
     tracing::info!(workers, "runtime 调度器与 worker 池已启动");
 }
 
+/// 黄金世界回归（VALIDATION §4.1 验证基建）：固定 world_id + 固定 fixture + 剧本化模型，
+/// 比对结构化产物是否逐字节不变。binary-only crate 无 lib.rs，只能落在 `#[cfg(test)]` 子模块，
+/// 好处是自动进现有 `platform-test` CI job，CI 改动为零。
+#[cfg(test)]
+mod golden;
 #[cfg(test)]
 mod tests;

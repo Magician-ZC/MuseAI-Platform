@@ -83,7 +83,7 @@
 
 | 功能 | 开发状态 | 验证状态 | 默认开关 |
 |---|---|---|---|
-| 世界引擎推演（决策/仲裁/写作/关系演化） | Integrated | 黄金世界回归待建 | T0 起开 |
+| 世界引擎推演（决策/仲裁/写作/关系演化） | Integrated | **黄金世界回归已建（仅管线层）** | T0 起开 |
 | 单人微本 + 新手礼包 | Specified | T0 待测 | T0 开 |
 | 日报召回 / 关键节点推送 | Implemented / Specified | T1 待测 | T1 开 |
 | 托梦（配额参数化） | Implemented（配额 Specified） | T1 待测 | 灰度 |
@@ -128,10 +128,58 @@
 
 1. **黄金世界回归**：一个公版/原创标准样板（固定角色卡 + 世界模板 + 20-30 个关键剧情测试点，
    覆盖正常结局/BE/死亡/托梦/多人关系）；每次换模型/Prompt/引擎版本重跑，对比 OOC、
-   剧情重复、角色曝光公平、成本变化。技术底座：现有 showcase/scenario 工装 + 确定性采样。
-2. **叙事质量 SLO**（正式监控，进运营看板）：OOC 申诉率 · 角色连续 N 拍无有效戏份比例 ·
-   剧情重复率 · 状态-文本矛盾率 · 强制收尾率 · 用户跳过/退出率 · 每角色有效事件分布
-   （**叙事注意力公平是平权的第二含义**）· 同角色二次入世率。
+   剧情重复、角色曝光公平、成本变化。
+
+   **技术底座（2026-07-26 核实，勘误：此前写作「现有 showcase/scenario 工装」——
+   该工装在工作树与 git 全历史均零命中，从未存在。它在总规格 §4 内容中台流水线里是
+   `Concept` 状态的待建项，被误转述为现成依赖）**：
+   - ✅ **确定性采样**（已有）：种子 `H(world_id‖阵容指纹‖template_version)`
+     `assembly/mod.rs`，跨版本测试向量 `prng_test_vectors`，禁三样（系统随机/浮点 RNG/map 迭代序）
+   - ✅ **mock 注入的 tick 联编**（已有）：`process_tick_with_model` + `runtime/tests.rs`
+     的全套播种助手与环节感知假模型，40+ 测试已验证
+   - ✅ **逐字节比对范式**（已有）：`degradation_is_deterministic_across_runs`、`run_confluence_scenario`
+   - ❌ **回放式 ModelClient**（待建，唯一真新建件）：全仓无任何 record-and-replay 设施；
+     现有三个 mock 都不能回放真实响应（`RecordingModel` 录的是 prompt 输入，不是 response）
+   - ⚠️ **落点受限**：`server` 是 binary-only crate（无 `lib.rs`），`server/tests/` 与独立 bin
+     都访问不到 `pub(crate)` 的 runtime/assembly API——回归只能建成 `#[cfg(test)]` 子模块，
+     好处是自动进现有 `platform-test` CI job，CI 改动为零
+   - ⚠️ **两条须先拍板**：生产写作温度 0.8 且是硬编码字面量 → prose 无法逐字比对，
+     建议只比对结构化产物（decisions/outcomes/patch/events/contributions/cost，这些已能逐字节相等）；
+     world_id 进采样种子 → 回归必须钉死 world_id，否则每次跑的是不同副本
+
+   **落地状态（2026-07-26）**：`server/src/runtime/golden.rs`（`#[cfg(test)]` 子模块，
+   自动进 `platform-test` CI job，CI 配置零改动）。fixture《长安夜宴》原创虚构、无版权素材，
+   3 玩家 + 1 NPC，覆盖五类剧情测试点（正常结局 / 崩塌 BE / 死亡含同意门 / 托梦 / 多人关系）。
+
+   🔴 **它测得了什么、测不了什么（务必分清，不得把"回归全绿"读成"叙事质量有保障"）**：
+   - ✅ **测得了「管线不回归」**：确定性装配、种子回灌、决策定序、规则层 R1-R6 与模型仲裁升级条件、
+     关系演化、不可逆同意门全链、托梦投喂、状态 CAS / 事件投影 / 内容安全第 2 层 / 预算实测计费、
+     三条终局判定与三层结算（含崩塌折算与产出封顶）。同一世界两遍跑出的结构化产物**逐字节相等**。
+   - ❌ **测不了「叙事质量」**：OOC（决策来自人写的剧本，按定义永不 OOC）· 剧情重复率与文本质量
+     （prose 从未落库 + 写作温度硬编码 0.8）· 换模型的真实成本变化（token 是剧本常数，
+     只反映调用构成变化）。补这一栏的前提是 record-and-replay 的 `ModelClient`，**仍未建**。
+
+   **首次运行即抓到一个真问题**：`load_active_cards` 的 `ORDER BY joined_at` 缺次级排序键，
+   两成员撞同一毫秒时装配产物顺序在重放间漂移（生产并发 join 同样可能撞）。回归侧已用固定
+   `joined_at` 绕开；根治需补次级键，但会改变已有世界的 `assembled_json` 字节，属破坏性变更待评审。
+2. **叙事质量 SLO**（正式监控，进运营看板）。**数据可得性核实于 2026-07-26——
+   八项里只有四项现在算得出来，别把这张表当成现成能力**：
+
+   | 指标 | 现在能算？ | 数据源 / 缺什么 |
+   |---|---|---|
+   | 每角色有效事件分布（基尼系数） | ✅ | `world_contributions.score_milli`（迁移 0025）就是逐角色有效戏份的权威账本，与引擎 `round_intensity` 总额恒等。**算基尼前须与 `world_members` 取交集**（NPC 也入表）。这是 T2 门槛「基尼 ≤0.35」的直接数据源，**当前无任何代码在算** |
+   | 角色连续 N 拍无有效戏份比例 | ✅ | `world_events.actors_json` × `tick_no` 对 `world_members` 全集做差集。注意 `actors_json` 是 JSON 文本，现有查询用 `LIKE '%cid%'`，大规模统计需改规范化解析 |
+   | 强制收尾率 | ✅ | `terminal_reason()` 产 `mainline_complete`/`time_cap`/`starved`，落 `world_ticks.error` 与 `audit_logs('world.ended')`。强制 = time_cap/time_limit/starved，自然 = mainline_complete |
+   | 同角色二次入世率 | ✅ | `world_members` 唯一索引 `(world_id, cloud_character_id)` + `joined_at`，`COUNT(DISTINCT world_id) >= 2` |
+   | 用户跳过/退出率 | ⚠️ 半 | 退出可算（`world_members.status='left'/'retired'`）但**只有 `joined_at`、没有 `left_at`** → 只能算截面、算不了留存曲线。「跳过」全仓无埋点 |
+   | 状态-文本矛盾率 | ❌ | 引擎的 `CriticReport`（characterConsistencyIssues/causalIssues）**模型已经算了，server 侧解构后直接丢弃、从未落库**——这是最可惜的缺口。可用的替代口径只有 `world_ticks.error='blocked'`（不变量 I1-I4 阻断数） |
+   | 剧情重复率 | ❌ | **prose 从未落库**。事件投影的 `event_summary` 只找 fact 的 `summary`/`narrative`/`text` 三键，而 `ActionResolved` 的 fact 是 `{result,action,consequence}`、`DialogueSpoken` 是 `{purpose}`，全部落到兜底分支。正文只存在于引擎 FS 的 scene 文件 |
+   | OOC 申诉率 | ❌ | 全仓唯一申诉表 `moderation_appeals` 是**内容风控申诉**（只允许 rejected 的卡/头像、每主体终身一次），与「角色演得不像/裁决不公」零关系。需新建叙事质量反馈表 + 客户端入口，**是唯一的真新建** |
+
+   补齐性价比排序：① `CriticReport` 落库（模型已跑，白扔）② `fact.consequence` 进事件投影
+   ③ `world_members` 加 `left_at`。另有一处同类浪费：`ModelCallLog` 的分环节 token
+   （agent/model_id/latency/retries）被 `TokenMeter` 求和成标量即丢弃，导致成本无法做
+   「decide 换便宜模型省了多少」的分环节归因。
 3. **台账维护**：每次合并/发布更新 §3 表；发布评审以台账为准，禁止口头"已完成"。
 
 ## 5. AI 失败安全降级（写入门槛，因公共事实不可回滚）

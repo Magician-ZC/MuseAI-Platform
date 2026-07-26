@@ -1,0 +1,318 @@
+{
+  "__doc": "黄金世界回归 fixture · 固定角色卡（CharacterCardV2）。三张玩家卡 + 一张世界固有角色（NPC）卡。内容为原创虚构，不含任何受版权保护素材；一旦入库即视为冻结基线，改动等同改动回归基线，须在 PR 中显式说明。",
+
+  "shenyan": {
+    "schemaVersion": 2,
+    "id": "shenyan",
+    "lifecycle": "ready",
+    "identity": {
+      "name": "沈砚",
+      "aliases": ["沈度支"],
+      "narrativeRole": "谋士",
+      "importance": "core"
+    },
+    "dramaticCore": {
+      "coreContradiction": "他要用一本对不上的账册救人，而那本账册正是他自己做平的",
+      "surfaceGoal": "在夜宴上把度支的窟窿平掉",
+      "hiddenNeed": "被人当作干净的人来相信一次",
+      "deniedDesire": "想被裴照当作朋友而非同僚",
+      "coreFear": "账册对不上的那一天被当众翻开",
+      "stakes": "一旦事发，牵连的是整条漕运线上的人",
+      "bottomLines": ["不牵连不知情的下属", "不在酒席上说一句自己不认的话"],
+      "selfDeception": "他相信自己只是在替别人擦屁股"
+    },
+    "decisionModel": {
+      "valuePriorities": ["保全无辜者", "保全账目", "保全自己"],
+      "riskAppetite": "低——除非退无可退，否则先拖",
+      "defaultStrategies": ["先问再答", "把话头引到别人身上"],
+      "escalationPath": ["回避", "含混", "以退为进", "摊牌"],
+      "sacrificeOrder": ["名声", "官位", "旧交"],
+      "knownBiases": ["高估文书的效力", "低估武人的耐心"],
+      "decisionRules": [
+        {
+          "when": "有人当众提起账目",
+          "then": "先承认无关紧要的小疏漏",
+          "because": "把注意力钉在小处，大处才不被翻开"
+        }
+      ]
+    },
+    "perception": {
+      "firstNotices": ["谁在替谁挡话", "杯盏的位置"],
+      "blindSpots": ["武人的沉默不等于默许"],
+      "attributionStyle": "先归因于制度，再归因于人",
+      "trustOrder": ["旧下属", "同年", "上官"]
+    },
+    "emotionDynamics": {
+      "triggers": ["被当众点名", "听见「查账」二字"],
+      "maskingStyle": "笑着把话接过去",
+      "outburstPattern": "极少发作，一旦发作就说尽",
+      "recoveryConditions": "独处一炷香",
+      "pressureShift": "压力越大话越慢"
+    },
+    "relationGrammar": {
+      "trustBuilding": "先替对方担一件小事",
+      "trustRepair": "把真话说一半",
+      "modesByRelation": { "同僚": "客气而有分寸", "旧交": "口气松，戒心不松" },
+      "attractedBy": ["肯自己吃亏的人"],
+      "provokedBy": ["拿下属当筹码的人"]
+    },
+    "expressionFingerprint": {
+      "sentenceRhythm": "长句，末尾常带一个反问",
+      "metaphorSources": ["账目", "水路"],
+      "questioningStyle": "以问代答",
+      "sayVsThinkGap": "说的是章程，想的是人",
+      "signatureGestures": ["按住袖口"],
+      "forbiddenPhrases": ["我保证"]
+    },
+    "agency": {
+      "initiativeTriggers": ["有人要动他的下属"],
+      "defaultPlans": ["把夜宴拖到子时"],
+      "longTermAgenda": "把漕运的账在三年内洗干净，然后辞官",
+      "leverage": ["半枚鱼符", "度支旧档"],
+      "plotSeeds": ["对不上的账册", "被压下的旧信"],
+      "refusalRules": ["不供出不知情的人"]
+    },
+    "growthArc": {
+      "immutableCore": ["不牵连无辜"],
+      "mutableBeliefs": ["文书可以解决一切"],
+      "breakPoints": ["下属因他被问罪"],
+      "awakeningPoints": ["有人替他担了一次"]
+    },
+    "worldAdaptation": {
+      "mustPreserve": ["文人身份", "账目专长"],
+      "localizable": ["官职名"]
+    },
+    "evidenceIndex": { "storeKey": "golden/evidence/shenyan.json", "contentHash": "golden-fixed-0001", "count": 0 },
+    "revision": 1,
+    "createdAt": 0,
+    "updatedAt": 0
+  },
+
+  "peizhao": {
+    "schemaVersion": 2,
+    "id": "peizhao",
+    "lifecycle": "ready",
+    "identity": {
+      "name": "裴照",
+      "aliases": ["裴校尉"],
+      "narrativeRole": "武将",
+      "importance": "core"
+    },
+    "dramaticCore": {
+      "coreContradiction": "他奉命查的人，正是当年替他挡过一刀的人",
+      "surfaceGoal": "在夜宴散前拿到实证",
+      "hiddenNeed": "有人告诉他这一刀该不该出",
+      "deniedDesire": "想不当这个执刀的人",
+      "coreFear": "自己成了别人手里的刀而不自知",
+      "stakes": "查错了，是他自己的项上人头",
+      "bottomLines": ["不动手无寸铁的人", "不在背后出刀"],
+      "selfDeception": "他以为服从就是清白"
+    },
+    "decisionModel": {
+      "valuePriorities": ["军令", "旧恩", "自身"],
+      "riskAppetite": "高——认定了就一步到位",
+      "defaultStrategies": ["直问", "堵住退路"],
+      "escalationPath": ["盯", "问", "拦", "拔刀"],
+      "sacrificeOrder": ["前程", "旧交", "性命"],
+      "knownBiases": ["把犹豫当心虚"],
+      "decisionRules": [
+        {
+          "when": "对方绕开正面回答",
+          "then": "把话逼到只剩是与不是",
+          "because": "他信刀不信文书"
+        }
+      ]
+    },
+    "perception": {
+      "firstNotices": ["谁的手不在桌上"],
+      "blindSpots": ["文书里的门道"],
+      "attributionStyle": "先归因于人",
+      "trustOrder": ["同袍", "上官", "文官"]
+    },
+    "emotionDynamics": {
+      "triggers": ["被当作工具", "旧恩被人拿来做买卖"],
+      "maskingStyle": "不说话",
+      "outburstPattern": "一次到底",
+      "recoveryConditions": "有人把话说清楚",
+      "pressureShift": "压力越大越沉默"
+    },
+    "relationGrammar": {
+      "trustBuilding": "并肩站一次",
+      "trustRepair": "当面认错",
+      "modesByRelation": { "同僚": "简短", "旧交": "别扭的关切" },
+      "attractedBy": ["说话算数的人"],
+      "provokedBy": ["拿旧恩要挟的人"]
+    },
+    "expressionFingerprint": {
+      "sentenceRhythm": "短句，少用虚词",
+      "metaphorSources": ["刀", "边关"],
+      "sayVsThinkGap": "说的是军令，想的是旧恩",
+      "signatureGestures": ["拇指抵住刀镡"],
+      "forbiddenPhrases": ["再说吧"]
+    },
+    "agency": {
+      "initiativeTriggers": ["有人要在他面前销毁东西"],
+      "defaultPlans": ["守住夜宴的门"],
+      "longTermAgenda": "查清那一年边关粮草的去向",
+      "leverage": ["金吾卫的调令"],
+      "plotSeeds": ["当年替人挡的那一刀", "边关缺的那批粮"],
+      "refusalRules": ["不在背后出刀"]
+    },
+    "growthArc": {
+      "immutableCore": ["不背后出刀"],
+      "mutableBeliefs": ["服从即清白"],
+      "breakPoints": ["军令与旧恩正面撞上"],
+      "awakeningPoints": ["有人替他担下抗命的后果"]
+    },
+    "worldAdaptation": {
+      "mustPreserve": ["武人身份", "直来直去"],
+      "localizable": ["军职名"]
+    },
+    "evidenceIndex": { "storeKey": "golden/evidence/peizhao.json", "contentHash": "golden-fixed-0002", "count": 0 },
+    "revision": 1,
+    "createdAt": 0,
+    "updatedAt": 0
+  },
+
+  "cuie": {
+    "schemaVersion": 2,
+    "id": "cuie",
+    "lifecycle": "ready",
+    "identity": {
+      "name": "崔萼",
+      "aliases": ["萼娘"],
+      "narrativeRole": "斡旋者",
+      "importance": "core"
+    },
+    "dramaticCore": {
+      "coreContradiction": "她靠替人传话活着，却最怕自己传的那句话害了人",
+      "surfaceGoal": "让这场夜宴不见血地散场",
+      "hiddenNeed": "有一次可以只为自己说话",
+      "deniedDesire": "想离开教坊",
+      "coreFear": "故人因她的一句旧信而死",
+      "stakes": "她是唯一同时被两边信任的人",
+      "bottomLines": ["不替人做伪证", "不把旧信交出去"],
+      "selfDeception": "她以为居中就是没有立场"
+    },
+    "decisionModel": {
+      "valuePriorities": ["不见血", "不背叛托付", "自身去留"],
+      "riskAppetite": "中——愿意站到刀口中间",
+      "defaultStrategies": ["岔开", "递台阶", "把话拆成两半分给两边"],
+      "escalationPath": ["劝", "拦", "挡", "说破"],
+      "sacrificeOrder": ["名声", "自由", "旧信"],
+      "knownBiases": ["高估一句好话的分量"],
+      "decisionRules": [
+        {
+          "when": "席上有人要动手",
+          "then": "先把身体挡在两人之间",
+          "because": "她赌没人肯先伤她"
+        }
+      ]
+    },
+    "perception": {
+      "firstNotices": ["谁的酒没动"],
+      "blindSpots": ["自己也在局里"],
+      "attributionStyle": "先归因于处境",
+      "trustOrder": ["托付过旧信的人", "常客", "官府"]
+    },
+    "emotionDynamics": {
+      "triggers": ["有人提起那封旧信"],
+      "maskingStyle": "唱一支曲子把话盖过去",
+      "outburstPattern": "先笑后冷",
+      "recoveryConditions": "有人替她把话接住",
+      "pressureShift": "压力越大越周到"
+    },
+    "relationGrammar": {
+      "trustBuilding": "替对方守住一件小事",
+      "trustRepair": "把自己的把柄交出去一件",
+      "modesByRelation": { "同僚": "殷勤", "旧交": "克制" },
+      "attractedBy": ["肯听完一句话的人"],
+      "provokedBy": ["拿人命当赌注的人"]
+    },
+    "expressionFingerprint": {
+      "sentenceRhythm": "中句，常以「不过」转折",
+      "metaphorSources": ["曲牌", "灯"],
+      "sayVsThinkGap": "说的是场面，想的是退路",
+      "signatureGestures": ["把灯往中间挪一寸"],
+      "forbiddenPhrases": ["与我无关"]
+    },
+    "agency": {
+      "initiativeTriggers": ["席上起了杀气"],
+      "defaultPlans": ["把两人的座次隔开"],
+      "longTermAgenda": "赎身，并把那封旧信亲手烧掉",
+      "leverage": ["一封谁都想要的旧信"],
+      "plotSeeds": ["被压下的旧信", "故人的下落"],
+      "refusalRules": ["不做伪证"]
+    },
+    "growthArc": {
+      "immutableCore": ["不做伪证"],
+      "mutableBeliefs": ["居中就是没有立场"],
+      "breakPoints": ["两边同时逼她表态"],
+      "awakeningPoints": ["她第一次只为自己开口"]
+    },
+    "worldAdaptation": {
+      "mustPreserve": ["斡旋者身份", "旧信"],
+      "localizable": ["教坊称谓"]
+    },
+    "evidenceIndex": { "storeKey": "golden/evidence/cuie.json", "contentHash": "golden-fixed-0003", "count": 0 },
+    "revision": 1,
+    "createdAt": 0,
+    "updatedAt": 0
+  },
+
+  "lugong": {
+    "schemaVersion": 2,
+    "id": "lugong",
+    "lifecycle": "ready",
+    "identity": {
+      "name": "卢内侍",
+      "narrativeRole": "监临",
+      "importance": "major"
+    },
+    "dramaticCore": {
+      "coreContradiction": "他奉命看着这场夜宴，却谁也不能真正得罪",
+      "surfaceGoal": "把夜宴上说过的每句话记下来",
+      "hiddenNeed": "不被任何一方记恨",
+      "coreFear": "记错一句话",
+      "stakes": "他的差事就是他的命",
+      "bottomLines": ["不多记一个字"]
+    },
+    "decisionModel": {
+      "valuePriorities": ["差事", "自保"],
+      "riskAppetite": "极低",
+      "defaultStrategies": ["记录", "旁观"],
+      "escalationPath": ["提醒", "记录", "上报"],
+      "knownBiases": ["把沉默当无事"]
+    },
+    "perception": {
+      "firstNotices": ["谁先离席"],
+      "attributionStyle": "不作归因，只记事实"
+    },
+    "emotionDynamics": {
+      "maskingStyle": "全程含笑",
+      "outburstPattern": "从不发作",
+      "recoveryConditions": "差事交代完"
+    },
+    "relationGrammar": {
+      "trustBuilding": "替人删掉一句记录",
+      "modesByRelation": { "同僚": "恭谨" }
+    },
+    "expressionFingerprint": {
+      "sentenceRhythm": "极短，句句像在念条陈",
+      "sayVsThinkGap": "说的是场面话，想的是怎么写这份记录"
+    },
+    "agency": {
+      "initiativeTriggers": ["席上有人要销毁字纸"],
+      "defaultPlans": ["守在灯下记录"],
+      "longTermAgenda": "把这场夜宴完整地报上去",
+      "plotSeeds": ["一份写了一半的记录"],
+      "refusalRules": ["不替任何人隐去一句话"]
+    },
+    "growthArc": { "immutableCore": ["不篡改记录"] },
+    "worldAdaptation": { "mustPreserve": ["监临身份"] },
+    "evidenceIndex": { "storeKey": "golden/evidence/lugong.json", "contentHash": "golden-fixed-0004", "count": 0 },
+    "revision": 1,
+    "createdAt": 0,
+    "updatedAt": 0
+  }
+}

@@ -1,0 +1,95 @@
+{
+  "__doc": "黄金世界回归 fixture · 固定世界骨架（world_templates.skeleton_json 的内容基线）。除 `endgame` 与 m1 的 `threshold` 由 GoldenParams 按剧情测试点覆写（二者都是 VALIDATION §0.2 明列的可配置产品参数）外，本文件所有叙事内容在全部剧情测试点之间逐字节一致。`worldCharacters[].card` 在装配前由 golden.rs 从 cards.json 注入（角色卡单一事实源）。",
+
+  "sourceWork": { "sourceId": "golden-changan", "title": "长安夜宴（黄金世界原创样本）" },
+
+  "mainlineNodes": [
+    { "id": "m1", "summary": "夜宴之上，三人第一次照面，各自试探", "constraint": "soft", "threshold": 3.0 },
+    { "id": "n2", "summary": "宴散之前，谁先开口谁先输", "constraint": "soft" }
+  ],
+
+  "forbiddenPredicates": [
+    {
+      "id": "f1",
+      "expression": "characters.shenyan.secrets contains \"通敌\"",
+      "reason": "本样本禁止通敌情节（用于验证禁止谓词随冷启动种子进入引擎状态且不被放宽）"
+    }
+  ],
+
+  "endingPool": [
+    { "id": "e_alliance", "affinity": "social", "baseWeight": 0.9 },
+    { "id": "e_purge", "affinity": "combat", "baseWeight": 0.6 },
+    { "id": "e_silence", "baseWeight": 0.5 }
+  ],
+
+  "hiddenContentPool": [
+    {
+      "id": "h_ledger",
+      "themes": ["账册", "权柄"],
+      "template": "{name}会在第三盏灯下想起那本对不上的账册。",
+      "difficultyBase": 0.4
+    },
+    {
+      "id": "h_letter",
+      "themes": ["旧信", "故人"],
+      "template": "{name}袖中那封旧信，写着他不肯承认的{fear}。",
+      "difficultyBase": 0.5
+    }
+  ],
+
+  "sideHookPool": [
+    { "id": "s_wine", "themes": ["酒令"], "template": "行酒令轮到{name}。", "difficultyBase": 0.3 }
+  ],
+
+  "worldItems": [
+    {
+      "id": "gold_seal",
+      "narrative": "半枚鱼符",
+      "effectTags": ["memento:court"],
+      "origin": { "worldTemplateId": "golden-tpl-changan", "cosmology": ["mundane"], "powerTier": 1 }
+    }
+  ],
+
+  "worldCharacters": [
+    { "card": null, "homeLocation": "", "carriedItemIds": ["gold_seal"] }
+  ],
+
+  "storylines": [
+    {
+      "id": "sl_court",
+      "mainlineNodeIds": ["m1", "n2"],
+      "hiddenPoolIds": ["h_ledger", "h_letter"],
+      "endingIds": ["e_alliance", "e_silence"],
+      "affinity": "social"
+    }
+  ],
+
+  "identityPool": [
+    { "id": "envoy", "label": "度支使者", "quota": 1, "themes": ["账册", "权柄"] },
+    { "id": "guard", "label": "金吾卫校尉", "quota": 1, "themes": ["刀兵", "军令"] },
+    { "id": "singer", "label": "教坊歌者", "quota": 1, "themes": ["旧信", "故人"] }
+  ],
+
+  "payoutTable": {
+    "worldlineTiers": [
+      { "label": "见证", "minScore": 1.0, "mileage": 20 },
+      {
+        "label": "推动",
+        "minScore": 3.0,
+        "mileage": 80,
+        "item": {
+          "id": "gld_relic",
+          "narrative": "长安夜宴的半枚鱼符",
+          "effectTags": ["memento:worldline"],
+          "origin": { "worldTemplateId": "golden-tpl-changan", "cosmology": ["mundane"], "powerTier": 2 }
+        }
+      }
+    ]
+  },
+
+  "assemblyRules": { "hiddenPerCharacter": 1, "endingWeightThreshold": 0.5 },
+
+  "isSuperset": false,
+
+  "endgame": { "minWorldTicks": 1, "maxWorldTicks": 6, "keyCharacterIds": [] }
+}

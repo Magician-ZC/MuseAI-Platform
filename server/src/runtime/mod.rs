@@ -182,14 +182,470 @@ fn stall_tracker() -> &'static StallTracker {
     TRACKER.get_or_init(StallTracker::default)
 }
 
+// ---------- 成本工程杠杆①：错峰调度（总规格 §17【拍板 16】） ----------
+
+/// 错峰调度：把**连载场 / 慢炖场**的 tick 优先排进供应商的夜间折扣时段（5-7.5 折常见）。
+///
+/// ═══════════════════════════════════════════════════════════════════════════
+/// 这是什么、为什么在调度器里
+/// ═══════════════════════════════════════════════════════════════════════════
+/// 总规格 §17 的四条成本杠杆里，②上下文缓存与④分环节路由都在**模型调用侧**（引擎
+/// `ModelRoutes` 已承载），只有①错峰是纯粹的**排期问题**——「这一拍什么时候跑」由本文件的
+/// `schedule_due_ticks` 独家决定，所以它只能落在这里。
+/// 目标是 §17 的量级线：叠加四杠杆后单玩家单阶段压到几毛~一元；这条线直接决定 VALIDATION.md
+/// T3 门槛「ARPPU ≥ 3× 单用户月度模型成本」能不能成立。
+///
+/// ═══════════════════════════════════════════════════════════════════════════
+/// 🔴 三条硬约束（各有用例锁死）
+/// ═══════════════════════════════════════════════════════════════════════════
+/// 1. **默认关闭**（VALIDATION §0.1）。开关 `MUSE_OFFPEAK_SCHEDULING` 默认 `false`，
+///    关闭时 `schedule_due_ticks` 走的是**与接线前逐字相同的代码路径**（见该函数里的
+///    `if !active { …原路… continue; }` 早退），不多一次查询、不改一次排序。
+///    用例 `offpeak_disabled_keeps_scheduling_byte_identical`。
+/// 2. **直播场不得延后**。§2 场次节奏三档里直播场的产品定义就是「一晚跑完一阶段 + 弹幕实时」，
+///    延后它等于毁掉它。豁免判据见 `Config::is_live_room`。用例 `offpeak_never_defers_live_room`。
+/// 3. **不得饿死世界**。错峰是「优先在便宜时段跑」，不是「只在便宜时段跑」：距上一拍超过
+///    `interval + 延后预算` 就无视时段照跑。预算参数化，且**恒为有限值**。
+///    用例 `offpeak_starvation_guard_fires_outside_window`。
+///
+/// ═══════════════════════════════════════════════════════════════════════════
+/// 时区口径：**全链路只有 UTC 一套**
+/// ═══════════════════════════════════════════════════════════════════════════
+/// 折扣时段是**供应商**的时间口径，不是用户的、也不是服务器本地时区的。而全仓日界已经统一到
+/// UTC（`admin_api::dashboards::utc_day_start_ms` / `runtime::day_string` / `reports::day_bounds`）。
+/// 为了不引入第二套口径：
+/// - 窗口字面量 `MUSE_OFFPEAK_WINDOWS`（如 `00:30-08:30`）**只在解析期**按
+///   `MUSE_OFFPEAK_TZ_OFFSET_MIN`（供应商时区相对 UTC 的分钟偏移，默认 0 = 直接按 UTC 书写）
+///   折算成 UTC 当日毫秒偏移；
+/// - 折算之后，判定、落库、聚合全部是 UTC。运行期没有任何一处再碰时区。
+/// 等价性由用例 `offpeak_utc_day_offset_matches_dashboard_day_boundary` 钉住。
+///
+/// ═══════════════════════════════════════════════════════════════════════════
+/// 为什么窗口内要压缩间隔（而不是简单地「窗口外不排」）
+/// ═══════════════════════════════════════════════════════════════════════════
+/// 简单地「窗口外不排」会把一个 24 拍/天的连载场变成 8 拍/天——那不是错峰，那是**节奏降档**
+/// （§2 的节奏是产品承诺，降它要单独拍板，不能作为成本优化的副作用偷偷发生）。
+/// 所以窗口内的有效间隔按窗口占全天的比例压缩：`interval × 窗口总长 / 一天`。
+/// 8 小时窗口 → 窗口内间隔是原来的 1/3 → 一天的拍数不变，只是全部挤进便宜时段。
+/// 压缩后有地板 `MUSE_OFFPEAK_MIN_INTERVAL_MS`（默认 1 分钟）防止窗口配得过窄时压出突发风暴。
+///
+/// ═══════════════════════════════════════════════════════════════════════════
+/// ⚠️ 杠杆③ Batch API：**本批次未做**，理由与改造路径
+/// ═══════════════════════════════════════════════════════════════════════════
+/// Batch API（约 5 折）是**异步**的：提交 → 轮询 → 取结果，延迟分钟到小时级。而一拍的形状是
+/// `run_round`（引擎内部**串行**跑 director → 每角色 decide → arbiter → writer → critic，
+/// 后一环的输入是前一环的产物）→ 同一事务 `commit_tick`。三个致命错配：
+/// 1. **串行链 × 异步批**：一拍要 5 次批往返，若每次按 Batch 的小时级 SLA 兑现，
+///    一拍就是数小时——连「慢炖场（数小时一拍）」都跑不动，更别说连载场。
+///    真正能省的做法是**跨世界同环节合批**（把 100 个世界的 director 调用打成一个批），
+///    这要求引擎把 `run_round` 从「一次跑完」改成**可挂起/可恢复的分步状态机**
+///    （每个环节产出后能把中间态序列化落库、下次从该环节续跑）。
+/// 2. **worker 认领超时**：`CLAIM_STALE_MS = 300_000`（5 分钟）。任何在 `process_tick` 内同步
+///    等待批结果的实现都会被调度器判定为「worker 崩溃遗留」回收重排 → 同一拍被重复执行。
+/// 3. **中间态即半通管线**：`run_round` 与 `commit_tick` 之间是无持久化的内存态。批途中进程重启，
+///    世界会卡在「批已提交、结果无人认领」的中间态——比不做更糟（VALIDATION §5「宁可停拍」
+///    的原则是失败要**干净地停**，不是停在一半）。
+///
+/// **需要谁改什么**（本批次禁止改 `crates/`，故只出改造路径）：
+/// - `crates/muse-engine`：`NarrativeEngine::run_round` 拆成分步接口（如
+///   `step(RoundState) -> Result<StepOutcome>`，`StepOutcome::Pending{批次句柄}` /
+///   `StepOutcome::Next(RoundState)`），`RoundState` 可 serde 落库；`ModelClient` 增加
+///   `submit_batch` / `poll_batch` 两个可选方法（默认实现回落同步 `complete`，保证
+///   `HttpModelClient` 与桌面轨零改动）。
+/// - `server`：新增 `world_round_states` 表存中间态 + 一个批次协调器 topic（提交批、轮询批、
+///   把结果喂回下一步），`CLAIM_STALE_MS` 对「等批中」的拍改为不回收（另立 `awaiting_batch` 状态）。
+/// - 降级路径（VALIDATION §5）：批提交失败 / 超时 / 结果缺失 → **回落同步 `complete` 重跑该环节**；
+///   连回落也失败 → 按现有 `mark_tick_failed_and_pause` 停拍暂停世界，绝不半提交。
+/// 工作量与风险都远超本批次范围，且**先做①的收益更确定**（错峰对全部非直播场立即生效，
+/// 不需要引擎改动）。故本批次只交付①，③留档待评审。
+mod offpeak {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    use sqlx::AnyPool;
+
+    /// 一天的毫秒数。窗口归一化与间隔压缩都以它为分母。
+    pub(super) const DAY_MS: i64 = 86_400_000;
+
+    /// 总开关名。**同时是运行时开关体系（`server/src/flags/`）的开关名**——两边同名是刻意的：
+    /// 运营后台看到的名字、`.env` 里写的名字、报警里出现的名字是同一个。
+    pub(super) const ENV_ENABLED: &str = "MUSE_OFFPEAK_SCHEDULING";
+    /// 折扣时段列表，`HH:MM-HH:MM` 逗号分隔，跨零点自动识别（`22:30-06:00`）。
+    pub(super) const ENV_WINDOWS: &str = "MUSE_OFFPEAK_WINDOWS";
+    /// 窗口字面量所处时区相对 UTC 的分钟偏移（北京时间 = 480）。默认 0 = 字面量本身就是 UTC。
+    pub(super) const ENV_TZ_OFFSET_MIN: &str = "MUSE_OFFPEAK_TZ_OFFSET_MIN";
+    /// 折扣时段的名义价格档位（百分比，50 = 5 折）。只进记账，不参与调度判定。
+    pub(super) const ENV_DISCOUNT_PCT: &str = "MUSE_OFFPEAK_DISCOUNT_PCT";
+    /// 延后预算 = `interval × 该百分比`（防饿死兜底的第一道口径）。
+    pub(super) const ENV_MAX_DEFER_PCT: &str = "MUSE_OFFPEAK_MAX_DEFER_PCT";
+    /// 延后预算的绝对上限毫秒（防饿死兜底的第二道口径，与第一道取**较小者**）。
+    pub(super) const ENV_MAX_DEFER_MS: &str = "MUSE_OFFPEAK_MAX_DEFER_MS";
+    /// 窗口内压缩后的间隔地板（防止窗口配得过窄压出突发风暴）。
+    pub(super) const ENV_MIN_INTERVAL_MS: &str = "MUSE_OFFPEAK_MIN_INTERVAL_MS";
+    /// `tick_per_day` 达到该值即按**直播场**处理，永不延后（红线 2 的参数化判据）。
+    pub(super) const ENV_LIVE_TICK_PER_DAY: &str = "MUSE_OFFPEAK_LIVE_TICK_PER_DAY";
+
+    /// 🔴 默认关闭（VALIDATION §0.1）。
+    pub(super) const DEFAULT_ENABLED: bool = false;
+    /// 默认窗口（UTC）：`16:30-00:30` ≡ 北京时间 `00:30-08:30`，即国内主流供应商的夜间折扣档。
+    /// 仅是**示例默认值**——开关默认关闭，它不会自己生效；真实窗口以供应商合同为准，运营配置。
+    pub(super) const DEFAULT_WINDOWS: &str = "16:30-00:30";
+    /// 默认名义折扣：5 折（§17 原文「Batch 约 5 折 / 错峰 5-7.5 折」的保守中值）。
+    pub(super) const DEFAULT_DISCOUNT_PCT: i64 = 50;
+    /// 默认延后预算 = 2 倍 interval。
+    pub(super) const DEFAULT_MAX_DEFER_PCT: i64 = 200;
+    /// 默认延后预算绝对上限 = 6 小时。**任何世界的最长静默 = interval + min(2×interval, 6h)**，
+    /// 恒为有限值——这就是「不得饿死世界」的数学保证。
+    pub(super) const DEFAULT_MAX_DEFER_MS: i64 = 21_600_000;
+    /// 默认窗口内间隔地板 = 1 分钟。
+    pub(super) const DEFAULT_MIN_INTERVAL_MS: i64 = 60_000;
+    /// 默认直播场判据：≥48 拍/天（每 30 分钟一拍以上）即视为「密集拍」。
+    /// §2 三档里连载场上限是「每小时一拍」(24/天)，取 2 倍留足安全边际——
+    /// **判错的方向是把连载场当直播场（不省钱），而不是把直播场当连载场（毁体验）**。
+    pub(super) const DEFAULT_LIVE_TICK_PER_DAY: i64 = 48;
+
+    /// ms 时间戳 → 当日 UTC 毫秒偏移 `[0, DAY_MS)`。
+    ///
+    /// 🔴 **与 `admin_api::dashboards::utc_day_start_ms` 是同一套日界**：后者恒等于
+    /// `ms - ms.rem_euclid(DAY_MS)`（Unix 纪元本身对齐 UTC 零点，毫秒时间戳不含闰秒），
+    /// 于是本函数就是 `ms - utc_day_start_ms(ms)`。不直接调用那个函数是因为它是
+    /// `pub(super)`（`admin_api` 私有），跨模块引用要改它的可见性——那属于「不要碰」的文件。
+    /// 等价性由用例 `offpeak_utc_day_offset_matches_dashboard_day_boundary` 用 chrono
+    /// 独立复算钉住，任何一侧改口径都会红。
+    pub(super) fn utc_ms_of_day(ms: i64) -> i64 {
+        ms.rem_euclid(DAY_MS)
+    }
+
+    fn env_i64(name: &str, default: i64) -> i64 {
+        std::env::var(name).ok().and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(default)
+    }
+
+    /// env 布尔解析。**与 `flags::parse_env_bool` 逐字同构**（那个是私有的）：
+    /// `1/true/on/yes` → 开，`0/false/off/no` → 关，其余（含空串）→ 回落默认。
+    pub(super) fn env_bool(name: &str, default: bool) -> bool {
+        match std::env::var(name) {
+            Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "on" | "yes" => true,
+                "0" | "false" | "off" | "no" => false,
+                _ => default,
+            },
+            Err(_) => default,
+        }
+    }
+
+    /// 解析 `HH:MM`（允许 `24:00`）→ 当日毫秒偏移；非法 → None。
+    fn parse_hhmm(s: &str) -> Option<i64> {
+        let (h, m) = s.trim().split_once(':')?;
+        let h: i64 = h.trim().parse().ok()?;
+        let m: i64 = m.trim().parse().ok()?;
+        if !(0..=24).contains(&h) || !(0..=59).contains(&m) {
+            return None;
+        }
+        let ms = h * 3_600_000 + m * 60_000;
+        (ms <= DAY_MS).then_some(ms)
+    }
+
+    /// 窗口列表解析 + 归一化：字面量按 `tz_offset_min` 折算成 UTC → 跨零点拆两段 →
+    /// 按 start 升序合并重叠/相接段。返回左闭右开的 UTC 当日毫秒区间。
+    ///
+    /// 防御式：单条非法只丢该条，不牵连其余（同 `seed_narrative_layer` 的口径）。
+    /// `start == end` 视为**非法**并丢弃——它到底是零长度还是整天完全歧义，
+    /// 与其猜一个不如让它显式不生效（全部条目被丢弃 → 整个错峰退化为关闭，见 `Config::from_env`）。
+    pub(super) fn parse_windows(raw: &str, tz_offset_min: i64) -> Vec<(i64, i64)> {
+        let shift = tz_offset_min.saturating_mul(60_000);
+        let mut spans: Vec<(i64, i64)> = Vec::new();
+        for item in raw.split(',') {
+            let item = item.trim();
+            if item.is_empty() {
+                continue;
+            }
+            let Some((a, b)) = item.split_once('-') else { continue };
+            let (Some(sa), Some(sb)) = (parse_hhmm(a), parse_hhmm(b)) else { continue };
+            // 字面量 → UTC：此处是**唯一**一次时区折算，之后全链路只有 UTC。
+            let s = (sa - shift).rem_euclid(DAY_MS);
+            let e = (sb - shift).rem_euclid(DAY_MS);
+            if s == e {
+                continue; // 歧义（零长 or 整天）→ 丢弃。
+            }
+            if e < s {
+                // 跨零点：拆成 [s, 24:00) 与 [00:00, e)。
+                spans.push((s, DAY_MS));
+                spans.push((0, e));
+            } else {
+                spans.push((s, e));
+            }
+        }
+        spans.retain(|(s, e)| s < e);
+        spans.sort_unstable();
+        let mut merged: Vec<(i64, i64)> = Vec::with_capacity(spans.len());
+        for (s, e) in spans {
+            match merged.last_mut() {
+                Some(last) if s <= last.1 => last.1 = last.1.max(e),
+                _ => merged.push((s, e)),
+            }
+        }
+        merged
+    }
+
+    /// 错峰配置（每轮调度解析一次，纯 env，无 IO）。
+    #[derive(Debug, Clone)]
+    pub(super) struct Config {
+        /// 归一化后的 UTC 折扣时段（左闭右开、已合并、按 start 升序）。恒非空（空则整个 Config 为 None）。
+        pub(super) windows: Vec<(i64, i64)>,
+        /// 折扣时段总时长（毫秒），窗口内间隔压缩的分子。
+        pub(super) window_total_ms: i64,
+        pub(super) discount_pct: i64,
+        pub(super) max_defer_pct: i64,
+        pub(super) max_defer_ms: i64,
+        pub(super) min_interval_ms: i64,
+        pub(super) live_tick_per_day: i64,
+    }
+
+    impl Config {
+        /// 从 env 解析。**窗口一条都解析不出来 → None**（整个错峰退化为关闭，逐字走原路）——
+        /// 配错窗口的后果必须是「功能不生效」，而不是「所有世界永远被延后」。
+        pub(super) fn from_env() -> Option<Self> {
+            let raw = std::env::var(ENV_WINDOWS).unwrap_or_else(|_| DEFAULT_WINDOWS.to_string());
+            let windows = parse_windows(&raw, env_i64(ENV_TZ_OFFSET_MIN, 0));
+            if windows.is_empty() {
+                return None;
+            }
+            let window_total_ms: i64 = windows.iter().map(|(s, e)| e - s).sum::<i64>().clamp(1, DAY_MS);
+            Some(Self {
+                windows,
+                window_total_ms,
+                discount_pct: env_i64(ENV_DISCOUNT_PCT, DEFAULT_DISCOUNT_PCT).clamp(1, 100),
+                max_defer_pct: env_i64(ENV_MAX_DEFER_PCT, DEFAULT_MAX_DEFER_PCT).max(0),
+                max_defer_ms: env_i64(ENV_MAX_DEFER_MS, DEFAULT_MAX_DEFER_MS).max(0),
+                min_interval_ms: env_i64(ENV_MIN_INTERVAL_MS, DEFAULT_MIN_INTERVAL_MS).max(1),
+                live_tick_per_day: env_i64(ENV_LIVE_TICK_PER_DAY, DEFAULT_LIVE_TICK_PER_DAY).max(1),
+            })
+        }
+
+        /// 该时刻是否落在折扣时段（UTC 口径）。
+        pub(super) fn in_window(&self, now: i64) -> bool {
+            let o = utc_ms_of_day(now);
+            self.windows.iter().any(|(s, e)| o >= *s && o < *e)
+        }
+
+        /// 🔴 **直播场豁免判据**（红线 2）。两条，命中任一即豁免、永不延后：
+        /// - `room_type == "arena"`：赛事房。§2 直播场的两个典型场景之一就是赛事，
+        ///   且它带弹幕实时观战，延后等于毁产品定义。
+        /// - `tick_per_day >= live_tick_per_day`：密集拍。§2 里「一晚跑完一阶段」的直播场在
+        ///   代码里的唯一载体就是 tick 节奏；连载场上限「每小时一拍」=24/天，默认阈值取 48。
+        ///
+        /// `chapter`/`idle` 房不按房型豁免——它们的档位由节奏决定（§2：连载场是官方阶段的
+        /// **默认**档，慢炖场是自定义房专属），房型本身（§1 已把 idle/chapter/arena 降级为
+        /// 「引擎运行模式」）不再是产品档位。
+        pub(super) fn is_live_room(&self, room_type: &str, tick_per_day: i64) -> bool {
+            room_type == "arena" || tick_per_day >= self.live_tick_per_day
+        }
+
+        /// 窗口内的有效间隔：按窗口占全天的比例压缩，**保住每天的拍数不变**（见模块头）。
+        /// 结果钳在 `[min(min_interval_ms, interval), interval]`——绝不比原间隔更长，
+        /// 也绝不短于地板（地板本身若比原间隔还大则以原间隔为准，避免钳制区间反转）。
+        pub(super) fn compressed_interval(&self, interval: i64) -> i64 {
+            if interval <= 0 {
+                return interval;
+            }
+            let scaled = (interval as i128 * self.window_total_ms as i128 / DAY_MS as i128) as i64;
+            scaled.max(self.min_interval_ms.min(interval)).min(interval)
+        }
+
+        /// 延后预算：`min(interval × max_defer_pct%, max_defer_ms)`。取**较小者**是因为
+        /// 阈值越小兜底触发越早、世界越不容易被饿着——安全方向恒为「早点跑」。
+        pub(super) fn defer_budget(&self, interval: i64) -> i64 {
+            let by_pct = (interval.max(0) as i128 * self.max_defer_pct as i128 / 100) as i64;
+            by_pct.min(self.max_defer_ms).max(0)
+        }
+
+        /// 🔴 **防饿死兜底线**：距上一拍超过它就无视时段照跑。恒为有限值。
+        pub(super) fn max_gap(&self, interval: i64) -> i64 {
+            interval.saturating_add(self.defer_budget(interval))
+        }
+    }
+
+    /// 一拍的排期标记：落 `world_ticks` 的 `off_peak / price_ratio_pct / defer_ms` 三列，
+    /// 是「错峰生效了多少、省了多少」在成本仪表上的唯一数据源（口径见迁移 0038 注释）。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct TickMark {
+        pub(crate) off_peak: bool,
+        pub(crate) price_ratio_pct: i64,
+        pub(crate) defer_ms: i64,
+    }
+
+    impl Default for TickMark {
+        /// 中性值 = 现状：未命中折扣时段、原价、未延后。
+        /// 所有非错峰路径（开关关闭 / 直播场 / 手动端点）都用它。
+        fn default() -> Self {
+            Self { off_peak: false, price_ratio_pct: 100, defer_ms: 0 }
+        }
+    }
+
+    /// 一轮调度对某个世界的裁决。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Verdict {
+        /// 未到点，本轮什么都不做（与错峰无关的原有语义）。
+        Idle,
+        /// 到点了但落在原价时段且未触兜底 → 本轮延后（错峰真正生效的那一支）。
+        Defer,
+        /// 排一拍，带标记。
+        Schedule(TickMark),
+    }
+
+    /// interval 模式（墙钟固定间隔）的错峰裁决。**纯函数**：所有时刻由调用方传入，
+    /// 用例可以精确钉住「窗口内 / 窗口外 / 刚好边界 / 已饿死」四种时刻而不依赖真实时钟。
+    ///
+    /// `last = None`（世界还没有任何一拍）→ **首拍绝不延后**：那是玩家建完房看到的第一印象，
+    /// 为省几分钱把它压掉是本末倒置。
+    pub(super) fn plan_interval(
+        cfg: &Config,
+        live: bool,
+        now: i64,
+        last: Option<i64>,
+        interval: i64,
+        held_ms: i64,
+    ) -> Verdict {
+        let in_win = cfg.in_window(now);
+        // 直播场按原间隔（豁免压缩，节奏就是它的产品定义）；非直播场在窗口内按压缩间隔。
+        let eff_interval = if live || !in_win { interval } else { cfg.compressed_interval(interval) };
+        let elapsed = last.map(|t| now - t);
+        let due = elapsed.map_or(true, |e| e >= eff_interval);
+        if !due {
+            return Verdict::Idle;
+        }
+        // 🔴 直播场豁免（红线 2）：到点即排，从不进入延后分支。
+        if live {
+            return Verdict::Schedule(TickMark::default());
+        }
+        if in_win {
+            return Verdict::Schedule(TickMark {
+                off_peak: true,
+                price_ratio_pct: cfg.discount_pct,
+                defer_ms: held_ms.max(0),
+            });
+        }
+        // 🔴 防饿死兜底（红线 3）：`last=None`（首拍）与「静默过久」都在这里照跑。
+        // 标记按原价（就是原价跑的），但 defer_ms 仍如实记录被压了多久。
+        if elapsed.map_or(true, |e| e >= cfg.max_gap(interval)) {
+            return Verdict::Schedule(TickMark { defer_ms: held_ms.max(0), ..TickMark::default() });
+        }
+        Verdict::Defer
+    }
+
+    /// event 模式（DES 背靠背，无墙钟 interval）的错峰裁决。调用方已确认「无 outstanding tick」。
+    ///
+    /// 没有 interval 可依，故防饿死兜底直接用绝对预算 `max_defer_ms`（默认 6h）：
+    /// 背靠背世界最长静默 6 小时，之后无视时段照推一拍。
+    pub(super) fn plan_event(
+        cfg: &Config,
+        live: bool,
+        now: i64,
+        last: Option<i64>,
+        held_ms: i64,
+    ) -> Verdict {
+        if live {
+            return Verdict::Schedule(TickMark::default());
+        }
+        if cfg.in_window(now) {
+            return Verdict::Schedule(TickMark {
+                off_peak: true,
+                price_ratio_pct: cfg.discount_pct,
+                defer_ms: held_ms.max(0),
+            });
+        }
+        let elapsed = last.map(|t| now - t);
+        if elapsed.map_or(true, |e| e >= cfg.max_defer_ms) {
+            return Verdict::Schedule(TickMark { defer_ms: held_ms.max(0), ..TickMark::default() });
+        }
+        Verdict::Defer
+    }
+
+    // ---------- 延后账（进程内存态，度量「错峰生效了多少」） ----------
+
+    /// world_id → **首次被延后的时刻**。排期时取走并清零，差值即本拍的 `defer_ms`。
+    ///
+    /// 与 `StallTracker` 同口径：**进程内存态、不持久化**，重启即清零属可接受降级
+    /// （表现为少记一段延后时长，方向是**低估**错峰效果，不会虚报省钱）。
+    /// 不做全量清理：一个世界被延后过又在结束前始终没被排上，会留一条 `(String, i64)` 残留——
+    /// 上界是「曾被延后过的世界数」，与 `StallTracker` 同级，可忽略。
+    #[derive(Default)]
+    pub(super) struct DeferTracker {
+        inner: Mutex<HashMap<String, i64>>,
+    }
+
+    impl DeferTracker {
+        /// 记一次延后（首次记时刻，后续保持不变）。
+        pub(super) fn mark(&self, world_id: &str, now: i64) {
+            let mut g = self.inner.lock().expect("defer tracker 锁不可中毒");
+            g.entry(world_id.to_string()).or_insert(now);
+        }
+        /// 已被压了多久（只读，供优先级排序用）。
+        pub(super) fn held_ms(&self, world_id: &str, now: i64) -> i64 {
+            let g = self.inner.lock().expect("defer tracker 锁不可中毒");
+            g.get(world_id).map(|t| (now - *t).max(0)).unwrap_or(0)
+        }
+        /// 取走并清零（真正排上一拍时调用），返回被压的毫秒数。
+        pub(super) fn take(&self, world_id: &str, now: i64) -> i64 {
+            let mut g = self.inner.lock().expect("defer tracker 锁不可中毒");
+            g.remove(world_id).map(|t| (now - t).max(0)).unwrap_or(0)
+        }
+        #[cfg(test)]
+        pub(super) fn clear(&self, world_id: &str) {
+            self.inner.lock().expect("defer tracker 锁不可中毒").remove(world_id);
+        }
+    }
+
+    /// 进程级延后账单例（调度器单线程读写，Mutex 只为与 worker 池共进程时的安全）。
+    pub(super) fn defer_tracker() -> &'static DeferTracker {
+        static T: OnceLock<DeferTracker> = OnceLock::new();
+        T.get_or_init(DeferTracker::default)
+    }
+
+    /// 某个世界是否启用错峰。
+    ///
+    /// 🔵 **优先走运行时开关体系**（`server/src/flags/`，迁移 0036），作用域取 **world**——
+    /// 错峰天然按世界灰度：先给几个慢炖场开，看成本曲线，再逐步铺开。
+    /// 但 `flags` 的登记表 `KNOWN_FLAGS` 是**白名单**，未登记的名字一律 fail-closed 到 false，
+    /// 而登记表在 `server/src/flags/mod.rs`（本批次不改该目录，避免与并行改动撞车）。
+    /// 故此处显式判定：
+    /// - **已登记** → 走 `flags::is_enabled`，user > world > global > env > 默认 全链生效；
+    /// - **未登记**（当前状态）→ 退回 env 兜底，语义与解析链第 ④ 层逐字一致，且**不发一次查询**。
+    ///
+    /// 后续把开关接进体系只需在 `KNOWN_FLAGS` 里加一条
+    /// `FlagDef { name: "MUSE_OFFPEAK_SCHEDULING", default_enabled: false, owner: "runtime", wired: true, .. }`
+    /// （并把 `flags::tests` 里的登记数断言 +1），**本文件一行都不用改**，世界级灰度即刻可用。
+    pub(super) async fn enabled_for_world(db: &AnyPool, world_id: &str) -> bool {
+        if crate::flags::find_flag(ENV_ENABLED).is_some() {
+            crate::flags::is_enabled(db, ENV_ENABLED, crate::flags::FlagCtx::world(world_id)).await
+        } else {
+            env_bool(ENV_ENABLED, DEFAULT_ENABLED)
+        }
+    }
+}
+
+pub(crate) use offpeak::TickMark;
+
 // ---------- 调度 ----------
 
-/// 插入 pending tick（唯一索引幂等）；已存在返回 false。
+/// 插入 pending tick（唯一索引幂等）；已存在返回 false。排期标记取中性值（非错峰路径）。
 pub async fn insert_tick(
     db: &AnyPool,
     world_id: &str,
     tick_no: i64,
     base_revision: i64,
+) -> Result<bool, ApiError> {
+    insert_tick_marked(db, world_id, tick_no, base_revision, TickMark::default()).await
+}
+
+/// `insert_tick` 的带标记版本：额外落 `off_peak / price_ratio_pct / defer_ms`（迁移 0038）。
+/// 中性标记下与 `insert_tick` 的落库结果逐列等价（三列都是各自的 DEFAULT 值）。
+pub(crate) async fn insert_tick_marked(
+    db: &AnyPool,
+    world_id: &str,
+    tick_no: i64,
+    base_revision: i64,
+    mark: TickMark,
 ) -> Result<bool, ApiError> {
     let exists = sqlx::query("SELECT 1 AS x FROM world_ticks WHERE world_id = ? AND tick_no = ?")
         .bind(world_id)
@@ -201,14 +657,18 @@ pub async fn insert_tick(
         return Ok(false);
     }
     match sqlx::query(
-        "INSERT INTO world_ticks (id, world_id, tick_no, base_revision, status, created_at) \
-         VALUES (?, ?, ?, ?, 'pending', ?)",
+        "INSERT INTO world_ticks (id, world_id, tick_no, base_revision, status, created_at, \
+         off_peak, price_ratio_pct, defer_ms) \
+         VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
     )
     .bind(new_id("tick"))
     .bind(world_id)
     .bind(tick_no)
     .bind(base_revision)
     .bind(now_ms())
+    .bind(i64::from(mark.off_peak))
+    .bind(mark.price_ratio_pct)
+    .bind(mark.defer_ms)
     .execute(db)
     .await
     {
@@ -221,6 +681,15 @@ pub async fn insert_tick(
 
 /// 为世界排下一个 tick（tick_no = max+1，base_revision = 当前 state_revision）并入队；已排则返回 None。
 pub async fn schedule_tick(state: &AppState, world_id: &str) -> Result<Option<i64>, ApiError> {
+    schedule_tick_marked(state, world_id, TickMark::default()).await
+}
+
+/// `schedule_tick` 的带标记版本（仅错峰调度器使用；手动端点一律走中性的 `schedule_tick`）。
+pub(crate) async fn schedule_tick_marked(
+    state: &AppState,
+    world_id: &str,
+    mark: TickMark,
+) -> Result<Option<i64>, ApiError> {
     let world = load_world(&state.db, world_id).await?;
     let max: i64 = sqlx::query("SELECT COALESCE(MAX(tick_no), -1) AS m FROM world_ticks WHERE world_id = ?")
         .bind(world_id)
@@ -228,7 +697,7 @@ pub async fn schedule_tick(state: &AppState, world_id: &str) -> Result<Option<i6
         .await?
         .try_get("m")?;
     let next = max + 1;
-    if insert_tick(&state.db, world_id, next, world.state_revision).await? {
+    if insert_tick_marked(&state.db, world_id, next, world.state_revision, mark).await? {
         queue::push_json(
             &*state.queue,
             TOPIC,
@@ -267,16 +736,49 @@ async fn schedule_due_ticks(state: &AppState) -> Result<(), ApiError> {
     .execute(&state.db)
     .await?;
 
-    let worlds =
+    let rows =
         sqlx::query("SELECT id, tick_per_day, timeline_mode, room_type FROM worlds WHERE status = 'running'")
             .fetch_all(&state.db)
             .await?;
+    let mut worlds: Vec<SchedWorld> = Vec::with_capacity(rows.len());
+    for w in &rows {
+        worlds.push(SchedWorld {
+            id: w.try_get("id")?,
+            tick_per_day: w.try_get("tick_per_day")?,
+            timeline_mode: w.try_get("timeline_mode")?,
+            // P2 Stage3：调度节奏由 room_type 驱动（与引擎 dispatch 的 timeline_mode 解耦）。
+            room_type: w.try_get("room_type")?,
+        });
+    }
+
+    // ── R3 成本工程杠杆①：错峰调度（总规格 §17【拍板 16】，模块头有完整设计说明） ──────────
+    // 🔴 默认关闭。`cfg=None`（窗口配错/配空）或某世界开关关闭 → 该世界走下方 `!active` 早退，
+    // 与接线前**逐字相同**。开关未登记进 flags 白名单时 `enabled_for_world` 只读 env，不发查询。
+    let offpeak_cfg = offpeak::Config::from_env();
+    let mut offpeak_on: HashMap<String, bool> = HashMap::new();
+    if offpeak_cfg.is_some() {
+        for w in &worlds {
+            offpeak_on.insert(w.id.clone(), offpeak::enabled_for_world(&state.db, &w.id).await);
+        }
+    }
+    // **折扣时段优先级**：被错峰压得最久的世界先排（先入队 = 先被 worker 领走）。
+    // `sort_by_key` 是**稳定排序**，未被延后的世界键恒为 0 → 无人被延后时**逐字保留原顺序**，
+    // 这是「开关关闭时行为不变」这条回归保证的一部分。
+    let sort_now = now;
+    worlds.sort_by_key(|w| std::cmp::Reverse(offpeak::defer_tracker().held_ms(&w.id, sort_now)));
+
     for w in &worlds {
-        let world_id: String = w.try_get("id")?;
-        let tick_per_day: i64 = w.try_get("tick_per_day")?;
-        let timeline_mode: String = w.try_get("timeline_mode")?;
-        // P2 Stage3：调度节奏由 room_type 驱动（与引擎 dispatch 的 timeline_mode 解耦）。
-        let room_type: String = w.try_get("room_type")?;
+        let world_id = w.id.clone();
+        let tick_per_day = w.tick_per_day;
+        let timeline_mode = w.timeline_mode.as_str();
+        let room_type = w.room_type.as_str();
+        // 该世界本轮是否走错峰路径。false → 下方全部早退回原逻辑。
+        let active = offpeak_cfg.is_some() && *offpeak_on.get(&world_id).unwrap_or(&false);
+        // 🔴 直播场豁免（红线 2）：命中即永不延后。
+        let live = offpeak_cfg
+            .as_ref()
+            .map(|c| c.is_live_room(room_type, tick_per_day))
+            .unwrap_or(true);
 
         // event 模式（DES，第二块 Phase 2 + P2 Stage3 全房型）：**去掉墙钟 interval 依赖**。调度节奏按 room_type：
         // idle 放置房「背靠背立即推进」——只要 running 且无 outstanding（pending/running）tick 就立即排新 tick；
@@ -321,7 +823,38 @@ async fn schedule_due_ticks(state: &AppState) -> Result<(), ApiError> {
                 .await?
                 .try_get("c")?;
                 if outstanding == 0 {
-                    let _ = schedule_tick(state, &world_id).await?;
+                    if !active {
+                        // 原路（错峰关闭）：逐字不变。
+                        let _ = schedule_tick(state, &world_id).await?;
+                    } else {
+                        // 错峰路径：背靠背世界是**慢炖场**的实现形态，正是最该错峰的一类
+                        //（它一天到晚满速烧 token，没有墙钟节奏可依）。
+                        let cfg = offpeak_cfg.as_ref().expect("active 蕴含 cfg 已解析");
+                        let last: Option<i64> = sqlx::query(
+                            "SELECT MAX(created_at) AS m FROM world_ticks WHERE world_id = ?",
+                        )
+                        .bind(&world_id)
+                        .fetch_one(&state.db)
+                        .await?
+                        .try_get("m")?;
+                        match offpeak::plan_event(
+                            cfg,
+                            live,
+                            now,
+                            last,
+                            offpeak::defer_tracker().held_ms(&world_id, now),
+                        ) {
+                            offpeak::Verdict::Idle => {}
+                            offpeak::Verdict::Defer => {
+                                offpeak::defer_tracker().mark(&world_id, now);
+                                tracing::debug!(world_id, "错峰：原价时段，背靠背世界本轮延后");
+                            }
+                            offpeak::Verdict::Schedule(mut mark) => {
+                                mark.defer_ms = offpeak::defer_tracker().take(&world_id, now);
+                                let _ = schedule_tick_marked(state, &world_id, mark).await?;
+                            }
+                        }
+                    }
                 }
             }
             continue;

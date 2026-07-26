@@ -223,7 +223,14 @@ async fn create_intervention(
     .bind(&req.character_id)
     .fetch_one(&state.db)
     .await?;
-    if used >= dream_quota_per_stage() {
+    // OOC 注解权补偿（§7 第 2 级）：复核确认「模型确实演错了」时补发的额度。
+    // 🔴 **只加加数、不动被加数**：补偿存在独立的加数表里，上面那条计数 SQL 一个字符都没改——
+    //    因为另外三条路都是错的：往 interventions 插「假托梦」会伪造玩家从没说过的话
+    //    （且 runtime 会当真把它喂给引擎）；把 applied 改回 accepted 会抹掉「已被引擎消费」
+    //    这个已落定的事实；新增一种 status 则直接篡改了上面这条计数的口径。
+    //    这里变的只是**被比较的阈值**，配额的事实来源仍然唯一。
+    let bonus = crate::annotations::dream_quota_bonus(&state.db, &world_id, &req.character_id).await;
+    if used >= dream_quota_per_stage() + bonus {
         reject_reason = Some("quota".into());
     }
 
@@ -687,4 +694,62 @@ mod tests {
         assert_eq!(parse_quota_override(Some("")), DEFAULT_DREAM_QUOTA_PER_STAGE);
         assert_eq!(parse_quota_override(None), DEFAULT_DREAM_QUOTA_PER_STAGE);
     }
+
+    /// OOC 补偿真正兑现：复核确认「模型确实演错了」后，用满基础配额的角色能再发一条托梦。
+    ///
+    /// 🔴 本用例守的是「只加加数、不动被加数」：补偿入账后 `used` 仍是 3
+    /// （补偿一行都没往 interventions 里插——那会伪造玩家从没说过的话，且 runtime 会当真喂给引擎），
+    /// 变的只是被比较的阈值。配额的事实来源始终唯一。
+    #[tokio::test]
+    async fn ooc_compensation_raises_threshold_without_touching_the_count() {
+        let _g = quota_guard();
+        let state = test_state().await;
+        seed_world(&state.db, "w_comp", 0, "running").await;
+
+        // 用满基础配额（默认 3 条）。
+        for i in 0..3 {
+            seed_intervention(&state, &format!("iv_c{i}"), "w_comp", "u1", "c1", "whisper", "accepted", 0).await;
+        }
+        let count_sql = "SELECT COUNT(*) FROM interventions \
+             WHERE world_id = ? AND character_id = ? AND kind = 'whisper' \
+               AND status IN ('accepted', 'applied')";
+        let used_before: i64 = sqlx::query_scalar(count_sql)
+            .bind("w_comp")
+            .bind("c1")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(used_before, 3, "前置：基础配额已用满");
+        assert!(used_before >= dream_quota_per_stage(), "前置：此时应已超限");
+
+        // 补偿入账（模拟 OOC 复核确认的产物）。
+        sqlx::query(
+            "INSERT INTO dream_quota_compensations \
+             (id, appeal_id, world_id, character_id, user_id, grants, created_at) \
+             VALUES ('dqc1', 'ap1', 'w_comp', 'c1', 'u1', 1, 0)",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+        let used_after: i64 = sqlx::query_scalar(count_sql)
+            .bind("w_comp")
+            .bind("c1")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(
+            used_after, 3,
+            "🔴 补偿绝不能往 interventions 插行：那是伪造玩家没说过的话，runtime 会当真把它喂给引擎"
+        );
+
+        let bonus = crate::annotations::dream_quota_bonus(&state.db, "w_comp", "c1").await;
+        assert_eq!(bonus, 1, "补偿账应记到 1 条");
+        assert!(
+            used_after < dream_quota_per_stage() + bonus,
+            "补偿后阈值抬高，应重新有额度：used={used_after} base={} bonus={bonus}",
+            dream_quota_per_stage()
+        );
+    }
+
 }

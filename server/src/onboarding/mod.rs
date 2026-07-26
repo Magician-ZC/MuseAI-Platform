@@ -27,6 +27,10 @@
 //! （不是 403：不向外泄露「平台有这个未开放功能」），且**已领过的礼包也读不出、开不了演**，
 //! 再打开则原样恢复。是可逆急停阀，不是一次性阉割。
 //!
+//! 🔵 **本模块是运行时开关体系（`crate::flags`）的参考接线**：`MUSE_ONBOARDING` 现在经
+//! `flags::is_enabled` 解析，支持**按用户灰度**（正对 §2 T0 的「邀请制 ≤100 人」）。
+//! env 仍是兜底层——`runtime_flags` 表为空时行为与接线前逐字一致，见 `onboarding_enabled`。
+//!
 //! ### ② 礼包不是特权通道 —— 本模块**永不写 `world_members`**
 //! 体例同 `invitations`（那里有源码断言测试锁死同一性质，本模块的对应用例是
 //! `tests::module_never_writes_world_members`）。领取礼包只做两件事：**发一张预制卡** +
@@ -126,25 +130,55 @@ const STARTER_SUBPLOT_CARD_LABEL: &str = "新手纪念·初入世界";
 /// 代码合并不等于对用户开放——必须运营显式打开。
 const DEFAULT_ONBOARDING_ENABLED: bool = false;
 
-/// 新手动线是否已由运营开启（env 覆盖 + 默认常量，范式同 `worlds::deathmatch_enabled` /
-/// `invitations::invitations_enabled`——本仓库尚无配置表，env 是当前唯一的运营开关形态；
-/// 将来配置表落地后只改本函数内部，调用点与降级语义不变）。
-pub fn onboarding_enabled() -> bool {
-    match std::env::var(ENV_ONBOARDING_ENABLED) {
-        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "on" | "yes" => true,
-            "0" | "false" | "off" | "no" => false,
-            // 配错不静默开启发放通道：回落默认（关闭）。
-            _ => DEFAULT_ONBOARDING_ENABLED,
-        },
-        Err(_) => DEFAULT_ONBOARDING_ENABLED,
-    }
+/// 🔴 **编译期钉死**：接线后默认值出现在两处（本常量 + `flags::KNOWN_FLAGS` 登记表），
+/// 两处不一致就是「默认关闭」这条 §0.1 约束有了两个事实源。改一处不改另一处直接编不过。
+const _: () = assert!(
+    crate::flags::declared_default(ENV_ONBOARDING_ENABLED) == DEFAULT_ONBOARDING_ENABLED,
+    "flags::KNOWN_FLAGS 中 MUSE_ONBOARDING 的默认值必须与 DEFAULT_ONBOARDING_ENABLED 一致"
+);
+
+/// 新手动线是否已由运营开启。
+///
+/// ════════════════════════════════════════════════════════════════════════════
+/// 🔴 **运行时开关体系的参考接线**（R1 补齐项，见 `crate::flags` 模块头）
+/// ════════════════════════════════════════════════════════════════════════════
+///
+/// 本函数曾经只读 env。现在改为经统一入口 `flags::is_enabled` 解析，回落链是：
+///
+/// ```text
+///   runtime_flags(user=<本人>) → runtime_flags(global) → env MUSE_ONBOARDING → false
+/// ```
+///
+/// 🔴 **行为零变化的保证**：`runtime_flags` 表为空时（迁移 0036 不插任何种子数据），
+/// 解析必然落到 env 分支，且 `flags::parse_env_bool` 与本函数原实现**逐字同构**
+/// （`1/true/on/yes` 开、`0/false/off/no` 关、其余回落 `DEFAULT_ONBOARDING_ENABLED`）。
+/// 于是本模块既有全部用例（都在空表上跑）一行不改即为回归保护，
+/// 另有 `crate::flags::tests::wired_onboarding_matches_legacy_env_semantics` 逐值比对。
+///
+/// 🔴 **默认仍是关闭**：DB 无记录 + env 未设 → `flags::KNOWN_FLAGS` 里声明的 `false`。
+/// 引入开关表**没有**把任何未验证功能变成默认开启（`flags::tests` 有专门红线用例）。
+///
+/// 灰度粒度选 **user**：新手动线的开放范围就是「哪些人能领礼包」，正对 VALIDATION §2
+/// T0 的「邀请制 ≤100 人」——运营给这 100 个 user 各写一条 `enabled=1` 的记录即可开测，
+/// 不必也不应把大盘打开。（world 作用域对本模块无意义：微本世界是领礼包时**才创建**的，
+/// 判定发生在世界存在之前。）
+///
+/// 保留 `ENV_ONBOARDING_ENABLED` / `DEFAULT_ONBOARDING_ENABLED` 两个常量与下方 RAII 夹具：
+/// env 仍是兜底层，不是被删掉的旧路径。
+pub async fn onboarding_enabled(db: &sqlx::AnyPool, user_id: Option<&str>) -> bool {
+    let ctx = match user_id {
+        Some(u) => crate::flags::FlagCtx::user(u),
+        None => crate::flags::FlagCtx::global(),
+    };
+    crate::flags::is_enabled(db, ENV_ONBOARDING_ENABLED, ctx).await
 }
 
 /// 开关门：关闭时整块能力**不存在**（404，而非 403）——不向外泄露「平台有这个未开放功能」。
 /// 每个端点第一行都调它，**读端点同样调**（读取侧降级：开关关掉后已领的礼包立即读不出、开不了演）。
-fn ensure_enabled() -> Result<(), ApiError> {
-    if onboarding_enabled() {
+///
+/// 传 `user_id` 使按用户灰度生效（T0 邀请制）；无用户上下文时传 `None` 走全局解析。
+async fn ensure_enabled(db: &sqlx::AnyPool, user_id: Option<&str>) -> Result<(), ApiError> {
+    if onboarding_enabled(db, user_id).await {
         Ok(())
     } else {
         Err(ApiError::NotFound)
@@ -169,11 +203,24 @@ impl OnboardingSwitch {
     }
 
     pub(crate) fn with(on: bool, extra: &[(&'static str, &str)]) -> Self {
+        Self::raw(Some(if on { "1" } else { "0" }), extra)
+    }
+
+    /// 置任意原始值（`None` = **移除该 env**），并可附带其它 env。
+    ///
+    /// 🔴 `crate::flags::tests` 也用这把夹具（而不是自建一把锁）——`MUSE_ONBOARDING` 是进程级 env，
+    /// 两个模块各拿各的锁等于没有锁：flags 的用例会与 onboarding 的用例并发改同一个变量，
+    /// 症状是随机失败的「开关值对不上」。**碰同一个 env 的用例必须共用同一把锁。**
+    /// 「移除」这个能力是 flags 侧需要的：它要验证「env 未设时默认关闭」这条红线。
+    pub(crate) fn raw(value: Option<&str>, extra: &[(&'static str, &str)]) -> Self {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut prev: Vec<(&'static str, Option<String>)> =
             vec![(ENV_ONBOARDING_ENABLED, std::env::var(ENV_ONBOARDING_ENABLED).ok())];
-        std::env::set_var(ENV_ONBOARDING_ENABLED, if on { "1" } else { "0" });
+        match value {
+            Some(v) => std::env::set_var(ENV_ONBOARDING_ENABLED, v),
+            None => std::env::remove_var(ENV_ONBOARDING_ENABLED),
+        }
         for (k, v) in extra {
             prev.push((k, std::env::var(k).ok()));
             std::env::set_var(k, v);
@@ -263,8 +310,8 @@ fn grant_response(g: &Grant) -> Value {
 
 /// 预制卡库列表（选卡页）。**不下发卡全文**：卡内容在领取时才落库，列表只给 id / 名字 / 一句话卖点，
 /// 免得把整张 DNA 卡当公开内容外泄（也顺带压住响应体积）。
-async fn list_presets(_user: AuthUser) -> Result<Json<Value>, ApiError> {
-    ensure_enabled()?;
+async fn list_presets(State(state): State<AppState>, user: AuthUser) -> Result<Json<Value>, ApiError> {
+    ensure_enabled(&state.db, Some(&user.user_id)).await?;
     let items: Vec<Value> = presets::PRESETS
         .iter()
         .map(|p| {
@@ -309,7 +356,7 @@ async fn claim_gift(
     headers: HeaderMap,
     Json(body): Json<ClaimReq>,
 ) -> Result<Json<Value>, ApiError> {
-    ensure_enabled()?;
+    ensure_enabled(&state.db, Some(&user.user_id)).await?;
 
     let preset = presets::find(body.preset_id.as_deref()).ok_or_else(|| {
         ApiError::BadRequest(format!(
@@ -500,7 +547,7 @@ async fn claim_gift(
 /// 这个端点同时是 T0 门槛（「10 分钟内完成首个微本 ≥70%」）的客户端侧读口径：
 /// `claimedAt` 是计时起点，`world.status == "ended"` 是完成判据。
 async fn my_onboarding(State(state): State<AppState>, user: AuthUser) -> Result<Json<Value>, ApiError> {
-    ensure_enabled()?;
+    ensure_enabled(&state.db, Some(&user.user_id)).await?;
 
     let Some(g) = load_grant(&state.db, &user.user_id).await? else {
         return Ok(Json(json!({
@@ -563,7 +610,7 @@ async fn my_onboarding(State(state): State<AppState>, user: AuthUser) -> Result<
 /// 幂等：`WHERE status='open'` 守卫使重复开演的第二次 `rows_affected=0`；已 running → 原样成功返回，
 /// 已 ended → 409（世界演完了，不能倒回去重开——公共事实不可回滚，§0.3）。
 async fn start_microworld(State(state): State<AppState>, user: AuthUser) -> Result<Json<Value>, ApiError> {
-    ensure_enabled()?;
+    ensure_enabled(&state.db, Some(&user.user_id)).await?;
 
     let g = load_grant(&state.db, &user.user_id)
         .await?

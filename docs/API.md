@@ -1,6 +1,7 @@
 # 平台后端 API 清单（server）
 
-> 全部端点 nest 在 `/api` 下（`server/src/app.rs`），共 **99 条路由声明 / 108 个方法-路径组合**。
+> 全部端点 nest 在 `/api` 下（`server/src/app.rs`），共 **103 条路由声明 / 112 个方法-路径组合**
+> （0036 运行时开关 +3 条声明 / +4 个组合；口径以 §8 的 grep 为准）。
 > 鉴权列语义：**JWT** = 需 `Authorization: Bearer <accessToken>`（`AuthUser` 提取器）；
 > **公开** = 无需 token；**admin+角色** = 需管理员 token 且 `require_role` 通过（`admin` 角色恒通过）。
 > 校验于 2026-07-26。**改路由必须同步改本文件**——与 `docs/VALIDATION.md` §3 台账同级纪律。
@@ -16,7 +17,20 @@
 
 未启用 feature 时对应路由**不注册**，请求返回 404。
 
-**运行时开关**（与 feature 门控正交，同样"未验证功能默认关闭"）：`invitations` 全部端点由
+**运行时开关体系**（migration 0036，`server/src/flags/`）：开关不再只有 env 一种形态。
+统一读取入口 `flags::is_enabled(db, name, ctx)`，解析链**按用户 > 按世界 > 全局 > env > 代码内默认值**
+（窄的赢）。运营面见 §7 的 `/api/admin/flags`。三条要点：
+
+- 🔴 **env 是兜底而非被替代**：`runtime_flags` 表为空（迁移不插种子数据）时解析必然落到 env 分支，
+  下面列的全部现存开关**行为逐字不变**。开闸是显式写入数据，不是升级的副作用。
+- 🔴 **fail-closed**：查库失败 / 记录损坏（作用域非法、`enabled` 非 0-1、时间窗反转）→
+  返回该开关声明的默认值，**且不再回落 env**。「安全」指不扩大用户可见范围的那一侧——
+  8 个未验证开关是**关**，`MUSE_SAFETY_LEXICON`（审核链）是**开**（继续过滤）。
+- **本批次只接线 `MUSE_ONBOARDING` 一个**（参考接线，支持按用户灰度 = VALIDATION §2 T0
+  「邀请制 ≤100 人」的执行手段）。其余 8 个仍是纯 env，登记表里 `wired=false`，
+  迁移清单见 `flags::MIGRATION_NOTES`。
+
+**各模块运行时开关现状**（与 feature 门控正交，同样"未验证功能默认关闭"）：`invitations` 全部端点由
 `MUSE_ROOM_INVITATIONS` 控制，**默认关闭 → 404**；`onboarding`（新手动线）全部端点由
 `MUSE_ONBOARDING` 控制，**默认关闭 → 404**；`subplot`（副本卡）全部端点**与结算铸卡**由
 `MUSE_SUBPLOT_CARDS` 控制，**默认关闭 → 端点 404 且结算一张不铸**；自定义房容器装配
@@ -381,9 +395,42 @@
 | GET | `/api/admin/model-routes` | operator | 模型路由列表 |
 | POST | `/api/admin/model-routes` | **admin 专属** | 建路由版本 |
 | POST | `/api/admin/model-routes/{id}/activate` | **admin 专属** | 激活（**一键回滚 = 激活旧版本**） |
+| GET | `/api/admin/flags?flag=` | operator | 运行时开关：登记表（`defaultEnabled`/`owner`/`wired`）+ 全部记录 + 每个开关的 `globalEffective`（大盘生效值及其来源） |
+| GET | `/api/admin/flags/resolve?flag=&userId=&worldId=` | operator | **dry-run**：该开关对这个人/这个世界解析成什么、来自哪一层（`db`/`env`/`default`/`failClosed`），含被时间窗跳过的记录。复盘主力工具 |
+| POST | `/api/admin/flags` | **admin 专属** | 设置一条（upsert，唯一键 `flag+scope+targetId`）。见下方「运行时开关」小节 |
+| DELETE | `/api/admin/flags/{id}?reason=` | **admin 专属** | 删除一条 = 该目标**回落到更宽作用域 / env**（不是强制关闭）。回执 `fallsBackTo` 直接告知删完变成什么 |
 | GET | `/api/admin/risk-events` | operator, reviewer, support | 风控事件 |
 | GET | `/api/admin/data-requests` | support | 数据主体请求 |
 | POST | `/api/admin/data-requests/{id}/run` | support | 执行数据请求 |
+
+### 运行时开关（flags，migration 0036；VALIDATION.md §0.1 的 R1 补齐项）
+
+`POST /api/admin/flags` 请求体：
+
+```jsonc
+{
+  "flag": "MUSE_ONBOARDING",   // 必须在 flags::KNOWN_FLAGS 白名单内，否则 400
+  "scope": "user",             // global | world | user
+  "targetId": "usr_1",         // global 不接受；world/user 必填，且**写入期校验目标存在**
+  "enabled": true,
+  "startsAt": 0,               // 毫秒；0 = 立即。窗口左闭右开 [startsAt, endsAt)
+  "endsAt": 0,                 // 毫秒；0 = 永不过期
+  "reason": "T0 邀请制首批内测"  // 🔴 必填非空，空/纯空白 → 400
+}
+```
+
+| 项 | 取值 |
+|---|---|
+| 解析优先级 | **user > world > global > env > 代码内默认值**（窄的赢）。窗口外的记录 = **不参与解析、回落更宽作用域**（不是强制关闭），使灰度可组合：窗口一过，受灰度用户自动跟随大盘 |
+| RBAC | 读 `operator`（急停时更需要看得见），**写 admin 专属**——开关直接决定用户能看到什么，爆炸半径与 prompt 激活同档甚至更高，按最严的来 |
+| 审计 | 每次 set/delete 落 `audit_logs`（`flag.set`/`flag.delete`），`subject = flag:scope:target`，reason 含**变更前后完整状态**（如 `on[0~0] -> off[0~0] \| 急停`）。记录行另存 `updatedBy`/`updatedAt`/`reason` 作为现状面 |
+| 缓存 | 进程内整表快照 + TTL `MUSE_FLAGS_CACHE_TTL_MS`（默认 5000ms，`0` = 禁用直查库）。**写端点内立即 `invalidate`**：本进程点完即生效，多进程部署 ≤TTL 收敛 |
+| 幂等 | upsert 语义（同 `flag+scope+targetId` 只有一行，后写的赢），并发下撞唯一索引会退回 UPDATE |
+| 外键 | **不建**（同 `prompt_versions.canary_world_ids` 先例）。世界/用户删除**不级联删灰度记录**——级联会静默改变开放范围、事后无从复盘；打错 id 由**写入期存在性校验**挡掉 |
+
+> 🔴 **默认关闭仍是默认**：迁移 0036 **不插任何种子数据**，`enabled` 列 `DEFAULT 0`，
+> 登记表里除 `MUSE_SAFETY_LEXICON`（审核链）外 `defaultEnabled` 全为 `false`。
+> 三条均有红线用例锁死（`flags::tests::red_line_*`）。
 
 > 生产管理员账号：靠 `users.role='admin'`，由运维经受控迁移/CLI 提权。
 > **注意（`admin_api/mod.rs:177` TODO）**：当前 `/api/auth/login` 恒发 `role='user'`，
@@ -395,7 +442,7 @@
 
 ```bash
 # 路由与方法
-grep -rhoE '\.route\("[^"]+"' server/src | wc -l           # 100 条 route 声明（0035 后）
+grep -rhoE '\.route\("[^"]+"' server/src | wc -l           # 103 条 route 声明（0036 后）
 # admin 角色矩阵
 grep -rn "require_role" server/src/admin_api/*.rs
 ```

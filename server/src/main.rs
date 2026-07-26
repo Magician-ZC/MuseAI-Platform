@@ -13,6 +13,11 @@ mod consents;
 mod db;
 mod error;
 mod events;
+// 运行时开关体系（VALIDATION.md §0.1「未验证功能默认关闭」的基础设施层，R1 补齐项）：
+// 统一读取入口 `flags::is_enabled`，解析链 **按用户 > 按世界 > 全局 > env > 代码内默认值**。
+// 🔴 env 是兜底而非被替代：`runtime_flags` 表为空时全部现存模块行为逐字不变。
+// 本批次只接线 `MUSE_ONBOARDING` 一个，其余 8 个的迁移清单见 `flags::MIGRATION_NOTES`。
+mod flags;
 mod idempotency;
 mod interventions;
 // 房间邀请（客户端设计文档 §6 辅助栏）：默认关闭的运营开关 `MUSE_ROOM_INVITATIONS`，

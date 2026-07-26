@@ -7,7 +7,9 @@
 ## 0. 三条工程约束（绑定所有后续开发）
 
 1. **未验证功能默认关闭**：经 feature flag / 运营开关 / 数据配置启用（现状抓手：cargo feature
-   `billing`/`arena`、admin 建房控制、建房参数；运行时开关体系列入 R1 开发）。
+   `billing`/`arena`、admin 建房控制、建房参数；**运行时开关体系基础设施已落地**——
+   迁移 `0036` + `server/src/flags/`，按用户/世界/全局三作用域灰度 + 时间窗 + 审计留痕，
+   env 作为兜底层，详见 §3.1。现仅接线 `MUSE_ONBOARDING` 一条，其余 8 个待逐个迁移）。
 2. **产品规则参数化**：托梦配额、死亡规则、奖励系数、成员规模、tick 节奏、历练阈值、
    崩塌惩罚系数等一律可配置，禁止写死。
 3. **状态语言七档**，文档与台账统一使用：
@@ -120,18 +122,47 @@
 
 **⚠️ 本表初版漏掉的一项（2026-07-26 补记）**：§0.1 原文写着「运行时开关体系**列入 R1 开发**」，
 但它既不在总规格 §19 的 R1 清单里，也不在本表初版中——**两边都漏了**。
+**基础设施层已于 2026-07-26 落地**（状态由 `Specified` 推进到 `Implemented`），下表已更新。
 
-| R1 项 | 开发状态 | 现状 | 默认开关 |
+| R1 项 | 开发状态 | 代码锚点 | 默认开关 |
 |---|---|---|---|
-| 运行时开关体系 | **Specified**（未动工） | 现有全部是 **env 进程级开关**：`MUSE_ONBOARDING` / `MUSE_SUBPLOT_CARDS` / `MUSE_LETHALITY_DEATHMATCH` / `MUSE_ROOM_INVITATIONS` / `MUSE_SAFETY_LEXICON`。它们**不能按世界灰度、不能按用户灰度、改一次要重启、运营在后台点不了**——与 §0.1 要的「运营开关」差一层 | — |
+| 运行时开关体系（基础设施 + 1 条参考接线） | **Implemented** | 迁移 `0036`（`runtime_flags`：开关名/作用域/目标/开关位/时间窗/修改人/修改时刻/理由，唯一键 `flag+scope+target_id`）；统一读取入口 `flags/mod.rs` `is_enabled(db, name, ctx)`，解析链 **user > world > global > env > 代码内默认值**；运营面 `admin_api/flags.rs`（GET/POST `/admin/flags`、GET `/admin/flags/resolve` dry-run、DELETE `/admin/flags/{id}`，**写 admin 专属**，全部落 `audit_logs`）。**参考接线仅 `MUSE_ONBOARDING`**（按用户灰度 = T0「邀请制 ≤100 人」的执行手段） | 恒开（体系本身）；**表为空 = 全部现存开关行为逐字不变** |
 
-> 这不只是形式问题：T0-T5 每个阶段都要求「开放范围」可控（如 T0「邀请制 ≤100 人」、
+> **为什么必须做**：T0-T5 每个阶段都要求「开放范围」可控（如 T0「邀请制 ≤100 人」、
 > T3「订阅制灰度」），而 env 开关只有全开/全关两态，**做不到分阶段开闸**。
-> 换句话说，验证计划本身依赖这套体系。另注 `prompt_versions.canary_world_ids`
-> （迁移 0001 就有）是现成的按世界灰度先例，但目前**只写不读**、无任何消费方。
+> 换句话说，验证计划本身依赖这套体系。
+>
+> 🔴 **引入它没有打开任何东西**（本项最大的风险点，已锁进测试）：迁移 0036 **不插种子数据**，
+> `enabled` 列 `DEFAULT 0`，登记表里除审核链外默认值全为 `false`；表为空时解析必然回落 env，
+> 于是 9 个现存开关行为零变化。红线用例：`flags::tests::red_line_empty_db_and_no_env_means_disabled`
+> / `red_line_only_safety_chain_defaults_on` / `red_line_migration_seeds_no_rows`。
+>
+> 🔴 **fail-closed**：查库失败 / 记录损坏（作用域非法、`enabled` 非 0-1、时间窗反转/为负）→
+> 返回声明的默认值**且不再回落 env**（否则「配坏了」会被静默降级成「按 env 开着」）。
+> 「安全」指不扩大用户可见范围的那一侧：8 个未验证开关是**关**，`MUSE_SAFETY_LEXICON`
+> （审核链，关掉 = 放行敏感词）是**开**。用例 `red_line_corrupt_records_fail_closed`
+> / `red_line_query_failure_fails_closed` / `red_line_safety_chain_fails_safe_to_on`。
+>
+> **与 `prompt_versions.canary_world_ids` 的口径关系**：后者（迁移 0001 就有）是现成的
+> 按世界灰度先例，至今**只写不读**、无任何消费方。本体系的 world 作用域与它**口径一致**——
+> 都以 `worlds.id` 为灰度单元、都是白名单式「命中即生效」、都**不建外键**（灰度名单是运营意图
+> 的记录，级联删除会静默改变开放范围）。**不一致处只在存储形态**：内联 JSON 数组无法承载
+> 「谁改的/何时/为什么/时间窗」，也无法按世界索引查询（要全表扫 + JSON 解析），故本体系改为
+> 独立行 + 唯一索引。本批次**不改 `prompt_versions`**（给它接消费方会改变引擎选 prompt 的行为，
+> 属另一件事）；将来接线时应复用 `runtime_flags` 而不是再造第三套灰度。
+
+**其余 8 个 env 开关的迁移清单**（尚未接线，`wired=false`；逐条注意事项见
+`server/src/flags/mod.rs` 的 `MIGRATION_NOTES` 文档注释）：
+`MUSE_SUBPLOT_CARDS` · `MUSE_LETHALITY_DEATHMATCH` · `MUSE_ROOM_INVITATIONS` ·
+`MUSE_CONTAINER_ASSEMBLY` · `MUSE_MEMORIAL` · `MUSE_WORLD_SERIES_AUTOSCALE` ·
+`MUSE_WORLD_BE_BIOGRAPHY` · `MUSE_SAFETY_LEXICON`（🔴 最后迁或不迁）。
+共同的坑：**多数消费点在事务内**（结算铸卡 / 封卷 / 扩容判定），`is_enabled` 会查库，
+须在进事务前解析一次再把 bool 传进去，否则 SQLite 单连接池自锁。
+**一次只迁一个、各自带回归用例**——批量改必然出错，这也是本批次只接一条线的原因。
 
 **仍缺的接线（不在上表，单独跟踪）**：生死契约 server 侧全部 · 身份池叙事回灌 ·
-第 3 层语义分类 · 机审耗时打点（`moderationLatency` 全仓无数据源，后台该列恒为 `—`）。
+第 3 层语义分类 · 机审耗时打点（`moderationLatency` 全仓无数据源，后台该列恒为 `—`）·
+**其余 8 个 env 开关接入运行时开关体系**（清单与注意事项见上）。
 
 > **纪律提醒**：本节存在的意义是 §4.3 那条"发布评审以台账为准，禁止口头'已完成'"。
 > 台账漏项 = 评审失去依据，与状态写错同等严重。改 R1 相关代码时同步改本表。

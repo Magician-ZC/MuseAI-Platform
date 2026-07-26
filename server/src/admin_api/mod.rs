@@ -14,6 +14,8 @@
 //!   数据看板：GET /admin/metrics/overview（SQL 聚合）、GET /admin/metrics/trends?days=（按天趋势，UTC 日界）
 //!   治理：    GET/POST /admin/prompts、POST /admin/prompts/{id}/activate|canary、
 //!            GET/POST /admin/model-routes、POST /admin/model-routes/{id}/activate（一键回滚=激活旧版本）
+//!   运行时开关：GET/POST /admin/flags、GET /admin/flags/resolve（dry-run）、DELETE /admin/flags/{id}
+//!            （VALIDATION §0.1 的运营面：按用户/世界/全局三作用域灰度；**写 admin 专属**）
 //!   风控：    GET /admin/risk-events?kind=&cursor=
 //!   工单：    GET /admin/data-requests?status=、POST /admin/data-requests/{id}/run
 
@@ -31,6 +33,7 @@ use crate::error::ApiError;
 
 mod audit;
 mod dashboards;
+mod flags;
 mod governance;
 mod ops;
 mod reconcile;
@@ -90,6 +93,11 @@ pub fn router() -> Router<AppState> {
             get(governance::list_routes).post(governance::create_route),
         )
         .route("/admin/model-routes/{id}/activate", post(governance::activate_route))
+        // 运行时开关（VALIDATION §0.1 的运营面；写 admin 专属，读 operator，理由见 flags.rs 模块头）
+        .route("/admin/flags", get(flags::list_flags).post(flags::set_flag))
+        // dry-run 诊断：静态段 `resolve` 与下一行的 `{id}` 是 matchit 的兄弟节点，静态优先。
+        .route("/admin/flags/resolve", get(flags::resolve_flag))
+        .route("/admin/flags/{id}", axum::routing::delete(flags::delete_flag))
         // 风控
         .route("/admin/risk-events", get(ops::list_risk_events))
         // 客服与工单

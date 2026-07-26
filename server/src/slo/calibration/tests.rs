@@ -6,7 +6,14 @@
 //!   `calibration_module_source_contains_no_write_statements`；
 //! - 🔴 **三态分得开**：`identity_dimension_separates_three_empty_states` /
 //!   `realm_dimension_separates_three_empty_states`；
-//! - 🔴 **不给单一综合分**：`calibration_readings_expose_no_composite_score`。
+//! - 🔴 **不给单一综合分**：`calibration_readings_expose_no_composite_score` /
+//!   `confidence_intervals_come_without_a_significance_verdict`。
+//!
+//! §7 是样本量那一批的锁（2026-07-27 补）：第四态 `insufficient_sample` 与前三态分得开
+//! （`readings_separate_insufficient_sample_from_the_two_empty_states`）、
+//! 每个读数随身带 n（`every_reading_carries_its_own_sample_size`）、
+//! 门槛参数化且回显（`sample_floor_is_parameterized_and_echoed_with_its_rationale`）、
+//! 以及本批的由来本身（`mean_share_gini_distinguishes_a_handful_of_observations_from_many`）。
 //!
 //! 外加两维各自的读数正确性、口径复用（`bulk_world_facts_match_single_world_facts`）、
 //! 与超限时"明说跳过"。
@@ -32,6 +39,11 @@ fn cfg() -> SloConfig {
         silent_streak_max: 3,
         scan_row_cap: 50_000,
         calibration_world_cap: 300,
+        // 🔴 用例里把最小样本量压到 1，让**口径用例测口径**（几个观察算出什么数），
+        // 门槛本身另有专门用例（`sample_floor_*` / `readings_separate_insufficient_*`）覆盖。
+        // 混在一起会让「改了口径」与「改了门槛」两种回归长得一样。
+        calibration_min_n: 1,
+        calibration_min_groups: 2,
     }
 }
 
@@ -486,24 +498,34 @@ async fn identity_dimension_detects_a_systematically_starved_identity() {
     assert_eq!(lead["observations"], 4);
     assert_eq!(extra["observations"], 3);
     // lead: 1.6, 1.6, 2.0（w_id3 里对手 0 分）, 1.5（w_id4） → 均值 1.675
-    close(&lead["meanRelativeShare"], (1.6 + 1.6 + 2.0 + 1.5) / 4.0);
+    close(&lead["meanRelativeShare"]["value"], (1.6 + 1.6 + 2.0 + 1.5) / 4.0);
+    assert_eq!(lead["meanRelativeShare"]["n"], 4, "读数随身带 n，取值必须穿过信封");
+    assert_eq!(lead["meanRelativeShare"]["worlds"], 4, "n 之外还要给聚类数（观察落在几个世界里）");
     // extra: 0.4, 0.4, 0.0 → 均值 0.2666…
-    close(&extra["meanRelativeShare"], (0.4 + 0.4 + 0.0) / 3.0);
+    close(&extra["meanRelativeShare"]["value"], (0.4 + 0.4 + 0.0) / 3.0);
     assert_eq!(
         d["lowestMeanIdentity"]["identityId"], "extra",
         "systematically starved 的那个身份必须能被直接指出来"
     );
     assert_eq!(d["highestMeanIdentity"]["identityId"], "lead");
+    // 极值也是选出来的：它必须把自己的 n 带上，否则「最低的那个身份」可能只有 1 个观察。
+    assert_eq!(d["lowestMeanIdentity"]["meanRelativeShare"]["n"], 3);
     assert!(
-        d["meanShareGini"].as_f64().unwrap() > 0.0,
+        d["meanShareGini"]["value"].as_f64().unwrap() > 0.0,
         "两个身份平均份额差这么多，各身份之间的集中度不可能是 0"
     );
 
     // (unassigned) 是对照桶：在场但没站位的 chF 拿到 0.5 倍均分。
     let un = identity_row(d, IDENTITY_UNASSIGNED);
     assert_eq!(un["observations"], 1);
-    close(&un["meanRelativeShare"], 0.5);
-    close(&d["unassignedMeanRelativeShare"], 0.5);
+    close(&un["meanRelativeShare"]["value"], 0.5);
+    close(&d["unassignedMeanRelativeShare"]["value"], 0.5);
+    assert_eq!(d["unassignedMeanRelativeShare"]["n"], 1);
+    assert_eq!(d["assignedMeanRelativeShare"]["n"], 7, "有站位的观察：lead 4 + extra 3");
+    assert_eq!(
+        d["assignedMeanRelativeShare"]["worlds"], 4,
+        "聚类数取世界并集 —— 同一个世界同时向多个身份桶供数，直接加桶内世界数会重复计"
+    );
     assert_eq!(d["identitiesObserved"], 2, "(unassigned) 不是配置出来的身份，不计入身份数");
 }
 
@@ -539,10 +561,10 @@ async fn identity_dimension_counts_members_without_contribution_rows_as_zero() {
     let d = dim(&d, "identityShareBalance");
     let extra = identity_row(d, "extra");
     assert_eq!(extra["observations"], 1, "零分成员必须进样本");
-    close(&extra["meanRelativeShare"], 0.0);
+    close(&extra["meanRelativeShare"]["value"], 0.0);
     assert_eq!(extra["zeroScoreObservations"], 1);
-    close(&extra["zeroScoreRate"], 1.0);
-    close(&identity_row(d, "lead")["meanRelativeShare"], 2.0);
+    close(&extra["zeroScoreRate"]["value"], 1.0);
+    close(&identity_row(d, "lead")["meanRelativeShare"]["value"], 2.0);
 }
 
 /// 🔴 三态：入口没开过 / 窗口零样本 / 真数（可以是 0）——三者绝不可混同。
@@ -583,9 +605,9 @@ async fn identity_dimension_separates_three_empty_states() {
     let d = calibration_readings(&db, &cfg()).await.unwrap();
     let d2 = dim(&d, "identityShareBalance");
     assert_eq!(d2["status"], "ok");
-    close(&d2["meanShareGini"], 0.0);
-    close(&identity_row(d2, "lead")["meanRelativeShare"], 1.0);
-    close(&identity_row(d2, "extra")["meanRelativeShare"], 1.0);
+    close(&d2["meanShareGini"]["value"], 0.0);
+    close(&identity_row(d2, "lead")["meanRelativeShare"]["value"], 1.0);
+    close(&identity_row(d2, "extra")["meanRelativeShare"]["value"], 1.0);
 }
 
 /// 窗口是 cohort 口径（`worlds.created_at` 落窗）：窗口外开出的世界不进样本。
@@ -652,22 +674,30 @@ async fn realm_dimension_groups_worlds_by_costume_and_keeps_the_untiered_control
     assert_eq!(low["worlds"], 2);
     assert_eq!(low["completion"]["natural"], 1);
     assert_eq!(low["completion"]["unfinished"], 1);
-    close(&low["completion"]["completionRate"], 0.5);
+    close(&low["completion"]["completionRate"]["value"], 0.5);
     assert_eq!(low["blocking"]["blockedTicks"], 1);
     assert_eq!(low["blocking"]["engineTicks"], 7, "提交 6 + 阻断 1");
-    close(&low["blocking"]["blockedRate"], 1.0 / 7.0);
+    close(&low["blocking"]["blockedRate"]["value"], 1.0 / 7.0);
     assert_eq!(low["blocking"]["eventsWithheld"], 1);
-    close(&low["blocking"]["withheldRate"], 0.5);
+    close(&low["blocking"]["withheldRate"]["value"], 0.5);
     assert_eq!(low["endings"]["distinctEndings"], 1);
+
+    // 🔴 三个比率的 n 各不相同（世界 / 拍 / 事件），必须各带各的，不可互相代读。
+    assert_eq!(low["completion"]["completionRate"]["n"], 2, "完读率的 n 是世界数");
+    assert_eq!(low["completion"]["completionRate"]["unit"], "world");
+    assert_eq!(low["blocking"]["blockedRate"]["n"], 7, "阻断率的 n 是拍数，不是世界数");
+    assert_eq!(low["blocking"]["blockedRate"]["unit"], "tick");
+    assert_eq!(low["blocking"]["withheldRate"]["n"], 2, "扣留率的 n 是事件数");
+    assert_eq!(low["blocking"]["withheldRate"]["unit"], "event");
 
     let high = realm_row(d, "t_high");
     assert_eq!(high["worlds"], 1);
     assert_eq!(high["completion"]["forced"], 1, "starved = 强制收尾");
-    close(&high["completion"]["completionRate"], 0.0);
+    close(&high["completion"]["completionRate"]["value"], 0.0);
 
     let none = realm_row(d, REALM_NONE);
     assert_eq!(none["worlds"], 1, "没钉戏服的世界是唯一的参照系，必须留着");
-    close(&none["completion"]["completionRate"], 1.0);
+    close(&none["completion"]["completionRate"]["value"], 1.0);
 }
 
 /// 🔴 形状锁：戏服维**没有组内分布**（§6 全员统一），只能跨世界对比。
@@ -690,7 +720,10 @@ async fn realm_dimension_has_no_within_group_distribution_by_design() {
         assert!(row.get("distribution").is_none(), "戏服桶内没有分布可看");
         assert!(row.get("meanRelativeShare").is_none(), "相对份额是身份维的单位，不属于戏服维");
         // 桶内允许出现的基尼只有一个：结局集中度（那是跨世界的结局分布，不是组内成员分布）。
-        assert!(row["endings"]["concentrationGini"].is_number());
+        // 它同样是带样本量的信封：分组数（结局种数）与门槛盯的观察数（落到真实结局的世界数）都在。
+        let g = &row["endings"]["concentrationGini"];
+        assert!(g["n"].is_number(), "结局集中度必须带分组数");
+        assert!(g["sampleN"].is_number(), "以及门槛盯的那个观察数");
     }
 }
 
@@ -727,7 +760,7 @@ async fn realm_dimension_separates_three_empty_states() {
     assert_eq!(d2["status"], "ok");
     assert_eq!(d2["tiersObserved"], 0);
     assert_eq!(d2["worldsWithoutTier"], 1);
-    close(&realm_row(d2, REALM_NONE)["completion"]["completionRate"], 1.0);
+    close(&realm_row(d2, REALM_NONE)["completion"]["completionRate"]["value"], 1.0);
 }
 
 /// 🔴 口径复用锁：批量取事实与单世界取事实**必须逐字段相等**。
@@ -773,6 +806,303 @@ async fn calibration_readings_skip_instead_of_guessing_when_over_cap() {
     }
 }
 
+// ============================================================================
+// §7 🔴 样本量与不确定性（第四态 · Wilson 区间 · 门槛参数化）
+// ============================================================================
+
+/// JSON 树遍历（对象逐个回调）。结构锁用它一次盯住**所有**读数，
+/// 而不是逐个键名列一遍——列举法会漏掉下一个新加的读数，那正是本批要防的。
+fn walk(v: &Value, f: &mut impl FnMut(&serde_json::Map<String, Value>)) {
+    match v {
+        Value::Object(m) => {
+            f(m);
+            m.values().for_each(|s| walk(s, f));
+        }
+        Value::Array(a) => a.iter().for_each(|s| walk(s, f)),
+        _ => {}
+    }
+}
+
+/// 播种「比例固定、只有世界数不同」的一批世界：`lead` 恒拿 8 成、`extra` 恒拿 2 成。
+/// 用来构造「同一个点估计、样本量差两个量级」的对照。
+async fn seed_ratio_worlds(db: &AnyPool, prefix: &str, count: usize) {
+    for i in 0..count {
+        let w = format!("{prefix}{i}");
+        let assembled = assembled_identity(&[("chA", "lead"), ("chB", "extra")]);
+        ins_world(db, &w, "running", Some(&assembled), IN_WINDOW).await;
+        ins_member(db, &w, "chA").await;
+        ins_member(db, &w, "chB").await;
+        ins_contribution(db, &w, "chA", 8_000).await;
+        ins_contribution(db, &w, "chB", 2_000).await;
+    }
+}
+
+/// Wilson 区间的两条关键性质：① 小样本上宽得一眼可见；
+/// ② 在 `p̂=0/1` 的边界上**不塌成一个点**（正态近似恰恰在那里最自信）。
+#[test]
+fn wilson_interval_stays_honest_at_small_n_and_at_the_boundary() {
+    assert!(wilson_interval(0, 0).is_none(), "分母 0 不编区间");
+
+    // 3 个观察全是零分：点估计 100%，但区间必须张开到「其实什么都没测出来」的程度。
+    let (lo3, hi3) = wilson_interval(3, 3).unwrap();
+    assert!(hi3 > 0.99, "上界贴 1");
+    assert!(lo3 < 0.5, "3 个观察撑不起「100%」，下界必须掉到 0.5 以下（实得 {lo3}）");
+
+    // 同样是 100%，300 个观察就该收紧 —— 这就是 n=3 与 n=300 长得不一样的地方。
+    let (lo300, _) = wilson_interval(300, 300).unwrap();
+    assert!(lo300 > 0.98, "300 个观察全中，下界应收到 0.98 以上（实得 {lo300}）");
+    assert!(lo300 > lo3);
+
+    // minN 默认 30 的依据①：最坏情形 p̂=0.5 下半宽 ≈ ±0.17。
+    let (lo30, hi30) = wilson_interval(15, 30).unwrap();
+    let half = (hi30 - lo30) / 2.0;
+    assert!((half - 0.168).abs() < 0.005, "n=30、p=0.5 的半宽应 ≈0.168，实得 {half}");
+
+    // 值域恒在 [0,1]：比例没有负数，也没有 >100%。
+    for (x, n) in [(0i64, 5i64), (5, 5), (1, 7), (2, 9)] {
+        let (l, h) = wilson_interval(x, n).unwrap();
+        assert!((0.0..=1.0).contains(&l) && (0.0..=1.0).contains(&h) && l <= h, "x={x} n={n}");
+    }
+}
+
+/// 🔴 **第四态**：`insufficient_sample` 与两个空态、与真数，四者互不混同。
+///
+/// 这条盯的是「样本不足不许渲染成 0 或空」：它比空态**多**给数据（点估计、n、门槛都在），
+/// 少给的只有 `value`——那个字段的语义是「可以据此调参的读数」。
+#[tokio::test]
+async fn readings_separate_insufficient_sample_from_the_two_empty_states() {
+    let db = test_db().await;
+    seed_identity_scenario(&db).await;
+    seed_realm_scenario(&db).await;
+
+    // 门槛压到 100：场景里最多 4 个观察，于是每个读数都该是「样本不足」。
+    let mut c = cfg();
+    c.calibration_min_n = 100;
+    let out = calibration_readings(&db, &c).await.unwrap();
+
+    // 块级三态**不受影响**：有样本就是 ok；「样本够不够」是读数级的事，两层不许互相顶替。
+    let d = dim(&out, "identityShareBalance");
+    assert_eq!(d["status"], "ok");
+
+    let mean = &identity_row(d, "lead")["meanRelativeShare"];
+    assert_eq!(mean["status"], "insufficient_sample");
+    assert!(mean["value"].is_null(), "🔴 样本不足时 value 必须是 null —— 不许给一个看起来正常的数");
+    assert!(mean["pointEstimate"].is_f64(), "点估计照给：这是「样本不足」不是「没有数据」");
+    assert_eq!(mean["n"], 4, "n 照给");
+    assert_eq!(mean["minN"], 100, "门槛照给 —— 差多远要看得见");
+
+    // 🔴 与「零样本」区分：分母真的是 0 的读数走 no_data_in_window，连点估计都没有。
+    let high = realm_row(dim(&out, "realmTierWorldQuality"), "t_high");
+    assert_eq!(high["blocking"]["eventsTotal"], 0);
+    let withheld = &high["blocking"]["withheldRate"];
+    assert_eq!(withheld["status"], "no_data_in_window", "一个事件都没落 → 零样本");
+    assert!(withheld["pointEstimate"].is_null(), "零样本连点估计都不成立");
+    assert!(withheld["value"].is_null());
+    assert_eq!(
+        high["blocking"]["blockedRate"]["status"], "insufficient_sample",
+        "同一个桶里有 1 拍 → 有样本，只是不够。与上面那条零样本必须分得开"
+    );
+    // 🔴 旧口径下这两个都会是 0.0（`rate()` 分母≤0 返回 0），「0 个事件里 0 个被扣留 = 0%」
+    // 正是「看起来棒极了、实际什么都没测」的那种数。
+    assert_ne!(withheld["value"], serde_json::json!(0.0));
+
+    // 与「入口没开过」区分：那是块级的，且一个计数都不发。
+    let db2 = test_db().await;
+    ins_template(&db2, "tpl_bare", r#"{"mainlineNodes":[]}"#).await;
+    let bare = calibration_readings(&db2, &c).await.unwrap();
+    assert_eq!(dim(&bare, "identityShareBalance")["status"], "entry_not_open");
+    assert!(dim(&bare, "identityShareBalance").get("observations").is_none());
+}
+
+/// 🔴 **本批的由来**：`meanShareGini` 在 3 个观察与 300 个观察上曾长得一模一样。
+///
+/// 两份比例完全相同、只有样本量差一个量级的数据：点估计必须相等（口径没变），
+/// 而**样本量必须看得出差别** —— 一边标「样本不足」，一边才是可以据此调参的真数。
+#[tokio::test]
+async fn mean_share_gini_distinguishes_a_handful_of_observations_from_many() {
+    let small = test_db().await;
+    ins_template(&small, "tpl_pool", POOL_SKELETON).await;
+    seed_ratio_worlds(&small, "w_s", 3).await;
+
+    let big = test_db().await;
+    ins_template(&big, "tpl_pool", POOL_SKELETON).await;
+    seed_ratio_worlds(&big, "w_b", 30).await;
+
+    let mut c = cfg();
+    c.calibration_min_n = 10;
+    let sg = dim(&calibration_readings(&small, &c).await.unwrap(), "identityShareBalance")
+        ["meanShareGini"]
+        .clone();
+    let bg = dim(&calibration_readings(&big, &c).await.unwrap(), "identityShareBalance")
+        ["meanShareGini"]
+        .clone();
+
+    // 口径没变：8:2 的世界不管开几个，各身份的平均份额都是 1.6 / 0.4。
+    close(&sg["pointEstimate"], bg["pointEstimate"].as_f64().unwrap());
+    assert_eq!(sg["n"], bg["n"], "身份桶数都是 2 —— 只报 n 的话两者确实一模一样，这正是原来的洞");
+    // 补上的那一层：门槛盯的是「最弱那条腿的观察数」。
+    assert_eq!(sg["sampleN"], 3);
+    assert_eq!(bg["sampleN"], 30);
+    assert_eq!(sg["status"], "insufficient_sample");
+    assert!(sg["value"].is_null(), "🔴 3 个观察的基尼不许长成一个可以据此调参的数");
+    assert_eq!(bg["status"], "ok");
+    close(&bg["value"], bg["pointEstimate"].as_f64().unwrap());
+}
+
+/// 🔴 只有一个分组时基尼恒为 0，而 0 读起来是「很分散」——真相恰恰相反（全压在这一个上）。
+/// 那是个**符号反了**的假指标，必须被门槛拦住而不是发出去。
+#[tokio::test]
+async fn single_group_gini_is_withheld_because_zero_would_read_backwards() {
+    let db = test_db().await;
+    seed_realm_scenario(&db).await;
+    let out = calibration_readings(&db, &cfg()).await.unwrap();
+
+    let low = realm_row(dim(&out, "realmTierWorldQuality"), "t_low");
+    assert_eq!(low["endings"]["distinctEndings"], 1, "这一桶只落到一个结局上");
+    let g = &low["endings"]["concentrationGini"];
+    assert_eq!(g["status"], "insufficient_sample");
+    assert!(g["value"].is_null(), "🔴 不许发 0：那会被读成「结局很分散」，而真相是全压在一个上");
+    assert!(g["pointEstimate"].is_null(), "1 个分组的基尼连点估计都不成立");
+    assert_eq!(g["minGroups"], 2);
+}
+
+/// 参数化（VALIDATION §0.2 禁写死）：最小样本量来自 `SloConfig`（env 可覆盖），
+/// **回显在响应里可自证**，且同一份数据只调门槛就能翻转读数状态。
+#[tokio::test]
+async fn sample_floor_is_parameterized_and_echoed_with_its_rationale() {
+    let db = test_db().await;
+    seed_identity_scenario(&db).await;
+
+    let mut c = cfg();
+    c.calibration_min_n = 3;
+    let out = calibration_readings(&db, &c).await.unwrap();
+    assert_eq!(out["sampleFloor"]["minN"], 3);
+    assert_eq!(out["sampleFloor"]["minGroups"], 2);
+    assert!(
+        out["sampleFloor"]["envKeys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "MUSE_SLO_CALIBRATION_MIN_N"),
+        "改门槛的方法要随数下发"
+    );
+    // 依据也随数下发（同 shapeRationale 的理由：数会被复制走，注释不会）。
+    assert!(out["sampleFloor"]["rationale"].as_array().unwrap().len() >= 4);
+    assert!(out["sampleFloor"]["readingStatuses"]["insufficient_sample"].is_string());
+
+    let d = dim(&out, "identityShareBalance");
+    assert_eq!(identity_row(d, "extra")["meanRelativeShare"]["status"], "ok", "3 个观察，门槛 3 → 够");
+    assert_eq!(
+        identity_row(d, IDENTITY_UNASSIGNED)["meanRelativeShare"]["status"],
+        "insufficient_sample",
+        "1 个观察 < 3"
+    );
+
+    c.calibration_min_n = 5;
+    let out = calibration_readings(&db, &c).await.unwrap();
+    let d = dim(&out, "identityShareBalance");
+    assert_eq!(
+        identity_row(d, "lead")["meanRelativeShare"]["status"], "insufficient_sample",
+        "门槛一抬，同一份数据（4 个观察）就不够了 —— 门槛真的在生效，不是摆设"
+    );
+
+    // 默认值：30 / 2（依据见 slo/mod.rs 常量注释与响应里的 rationale）。
+    let dflt = SloConfig::from_env(7, T0, T0 + 7 * DAY_MS);
+    assert_eq!(dflt.calibration_min_n, 30);
+    assert_eq!(dflt.calibration_min_groups, 2);
+}
+
+/// 🔴 **结构锁：任何读数都必须随身带 n。**
+///
+/// 判据不是列举键名（列举法会漏掉下一个新加的读数），而是形状：
+/// 树里每一个含 `pointEstimate` 的对象都是一个读数，必须同时有 `status`/`n`/`minN`/`ci95`/`ciNoteRef`。
+/// 顺带锁住短码不悬空（全文在 `ciNotes` 里给一次，是为了不让被轮询的端点胖上百 KB）。
+/// 反向再锁一遍：已知的那些读数键名不许退回裸数字——退回去，n 就又跑掉了。
+#[tokio::test]
+async fn every_reading_carries_its_own_sample_size() {
+    let db = test_db().await;
+    seed_identity_scenario(&db).await;
+    seed_realm_scenario(&db).await;
+    let out = calibration_readings(&db, &cfg()).await.unwrap();
+
+    let notes = out["ciNotes"].as_object().expect("区间说明全文必须随数下发一次");
+    let mut readings = 0usize;
+    walk(&out, &mut |obj| {
+        if !obj.contains_key("pointEstimate") {
+            return;
+        }
+        readings += 1;
+        for k in ["status", "n", "minN", "ci95", "ciNoteRef"] {
+            assert!(obj.contains_key(k), "读数缺 `{k}`：{:?}", obj.keys().collect::<Vec<_>>());
+        }
+        // 短码必须在同一份文档里解析得到，否则「理由随数下发」就是空话。
+        if let Some(code) = obj["ciNoteRef"].as_str() {
+            assert!(notes.contains_key(code), "ciNoteRef `{code}` 在 ciNotes 里悬空");
+        }
+    });
+    assert!(readings >= 10, "两维加起来应产出足够多的读数（实得 {readings}）");
+
+    for key in [
+        "meanRelativeShare",
+        "zeroScoreRate",
+        "completionRate",
+        "forcedRateAmongEnded",
+        "blockedRate",
+        "withheldRate",
+        "topEndingShare",
+        "meanShareGini",
+        "concentrationGini",
+        "assignedMeanRelativeShare",
+        "unassignedMeanRelativeShare",
+    ] {
+        let mut seen = 0usize;
+        walk(&out, &mut |obj| {
+            if let Some(v) = obj.get(key) {
+                seen += 1;
+                assert!(v.get("n").is_some(), "`{key}` 退回了裸数字，n 又跑掉了：{v}");
+            }
+        });
+        assert!(seen > 0, "样本场景里应出现 `{key}`");
+    }
+}
+
+/// 🔴 有了区间**更不能**顺手给一个「显著/不显著」的布尔：那等于把统计判断包办了。
+/// 区间只给上下界与方法/水平，多一个字段就是在替运营下结论。
+#[tokio::test]
+async fn confidence_intervals_come_without_a_significance_verdict() {
+    let db = test_db().await;
+    seed_identity_scenario(&db).await;
+    seed_realm_scenario(&db).await;
+    let out = calibration_readings(&db, &cfg()).await.unwrap();
+
+    let allowed: BTreeSet<&str> = ["low", "high", "method", "level"].into_iter().collect();
+    let mut intervals = 0usize;
+    walk(&out, &mut |obj| {
+        let Some(Value::Object(ci)) = obj.get("ci95") else { return };
+        intervals += 1;
+        let keys: BTreeSet<&str> = ci.keys().map(String::as_str).collect();
+        assert_eq!(keys, allowed, "区间只给上下界与方法/水平");
+        assert_eq!(ci["method"], "wilson");
+        assert_eq!(ci["level"], 0.95);
+        let (lo, hi) = (ci["low"].as_f64().unwrap(), ci["high"].as_f64().unwrap());
+        assert!((0.0..=1.0).contains(&lo) && (0.0..=1.0).contains(&hi) && lo <= hi);
+    });
+    assert!(intervals > 0, "比例类读数必须带区间，否则「n 小」这件事只有 n 一个人知道");
+
+    // 判语式字段名（本批新增的一组：统计判断也是判语）。
+    let mut keys: Vec<String> = Vec::new();
+    collect_keys(&out, &mut keys);
+    const FORBIDDEN_STATS: &[&str] =
+        &["significant", "issignificant", "significance", "pvalue", "conclusive", "actionable"];
+    for k in &keys {
+        let lower = k.to_ascii_lowercase();
+        assert!(
+            !FORBIDDEN_STATS.contains(&lower.as_str()),
+            "读数出现统计判语字段 `{k}` —— 给区间，让人自己看"
+        );
+    }
+}
+
 /// 空库：不除零、不 panic，两维各自给出自己的空态。
 #[tokio::test]
 async fn calibration_readings_are_zero_safe_on_empty_platform() {
@@ -784,3 +1114,4 @@ async fn calibration_readings_are_zero_safe_on_empty_platform() {
         assert_eq!(dim(&out, name)["status"], "entry_not_open", "空库连模板都没有 → 这一维从未开工");
     }
 }
+

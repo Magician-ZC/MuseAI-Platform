@@ -4,7 +4,10 @@
 // 🔴 这个页面必须说清楚、且在结构上守住的三件事：
 //
 // ① **本页只改举报单的状态，不执行处置**。`resolve` 写的是 pending → actioned/dismissed + 备注 + 审计；
-//    封禁 / 内容驳回 / 改判走各自既有入口（详情抽屉里的跳转按钮）。原作者刻意没把处置塞进举报接口——
+//    封禁 / 内容驳回 / 已过审内容的再审与下架 / 改判走各自既有入口（详情抽屉里的跳转按钮）。
+//    ⚠️ 跳转清单里那条「已过审的卡后台没有再审/下架入口」的**诚实空缺已于 0044 补上**：
+//    现在指向 `/audit?tab=disposal`（`admin/src/components/ContentDisposal.tsx`）。
+//    原作者刻意没把处置塞进举报接口——
 //    塞进来等于给封禁开一条**绕过既有权限矩阵**的侧门。前端因此只做「跳转 + 回填」，
 //    一条新的写路径都不开；跳转按钮还要**受前端 RBAC 收敛**：reviewer 看得见举报队列但进不去用户管理，
 //    那他就不该有一个能点的封禁按钮（后端仍会二次校验，前端做的是纵深与诚实）。
@@ -211,8 +214,19 @@ function jumpTargets(row: ReportRow, escalateAt: number | null): JumpTarget[] {
       label: '内容审核 → 人审队列',
       to: '/audit',
       endpoint: 'POST /admin/audit-queue/{id}/reject（require_role(reviewer)）',
+      hint: '仅当这张角色卡仍在人审队列中才能在那里驳回；已过审的卡走下面那条「已过审内容处置」。',
+    });
+    targets.push({
+      key: 'disposal',
+      module: 'audit',
+      label: '内容审核 → 已过审内容处置（再审 / 下架）',
+      // 深链带上主体坐标，落地即自动查出这张卡的处置态，免得从举报单里手抄一遍 id。
+      to: `/audit?tab=disposal&kind=character&subject=${encodeURIComponent(row.subjectId)}`,
+      endpoint:
+        'POST /admin/content/character/{id}/recheck|takedown（require_role(reviewer)；永久移除为 admin 专属）',
       hint:
-        '仅当这张角色卡仍在人审队列中才能在那里驳回；已过审的卡，后台目前没有「再审 / 下架」入口（诚实空缺，不是本页藏起来了）。',
+        '角色卡已过审时走这条：再审 = 送回人审队列且不改展示态；下架 = 立即停止展示与新入场，默认可恢复。' +
+        '🔴 下架只作用于展示面，已落定的世界事实不改；已在进行中的世界不受影响（需中止请另行暂停该世界）。',
     });
   }
   return targets;
@@ -496,7 +510,7 @@ export default function SocialReports() {
             showIcon
             style={{ marginBottom: 16 }}
             title="本页只改举报单状态，不执行处置"
-            description="复核处置写的是这张举报单的「待处理 → 已处置 / 不予支持」+ 结论备注 + 审计留痕。封禁、内容驳回、申诉改判走各自既有入口（详情抽屉内的跳转按钮），各带自己的权限校验与审计。举报接口刻意不包办处置——包办等于给封禁开一条绕过既有权限矩阵的侧门。"
+            description="复核处置写的是这张举报单的「待处理 → 已处置 / 不予支持」+ 结论备注 + 审计留痕。封禁、内容驳回、已过审内容的再审 / 下架、申诉改判走各自既有入口（详情抽屉内的跳转按钮），各带自己的权限校验与审计。举报接口刻意不包办处置——包办等于给封禁开一条绕过既有权限矩阵的侧门。"
           />
 
           {summaryError && (

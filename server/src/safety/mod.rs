@@ -9,7 +9,7 @@
 //!   复用 `inject` 的同一条归一化管线（零宽/同形字/全角/标点绕过一并挡住）。纯本地、无 IO。
 //! - `record_risk`：统一风控事件落库（其他模块复用；签名稳定）；`record_risk_tx` 为其事务内变体。
 //!
-//! ## 入队/记险的两条入口（**契约：只有这两条**）
+//! ## 入队/记险的三条入口（**契约：只有这三条**）
 //! 1. `moderate_and_queue`：**静态内容**（角色卡 / 世界模板 / 装配期钩子 / 入站托梦）的分层机审——
 //!    provider 机审 + 注入检测，Approved 直过 / Pending（含注入命中）进 `audit_queue` / Rejected 直拒；
 //!    命中或非过写 `risk_events`。调用方（assets/interventions/assembly）只取返回裁决，
@@ -19,9 +19,17 @@
 //!    **默认不写 `audit_queue`**，只有高危分类才入队（策略见 `MUSE_SAFETY_RUNTIME_AUDIT`）。
 //!    理由：运行时每 tick 每事件都可能命中，若比照 ① 逐条入队，人审队列会被淹到不可用——
 //!    「记险不入队」保证留痕完整、队列可用，人审仍可从 risk_events 反查。
+//! 3. `queue_operator_recheck`：**已发布内容的运营再审**（人工发起，非机器判定）。
+//!    ①② 都是「内容刚产生时」的闸；已过审内容事后被举报出问题时，没有任何一条既有路径能把它
+//!    送回人审队列——`admin_api::takedown` 需要的正是这条。它与 ① 跑同一套机审（provider +
+//!    注入检测，让人审看到同样的机审命中），但**无论裁决如何都入队**：入队理由是「有人举报」
+//!    而不是「机器判定可疑」，机审直过恰恰是需要人来看的情形。
 //!
-//! 换言之「唯一写入方」的旧契约现在读作：**静态内容走 ①，运行时产出走 ②，此外任何模块都不得
-//! 直接 INSERT audit_queue / risk_events**。
+//!    🔴 它**不是**给 admin 开的侧门 —— 侧门的定义是绕过本模块直接 INSERT。这是同一扇门加宽一格：
+//!    写入仍然只发生在本文件里，机审、留痕、字段口径与 ① 逐字一致。
+//!
+//! 换言之「唯一写入方」的旧契约现在读作：**静态内容走 ①，运行时产出走 ②，已发布内容的运营再审
+//! 走 ③，此外任何模块都不得直接 INSERT audit_queue / risk_events**。
 
 use crate::app::AppState;
 use crate::error::ApiError;
@@ -99,6 +107,104 @@ pub async fn moderate_and_queue(
     }
 
     Ok(verdict)
+}
+
+// ==================== 入口 ③：已发布内容的运营再审 ====================
+
+/// 运营发起的再审留痕 kind（`risk_events.kind`）。与 ① 的 'moderation'/'injection' 分开：
+/// 那两个是「机器判定」，这个是「人工调取」，混在一起会让风控面上的机审命中率算不准。
+const RECHECK_RISK_KIND: &str = "content_recheck";
+
+/// 入口 ③：把**已发布**的静态内容重新送回人审队列（`audit_queue`，status='open'）。
+///
+/// 与 ① `moderate_and_queue` 的差别只有一处，但很关键：**无论机审裁决如何都入队**。
+/// ① 的语义是「机器觉得可疑才叫人来看」；③ 的语义是「有人举报，所以叫人来看」——
+/// 机审直过在这里恰恰是最需要人眼的情形（能过机审的违规内容才是举报的主要来源）。
+/// 机审仍然照跑，是为了把 `machine_hits` 一并摆到审核工作台上，让人审拿到与 ① 同样的上下文。
+///
+/// **幂等**：同一主体已有 `status='open'` 的队列行时不再插新行，原样返回既有那条
+/// （`created=false`）。同一张卡被多人举报是常态，一举报一入队会让人审队列被同一个主体刷屏。
+///
+/// 副作用（本函数是这条路径上唯一的写入方）：
+/// - 新建时 → INSERT `audit_queue`（`subject_kind` 必须是 `admin_api::audit::review` 认识的值，
+///   否则人审裁决无处回写）；
+/// - **每次调用**（含幂等命中）→ `record_risk(kind='content_recheck')`，detail 含发起人与理由。
+///   幂等命中也记：那是一次真实发生的运营调取动作，不该因为队列里已有行就不留痕。
+///
+/// 返回 `(队列行 id, 机审裁决, 是否新建)`。
+pub async fn queue_operator_recheck(
+    state: &AppState,
+    subject_kind: &str,
+    subject_id: &str,
+    text: &str,
+    actor_id: &str,
+    reason: &str,
+) -> Result<(String, ModerationVerdict, bool), ApiError> {
+    let hits = detect_injection(text);
+    let provider = state
+        .moderation
+        .check_text(text)
+        .await
+        .map_err(|e| ApiError::internal(std::io::Error::other(e)))?;
+    // 与 ① 同一条折叠规则：注入命中即便 provider 直过也算 Pending（保守阈值，§14 最高优先级威胁）。
+    let verdict = match provider {
+        ModerationVerdict::Rejected => ModerationVerdict::Rejected,
+        ModerationVerdict::Pending => ModerationVerdict::Pending,
+        ModerationVerdict::Approved if !hits.is_empty() => ModerationVerdict::Pending,
+        ModerationVerdict::Approved => ModerationVerdict::Approved,
+    };
+
+    // 幂等：已有 open 行就复用。全序取一行（`created_at DESC, id DESC`）——同毫秒并列时
+    // 不加次级键会取到不确定的那一行，回执里的 queueId 就会在两次调用间跳变。
+    let existing: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM audit_queue WHERE subject_kind = $1 AND subject_id = $2 AND status = 'open' \
+         ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(subject_kind)
+    .bind(subject_id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let (queue_id, created) = match existing {
+        Some(id) => (id, false),
+        None => {
+            let id = crate::db::new_id("aq");
+            sqlx::query(
+                "INSERT INTO audit_queue (id, subject_kind, subject_id, machine_verdict, machine_hits, status, created_at) \
+                 VALUES ($1, $2, $3, $4, $5, 'open', $6)",
+            )
+            .bind(&id)
+            .bind(subject_kind)
+            .bind(subject_id)
+            .bind(verdict_str(verdict))
+            .bind(serde_json::to_string(&hits).unwrap_or_else(|_| "[]".into()))
+            .bind(crate::db::now_ms())
+            .execute(&state.db)
+            .await?;
+            (id, true)
+        }
+    };
+
+    record_risk(
+        &state.db,
+        None,
+        None,
+        RECHECK_RISK_KIND,
+        serde_json::json!({
+            "subjectKind": subject_kind,
+            "subjectId": subject_id,
+            "queueId": queue_id,
+            "created": created,
+            "verdict": verdict_str(verdict),
+            "providerVerdict": verdict_str(provider),
+            "hits": hits,
+            "actorId": actor_id,
+            "reason": reason,
+        }),
+    )
+    .await?;
+
+    Ok((queue_id, verdict, created))
 }
 
 // ==================== 运行时产出闸（§15 第 2 层 + 第 3 层接口位） ====================

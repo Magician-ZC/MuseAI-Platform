@@ -839,7 +839,7 @@ pub(super) async fn template_identity_pool(
             // 🔴 下发文案一律**纯文本**：前端把它当普通字符串渲染，写 Markdown 星号只会在界面上
             // 露出两个字面的 `**`（已在验收中出现过一次）。强调一律用中文引号「」。
             "summary": "身份 = 开局站位。分配层与叙事感知层都已落地（他人称谓「唐三（户部主事）」+ 本人 self_identities 进引擎上下文），但按 §0.1 平权红线「永不进数值层」：不改判定、不改发奖、不开权限、不调难度、不改准入。",
-            "warning": "本页只呈现分配结果，不构成效果验证。「身份池调整 → 戏份分布变化」的读数在 GET /admin/metrics/overview 的 narrativeSlo.calibration.dimensions.identityShareBalance：它按身份 id 分组，给出每个身份的「相对均分倍率」均值与零分观察数（SLO 的叙事注意力基尼按 character_id 聚合，答不了这个问题）。🔴 那份读数是只读观测，不回灌引擎，也不给「配得对不对」的判语——调整身份池后仍须以仿真试跑 + 世界质量回归判断影响，不要拿本页的分布图当「调好了」的证据。",
+            "warning": "本页只呈现分配结果，不构成效果验证。「身份池调整 → 戏份分布变化」的读数在 GET /admin/metrics/overview 的 narrativeSlo.calibration.dimensions.identityShareBalance：它按身份 id 分组，给出每个身份的「相对均分倍率」均值与零分观察数（SLO 的叙事注意力基尼按 character_id 聚合，答不了这个问题）。🔴 看那份读数时先看 n：每个读数随身带观察数 n 与最小样本量 minN，n 低于 minN（默认 30）的读数状态是「样本不足」且不给 value——那不是 0，也不是「很均衡」，是还不能据此调参。比例类读数另带 95% 置信区间，区间有多宽就是这个数有多不确定。🔴 那份读数是只读观测，不回灌引擎，也不给「配得对不对」的判语，更不给「差异是否显著」的结论——调整身份池后仍须以仿真试跑 + 世界质量回归判断影响，不要拿本页的分布图当「调好了」的证据。",
         },
         "editable": false,
         "editPath": "身份池的唯一写入路径是模板骨架：POST /admin/world-templates 的 skeletonJson.identityPool（新建模板）。本端点只读，不提供在线改配额 / 改主题词。已开出的世界其分配在装配时即钉死在 assembled_json，改模板不会回溯改写既有实例。",
@@ -976,7 +976,7 @@ fn realm_tier_effect() -> Value {
         // 🔴 下发文案一律**纯文本**：前端把它当普通字符串渲染，写 Markdown 星号只会在界面上
         // 露出两个字面的 `**`。强调一律用中文引号「」。
         "summary": "境界档 = 世界发给全员的同一件戏服（总规格 §6「境界跟着副本走，不跟着角色走」）。它全员统一、无配额、装配层零抽样，只是把模板声明原样钉进实例 assembled_json，再由 runtime 把其中的 briefing 与 flavorNotes 喂给每拍的入场导演。与身份池正相反：身份各不相同，境界人人一样。",
-        "warning": "叙事感知层已接通，但只接通了「描写」这一头：七个字段里只有 briefing 与 flavorNotes 进入引擎的入场导演 prompt，改变的是这一篇被怎么写（大家什么水位、招式译成什么风味）；id 与 label 只用于本页展示与审计，cosmology 与 genre 只是取值域标注，conflictIntensity 刻意不进模型上下文——世界是否致命由建房参数 lethality 独立决定，与它无关。境界档一个数字都没有，也永远不改判定、发奖、权限、难度与准入。「换一件戏服，那批世界演得怎么样」的读数在 GET /admin/metrics/overview 的 narrativeSlo.calibration.dimensions.realmTierWorldQuality：按钉住的戏服分桶，各桶各自报完读率 / 阻断率 / 结局分布，另留没钉戏服的世界作对照桶。🔴 那是跨世界对比不是组内分布（境界档全员统一，组内分布恒为退化），且只给分维度的事实、不给综合评分，所以本页仍然不回答「这件戏服配得对不对」。",
+        "warning": "叙事感知层已接通，但只接通了「描写」这一头：七个字段里只有 briefing 与 flavorNotes 进入引擎的入场导演 prompt，改变的是这一篇被怎么写（大家什么水位、招式译成什么风味）；id 与 label 只用于本页展示与审计，cosmology 与 genre 只是取值域标注，conflictIntensity 刻意不进模型上下文——世界是否致命由建房参数 lethality 独立决定，与它无关。境界档一个数字都没有，也永远不改判定、发奖、权限、难度与准入。「换一件戏服，那批世界演得怎么样」的读数在 GET /admin/metrics/overview 的 narrativeSlo.calibration.dimensions.realmTierWorldQuality：按钉住的戏服分桶，各桶各自报完读率 / 阻断率 / 结局分布，另留没钉戏服的世界作对照桶。🔴 三个比率的 n 各不相同（完读率数世界、阻断率数拍、扣留率数事件），各带各的 n 与 95% 置信区间；n 低于 minN（默认 30）的读数标「样本不足」且不给 value——那不是 0。跨戏服横比之前先看 tiersWithSufficientSample：不足 2 个够样本的桶时，「对比」这件事本身还不成立。🔴 那是跨世界对比不是组内分布（境界档全员统一，组内分布恒为退化），且只给分维度的事实、不给综合评分、不给显著性判定，所以本页仍然不回答「这件戏服配得对不对」。",
     })
 }
 

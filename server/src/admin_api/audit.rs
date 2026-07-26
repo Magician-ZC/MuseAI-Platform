@@ -1,5 +1,9 @@
 //! 内容审核：审核队列（机审结果 + 人审操作）。approve/reject 同步回写主体 moderation，
 //! reject 另将理由落 audit_queue.reject_reason（用户侧 status 端点回显）。
+//!
+//! ⚠️ 本文件只处置**仍在人审队列里**的条目。**已过审内容**的事后处置（再审 / 下架 / 恢复）
+//! 在兄弟模块 `super::takedown`（migration 0044）——approve 回写在此加了一道
+//! 「不复活已下架主体」的守卫，两处必须一起读。
 //! 申诉复审：GET /admin/appeals 列表 + POST /admin/appeals/{id}/resolve（overturn/uphold）——
 //! resolve 是机审/人审驳回后的唯一改判路径，必留 audit_logs。
 
@@ -228,21 +232,39 @@ async fn review(
 
     // 回写主体 moderation：character→cloud_characters，template→world_templates。
     let moderation = if verdict == "approved" { "approved" } else { "rejected" };
+
+    // 🔴 **已被运营下架的主体不得经人审队列悄悄复活**（migration 0044 / `super::takedown`）。
+    // 场景：先对已过审内容发起再审（入队），期间又把它下架了，随后有人在工作台点「通过」——
+    // 若不设防，回写会把 `moderation` 写回 `'approved'`，等于**绕过 `restore` 的可逆性台阶与
+    // 权限台阶**把下架撤销掉，而且 `content_takedowns` 里还留着一条自称仍在下架的记录。
+    //
+    // 守卫只加在 **approve 方向**：reject 写 `'rejected'` 是比下架更强的处置，让它落地是对的。
+    // 恢复展示的唯一路径是 POST /admin/content/{kind}/{id}/restore。
+    let takedown_guard = if verdict == "approved" {
+        format!(" AND moderation <> '{}'", super::takedown::TAKEDOWN)
+    } else {
+        String::new()
+    };
+
     match subject_kind.as_str() {
         "character" => {
-            sqlx::query("UPDATE cloud_characters SET moderation = $1 WHERE id = $2")
-                .bind(moderation)
-                .bind(&subject_id)
-                .execute(&state.db)
-                .await?;
+            sqlx::query(&format!(
+                "UPDATE cloud_characters SET moderation = $1 WHERE id = $2{takedown_guard}"
+            ))
+            .bind(moderation)
+            .bind(&subject_id)
+            .execute(&state.db)
+            .await?;
         }
         // "template"（admin 官方模板）与 "world_template"（创作者 /assets/worlds 资产）同落 world_templates。
         "template" | "world_template" => {
-            sqlx::query("UPDATE world_templates SET moderation = $1 WHERE id = $2")
-                .bind(moderation)
-                .bind(&subject_id)
-                .execute(&state.db)
-                .await?;
+            sqlx::query(&format!(
+                "UPDATE world_templates SET moderation = $1 WHERE id = $2{takedown_guard}"
+            ))
+            .bind(moderation)
+            .bind(&subject_id)
+            .execute(&state.db)
+            .await?;
         }
         // intervention / event 等主体的回写路径随对应模块接入（当前仅登记裁决）。
         _ => {}

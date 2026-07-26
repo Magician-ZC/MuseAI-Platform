@@ -330,6 +330,23 @@ const DEFAULT_SCAN_ROW_CAP: i64 = 50_000;
 /// 校准维度读数一次最多展开的世界数。**比 `scan_row_cap` 小两个量级是刻意的**：
 /// 那一路要把 `worlds.assembled_json`（可达数十 KB/份）解析一遍，上限管的是内存峰值不是行数。
 const DEFAULT_CALIBRATION_WORLD_CAP: i64 = 300;
+/// 校准读数的**最小样本量**：低于它的读数标「样本不足」（`insufficient_sample`），
+/// `value` 置 null 而不是给一个看起来正常的数。
+///
+/// 默认取 30 的依据（三条，都可被 env 覆盖——这是**默认值不是物理常量**，同 `gini_max`：
+/// 预注册纪律要求门槛「开测前可改、开测后冻结」）：
+/// ① 比例类读数在最坏情形 `p̂=0.5` 下，95% Wilson 区间半宽随 n 收缩：
+///    n=3 → ±0.37（几乎覆盖整个值域，什么也没说）、n=10 → ±0.26、**n=30 → ±0.17**、n=100 → ±0.10。
+///    30 大致是「区间首次窄过运营真正会据此行动的效应量（两档之间差 20 个百分点）」的位置。
+/// ② n=30 时**单个观察最多把比例挪动 3.3 个百分点**；n=3 时是 33 个百分点——
+///    「一条数据翻转结论」在 30 上不再发生，这是能不能拿它调参的分界。
+/// ③ 30 同时是教科书里 CLT 的惯例门槛，均值类读数在此之上谈「均值的抽样分布近似正态」才不荒唐。
+/// 🔴 但**过了 30 不等于结论成立**：那是区间要回答的问题，不是这个门槛能回答的。
+const DEFAULT_CALIBRATION_MIN_N: i64 = 30;
+/// 集中度类读数（基尼）的**最小分组数**。默认 2 不是凑数：`gini_coefficient` 在只有 1 个分组时
+/// **恒返回 0**，而 0 读起来是「完全均分 / 很分散」——真相恰恰相反（全压在这一个分组上）。
+/// 这是个**符号反了**的假指标，必须被样本量门槛拦住而不是发出去。
+const DEFAULT_CALIBRATION_MIN_GROUPS: i64 = 2;
 /// 榜单长度（最不公平的世界 / 最久没戏的角色只展示头部；分布统计仍覆盖窗口全量）。
 const TOP_N: usize = 10;
 
@@ -365,12 +382,17 @@ pub(crate) struct SloConfig {
     pub scan_row_cap: i64,
     /// 校准维度读数一次最多展开的世界数（那一路要解析 `assembled_json`，管的是内存峰值）。
     pub calibration_world_cap: i64,
+    /// 校准读数的最小样本量：n 低于它 → `insufficient_sample`（`value` 为 null，不给看起来正常的数）。
+    pub calibration_min_n: i64,
+    /// 集中度类读数（基尼）的最小分组数：低于它 → `insufficient_sample`（1 组时基尼恒为 0，符号是反的）。
+    pub calibration_min_groups: i64,
 }
 
 impl SloConfig {
     /// env 覆盖 + 默认值。`MUSE_SLO_GINI_MAX` / `MUSE_SLO_SILENT_STREAK_TICKS` /
     /// `MUSE_SLO_SCAN_ROW_CAP` / `MUSE_SLO_OOC_APPEAL_RATE_MAX` /
-    /// `MUSE_SLO_CALIBRATION_WORLD_CAP`。
+    /// `MUSE_SLO_CALIBRATION_WORLD_CAP` / `MUSE_SLO_CALIBRATION_MIN_N` /
+    /// `MUSE_SLO_CALIBRATION_MIN_GROUPS`。
     pub(crate) fn from_env(days: i64, window_start: i64, window_end: i64) -> Self {
         Self {
             days,
@@ -386,6 +408,11 @@ impl SloConfig {
             calibration_world_cap: env_i64(
                 "MUSE_SLO_CALIBRATION_WORLD_CAP",
                 DEFAULT_CALIBRATION_WORLD_CAP,
+            ),
+            calibration_min_n: env_i64("MUSE_SLO_CALIBRATION_MIN_N", DEFAULT_CALIBRATION_MIN_N),
+            calibration_min_groups: env_i64(
+                "MUSE_SLO_CALIBRATION_MIN_GROUPS",
+                DEFAULT_CALIBRATION_MIN_GROUPS,
             ),
         }
     }

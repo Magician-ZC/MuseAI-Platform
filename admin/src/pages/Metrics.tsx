@@ -1,7 +1,7 @@
 // 数据看板：/admin/metrics/overview 聚合 → antd Statistic + echarts（token 成本 / tick 分布
 // / 错峰调度成本仪表）+ /admin/metrics/trends 按天趋势（近 7/14/30 天折线，独立加载不影响 overview）。
 import { useEffect, useRef, useState } from 'react';
-import { Button, Card, Col, Empty, Row, Segmented, Space, Spin, Statistic, Table, Typography } from 'antd';
+import { Button, Card, Col, Empty, Row, Segmented, Space, Spin, Statistic, Table, Tag, Tooltip, Typography } from 'antd';
 import ReactECharts from 'echarts-for-react';
 import { adminFetch } from '../api';
 import { ErrorAlert, formatNumber, formatPercent, friendlyError } from '../components/shared';
@@ -61,6 +61,96 @@ interface CostOverview {
   offPeak?: OffPeakMeter | null;
 }
 
+/**
+ * **一个校准读数的信封**（服务端 `slo/calibration.rs` §0.5，随 `narrativeSlo.calibration` 下发）。
+ *
+ * 🔴 `value` 与 `n` 同处一个对象是**刻意的**：取值必须穿过这层信封，于是
+ * 「拿到一个数却不知道它压在几个观察上」在结构上不可能发生。前端这一侧对应的纪律是
+ * `ReadingCell` —— 渲染读数**只准**走它，它永远把 n 一起画出来。
+ */
+interface Reading {
+  /** 四态见 `ReadingStatus`。 */
+  status: ReadingStatus;
+  /** **可据此调参的读数**；`status ≠ ok` 时恒为 null。🔴 不得回落成 `pointEstimate` 渲染。 */
+  value: number | null;
+  /** 原始算术，永远给。只在明确标着「样本不足」的地方出现（tooltip），不进正文。 */
+  pointEstimate: number | null;
+  /** 观察数。`unit` 说明它数的是世界 / 拍 / 事件 / 观察。 */
+  n: number;
+  /** 生效的最小样本量门槛（服务端 `MUSE_SLO_CALIBRATION_MIN_N`）。 */
+  minN: number;
+  unit?: string;
+  /** 比例类读数带 95% Wilson 区间；基尼与均值类恒为 null，理由见 `ciNoteRef`。 */
+  ci95?: { low: number; high: number; method: string; level: number } | null;
+  /** 区间说明的**短码**，全文在 `calibration.ciNotes[code]`（逐条重发会让被轮询的端点胖上百 KB）。 */
+  ciNoteRef?: string | null;
+  worlds?: number;
+  sampleN?: number;
+}
+
+/**
+ * 🔴 **四态绝不可长成同一个样子**：
+ * `entry_not_open`（这一维从未被配置过，块级）/ `no_data_in_window`（分母为 0）/
+ * `insufficient_sample`（**有样本但 n < minN**）/ `ok`（真数，可以是 0）。
+ * 前两者显示 `—`；第三者显示「样本不足（n=…）」——它既不是 0 也不是 `—`。
+ */
+type ReadingStatus = 'ok' | 'insufficient_sample' | 'no_data_in_window' | 'entry_not_open';
+
+interface IdentityBucket {
+  identityId: string;
+  status: ReadingStatus;
+  observations: number;
+  worlds: number;
+  meanRelativeShare: Reading;
+  zeroScoreObservations: number;
+  zeroScoreRate: Reading;
+}
+
+interface RealmBucket {
+  tierId: string;
+  status: ReadingStatus;
+  worlds: number;
+  completion: { completionRate: Reading; natural: number; unfinished: number };
+  blocking: { blockedRate: Reading; withheldRate: Reading };
+  endings: { distinctEndings: number; concentrationGini: Reading };
+}
+
+/** 按校准维度分组的只读读数（身份维 = 组内分布，戏服维 = 跨世界对比）。 */
+interface CalibrationReadings {
+  status: string;
+  windowDays?: number;
+  worldsScanned?: number;
+  sampleFloor?: { minN: number; minGroups: number };
+  /** 短码 → 区间说明全文。读数只带短码，全文在这里给一次。 */
+  ciNotes?: Record<string, string>;
+  dimensions: {
+    identityShareBalance?: {
+      status: ReadingStatus;
+      title?: string;
+      notes?: string[];
+      observations?: number;
+      worldsCounted?: number;
+      identitiesObserved?: number;
+      meanShareGini?: Reading;
+      byIdentity?: IdentityBucket[];
+    };
+    realmTierWorldQuality?: {
+      status: ReadingStatus;
+      title?: string;
+      notes?: string[];
+      worldsScanned?: number;
+      tiersObserved?: number;
+      tiersWithSufficientSample?: number;
+      byRealmTier?: RealmBucket[];
+    };
+  };
+}
+
+interface NarrativeSlo {
+  status: string;
+  calibration?: CalibrationReadings | null;
+}
+
 interface MetricsOverview {
   users: { total: number; banned: number };
   dailyReports: { total: number; opened: number; openRate: number };
@@ -72,6 +162,8 @@ interface MetricsOverview {
   worlds: { active: number; fused: number };
   riskEvents: number;
   dataRequestsPending: number;
+  /** 旧版 server 可能不下发；缺席时校准区整段走空态，不报错。 */
+  narrativeSlo?: NarrativeSlo | null;
 }
 
 /** 按天趋势（GET /admin/metrics/trends）：UTC 日界、升序、末位为今天、空天补零。 */
@@ -123,6 +215,86 @@ function formatCny(cny?: number | null): string {
 
 function StatCard({ children }: { children: React.ReactNode }) {
   return <Card size="small">{children}</Card>;
+}
+
+/** 读数的数值格式：比例走百分比，倍率 / 基尼走两位小数。null → `—`。 */
+function readingText(v: number | null | undefined, kind: 'percent' | 'ratio'): string {
+  if (v == null) return '—';
+  return kind === 'percent' ? formatPercent(v) : v.toFixed(2);
+}
+
+/**
+ * 🔴 **校准读数的唯一渲染入口。永远同时画出 n。**
+ *
+ * 由来：`meanShareGini` 曾在 3 个观察与 300 个观察上长得一模一样，运营会追着噪声调参。
+ * 四态各有各的样子，绝不混同：
+ * - `ok` → 数值 + n（比例类另附 95% 区间——**区间有多宽，这个数就有多不确定**）；
+ * - `insufficient_sample` → 「样本不足」标签 + n，🔴 **正文里不出现数字**
+ *   （点估计只在 tooltip 里，且明说不足以据此调参）。它既不是 0 也不是 `—`；
+ * - `no_data_in_window` → `—` + 「零样本」（分母真的是 0）；
+ * - `entry_not_open` → 由外层整块渲染，不会走到这里。
+ *
+ * 🔴 本组件**不做判断**：不标红、不比大小、不给「显著」结论。给数与 n，让人自己看。
+ */
+function ReadingCell({
+  r,
+  kind,
+  notes,
+}: {
+  r?: Reading | null;
+  kind: 'percent' | 'ratio';
+  /** 短码 → 全文（服务端 `calibration.ciNotes`）。缺席时 tooltip 只少一句解释，不影响 n 与状态。 */
+  notes?: Record<string, string>;
+}) {
+  if (!r) return <span>—</span>;
+  const n = (
+    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+      n={formatNumber(r.n)}
+    </Typography.Text>
+  );
+  if (r.status === 'no_data_in_window') {
+    return (
+      <Space size={4}>
+        <span>—</span>
+        <Typography.Text type="secondary" style={{ fontSize: 12 }}>零样本</Typography.Text>
+      </Space>
+    );
+  }
+  if (r.status === 'insufficient_sample') {
+    return (
+      <Tooltip
+        title={`样本不足：n=${r.n} < minN=${r.minN}。点估计 ${readingText(r.pointEstimate, kind)} 只是原始算术，不足以据此调参。${(r.ciNoteRef && notes?.[r.ciNoteRef]) ?? ''}`}
+      >
+        <Space size={4}>
+          <Tag color="warning" style={{ marginInlineEnd: 0 }}>样本不足</Tag>
+          {n}
+        </Space>
+      </Tooltip>
+    );
+  }
+  const body = (
+    <Space size={4} wrap>
+      <strong>{readingText(r.value, kind)}</strong>
+      {n}
+      {r.ci95 && (
+        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+          95% CI [{readingText(r.ci95.low, kind)}, {readingText(r.ci95.high, kind)}]
+        </Typography.Text>
+      )}
+    </Space>
+  );
+  // 有区间的读数附「这个区间怎么读」，没区间的读数附「为什么不给区间」——两种都要看得见。
+  const note = r.ciNoteRef ? notes?.[r.ciNoteRef] : null;
+  return note ? <Tooltip title={note}>{body}</Tooltip> : body;
+}
+
+/** 维度整块的空态：把服务端下发的第一条 note 原样显示（「没测过」不是「很均衡」）。 */
+function DimensionEmpty({ status, notes }: { status: ReadingStatus; notes?: string[] }) {
+  const fallback =
+    status === 'entry_not_open'
+      ? '这一维从未被任何模板配置过 —— 是「没测过」，不是「很均衡」。'
+      : '窗口内零样本 —— 是「没测过」，不是「很均衡」。';
+  return <Empty description={notes?.[0] ?? fallback} />;
 }
 
 export default function Metrics() {
@@ -300,6 +472,11 @@ export default function Metrics() {
     ],
   };
 
+  // ---------- 校准维度读数（narrativeSlo.calibration） ----------
+  const calibration = data?.narrativeSlo?.calibration ?? null;
+  const identityDim = calibration?.dimensions?.identityShareBalance;
+  const realmDim = calibration?.dimensions?.realmTierWorldQuality;
+
   const tickOther = data ? Math.max(0, data.ticks.total - data.ticks.done - data.ticks.failed) : 0;
   const tickPieOption = data && {
     tooltip: { trigger: 'item' as const },
@@ -462,6 +639,124 @@ export default function Metrics() {
                 </Typography.Paragraph>
               </>
             )}
+
+            {/* ---- 校准维度读数（narrativeSlo.calibration，只读观测，绝不回灌引擎） ---- */}
+            <Typography.Title level={5} style={{ margin: '24px 0 12px' }}>
+              校准维度读数
+              {calibration?.windowDays ? (
+                <Typography.Text type="secondary" style={{ fontWeight: 400, marginLeft: 8 }}>
+                  近 {calibration.windowDays} 日开出的世界（cohort）· 已扫描 {formatNumber(calibration.worldsScanned)} 个
+                  {calibration.sampleFloor ? ` · 最小样本量 minN=${calibration.sampleFloor.minN}` : ''}
+                </Typography.Text>
+              ) : null}
+            </Typography.Title>
+
+            {!calibration ? (
+              <Card size="small"><Empty description="服务端未返回校准读数（narrativeSlo.calibration）" /></Card>
+            ) : calibration.status !== 'ok' ? (
+              // skipped_by_request / skipped_too_large：明说跳过，不给残缺数。
+              <Card size="small"><Empty description={`本次未计算校准读数：${calibration.status}`} /></Card>
+            ) : (
+              <Row gutter={[16, 16]}>
+                <Col xs={24} lg={12}>
+                  <Card size="small" title="身份维：身份分配 × 戏份分布（组内分布）">
+                    {identityDim?.status !== 'ok' ? (
+                      <DimensionEmpty status={identityDim?.status ?? 'no_data_in_window'} notes={identityDim?.notes} />
+                    ) : (
+                      <>
+                        <Space wrap style={{ marginBottom: 12 }}>
+                          <Typography.Text type="secondary">
+                            观察 {formatNumber(identityDim.observations)} · 世界 {formatNumber(identityDim.worldsCounted)} · 身份 {formatNumber(identityDim.identitiesObserved)}
+                          </Typography.Text>
+                          <span>
+                            各身份均值之间的集中度：<ReadingCell r={identityDim.meanShareGini} kind="ratio" notes={calibration.ciNotes} />
+                          </span>
+                        </Space>
+                        <Table<IdentityBucket>
+                          size="small"
+                          rowKey={(r) => r.identityId}
+                          dataSource={identityDim.byIdentity ?? []}
+                          pagination={false}
+                          locale={{ emptyText: <Empty description="窗口内没有身份分桶" /> }}
+                          columns={[
+                            { title: '身份', dataIndex: 'identityId', key: 'id' },
+                            { title: '观察数', dataIndex: 'observations', key: 'obs', align: 'right', render: formatNumber },
+                            {
+                              title: '相对均分倍率',
+                              key: 'mean',
+                              // 1.0 = 恰好拿到均分；这是倍率不是百分比，不能走 formatPercent。
+                              render: (_: unknown, r: IdentityBucket) => <ReadingCell r={r.meanRelativeShare} kind="ratio" notes={calibration.ciNotes} />,
+                            },
+                            {
+                              title: '零分率',
+                              key: 'zero',
+                              render: (_: unknown, r: IdentityBucket) => <ReadingCell r={r.zeroScoreRate} kind="percent" notes={calibration.ciNotes} />,
+                            },
+                          ]}
+                        />
+                      </>
+                    )}
+                  </Card>
+                </Col>
+
+                <Col xs={24} lg={12}>
+                  <Card size="small" title="戏服维：境界档 × 世界质量（跨世界对比）">
+                    {realmDim?.status !== 'ok' ? (
+                      <DimensionEmpty status={realmDim?.status ?? 'no_data_in_window'} notes={realmDim?.notes} />
+                    ) : (
+                      <>
+                        <Typography.Paragraph type="secondary" style={{ marginBottom: 12 }}>
+                          戏服 {formatNumber(realmDim.tiersObserved)} 档 · 其中样本量达标 {formatNumber(realmDim.tiersWithSufficientSample)} 档
+                          {(realmDim.tiersWithSufficientSample ?? 0) < 2
+                            ? '：还不足 2 档，「跨戏服对比」这件事本身尚不成立，下表只是各桶各自的事实。'
+                            : '。'}
+                        </Typography.Paragraph>
+                        <Table<RealmBucket>
+                          size="small"
+                          rowKey={(r) => r.tierId}
+                          dataSource={realmDim.byRealmTier ?? []}
+                          pagination={false}
+                          locale={{ emptyText: <Empty description="窗口内没有戏服分桶" /> }}
+                          columns={[
+                            { title: '戏服', dataIndex: 'tierId', key: 'id' },
+                            { title: '世界', dataIndex: 'worlds', key: 'worlds', align: 'right', render: formatNumber },
+                            {
+                              // 🔴 三个比率的 n 各不相同（世界 / 拍 / 事件），故各自渲染各自的 n，
+                              // 不共用上面那一列「世界」。混着读会把最不可信的数当成最可信的。
+                              title: '完读率',
+                              key: 'completion',
+                              render: (_: unknown, r: RealmBucket) => <ReadingCell r={r.completion?.completionRate} kind="percent" notes={calibration.ciNotes} />,
+                            },
+                            {
+                              title: '阻断率',
+                              key: 'blocked',
+                              render: (_: unknown, r: RealmBucket) => <ReadingCell r={r.blocking?.blockedRate} kind="percent" notes={calibration.ciNotes} />,
+                            },
+                            {
+                              title: '安全扣留率',
+                              key: 'withheld',
+                              render: (_: unknown, r: RealmBucket) => <ReadingCell r={r.blocking?.withheldRate} kind="percent" notes={calibration.ciNotes} />,
+                            },
+                          ]}
+                        />
+                      </>
+                    )}
+                  </Card>
+                </Col>
+              </Row>
+            )}
+
+            <Typography.Paragraph type="secondary" style={{ marginTop: 12 }}>
+              读数<strong>只读</strong>：不回灌引擎、不进世界状态、不改任何判定（§0.1 平权红线）。
+              每个数随身带 <strong>n</strong>（观察数）与 <strong>minN</strong>（最小样本量）：
+              n 低于 minN 的读数显示「样本不足」而<strong>不给数</strong>——那既不是 0，也不是「很均衡」，
+              是<strong>还不能据此调参</strong>；分母真为 0 的显示 <strong>—</strong>（零样本），
+              这一维从没配置过的整块显示为空态。三者是三件不同的事。
+              比例类读数附 95% 置信区间（Wilson）：<strong>区间有多宽，这个数就有多不确定</strong>；
+              基尼与均值类不给区间，理由随数下发（鼠标悬停「样本不足」可见）。
+              🔴 本区<strong>不给综合评分、不给「配得对不对」的判语、也不给「差异是否显著」的结论</strong>——
+              给事实与不确定性，判断由人来做。读数建成 ≠ 校准闭环已验证。
+            </Typography.Paragraph>
           </>
         )
       )}

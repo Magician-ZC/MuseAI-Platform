@@ -16,17 +16,20 @@
 //! 「身份影响判定」，直接违反 §0.1 平权红线。**算出来给人看，不能变成引擎判定输入。**
 //! 锁：`calibration_readings_never_write_anything`、`calibration_readings_never_touch_narrative_state`。
 //!
-//! ## ② 三态必须分得开（口径抄 `slo::ooc_appeal_block`）
+//! ## ② 四态必须分得开（前三态口径抄 `slo::ooc_appeal_block`，第四态见 §0.5）
 //!
 //! | 情形 | status | value 侧 | 后台显示 |
 //! |---|---|---|---|
-//! | 这一维从未被任何模板配置过 | `entry_not_open` | 全部计数缺席 | `—` |
+//! | 这一维从未被任何模板配置过 | `entry_not_open`（块级） | 全部计数缺席 | `—` |
 //! | 配置过，但窗口内零样本 | `no_data_in_window` | 计数为 0 但无读数 | `—` |
-//! | 有样本 | `ok` | 真数（**可以是 0**） | 真数 |
+//! | 有样本，但 n < `minN` | `insufficient_sample`（读数级） | `value=null`，**点估计与区间照给** | `样本不足（n=3）` |
+//! | 有样本且 n ≥ `minN` | `ok` | 真数（**可以是 0**） | 真数 |
 //!
 //! 这条纪律的由来：直接报 0 会得到「看起来棒极了、实际上什么都没测」的数，而门槛判定恰恰要拿它
-//! 决定继续 / 调整 / 停止。锁：`identity_dimension_separates_three_empty_states`、
-//! `realm_dimension_separates_three_empty_states`。
+//! 决定继续 / 调整 / 停止。第四态是同一个病的另一半：`meanShareGini` 在 **3 个观察**和
+//! **300 个观察**上曾长得一模一样，运营会追着噪声调参。
+//! 锁：`identity_dimension_separates_three_empty_states`、`realm_dimension_separates_three_empty_states`、
+//! `readings_separate_insufficient_sample_from_the_two_empty_states`。
 //!
 //! ## ③ 不许算成「越高越好」的单一分数
 //!
@@ -34,6 +37,10 @@
 //! 运营去优化那个数字本身。本模块**只给分维度的事实，不给判语**——没有 score、没有 grade、
 //! 没有 pass/fail、没有 recommendation，与 `admin_api::calibration` 现有页面「只呈现事实」一致。
 //! 锁：`calibration_readings_expose_no_composite_score`。
+//!
+//! 🔴 补了置信区间之后**更不能**顺手给一个「显著/不显著」的布尔：那等于把统计判断包办了，
+//! 而「差 0.1 算不算差」取决于运营在权衡什么，不取决于 p 值。**给区间，让人自己看。**
+//! `insufficient_sample` 不是判语的例外——它说的是「这个数还不能用」，不是「配得对不对」。
 //!
 //! # 两维形状**刻意不同构**（想清楚再改）
 //!
@@ -81,6 +88,13 @@
 //! 聚合列一律 `CAST(… AS BIGINT)`（PG 下 `SUM(bigint)` 返回 numeric，不 CAST 解码会炸）。
 //! 无 JSONB、无 serial、无 `NOW()`、无 `strftime` / `date_trunc`。占位符 `$N` 严格顺序不复用。
 //! **JSON 一律 Rust 侧 serde 解析**（`json_extract` 是 SQLite 方言）。
+//!
+//! # 确定性契约（直接决定 §0.5 能用什么统计方法）
+//!
+//! 本模块**不用系统随机、不用浮点 RNG、不依赖 map 迭代顺序**（分组一律 `BTreeMap` / `BTreeSet`，
+//! 桶序由 id 升序定死）。同一份数据必须永远算出同一个数——否则「调参前后差了多少」这句话失去意义。
+//! 这条约束把 **bootstrap 置信区间排除在外**（它要随机重采样），故 §0.5 的区间一律是**闭式解**；
+//! 不适合闭式解的统计量（基尼）宁可不给区间，也不引入随机性，理由与替代方案写在 [`ci_notes`] 的 `giniNoInterval` 一条里（随响应下发）。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -113,6 +127,285 @@ const BIND_CHUNK: usize = 200;
 /// 每维展开的桶数上限（脏数据防线：身份 id 是自由文本，历史实例可能钉着任意串）。
 /// 超出即**按观察数取头部并置 `bucketsTruncated`**，不静默丢。
 const BUCKET_MAX: usize = 50;
+
+// ============================================================================
+// §0.5 样本量与不确定性（每个读数的统一信封）
+// ============================================================================
+//
+// 由来：上一批建成的读数里，`meanShareGini` 在 **3 个观察**和 **300 个观察**上长得一模一样。
+// 拿它做门槛判定，运营会追着噪声调参——而这些读数存在的**全部理由**就是给运营调参用。
+// 本节补两件事：① 每个读数随身带 `n`（跑不掉：`value` 与 `n` 在同一个对象里，
+// 取值必须穿过这层信封）；② 低于最小样本量的读数明确标成「样本不足」而不是给一个看起来正常的数。
+
+/// 读数的**第四态**：测了、有样本，但样本量不足以据此调参。
+///
+/// 🔴 **绝不许渲染成 0 或空。** 它与两个空态的区别是**多**给数据而不是少给：
+/// `n` / 分子分母 / 点估计 / 置信区间全在，只有 `value`（「可以据此调参的读数」）是 null。
+/// 后台该显示的是「样本不足（n=3）」而不是 `—`，更不是 `0`。
+const STATUS_INSUFFICIENT: &str = "insufficient_sample";
+/// 读数级的零样本（分母为 0）。与块级 `no_data_in_window` 同名同义，粒度不同：
+/// 一个 `ok` 的块里完全可能有某个读数的分母是 0（如某桶一个事件都没落）——
+/// 此时 `rate()` 会给 0.0，而「0 个事件里 0 个被扣留 = 扣留率 0%」正是「看起来棒极了」的那种数。
+const STATUS_NO_DATA: &str = "no_data_in_window";
+/// 真数（**可以是 0**）。
+const STATUS_OK: &str = "ok";
+
+/// 标准正态 0.975 分位点（双侧 95%）。**这是常数不是随机数**——本模块的确定性契约禁 RNG，
+/// 所有区间都是闭式解，同一份数据永远算出同一个区间。
+const Z95: f64 = 1.959_964;
+/// 置信水平（随区间一起下发，免得有人把 95% 的区间当 99% 读）。
+const CI_LEVEL: f64 = 0.95;
+
+/// 比例类读数的 95% **Wilson 得分区间**。
+///
+/// 为什么是 Wilson 而不是正态近似 `p̂ ± z√(p̂(1−p̂)/n)`：后者在 p̂ 贴边时宽度**塌成 0**——
+/// 「3 个观察全是零分 → 零分率 100%，区间 [1,1]」，偏偏那正是最该提示「这是噪声」的地方。
+/// Wilson 把估计往 0.5 收缩、区间恒非退化，小样本与边界上都不骗人（n=3、x=3 时给出的是
+/// 约 [0.44, 1.00]，一眼可见「什么都没测出来」）。闭式解、无迭代、无随机。
+///
+/// 分母 ≤0 → `None`（不除零、不编区间）。
+fn wilson_interval(numer: i64, denom: i64) -> Option<(f64, f64)> {
+    if denom <= 0 {
+        return None;
+    }
+    let n = denom as f64;
+    let p = (numer as f64 / n).clamp(0.0, 1.0);
+    let z2 = Z95 * Z95;
+    let scale = 1.0 + z2 / n;
+    let center = (p + z2 / (2.0 * n)) / scale;
+    let half = (Z95 / scale) * (p * (1.0 - p) / n + z2 / (4.0 * n * n)).sqrt();
+    Some(((center - half).max(0.0), (center + half).min(1.0)))
+}
+
+/// 样本量 → 读数状态。三档：零样本 / 样本不足 / 够。
+fn reading_status(n: i64, min_n: i64) -> &'static str {
+    if n <= 0 {
+        STATUS_NO_DATA
+    } else if n < min_n {
+        STATUS_INSUFFICIENT
+    } else {
+        STATUS_OK
+    }
+}
+
+/// `value` 只在 `ok` 态给数——**这就是「样本不足不许渲染成正常数」的物理实现**。
+/// 点估计另存 `pointEstimate`（事实不藏），但那个键名摆明了是「原始算术」，不是可据此调参的读数。
+fn gated_value(status: &str, point: Option<f64>) -> Value {
+    if status == STATUS_OK {
+        json!(point)
+    } else {
+        Value::Null
+    }
+}
+
+/// 这个读数的区间怎么处理。
+enum Ci {
+    /// 给 Wilson 区间；`Some(note)` 附上这个区间的适用边界（不是免责声明，是读法说明）。
+    Wilson(Option<&'static str>),
+    /// 不给区间，附**为什么不给**——空着会被当成「忘了算」，而这里是想清楚了才不给。
+    Omitted(&'static str),
+}
+
+// ---- 区间说明：读数里只带**短码**，全文在 `calibration.ciNotes` 里给一次 ----
+//
+// 🔴 这不是为了省事：每条说明 150-500 字，而读数最多可达 50 桶 × 每桶 4 条 ——
+// 全文逐条重复会让被轮询的 `/admin/metrics/overview` 凭空胖上百 KB，
+// 与模块头「保护被轮询端点」是同一条纪律。短码在同一个文档里解析得到，
+// 由 `every_reading_carries_its_own_sample_size` 锁住不会出现悬空引用。
+
+/// 观察按世界聚类时，Wilson 区间的读法（Wilson 假设 n 次**独立**伯努利试验）。
+const NOTE_CLUSTERED: &str = "clustered";
+/// 完读率专属：区间只管抽样噪声，管不了 cohort 截断偏差。
+const NOTE_TRUNCATION: &str = "cohortTruncation";
+/// 「先选最大再算比例」的读数为什么不给区间。
+const NOTE_POST_SELECTION: &str = "postSelection";
+/// 均值类读数为什么不给区间。
+const NOTE_MEAN: &str = "meanNotIid";
+/// 🔴 基尼为什么不给区间（本批被点名的那一条，判断与替代方案都在这条文案里）。
+const NOTE_GINI: &str = "giniNoInterval";
+
+/// 短码 → 全文。随 `calibration.ciNotes` 下发**一次**（数会被复制走，注释不会）。
+fn ci_notes() -> Value {
+    let mut m = serde_json::Map::new();
+    m.insert(
+        NOTE_CLUSTERED.into(),
+        json!(
+            "n 按世界聚类（同一个世界的多个成员 / 多拍 / 多事件不独立），而 Wilson 假设 n 次独立试验：\
+             真实区间比这个**宽**（设计效应 ≥1）。当宽度下界读——它足以否定一个数，不足以坐实一个数。"
+        ),
+    );
+    m.insert(
+        NOTE_TRUNCATION.into(),
+        json!(
+            "区间只描述抽样噪声，**不覆盖 cohort 截断偏差**（分母含未收尾世界，近期窗口天然偏低）。\
+             那是系统偏差，样本量再大也不会消失——跨桶横比时请一并看 firstCreatedAt / lastCreatedAt / unfinished。"
+        ),
+    );
+    m.insert(
+        NOTE_POST_SELECTION.into(),
+        json!(
+            "topEndingShare 是**先选出最大的那个结局、再算它的占比**（post-selection）：\
+             朴素区间会系统性偏窄偏乐观，结局种类越多越乐观。故不给区间，改为把 n（落到真实结局的世界数）\
+             与 distinctEndings 一并给出，让读的人自己判断「最大占比 0.6」是几个结局里挑出来的。"
+        ),
+    );
+    m.insert(
+        NOTE_MEAN.into(),
+        json!(
+            "均值类读数不给置信区间，因为观察**不独立**：同一个世界内各成员的相对份额之和恒等于成员数\
+             （结构约束），且同一个世界同时向多个身份桶供数。t / 正态区间会系统性低估宽度，\
+             而把它标成 95% 会比不给更糟。做对了要按世界聚类的稳健方差，可窗口内世界数（worlds）\
+             常常只有个位数，那样的区间同样不可信。这里给 n / worlds（聚类数）/ sd / 中位数 / 极值，\
+             宽度由读的人自己判断。"
+        ),
+    );
+    m.insert(
+        NOTE_GINI.into(),
+        json!(
+            "基尼是非线性统计量，没有闭式置信区间。三条路各自的结论：\
+             ① **bootstrap 不做** —— 它要随机重采样，而本模块的确定性契约禁系统随机与浮点 RNG\
+             （同一份数据必须永远算出同一个数，否则「调参前后差了多少」无从谈起）；\
+             ② **jackknife（留一，无随机）技术上可做，但答错了问题** —— 它重采样的是**分组**，\
+             而身份池 / 结局池是配置出来的总体、不是抽样得到的样本；真正的抽样波动在**组内**\
+             （每个分组的均值只由 sampleN 个观察支撑）。留一组区间会给出一个看起来很权威、\
+             实则没人问过的数，比不给更危险；\
+             ③ **delta 法**能把组内标准误传播上去，但基尼在并列值处不可导、值域有界，k 又常常只有 2-8，\
+             正是正态近似最不成立的区间——在那里发一条 ± 带正好是本批要堵的病。\
+             故**改为报样本量本身**：n（分组数）、sampleN（门槛盯的那个观察数）、\
+             minGroups / minN，外加各组均值的极值。n=3 与 n=300 因此长得不一样，这就是本读数要的效果。"
+        ),
+    );
+    Value::Object(m)
+}
+
+/// 比例类读数（分子分母都是计数）的统一信封。
+///
+/// 🔴 `n` 与 `value` 在同一个对象里是**刻意的**：取值必须穿过这层信封，
+/// 于是「拿到一个比例却不知道它压在几个观察上」在结构上不可能发生。
+/// `ciNoteRef` 是短码，全文在 `calibration.ciNotes` 里给一次（见上方那段关于载荷体积的说明）。
+fn proportion_reading(numer: i64, denom: i64, unit: &str, min_n: i64, ci: Ci) -> Value {
+    let status = reading_status(denom, min_n);
+    let point = (denom > 0).then(|| rate(numer, denom));
+    let (ci95, note) = match ci {
+        Ci::Wilson(note) => (
+            wilson_interval(numer, denom)
+                .map(|(lo, hi)| json!({ "low": lo, "high": hi, "method": "wilson", "level": CI_LEVEL }))
+                .unwrap_or(Value::Null),
+            note,
+        ),
+        Ci::Omitted(why) => (Value::Null, Some(why)),
+    };
+    json!({
+        "status": status,
+        "value": gated_value(status, point),
+        "pointEstimate": point,
+        "numerator": numer,
+        "n": denom,
+        "unit": unit,
+        "minN": min_n,
+        "ci95": ci95,
+        "ciNoteRef": note,
+    })
+}
+
+/// 均值类读数的统一信封（入参必须**已升序**：中位数与极值直接取自它）。
+///
+/// `worlds` = 这些观察落在几个世界里，即**聚类数**。它与 `n` 一起给不是冗余：
+/// 「30 个观察」落在 15 个世界与落在 1 个世界，可信度差着量级。
+fn mean_reading(sorted: &[f64], worlds: i64, min_n: i64) -> Value {
+    let n = sorted.len() as i64;
+    let status = reading_status(n, min_n);
+    let mean = (n > 0).then(|| sorted.iter().sum::<f64>() / n as f64);
+    // 样本标准差（n−1 分母）。n<2 无从谈起 → None，不编 0（0 会被读成「完全一致」）。
+    let sd = match (n >= 2, mean) {
+        (true, Some(m)) => {
+            let ss: f64 = sorted.iter().map(|v| (v - m) * (v - m)).sum();
+            Some((ss / (n as f64 - 1.0)).sqrt())
+        }
+        _ => None,
+    };
+    json!({
+        "status": status,
+        "value": gated_value(status, mean),
+        "pointEstimate": mean,
+        "n": n,
+        "worlds": worlds,
+        "unit": "observation",
+        "minN": min_n,
+        "sd": sd,
+        "median": percentile(sorted, 0.5),
+        "min": sorted.first().copied(),
+        "max": sorted.last().copied(),
+        "ci95": Value::Null,
+        "ciNoteRef": NOTE_MEAN,
+    })
+}
+
+/// 集中度（基尼）类读数的入参。字段多是因为**它的样本量有两层**：
+/// 统计量算在几个分组上（`groups`），以及那些分组各自压在多少观察上（`sample_n`）。
+/// 只报前者会重演本批要修的病：2 个身份 × 各 2 个观察，与 2 个身份 × 各 300 个观察，`groups` 都是 2。
+struct GiniInput<'a> {
+    /// 点估计。分组数 <2 时传 `None`（那时基尼恒为 0，是个符号反了的假指标）。
+    point: Option<f64>,
+    /// 统计量算在几个分组上。
+    groups: i64,
+    /// 分组的单位名（`identity` / `ending`）。
+    group_unit: &'a str,
+    /// **门槛盯的那个观察数**：取「最弱那条腿」或「总观察数」，由调用方按语义选，并在 `sample_basis` 里说明。
+    sample_n: i64,
+    /// `sample_n` 数的是什么（下发给读的人，不然 n 与 sampleN 谁是谁分不清）。
+    sample_basis: &'a str,
+}
+
+/// **最小样本量约定**：随读数一起下发（同 `shapeRationale` 的理由——数会被复制走，注释不会）。
+///
+/// 依据写进响应而不是只写进注释，是因为「30 从哪来的」会在第一次有人质疑读数时被问到，
+/// 而那时手边只有 JSON。
+fn sample_floor(cfg: &SloConfig) -> Value {
+    json!({
+        "minN": cfg.calibration_min_n,
+        "minGroups": cfg.calibration_min_groups,
+        "envKeys": ["MUSE_SLO_CALIBRATION_MIN_N", "MUSE_SLO_CALIBRATION_MIN_GROUPS"],
+        "rationale": [
+            "minN 默认 30 的依据①：比例类读数在最坏情形 p̂=0.5 下的 95% Wilson 区间半宽 —— n=3 → ±0.37（几乎覆盖整个值域）、n=10 → ±0.26、n=30 → ±0.17、n=100 → ±0.10。30 大致是「区间首次窄过运营真正会据此行动的效应量（两档之间差 20 个百分点）」的位置。",
+            "依据②：n=30 时单个观察最多把比例挪动 3.3 个百分点，n=3 时是 33 个百分点 —— 「一条数据翻转结论」在 30 上不再发生，这是能不能拿它调参的分界。",
+            "依据③：30 同时是 CLT 的教科书惯例门槛，均值类读数在此之上谈「均值的抽样分布近似正态」才不荒唐。",
+            "minGroups 默认 2：gini_coefficient 在只有 1 个分组时恒返回 0，而 0 读起来是「很分散」—— 真相恰恰相反（全压在这一个分组上）。那是个符号反了的假指标，必须被门槛拦住。",
+            "🔴 这是**默认值不是物理常量**（同 attentionGiniMax）：预注册纪律要求门槛「开测前可改、开测后冻结」，故经 env 可覆盖。",
+            "🔴 过了 minN 不等于结论成立 —— 那是区间要回答的问题，不是样本量门槛能回答的。本段只拦住「数太少不该看」，不判断「配得对不对」。",
+        ],
+        "readingStatuses": {
+            "entry_not_open": "这一维从未被任何模板配置过（块级）。value=null，显示 —。",
+            "no_data_in_window": "配置过 / 有世界，但这个读数的分母是 0。value=null，显示 —。",
+            "insufficient_sample": "有样本但 n < minN。value=null，pointEstimate 与 ci95 照给。🔴 显示「样本不足（n=…）」，不许显示成 0，也不宜与 — 混同。",
+            "ok": "n ≥ minN。value 给真数（可以是 0）。",
+        },
+    })
+}
+
+/// 集中度类读数的统一信封。**不给区间**，理由与替代方案见 [`ci_notes`] 的 `giniNoInterval`。
+fn gini_reading(input: GiniInput<'_>, min_groups: i64, min_n: i64) -> Value {
+    let status = if input.groups <= 0 {
+        STATUS_NO_DATA
+    } else if input.point.is_none() || input.groups < min_groups || input.sample_n < min_n {
+        STATUS_INSUFFICIENT
+    } else {
+        STATUS_OK
+    };
+    json!({
+        "status": status,
+        "value": gated_value(status, input.point),
+        "pointEstimate": input.point,
+        "n": input.groups,
+        "unit": input.group_unit,
+        "sampleN": input.sample_n,
+        "sampleBasis": input.sample_basis,
+        "minGroups": min_groups,
+        "minN": min_n,
+        "ci95": Value::Null,
+        "ciNoteRef": NOTE_GINI,
+    })
+}
 
 // ============================================================================
 // §1 装配产物的防御式解析（Rust 侧，绝不用 json_extract）
@@ -317,6 +610,21 @@ impl IdentityAcc {
         (!self.shares.is_empty())
             .then(|| self.shares.iter().sum::<f64>() / self.shares.len() as f64)
     }
+
+    fn observations(&self) -> i64 {
+        self.shares.len() as i64
+    }
+
+    fn worlds(&self) -> i64 {
+        self.worlds.len() as i64
+    }
+
+    /// 升序副本（`mean_reading` 的入参契约：中位数与极值直接取自它）。
+    fn sorted_shares(&self) -> Vec<f64> {
+        let mut v = self.shares.clone();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        v
+    }
 }
 
 /// 一个世界内部，把每个成员的戏份折成**相对均分的倍率**：`(score / total) × n`。
@@ -361,6 +669,7 @@ fn relative_shares(scores: &BTreeMap<String, i64>) -> Option<BTreeMap<String, f6
 async fn identity_block(
     db: &AnyPool,
     worlds: &[ScannedWorld],
+    cfg: &SloConfig,
 ) -> Result<Value, ApiError> {
     const METRIC: &str = "identityShareBalance";
     const TITLE: &str = "身份维：身份分配 × 戏份分布";
@@ -439,64 +748,88 @@ async fn identity_block(
                 "窗口内没有一个「有身份分配 ∧ 成员数≥2 ∧ 有正贡献分」的世界 —— 零样本。",
                 "🔴「没测过」不是「分配很均衡」：后台必须显示 —，显示 0 即为误报。",
                 "worldsSingleMember / worldsWithoutScore 分开计数：前者是单人世界（份额恒为 1，无信息），后者是全员还没挣到分（没开演，不是不公平）。",
+                "🔴 与 insufficient_sample 也不是一回事：那是「有样本但不够（n < minN）」，这里是「一个可比观察都没有（n = 0）」。",
             ],
         }));
     }
 
+    let min_n = cfg.calibration_min_n;
+
     // 逐身份读数。桶按 id 升序（BTreeMap），跨运行定序。
     let mut rows: Vec<Value> = Vec::with_capacity(by_identity.len());
     let mut declared_means: Vec<i64> = Vec::new();
-    let mut ranked: Vec<(String, f64)> = Vec::new();
+    // 🔴 基尼的「最弱那条腿」：各身份桶里观察数最少的那个。只报身份桶数（n=2）而不报它，
+    // 就会让「2 个身份 × 各 2 个观察」与「2 个身份 × 各 300 个观察」长得一模一样。
+    let mut weakest_identity_obs = i64::MAX;
+    // (身份 id, 均值, 该桶的均值读数信封) —— 极值直接复用信封，同一个键名不出现两种形状。
+    let mut ranked: Vec<(String, f64, Value)> = Vec::new();
     for (identity_id, acc) in &by_identity {
-        let mut sorted = acc.shares.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let mean = acc.mean();
+        let sorted = acc.sorted_shares();
+        let obs = acc.observations();
+        let mean_block = mean_reading(&sorted, acc.worlds(), min_n);
         if identity_id != IDENTITY_UNASSIGNED {
-            if let Some(m) = mean {
+            if let Some(m) = acc.mean() {
                 // 定点化后送进整数基尼（`gini_coefficient` 入参恒为 &[i64]）。
                 declared_means.push((m * SHARE_SCALE).round() as i64);
-                ranked.push((identity_id.clone(), m));
+                weakest_identity_obs = weakest_identity_obs.min(obs);
+                ranked.push((identity_id.clone(), m, mean_block.clone()));
             }
         }
         rows.push(json!({
             "identityId": identity_id,
-            "observations": acc.shares.len() as i64,
-            "worlds": acc.worlds.len() as i64,
-            "meanRelativeShare": mean,
-            "medianRelativeShare": percentile(&sorted, 0.5),
-            "minRelativeShare": sorted.first().copied(),
-            "maxRelativeShare": sorted.last().copied(),
+            // 本桶整体的样本量状态（各读数另有自己的状态，分母不同时会不一样）。
+            "status": reading_status(obs, min_n),
+            "observations": obs,
+            "worlds": acc.worlds(),
+            "meanRelativeShare": mean_block,
             "zeroScoreObservations": acc.zero_score,
-            "zeroScoreRate": rate(acc.zero_score, acc.shares.len() as i64),
+            "zeroScoreRate": proportion_reading(
+                acc.zero_score, obs, "observation", min_n, Ci::Wilson(Some(NOTE_CLUSTERED)),
+            ),
             "totalScoreMilli": acc.raw_score_milli as i64,
         }));
     }
     let buckets_truncated = rows.len() > BUCKET_MAX;
+    // 「样本量达标的身份数」：`(unassigned)` 不是配置出来的身份，与 `identitiesObserved` 一致地排除。
+    let buckets_with_sample = rows
+        .iter()
+        .filter(|r| r["identityId"] != IDENTITY_UNASSIGNED && r["status"] == STATUS_OK)
+        .count() as i64;
     rows.truncate(BUCKET_MAX);
 
     // 各身份**均值之间**的集中度：0 = 各身份平均拿到一样多，越大 = 越不均。
     // 至少两个身份桶才谈得上「之间」；`(unassigned)` 不是配置出来的身份，不进这个数。
-    let mean_share_gini: Option<f64> =
-        (declared_means.len() >= 2).then(|| gini_coefficient(&declared_means));
+    let identities_observed = declared_means.len() as i64;
+    let mean_share_gini = gini_reading(
+        GiniInput {
+            point: (declared_means.len() >= 2).then(|| gini_coefficient(&declared_means)),
+            groups: identities_observed,
+            group_unit: "identity",
+            sample_n: if identities_observed > 0 { weakest_identity_obs } else { 0 },
+            sample_basis: "观察数最少的那个身份桶的观察数（最弱那条腿：基尼只与它同样可信）",
+        },
+        cfg.calibration_min_groups,
+        min_n,
+    );
     ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
-    let extreme = |x: Option<&(String, f64)>| -> Value {
-        x.map(|(id, m)| json!({ "identityId": id, "meanRelativeShare": m })).unwrap_or(Value::Null)
+    let extreme = |x: Option<&(String, f64, Value)>| -> Value {
+        x.map(|(id, _, block)| json!({ "identityId": id, "meanRelativeShare": block }))
+            .unwrap_or(Value::Null)
     };
 
     let unassigned = by_identity.get(IDENTITY_UNASSIGNED);
-    let assigned_obs: i64 = by_identity
+    let mut assigned_sorted: Vec<f64> = by_identity
         .iter()
         .filter(|(k, _)| k.as_str() != IDENTITY_UNASSIGNED)
-        .map(|(_, a)| a.shares.len() as i64)
-        .sum();
-    let assigned_mean: Option<f64> = (assigned_obs > 0).then(|| {
-        by_identity
-            .iter()
-            .filter(|(k, _)| k.as_str() != IDENTITY_UNASSIGNED)
-            .flat_map(|(_, a)| a.shares.iter())
-            .sum::<f64>()
-            / assigned_obs as f64
-    });
+        .flat_map(|(_, a)| a.shares.iter().copied())
+        .collect();
+    assigned_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // 聚类数取并集：同一个世界可能同时向多个身份桶供数，直接加桶内世界数会重复计。
+    let assigned_worlds: BTreeSet<&str> = by_identity
+        .iter()
+        .filter(|(k, _)| k.as_str() != IDENTITY_UNASSIGNED)
+        .flat_map(|(_, a)| a.worlds.iter().map(String::as_str))
+        .collect();
 
     Ok(json!({
         "metric": METRIC,
@@ -512,15 +845,20 @@ async fn identity_block(
         "worldsWithoutScore": worlds_without_score,
         "observations": observations,
         "unknownAssignmentCount": unknown_assignments,
-        "identitiesObserved": declared_means.len() as i64,
+        "identitiesObserved": identities_observed,
+        "identitiesWithSufficientSample": buckets_with_sample,
         "meanShareGini": mean_share_gini,
         "lowestMeanIdentity": extreme(ranked.first()),
         "highestMeanIdentity": extreme(ranked.last()),
         // 「有身份的人」与「没拿到身份的人」的直接对照（前者若系统性更高，说明站位真的在起作用）。
-        "assignedMeanRelativeShare": assigned_mean,
-        "assignedObservations": assigned_obs,
-        "unassignedMeanRelativeShare": unassigned.and_then(IdentityAcc::mean),
-        "unassignedObservations": unassigned.map(|a| a.shares.len() as i64).unwrap_or(0),
+        "assignedMeanRelativeShare": mean_reading(
+            &assigned_sorted, assigned_worlds.len() as i64, min_n,
+        ),
+        // 一个没拿到站位的成员都没有 → 给 n=0 的零样本读数，**不给 null**：
+        // 「没有对照组」是事实，不是「字段缺席」。
+        "unassignedMeanRelativeShare": unassigned
+            .map(|a| mean_reading(&a.sorted_shares(), a.worlds(), min_n))
+            .unwrap_or_else(|| mean_reading(&[], 0, min_n)),
         "byIdentity": rows,
         "bucketsTruncated": buckets_truncated,
         "notes": [
@@ -530,6 +868,11 @@ async fn identity_block(
             "unknownAssignmentCount = 分配里有、world_members 里没有的角色（模板改版 / 成员已清理），不进任何桶，也不当成 0 分成员。",
             "(unassigned) 是对照桶不是身份：它不进 meanShareGini，但与 assignedMeanRelativeShare 并排给出。",
             "meanShareGini 的观察单位是「身份」，attentionGini 的是「角色」，两者可以一个为 0 一个很高，不矛盾也不可换算。",
+            "🔴 每个读数随身带 n 与 minN：n < minN 时 status=insufficient_sample 且 value=null（点估计与区间仍给出）—— 那是「样本不足」，既不是 0 也不是空，后台应显示「样本不足（n=…）」。",
+            "meanShareGini 有两层样本量：n = 身份桶数，sampleN = 观察数最少的那个桶的观察数。2 个身份 × 各 2 个观察与 2 个身份 × 各 300 个观察，n 都是 2 —— 门槛盯的是 sampleN。",
+            "zeroScoreRate 带 95% Wilson 区间（小样本与 0/1 边界上比正态近似稳；正态近似在 p̂=1 时区间会塌成一个点）。n 按世界聚类，故真实区间更宽，当宽度下界读。",
+            "meanRelativeShare 不给区间：观察不独立（同一世界内份额之和恒等于成员数，且同一世界同时供多个桶），iid 区间会低估宽度。改给 n / worlds（聚类数）/ sd / 中位数 / 极值，全文见 ciNotes.meanNotIid。",
+            "lowestMeanIdentity / highestMeanIdentity 是**选出来的极值**，本身带选择偏差（桶越多、每桶 n 越小，极值越极端）：两者各自携带完整读数信封（含 n 与 status），先看 n 再看数。",
             "🔴 本读数不判断哪种分布更好：把戏份摊平到各身份均值全是 1.0 就没有主角了，公平与戏剧性是两个目标，这里只给事实。",
             "配额视角（quota / fillRatio / 从没被分到过的站位）在 GET /admin/world-templates/{id}/identity-pool，本读数不重复。",
             "byIdentity 按身份 id 升序，超过上限时截断并置 bucketsTruncated —— 那是针对脏数据的防线（身份 id 是自由文本，老实例可能钉着任意串），正常身份池远小于上限。identitiesObserved 与极值取自截断前的全集。",
@@ -541,14 +884,42 @@ async fn identity_block(
 // §4 维度二：戏服维（境界档 × 世界质量，跨世界对比）
 // ============================================================================
 
-/// 一个戏服桶的世界质量读数：**完全由 `super::quality` 的三个既有函数算出**，本函数只负责分桶与序列化。
-fn realm_bucket_json(tier_id: &str, facts: &[WorldQualityFacts], first: i64, last: i64) -> Value {
+/// 一个戏服桶的世界质量读数：**完全由 `super::quality` 的三个既有函数算出**，本函数只负责分桶、
+/// 套上 §0.5 的样本量信封、序列化。
+///
+/// 🔴 三个比率各有各的分母（世界 / 拍 / 事件），所以**各带各的 n**：
+/// 「这一桶有 40 个世界」不等于「阻断率压在 40 个观察上」——阻断率的分母是拍，
+/// 一个世界可能贡献几十拍，也可能一拍都没跑。混着读会把最不可信的那个数当成最可信的。
+fn realm_bucket_json(
+    tier_id: &str,
+    facts: &[WorldQualityFacts],
+    first: i64,
+    last: i64,
+    cfg: &SloConfig,
+) -> Value {
     let c = quality::completion_stats(facts);
     let b = quality::block_stats(facts);
     let e = quality::ending_distribution(facts);
+    let min_n = cfg.calibration_min_n;
+
+    // 真实结局（排掉 `(none)` / `(unfinished)` 两个特殊桶）的逐结局世界数——
+    // 集中度基尼与 topEndingShare 的共同底座，与 `EndingDistribution` 内部口径逐字一致。
+    let ending_counts: Vec<i64> = e
+        .by_ending
+        .iter()
+        .filter(|(k, _)| {
+            k.as_str() != quality::ENDING_NONE && k.as_str() != quality::ENDING_UNFINISHED
+        })
+        .map(|(_, v)| *v)
+        .collect();
+    let top_ending_worlds = ending_counts.iter().copied().max().unwrap_or(0);
+
     json!({
         "tierId": tier_id,
+        // 本桶「世界数」这一层的样本量状态（拍 / 事件那两层各自另有状态）。
+        "status": reading_status(c.worlds, min_n),
         "worlds": c.worlds,
+        "minN": min_n,
         // 桶内世界的年龄跨度：横向比之前先看这个，年龄差得远的两桶不具可比性。
         "firstCreatedAt": first,
         "lastCreatedAt": last,
@@ -560,23 +931,46 @@ fn realm_bucket_json(tier_id: &str, facts: &[WorldQualityFacts], first: i64, las
             "unknownEnded": c.unknown_ended,
             "unfinished": c.unfinished,
             "endedWorlds": c.ended(),
-            "completionRate": c.completion_rate(),
-            "forcedRateAmongEnded": c.forced_rate(),
+            "completionRate": proportion_reading(
+                c.natural, c.worlds, "world", min_n, Ci::Wilson(Some(NOTE_TRUNCATION)),
+            ),
+            "forcedRateAmongEnded": proportion_reading(
+                c.forced + c.collapsed + c.unknown_ended, c.ended(), "world", min_n,
+                Ci::Wilson(None),
+            ),
         },
         "blocking": {
             "blockedTicks": b.blocked_ticks,
             "engineTicks": b.engine_ticks,
-            "blockedRate": b.blocked_rate(),
+            "blockedRate": proportion_reading(
+                b.blocked_ticks, b.engine_ticks, "tick", min_n, Ci::Wilson(Some(NOTE_CLUSTERED)),
+            ),
             "worldsWithBlock": b.worlds_with_block,
             "eventsWithheld": b.events_withheld,
             "eventsTotal": b.events_total,
-            "withheldRate": b.withheld_rate(),
+            "withheldRate": proportion_reading(
+                b.events_withheld, b.events_total, "event", min_n, Ci::Wilson(Some(NOTE_CLUSTERED)),
+            ),
         },
         "endings": {
             "worldsWithEnding": e.with_ending,
             "distinctEndings": e.distinct_endings,
-            "topEndingShare": e.top_share(),
-            "concentrationGini": e.concentration_gini(),
+            "topEndingShare": proportion_reading(
+                top_ending_worlds, e.with_ending, "world", min_n, Ci::Omitted(NOTE_POST_SELECTION),
+            ),
+            "concentrationGini": gini_reading(
+                GiniInput {
+                    // 只有一种结局时基尼恒为 0，读起来是「很分散」，真相是「全压在这一个上」——
+                    // 符号是反的，故不给点估计，交由样本量门槛拦住。
+                    point: (ending_counts.len() >= 2).then(|| e.concentration_gini()),
+                    groups: e.distinct_endings,
+                    group_unit: "ending",
+                    sample_n: e.with_ending,
+                    sample_basis: "落到真实结局的世界数（结局分布的抽样波动来自世界，不来自结局池）",
+                },
+                cfg.calibration_min_groups,
+                min_n,
+            ),
             "byKind": e.by_kind,
             "byEnding": e.by_ending,
         },
@@ -593,7 +987,11 @@ fn realm_bucket_json(tier_id: &str, facts: &[WorldQualityFacts], first: i64, las
 ///
 /// 三指标一律走 `super::quality`（`completion_stats` / `block_stats` / `ending_distribution`），
 /// 与仿真试跑、世界质量回归**算的是同一个数**，本函数只负责分桶。
-async fn realm_block(db: &AnyPool, worlds: &[ScannedWorld]) -> Result<Value, ApiError> {
+async fn realm_block(
+    db: &AnyPool,
+    worlds: &[ScannedWorld],
+    cfg: &SloConfig,
+) -> Result<Value, ApiError> {
     const METRIC: &str = "realmTierWorldQuality";
     const TITLE: &str = "戏服维：境界档 × 世界质量（跨世界对比）";
     const SHAPE: &str = "境界档全员统一（总规格 §6【拍板 3】）：一个世界只有一件戏服，无池、无配额、\
@@ -662,8 +1060,14 @@ async fn realm_block(db: &AnyPool, worlds: &[ScannedWorld]) -> Result<Value, Api
         buckets.keys().filter(|k| k.as_str() != REALM_NONE).count() as i64;
 
     let mut rows: Vec<Value> =
-        buckets.iter().map(|(k, (f, lo, hi))| realm_bucket_json(k, f, *lo, *hi)).collect();
+        buckets.iter().map(|(k, (f, lo, hi))| realm_bucket_json(k, f, *lo, *hi, cfg)).collect();
     let buckets_truncated = rows.len() > BUCKET_MAX;
+    // 「够样本的桶」= 世界数达到 minN 的桶。跨戏服对比至少要两个这样的桶才谈得上对比 ——
+    // 一个 40 世界的桶与一个 2 世界的桶并排，看起来像对比，实际上只有一边有数。
+    let buckets_with_sample = rows
+        .iter()
+        .filter(|r| r["tierId"] != REALM_NONE && r["status"] == STATUS_OK)
+        .count() as i64;
     rows.truncate(BUCKET_MAX);
 
     Ok(json!({
@@ -677,10 +1081,15 @@ async fn realm_block(db: &AnyPool, worlds: &[ScannedWorld]) -> Result<Value, Api
         "worldsAssembled": worlds_assembled,
         "worldsWithoutTier": without_tier,
         "tiersObserved": tiers_observed,
+        "tiersWithSufficientSample": buckets_with_sample,
         "byRealmTier": rows,
         "bucketsTruncated": buckets_truncated,
         "notes": [
             "三指标全部复用 slo::quality（completion_stats / block_stats / ending_distribution），与仿真试跑、世界质量回归算的是同一个数；本读数只负责分桶。",
+            "🔴 每个比率随身带自己的 n 与 minN：完读率的 n 是**世界数**、阻断率是**拍数**、扣留率是**事件数**，三者不是一个数，不可互相代读。n < minN → status=insufficient_sample 且 value=null（点估计与区间照给）。",
+            "比率一律带 95% Wilson 区间（小样本与 0/1 边界上比正态近似稳）。拍 / 事件按世界聚类，真实区间更宽，当宽度下界读；完读率的区间另不覆盖 cohort 截断偏差（那是系统偏差，样本量再大也不消失）。",
+            "topEndingShare 不给区间：它是「先选最大再算占比」，post-selection 的朴素区间会偏乐观。concentrationGini 不给区间的理由见 ciNotes.giniNoInterval（bootstrap 违反确定性契约；jackknife 重采样的是结局池不是抽样波动的来源）。",
+            "tiersWithSufficientSample = 世界数达到 minN 的非对照桶数；它 < 2 时「跨戏服对比」这件事本身还不成立 —— 一个 40 世界的桶与一个 2 世界的桶并排，看起来像对比，实际上只有一边有数。",
             "(none) 是对照桶不是缺数据：没钉住戏服的世界是「配了戏服的世界」唯一的参照系，不得丢弃。模板声明 realmTier 之前装配的实例本就不会回溯补写。",
             "tiersObserved < 2 时本读数只是那一桶的事实，不构成跨戏服对比 —— 「对比」至少要有两个非空桶。",
             "窗口口径 = worlds.created_at 落窗（cohort：窗口内开出的这一批世界），与 §4 attentionGini 的「有贡献分更新的世界」不是同一批，两处数字不可互相校验。",
@@ -725,8 +1134,8 @@ pub(crate) async fn calibration_readings(
         }));
     };
 
-    let identity = identity_block(db, &worlds).await?;
-    let realm = realm_block(db, &worlds).await?;
+    let identity = identity_block(db, &worlds, cfg).await?;
+    let realm = realm_block(db, &worlds, cfg).await?;
 
     Ok(json!({
         "status": "ok",
@@ -736,13 +1145,20 @@ pub(crate) async fn calibration_readings(
         "windowBasis": "worlds.created_at（cohort：窗口内开出的这一批世界，两维共用）",
         "worldsScanned": worlds.len() as i64,
         "worldScanCap": cap,
+        // 🔴 样本量约定随数一起下发（同 shapeRationale 的理由：**数会被复制走，注释不会**）。
+        "sampleFloor": sample_floor(cfg),
+        // 区间说明全文，按短码索引。读数里只带 `ciNoteRef`，全文在这里给一次 ——
+        // 逐条重复会让被轮询的端点凭空胖上百 KB（50 桶 × 每桶 4 条 × 每条数百字）。
+        "ciNotes": ci_notes(),
         "dimensions": {
             "identityShareBalance": identity,
             "realmTierWorldQuality": realm,
         },
         "notes": [
             "🔴 只读聚合：本段不写任何库、不回灌引擎。这些数永远不进 narrative_state_json，也永远不作为引擎判定输入 —— 同 world_contributions 独立建表的理由（回灌即违反 §0.1 平权红线）。",
-            "🔴 三态：entry_not_open（这一维从未被任何模板配置过）/ no_data_in_window（配过但窗口内零样本）/ ok（真数，可以是 0）。前两者 value=null，后台必须显示 —。",
+            "🔴 四态：entry_not_open（这一维从未被任何模板配置过）/ no_data_in_window（配过但零样本）/ insufficient_sample（有样本但 n < minN）/ ok（真数，可以是 0）。前两者显示 —；第三者显示「样本不足（n=…）」，🔴 不许显示成 0 或 —。",
+            "🔴 每个读数是一个信封：value（可据此调参的读数，样本不足时为 null）/ pointEstimate（原始算术，永远给）/ n / minN / ci95 / ciNote。n 与 value 在同一个对象里是刻意的 —— 取值必须穿过信封，「拿到比例却不知道压在几个观察上」在结构上不可能发生。",
+            "🔴 有区间不等于有判语：本段不给显著性布尔、不给「差异是否成立」的结论。给区间，让人自己看 —— 「差 0.1 算不算差」取决于运营在权衡什么，不取决于 p 值。",
             "🔴 不给综合评分：校准是多目标的（公平 vs 戏剧性），一个「越高越好」的分会诱导去优化那个数字本身。这里只给分维度的事实，不给判语。",
             "两维形状刻意不同构：身份各不相同 → 看组内分布；境界档全员统一 → 只能看跨世界对比。把后者套成前者会得到恒为 0 的假指标。",
             "🔴 读数建成 ≠ 校准闭环已验证（§0.3 七档）：闭环成立要等运营真的用它调过参、并在下一批世界上看到因果。当前状态最高只到 Implemented。",

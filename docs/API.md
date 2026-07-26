@@ -64,7 +64,7 @@
 |---|---|---|---|
 | POST | `/api/assets/characters` | JWT | 发布角色卡到云端（字段级选择权在客户端落实） |
 | GET | `/api/assets/characters/mine` | JWT | 我的云端角色卡列表 |
-| GET | `/api/assets/characters/{id}/status` | JWT | 审核状态查询 |
+| GET | `/api/assets/characters/{id}/status` | JWT | 审核状态查询。含 `rejectReason`（人审驳回理由）、`appeal`（申诉行）、`takedown`（事后下架告知，见 §7「已过审内容处置」——只给状态与时间，**不含运营内部理由**）|
 | POST | `/api/assets/characters/{id}/appeal` | JWT | 审核驳回后申诉 |
 | GET | `/api/assets/characters/{id}/manifest` | JWT | 角色卡清单（钉住版本） |
 | POST | `/api/assets/characters/{id}/avatar` | JWT | 上传立绘 |
@@ -601,7 +601,7 @@ if 线：   从终局那一拍岔出去的、只属于你的一条平行线   �
 | 拉黑实效 | **按 user 判定、按面具录入**（按角色判定会被换卡绕过）。落库同时**撤销**双方 `pending`/`accepted` 解锁 → `revoked`（已授予的身份可见性立即收回）；被拉黑者发不出解锁请求；🔴 **跨通道生效**——`invitations::create_invitation` 前门也调 `social::is_blocked_pair`，且**不看社交开关**（拉黑是保护态，急停不应让它失效，方向同 `MUSE_SAFETY_LEXICON` 的 fail-safe） |
 | 终局态 | `declined`/`expired`/`revoked` 均为**终局**，唯一索引 `(world_id, requester_character_id, target_character_id)` 使同一条线只有一行 → **拒绝后不能再问一次**（真人身份是最敏感的一次授予，不给反复施压的空间）。解除拉黑**不恢复**已撤销的解锁 |
 | 举报 | 进 `social_reports` 队列（`pending → actioned/dismissed`，CAS + 同事务 `audit_logs('social.report_resolved')`）。同一被举报人 pending 数**恰好**达 `MUSE_SOCIAL_REPORT_ESCALATE_AT` → 写一条 `risk_events(kind='social_report_threshold')` 升级到既有风控面。冷却窗口内重复提交幂等复用既有那条（**不建唯一索引**：唯一即"终身只能举报一次"，会让再犯无法被举报） |
-| 🔴 处置边界 | `resolve` **只改举报单自身的状态 + 留痕**，不做任何实处置。封禁走 `POST /admin/users/{id}/ban`（`require_role(support)`）、内容驳回走 `POST /admin/audit-queue/{id}/reject`（`require_role(reviewer)`）、改判走 `POST /admin/appeals/{id}/resolve`，各自带自己的权限与审计。把处置塞进举报接口等于给封禁开一条**绕过既有权限矩阵**的侧门。后台前端因此只做「跳转 + 回填」，不新开写路径 |
+| 🔴 处置边界 | `resolve` **只改举报单自身的状态 + 留痕**，不做任何实处置。封禁走 `POST /admin/users/{id}/ban`（`require_role(support)`）、内容驳回走 `POST /admin/audit-queue/{id}/reject`（`require_role(reviewer)`）、**已过审内容**的再审/下架走 `POST /admin/content/{kind}/{id}/recheck|takedown`（见 §7「已过审内容处置」）、改判走 `POST /admin/appeals/{id}/resolve`，各自带自己的权限与审计。把处置塞进举报接口等于给封禁开一条**绕过既有权限矩阵**的侧门。后台前端因此只做「跳转 + 回填」，不新开写路径 |
 | admin 前端 | `admin/src/pages/SocialReports.tsx`（RBAC 模块 `social`，可见角色 reviewer/support/admin，与 `require_report_handler` 逐字对齐）。列表按状态/类别/主体种类筛 + 复合游标翻页 + 详情抽屉 + 复核处置（理由必填 ≤500 字）；处置动作跳 `/users?query=<被举报人>`、`/audit`、`/risk?kind=social_report_threshold` 三个既有入口，且**跳转按钮受前端 RBAC 收敛**（reviewer 看得到举报队列但进不去用户管理，就不该有一个能点的封禁按钮）。开关未开启（端点 404）→ 整页「功能未开启」空态，不报错 |
 | 参数化（§0.2） | `MUSE_SOCIAL_UNLOCK_MIN_BOND`(0.6) / `_HOSTILE_MAX`(0.3) / `_HOSTILE_FEAR`(0.5) / `_MIN_SHARED_WORLDS`(1) / `_DEATH_BOND_COUNTS`(on) / `_UNLOCK_DAILY_LIMIT`(3) / `_UNLOCK_TTL_MS`(7d) / `_BLOCK_MAX`(500) / `_REPORT_DAILY_LIMIT`(20) / `_REPORT_COOLDOWN_MS`(24h) / `_REPORT_ESCALATE_AT`(3) / `_PAGE_SIZE`(20) |
 | 幂等 | 发起/回应支持 `Idempotency-Key`；DB 侧 `INSERT ... ON CONFLICT(...) DO NOTHING` + 回读权威行（解锁请求与拉黑均如此，杜绝「先查后插」的并发竞态） |
@@ -704,6 +704,39 @@ if 线：   从终局那一拍岔出去的、只属于你的一条平行线   �
 | POST | `/api/admin/audit-queue/{id}/approve`·`/reject` | reviewer | 审核裁定（回写主体 moderation） |
 | GET | `/api/admin/appeals` | reviewer | 申诉列表 |
 | POST | `/api/admin/appeals/{id}/resolve` | reviewer | 申诉复审（overturn/uphold，**唯一改判路径**） |
+| GET | `/api/admin/content/takedowns?state=&kind=&cursor=&limit=` | reviewer | 已过审内容处置台账（复合游标 `createdAt:id`）。`state` ∈ `restricted`/`removed`/`restored`/`all`；未知 `state`/`kind` → 400（空列表会被读成「这类内容没被处置过」）|
+| GET | `/api/admin/content/{kind}/{id}` | reviewer | 单主体处置态 + `affectedRunningWorlds`（该主体仍在哪些运行中的世界里）|
+| POST | `/api/admin/content/{kind}/{id}/recheck` | reviewer | **再审**：把已过审内容送回人审队列，**不改展示态**。经 `safety::queue_operator_recheck`（入队/记险入口③）；同主体已有 `open` 队列行时幂等复用（`created:false`）|
+| POST | `/api/admin/content/{kind}/{id}/takedown` | reviewer；`permanent:true` 为 **admin 专属** | **下架**：展示态列置 `'takedown'`。默认 `restricted`（可恢复）；`permanent:true` → `removed`（不可恢复，位图主体连对象字节一并删除）|
+| POST | `/api/admin/content/{kind}/{id}/restore` | reviewer | **恢复**：写回台账里的 `prevModeration`。仅 `restricted` 可恢复，`removed` 恒 409 |
+
+### 已过审内容处置（migration 0044）
+
+`audit-queue` 的 approve/reject 只作用于**仍在人审队列里**的条目；本组端点作用于**已经在线上**的内容
+（举报队列指过来的那条路径）。实现 `server/src/admin_api/takedown.rs`，后台页面在
+`admin/src/components/ContentDisposal.tsx`（内容审核 → 已过审内容处置，深链
+`/audit?tab=disposal&kind=&subject=`）。
+
+`kind` 白名单四项，各自落在既有的**展示态列**上——处置写入一个非 `'approved'` 值，
+四个既有闸门（判「等于 approved」）随之自动关闭，无需给任何读取面新增过滤条件：
+
+| kind | 表.列 | 关掉的既有闸门 |
+|---|---|---|
+| `character` | `cloud_characters.moderation` | `join` 409 `character_not_approved`；邀请接受同判 |
+| `character_avatar` | `cloud_characters.avatar_moderation` | `CharacterView` / world roster / backpack 三处「仅 approved 才下发 avatarUrl」|
+| `world_cover` | `worlds.cover_moderation` | `worlds::visible_cover_url`（大厅 / 世界详情 / 后台世界列表唯一闸门）|
+| `world_template` | `world_templates.moderation` | `create_room` 409 `template_not_approved`；assembly 蓝图解引用同判 |
+
+| 约束 | 口径 |
+|---|---|
+| 🔴 边界 | 处置的是**展示面**，不是已发生的世界事实。`world_events` / `world_ticks` / `world_members` / `world_contributions` / `world_biographies` **一个字节不改**（§0.3 公共事实不可回滚），回执 `worldlineUntouched:true` 自述，用例逐字节快照守死 |
+| 🔴 运行中的世界 | **不受影响**：入场闸只在入场时判一次，被下架的卡会继续参演存量世界。回执与后台界面直接列出 `affectedRunningWorlds`，中止请走既有 `POST /admin/worlds/{id}/pause`；本端点**不代做强制离场**（那要改世界线相关表，需红线评审）|
+| 哨兵值 | `'takedown'`，**不复用 `'rejected'`**——后者是「发布时被驳回」的语义，复用会被 `POST /admin/appeals/{id}/resolve` 的改判路径悄悄翻转，且从此分不清「从未过审」与「过审后被下架」|
+| 队列不得复活 | `POST /admin/audit-queue/{id}/approve` 的回写带 `AND moderation <> 'takedown'` 守卫：已下架主体不得经人审队列绕过 `restore` 的权限与可逆性台阶复活。**reject 方向不设守卫**（驳回是更强的处置，应当落地）|
+| 再审可用范围 | 仅文本主体（`character` / `world_template`）。位图主体 400 如实告知：`check_image` 至今没有人审入队路径（见 migration 0027 注释），不假装排了队 |
+| 留痕 | `audit_logs`（`content.takedown` / `content.takedown_permanent` / `content.restore` / `content.recheck`）+ `risk_events`（`content_disposal` / `content_recheck`，经 `safety` 入口，本模块不直写）。下架/恢复与留痕**同事务** |
+| 作者告知 | `GET /api/assets/characters/{id}/status` 增 `takedown` 字段（`state`/`reversible`/`takenDownAt`/固定 `notice`）。🔴 **不回显运营内部处置理由**（口径同 `audit_logs.reason`；对比人审驳回理由走的是专为回显而设的 `audit_queue.reject_reason`）。已恢复 → 不下发 |
+| 运营开关 | **无**。内容安全处置属于合规设施，定位同 `MUSE_SAFETY_LEXICON`——一个能被关掉的下架入口，在需要它的那一刻恰好可能是关的 |
 | GET | `/api/admin/worlds` | operator | 世界列表。含 `participantCount`、`successRate`（**0..1 小数**，无已终结 tick 时为 null）、`todayTokens`/`todayCostCents`/`todayCostCny` |
 | POST | `/api/admin/worlds` | operator | 官方建房。可选 `cover`（一次建完带图）· 可选 `series: {maxInstances}`（**登记为世界系列 1 号实例**，migration 0035；开关未开时 400，见 §3「世界系列自动扩容」）|
 | GET | `/api/admin/worlds/{id}/diagnostics` | operator | 脱敏诊断（采样种子不外泄）。`budget` 含金额换算与用量比：`spentCny`/`dailyCnyBudget`/`usageRatio`（**0..1**，取 token 与 cny 两维较大者）/`spentTokensTodayEffective`（跨日已归零）。另含 `series`（系列队列态；**不受 env 开关门控**——关阀时运营更需要看得见队列，开关状态另作 `autoscaleEnabled` 明示）与 `beBiography`（崩塌封卷元信息，正文另走玩家读取面）|
@@ -860,7 +893,7 @@ Schema（全部字符串或字符串数组，**一个数字都没有**——§6�
 
 | 维度 | 键 | 形状 | 读数 |
 |---|---|---|---|
-| 身份维（§5） | `dimensions.identityShareBalance` | **组内分布**（身份各不相同，一个世界里同时存在多个） | 每个身份的**相对均分倍率**：`(该成员贡献分 ÷ 本世界成员贡献分总和) × 本世界成员数`，**1.0 = 恰好拿到均分**。给均值 / 中位数 / 极值 / 零分观察数 / 零分率，外加各身份**均值之间**的集中度 `meanShareGini`，以及 `(unassigned)` 对照桶 |
+| 身份维（§5） | `dimensions.identityShareBalance` | **组内分布**（身份各不相同，一个世界里同时存在多个） | 每个身份的**相对均分倍率**：`(该成员贡献分 ÷ 本世界成员贡献分总和) × 本世界成员数`，**1.0 = 恰好拿到均分**。`meanRelativeShare` 是读数信封（均值 + `n`/`worlds`/`sd`/中位数/极值），`zeroScoreRate` 是带 Wilson 区间的比例读数，外加各身份**均值之间**的集中度 `meanShareGini`（两层样本量：`n`=身份桶数、`sampleN`=最弱那条腿的观察数），以及 `(unassigned)` 对照桶 |
 | 戏服维（§6【拍板 3】） | `dimensions.realmTierWorldQuality` | **跨世界对比**（境界档全员统一，**没有组内分布**——组内基尼恒为 0，是个假指标） | 按钉住的 `realmTier.id` 分桶，各桶各自报 `slo::quality` 的世界质量三指标：完读率 / 阻断率（含独立的内容安全扣留率）/ 结局分布。`(none)` 是未钉戏服的**对照桶**，不丢弃 |
 
 | 项 | 口径 |
@@ -868,10 +901,14 @@ Schema（全部字符串或字符串数组，**一个数字都没有**——§6�
 | 归一化 | 身份维**先按世界归一化再跨世界求均值**：原始分跨世界求和测的是**世界寿命**不是身份失衡（跑得久的世界分自然多）。归一化后每个「世界 × 角色」观察等权，大小世界不互相主导 |
 | 🔴 分母差异 | 身份维分母 = `world_members` **全集**，无贡献分行的成员按 **0 分**计入。`world_contributions` 是**挣到分才落行**的，`attentionGini` 的交集口径因此**看不见「一分没挣到」的人**——而「某个身份是不是系统性拿不到戏」恰恰要靠这些人才答得了。两个数不可互相校验 |
 | 🔴 只读不回灌 | 本段**没有一条写语句**，产物只作 JSON 返回。理由与 `world_contributions` 独立建表同源（迁移 0025）：一旦按身份分组的戏份差进了引擎判定输入，「身份影响判定」就成立，直接违反 §0.1 平权红线。锁：`calibration_readings_never_write_anything` / `calibration_readings_never_touch_narrative_state` / `calibration_module_source_contains_no_write_statements` |
-| 🔴 三态 | `entry_not_open`（**这一维从未被任何模板配置过**，`value:null`，显示 `—`，且**不发任何计数**——发了会被当成 0 读）/ `no_data_in_window`（配置过但窗口内零样本，`value:null`，`—`，计数照发以便区分是「没世界」还是「有世界但没分配 / 都没挣到分」）/ `ok`（真数，**可以是 0**） |
+| 🔴 四态 | `entry_not_open`（**这一维从未被任何模板配置过**，块级，`value:null`，显示 `—`，且**不发任何计数**——发了会被当成 0 读）/ `no_data_in_window`（配置过但零样本，`value:null`，`—`，计数照发以便区分是「没世界」还是「有世界但没分配 / 都没挣到分」；读数级则指分母为 0）/ `insufficient_sample`（**有样本但 `n < minN`**，`value:null` 而 `pointEstimate`/`n`/`ci95` 照给，显示「样本不足（n=…）」，🔴 不许显示成 `0`，也不宜与 `—` 混同）/ `ok`（真数，**可以是 0**） |
+| 🔴 读数信封 | 每个读数是一个对象：`value`（可据此调参的读数，样本不足时 `null`）/ `pointEstimate`（原始算术，永远给）/ `n` / `unit`（`n` 数的是什么：`world`/`tick`/`event`/`observation`）/ `minN` / `ci95` / `ciNote`。**`n` 与 `value` 同处一个对象是刻意的**——取值必须穿过信封，「拿到比例却不知道压在几个观察上」在结构上不可能发生。🔴 渲染时必须与 `n`、`status` 一起渲染；`status ≠ ok` 的读数**不得**渲染成数字。锁：`every_reading_carries_its_own_sample_size` |
+| 🔴 最小样本量 | `MUSE_SLO_CALIBRATION_MIN_N`（默认 **30**）+ `MUSE_SLO_CALIBRATION_MIN_GROUPS`（默认 **2**，集中度类专用：1 个分组时基尼恒为 0，读起来是「很分散」而真相是「全压在一个上」，**符号反了**）。两者与依据一起回显在 `calibration.sampleFloor`（数会被复制走，文档不会）。30 的依据：`p̂=0.5` 时 95% Wilson 半宽 n=3 → ±0.37 / n=30 → ±0.17 / n=100 → ±0.10，且 n=30 时单个观察最多挪动比例 3.3 个百分点。**默认值不是物理常量**，同 `attentionGiniMax` |
+| 🔴 不确定性 | 比例类读数带 **95% Wilson 区间**（`ci95.method="wilson"`、`level=0.95`）——不用正态近似是因为它在 `p̂` 贴边时区间会塌成一个点。基尼与均值类**不给区间**，理由与替代方案随数下发在 `ciNote`（bootstrap 违反确定性契约；jackknife 重采样的是配置出来的总体、答错问题；均值的观察按世界聚类、iid 区间会低估宽度）。🔴 **有区间不等于有判语**：不给显著性布尔，区间对象只许有 `low`/`high`/`method`/`level`。锁：`confidence_intervals_come_without_a_significance_verdict` |
 | 🔴 不给综合分 | 校准是**多目标**的（公平 vs 戏剧性：把戏份摊平到各身份均值全是 1.0 就没有主角了）。两维在 `ok` 态都**没有**代表整维的标量 `value`，全树也不出现 `score`/`grade`/`verdict`/`recommendation` 一类判语字段。锁：`calibration_readings_expose_no_composite_score` |
 | 口径复用 | 集中度走 `slo::gini_coefficient`（与叙事注意力基尼同一实现）、三指标走 `slo::quality`（与仿真试跑、世界质量回归**算同一个数**）。批量取事实与单世界取事实由 `bulk_world_facts_match_single_world_facts` 锁住不漂移 |
-| cohort 偏差 | `completionRate` 分母含未收尾世界（`quality.rs` 口径），近期窗口天然偏低。本读数的用途是**横向对比**——同一窗口内各桶承受同样的截断偏差；各桶另给 `firstCreatedAt`/`lastCreatedAt`/`unfinished`，年龄分布差得远时的失真要读的人自己看得见 |
+| cohort 偏差 | `completionRate` 分母含未收尾世界（`quality.rs` 口径），近期窗口天然偏低。本读数的用途是**横向对比**——同一窗口内各桶承受同样的截断偏差；各桶另给 `firstCreatedAt`/`lastCreatedAt`/`unfinished`，年龄分布差得远时的失真要读的人自己看得见。⚠️ 置信区间**只覆盖抽样噪声、不覆盖这个截断偏差**（系统偏差，样本量再大也不消失），该说明随 `completionRate.ciNote` 下发 |
+| 各比率的 n 不同 | 戏服桶里三个比率的分母各是**世界 / 拍 / 事件**：`completionRate.n`=世界数、`blockedRate.n`=引擎拍数、`withheldRate.n`=事件数。「这一桶有 40 个世界」**不等于**「阻断率压在 40 个观察上」，混着读会把最不可信的那个数当成最可信的。桶级 `status` 只说世界数那一层 |
 | 上限 | 一次最多展开 `MUSE_SLO_CALIBRATION_WORLD_CAP` 个世界（默认 **300**，比 `scanRowCap` 小两个量级是刻意的——那一路解析 `assembled_json`，管的是内存峰值不是行数）。超限 → `skipped_too_large`，**明说跳过而不给残缺数** |
 
 > 🔴 **读数建成 ≠ 校准闭环已验证**（§0.3 七档）。两处 `effect.calibrationLoop` 因此从 `Missing`

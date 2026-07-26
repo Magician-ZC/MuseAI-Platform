@@ -1,13 +1,21 @@
 // 内容审核：Tab「审核队列」（机审预标注 + 人审 + 详情抽屉 + approve/reject）
-// + Tab「申诉复审」（components/AuditAppeals，被驳回内容的申诉裁决）。
+// + Tab「申诉复审」（components/AuditAppeals，被驳回内容的申诉裁决）
+// + Tab「已过审内容处置」（components/ContentDisposal，再审 / 下架 / 恢复，migration 0044）。
 // #10b（§10）：详情抽屉展示「卡片全文 cardJson + 机审命中点 + 同作者历史」。
 // 卡片全文/历史由审核详情端点（G-ASSETS #10a 契约）提供；端点未就绪时优雅降级——
 // 仍展示机审命中并标注「卡片全文需后端支持」，不崩溃。
+//
+// 🔴 前两个 Tab 只作用于**仍在人审队列里**的条目；第三个 Tab 作用于**已经在线上**的内容——
+// 这正是举报队列（社交举报 → 详情抽屉 → 跳转清单）指过来的那条路径。深链形如
+// `/audit?tab=disposal&kind=character&subject=cchar_x`，落地即自动查出目标主体，
+// 免得运营从举报单里手抄一遍 id。
 import { useEffect, useRef, useState } from 'react';
 import { Alert, Button, Descriptions, Drawer, message, Select, Space, Spin, Table, Tabs, Tag, Typography } from 'antd';
 import type { TableColumnsType } from 'antd';
+import { useLocation } from 'react-router-dom';
 import { adminFetch } from '../api';
 import AuditAppeals from '../components/AuditAppeals';
+import ContentDisposal from '../components/ContentDisposal';
 import { ErrorAlert, formatTime, friendlyError, ReasonModal, usePagedList } from '../components/shared';
 
 interface AuditRow {
@@ -122,6 +130,12 @@ const HISTORY_COLUMNS: TableColumnsType<AuthorHistoryEntry> = [
 ];
 
 export default function Audit() {
+  // 深链参数（举报队列的跳转清单会带上它们）。只读一次初值：之后的 Tab 切换由用户控制，
+  // 不该被地址栏里那次跳转反复拽回去。
+  const search = new URLSearchParams(useLocation().search);
+  const [tab, setTab] = useState(search.get('tab') === 'disposal' ? 'disposal' : 'queue');
+  const deepLinkKind = search.get('kind');
+  const deepLinkSubject = search.get('subject');
   const [status, setStatus] = useState('open');
   const [detail, setDetail] = useState<AuditRow | null>(null);
   const [enriched, setEnriched] = useState<AuditDetail | null>(null);
@@ -288,11 +302,21 @@ export default function Audit() {
     <div>
       <Typography.Title level={4}>内容审核</Typography.Title>
       <Tabs
-        defaultActiveKey="queue"
+        activeKey={tab}
+        onChange={setTab}
         items={[
           { key: 'queue', label: '审核队列', children: queuePane },
           // 申诉复审：被驳回内容的申诉裁决（改判通过 / 维持原判），惰性挂载，切到该 Tab 才拉取。
           { key: 'appeals', label: '申诉复审', children: <AuditAppeals /> },
+          // 已过审内容处置：前两个 Tab 够不着的那一半——内容一旦过审就离开了队列，
+          // 此后出问题只能从这里再审 / 下架 / 恢复。
+          {
+            key: 'disposal',
+            label: '已过审内容处置',
+            children: (
+              <ContentDisposal initialKind={deepLinkKind} initialSubjectId={deepLinkSubject} />
+            ),
+          },
         ]}
       />
 

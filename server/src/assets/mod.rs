@@ -6,6 +6,7 @@
 //!                                      → audit_queue / risk_events 由 moderate_and_queue 统一落库，本模块不二次写；Idempotency-Key 必须
 //! GET    /assets/characters/mine       我的云端版本列表（含审核态）
 //! GET    /assets/characters/{id}/status     审核态 + rejectReason（驳回理由回显）+ appeal（申诉状态）
+//!                                      + takedown（事后下架告知，migration 0044；只给状态与时间，不给运营内部理由）
 //! POST   /assets/characters/{id}/appeal     对机审/人审驳回发起申诉（owner-only，每主体终身一次；不改 moderation）
 //! POST   /assets/characters/{id}/withdraw   停止后续投放（withdrawn=1；运行中世界按入场协议处理，S3 消费）
 //! DELETE /assets/characters/{id}       异步删除任务（data_requests）：从未投放 → 立删；已投放 → 标记 + 任务清理
@@ -410,6 +411,41 @@ async fn fetch_appeal_view(
     })
 }
 
+/// 作者侧下架告知（无处置记录 / 已恢复 → null）。
+///
+/// 只给「状态 + 时间 + 是否可恢复 + 固定说明」四样，**不给运营内部处置理由**（见调用点注释）。
+/// `restored` 行不下发：已经恢复的内容对作者而言就是正常内容，翻旧账没有意义。
+async fn fetch_takedown_notice(
+    state: &AppState,
+    subject_kind: &str,
+    subject_id: &str,
+) -> Result<serde_json::Value, ApiError> {
+    let row: Option<(String, i64)> = sqlx::query_as(
+        "SELECT state, created_at FROM content_takedowns \
+         WHERE subject_kind = $1 AND subject_id = $2 AND state IN ('restricted', 'removed')",
+    )
+    .bind(subject_kind)
+    .bind(subject_id)
+    .fetch_optional(&state.db)
+    .await?;
+    Ok(match row {
+        Some((state, created_at)) => {
+            let reversible = state == "restricted";
+            serde_json::json!({
+                "state": state,
+                "reversible": reversible,
+                "takenDownAt": created_at,
+                "notice": if reversible {
+                    "该内容已被平台下架，暂不对外展示，也不能再投放到新的世界。如有异议请联系客服申诉。"
+                } else {
+                    "该内容已被平台永久移除，不可恢复。如需重新上线请重新发布。"
+                },
+            })
+        }
+        None => serde_json::Value::Null,
+    })
+}
+
 /// GET /assets/characters/{id}/status：审核态查询（owner 隔离，非本人 → 404 不泄露存在性）。
 /// 内联可审计 manifest（§2.3），发布方可直接预览云端副本的字段/用途/可见范围/删除策略。
 /// 另回显 rejectReason（卡被驳回时：最新 audit_queue.reject_reason 人审理由；机审直拒不入队，
@@ -447,6 +483,12 @@ async fn status(State(state): State<AppState>, user: AuthUser, Path(id): Path<St
 
     let appeal = fetch_appeal_view(&state, "character", &id).await?;
 
+    // 下架告知（migration 0044）：内容被运营事后下架时，作者有权知道「被处置了、什么时候」。
+    // 🔴 **不回显 `content_takedowns.reason`**——那是运营内部处置备注，口径同 `audit_logs.reason`
+    // （对比：人审驳回理由走的是另一列 `audit_queue.reject_reason`，那一列本就是为回显而设的）。
+    // 面向作者的说明用固定文案，避免内部备注经由本端点外泄。
+    let takedown = fetch_takedown_notice(&state, "character", &id).await?;
+
     let resp = serde_json::json!({
         "id": id,
         "moderation": moderation,
@@ -455,6 +497,7 @@ async fn status(State(state): State<AppState>, user: AuthUser, Path(id): Path<St
         "manifest": manifest,
         "rejectReason": reject_reason,
         "appeal": appeal,
+        "takedown": takedown,
     });
     Ok(json_response(serde_json::to_string(&resp).unwrap()))
 }

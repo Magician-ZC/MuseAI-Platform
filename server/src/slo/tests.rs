@@ -34,6 +34,8 @@ fn cfg() -> SloConfig {
         silent_streak_max: 3,
         scan_row_cap: 50_000,
         calibration_world_cap: 300,
+        calibration_min_n: 30,
+        calibration_min_groups: 2,
     }
 }
 

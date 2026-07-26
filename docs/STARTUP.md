@@ -113,7 +113,28 @@ cd server && MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo ru
 | `MUSE_SAFETY_RUNTIME_AUDIT` | `high` | 运行时命中入人审队列的策略:`high`(仅高危)/`all`/`none`。**命中一律记 risk_events**,本开关只管是否额外入 `audit_queue`(每 tick 每事件都入队会淹掉人审)。配错值回落 `high`,不静默放宽或收紧 |
 | `MUSE_CORS_ORIGINS` | 本地开发六项(见下) | 跨源白名单(逗号分隔)。**三个前端都与 server 不同源**:玩家端 Vite `:1420`、运营后台 Vite `:1430`、Tauri webview(`tauri://localhost` / `https://tauri.localhost`),而 server 在 `:8787`。🔴 **生产必配**——不配则只放行本地开发来源,线上域名会被拦。非法条目跳过并告警,全部非法则退化为「不放行任何跨源」(fail-closed:配错了宁可前端连不上、立刻可见,也不静默放宽成通配)。**刻意不提供通配选项**:这些接口虽有 JWT 鉴权,放开任意源仍是无谓攻击面 |
 
-> 上表即全部 `MUSE_*` 变量(校验命令:`grep -rhoE '"MUSE_[A-Z0-9_]+"' server/src crates | sort -u`)。
+> 🔴 **上表不是全部——它是「部署时必须关心」的那些。** 此处原先写着「上表即全部」,
+> 而 2026-07-27 用它自己给的校验命令清点:代码里 **105 个** `MUSE_*`,表里 **21 个**,
+> 差着 84 个。那句话从写下之后的每一批开发都在让它更不成立。
+>
+> 剩下的绝大多数是**功能参数**(配额、阈值、窗口、页大小、分成比例……),
+> dev 与生产**都有合理默认值,不配也能跑**;把它们全列进这张表,只会淹没掉真正需要
+> 在生产改的那几行(`MUSE_DEV` / `MUSE_JWT_SECRET` / `MUSE_DATABASE_URL` /
+> `MUSE_CORS_ORIGINS` / `MUSE_LIVEGATE_SECRET`)。
+>
+> 需要完整清单时**以代码为准**:
+>
+> ```bash
+> grep -rhoE '"MUSE_[A-Z0-9_]+"' server/src crates | tr -d '"' | sort -u
+> ```
+>
+> - **功能开关类**(默认开/关、可按用户/世界灰度)以 `flags::KNOWN_FLAGS` 为唯一权威——
+>   那里有每个开关的默认值、归属模块、一句话说明与是否已接线,比任何文档副本都新。
+> - **各模块的参数**在其模块头注释里就地说明(如 `runtime::offpeak`、`slo::calibration`、
+>   `social`、`livestage`),改参数的人一定会读那里,不一定会读本文。
+>
+> 同理见 `docs/STARTUP.md` §7(用例基线)、`flags::KNOWN_FLAGS`(开关数)、`docs/API.md`(路由数)
+> ——本仓库一律**不复述会过期的清单**,只指向唯一权威源。
 
 > 生产最小改动:`MUSE_DEV=0`、`MUSE_JWT_SECRET=<强随机>`、`MUSE_DATABASE_URL=<postgres>`、`MUSE_LIVEGATE_SECRET=<密钥>`(若开 arena)。
 
@@ -183,8 +204,8 @@ cd server && MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo ru
 ```bash
 # 引擎 + 后端 + 桌面壳
 cargo test --manifest-path crates/muse-engine/Cargo.toml          # 291 passed
-(cd server && cargo test)                                          # 886 passed(default,含黄金世界回归)
-(cd server && cargo test --features billing,arena)                 # 964 passed
+(cd server && cargo test)                                          # 912 passed(default,含黄金世界回归)
+(cd server && cargo test --features billing,arena)                 # 990 passed
 (cd server && cargo test golden)                                   # 14 passed(12 项 runtime::golden::* + 2 项录放 round-trip)
 cargo test --manifest-path src-tauri/Cargo.toml                    # 216 passed
 # 前端 + 后台

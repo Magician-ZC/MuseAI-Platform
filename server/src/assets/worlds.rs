@@ -291,7 +291,11 @@ fn auto_star_rating(skeleton: &Value) -> i64 {
 
 /// 机审文本：拼接可叙述内容（源作品标题 + 各 NPC 卡语义字段 + 地点名 + 道具叙事 + 隐藏/支线模板 + 剧情线摘要）。
 /// 在语义拼接文本（而非序列化 JSON 串）上机审，绕过跨字段/跨元素分段绕过；NPC 卡复用 `card_scan_text` 语义。
-fn world_scan_text(skeleton: &Value) -> String {
+///
+/// 可见性放宽至 `pub(crate)`（逻辑一字未改）：已过审模板的**运营再审**
+/// （`admin_api::takedown::recheck`）必须送与发布时**逐字一致**的那段文本进机审，
+/// 否则两次机审看的不是同一份内容，「上次过了这次没过」就无从归因。
+pub(crate) fn world_scan_text(skeleton: &Value) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut push = |s: &str| {
         let t = s.trim();

@@ -1242,6 +1242,11 @@ fn materialize_item_facts(resources: &mut Vec<String>, facts: &[String]) {
 /// 玩家 backpack 物化：读本世界 `carried` 状态的物品 → 按角色 id 聚合持有事实（`item:<id>`/`tag:<t>`）。
 /// 事实源单一化：物品事实只来自 backpacks（§9.6 服务端权威写入路径），不信任 CharacterState 历史残留。
 /// effectTags 优先取 carry 落库的降档覆盖（S-5 转译入场覆盖列），否则取 items 定义。
+///
+/// 🔴 次级键 `b.id` 不可省：本函数的产物进 `CharacterState.resources`，是**引擎判定输入**
+/// （R6b 秘境准入读它），且 `tag:` 的入表顺序由行序决定。`backpacks` 无 `(user, item)` 唯一约束 ⇒
+/// 同一角色可持有同一 item 的多行，各行 `effect_tags_override` 可不同，`(cid, item_id)` 因此不唯一。
+/// `b.id` 是主键，补上即得全序。
 async fn load_carried_item_facts(
     db: &AnyPool,
     world_id: &str,
@@ -1253,7 +1258,7 @@ async fn load_carried_item_facts(
          JOIN backpacks b ON b.user_id = wm.user_id AND b.carried_world_id = wm.world_id \
          JOIN items i ON i.id = b.item_id \
          WHERE wm.world_id = $1 AND wm.status = 'active' AND b.status = 'carried' \
-         ORDER BY wm.cloud_character_id, i.id",
+         ORDER BY wm.cloud_character_id, i.id, b.id",
     )
     .bind(world_id)
     .fetch_all(db)
@@ -2308,11 +2313,14 @@ async fn process_tick_inner(
 
     // 7) 托梦（accepted whisper）：Q-3 只喂给真正参与本回合决策的活跃角色，并记录被喂入的干预 id，
     //    仅这些在 commit 时置 applied（避免把长回合中途新到、或非在场角色的 whisper 静默标 applied 却从不投递）。
+    // 🔴 次级键 `id` 不可省：同一角色的多条 whisper 在下面**按行序换行拼接成一个字符串**直接进
+    //    Q-3 prompt——行序变即模型输入变，回放/黄金世界的确定性随之破。同一玩家连发两条托梦
+    //    共用一个 `now_ms()` 属常态，`created_at` 单键在 PG 上不定序。
     let mut whispers: BTreeMap<String, String> = BTreeMap::new();
     let mut fed_intervention_ids: Vec<String> = Vec::new();
     let wrows = sqlx::query(
         "SELECT id, character_id, payload_json FROM interventions \
-         WHERE world_id=$1 AND status='accepted' AND kind='whisper' ORDER BY created_at ASC",
+         WHERE world_id=$1 AND status='accepted' AND kind='whisper' ORDER BY created_at ASC, id ASC",
     )
     .bind(world_id)
     .fetch_all(db)

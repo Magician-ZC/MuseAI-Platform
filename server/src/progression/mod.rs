@@ -752,9 +752,12 @@ async fn seal_be_biography_tx(
     }
 
     // ---- 崩塌原因：唯一来源 = audit_logs('world.ended')（runtime 在本事务内、本函数之前写入） ----
+    // 🔴 次级键 `id` 不可省：这条 SELECT 的产物是写进 BE 传记的**死因**，注释自称"唯一确定性事实源"——
+    // 排序键并列即证伪该自称。`end_world_tx` 的 `WHERE status='running'` CAS 保证同一世界只会写一条
+    // `world.ended`，故实践中不会并列；但"实践中不会"不是确定性，补 `id ASC` 让它在 schema 层面成立。
     let audit_row = sqlx::query(
         "SELECT reason, created_at FROM audit_logs \
-         WHERE action = 'world.ended' AND subject = $1 ORDER BY created_at ASC LIMIT 1",
+         WHERE action = 'world.ended' AND subject = $1 ORDER BY created_at ASC, id ASC LIMIT 1",
     )
     .bind(world_id)
     .fetch_optional(&mut **tx)

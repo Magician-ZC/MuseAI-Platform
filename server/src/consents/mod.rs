@@ -129,7 +129,7 @@ async fn my_consents(
     let rows: Vec<(String, String, String, String, String, String, String, i64, i64)> = sqlx::query_as(
         "SELECT DISTINCT c.id, c.world_id, c.event_kind, c.subject_character_ids, c.detail, c.status, c.responses_json, c.expires_at, c.created_at \
          FROM consent_requests c JOIN world_members m ON m.world_id = c.world_id AND m.user_id = $1 \
-         WHERE ($2 = 'all' OR c.status = $3) ORDER BY c.created_at DESC LIMIT 100",
+         WHERE ($2 = 'all' OR c.status = $3) ORDER BY c.created_at DESC, c.id DESC LIMIT 100",
     )
     .bind(&user.user_id)
     .bind(&status_filter)

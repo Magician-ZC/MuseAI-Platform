@@ -145,14 +145,10 @@
 > **不是** `Production-ready`，更**不是** `Validated`：
 >
 > - 从未在真实部署 / 真实并发 / 真实数据量下跑过；连接池、超时、迁移锁、故障恢复零验证。
-> - ⚠️ **已登记未修：排序稳定性**。PG 对 `ORDER BY` 的并列行不保证顺序，SQLite 则常按 rowid
->   稳定返回。已审出约 30 处生产 SQL 的排序键不唯一且顺序可观测，其中数处并列是**结构性必然**
->   （如 `events::insert_events_tx` 整批事件共用一个 `now_ms()`，而 `reports/mod.rs` 按
->   `occurred_at ASC LIMIT 200` 取日报素材）。**当前 CI 全绿并不能证明这些是对的**——
->   它们是非确定性的，绿只说明这一轮没抽中。清单与优先级见 **§3.3**。
-> - 已知未修的一处特殊情况：`auth/mod.rs` 的 `sms_challenges ORDER BY created_at DESC LIMIT 1`。
->   该表无单调列、`id` 是 uuid v4，补次级键只能把「不稳定的任意」变成「稳定的任意」，
->   **语义上仍不等于「最新那条」**。需产品决定或加单调序列，不得自行补一个假的确定性。
+> - ⚠️ **排序稳定性：清单已修，两处硬骨头仍在**（2026-07-27）。PG 对 `ORDER BY` 的并列行不保证
+>   顺序，SQLite 则常按 rowid 稳定返回。审出的约 30 处已按三类处置完毕（见 **§3.3**）；
+>   剩余两项是**并发正确性**而非排序问题，需迁移 + 评审：`world_events.sequence` 的
+>   `MAX+1` 分配、`sms_challenges` 的「最新那条」。**CI 全绿仍不能证明剩余项是对的。**
 >
 > CI（`.github/workflows/test.yml` 的 `platform-test`）已把 PG 全量两个 feature 组合都设为
 > **阻塞门禁**（`continue-on-error` 已删除）。
@@ -349,52 +345,101 @@ if 线现在是「可开、可跑、可读、可审、可查成本」，但仍**
 > **纪律提醒**：本节存在的意义是 §4.3 那条"发布评审以台账为准，禁止口头'已完成'"。
 > 台账漏项 = 评审失去依据，与状态写错同等严重。改 R1 相关代码时同步改本表。
 
-### 3.3 Postgres 排序稳定性待办（登记于 2026-07-27，**未修**）
+### 3.3 Postgres 排序稳定性（登记 2026-07-27 · **排序清单已修，两处并发问题仍在**）
 
 PG 对 `ORDER BY` 并列行的顺序**不作任何保证**（可随计划、并行度、物理页序变化）；SQLite 则
-常按 rowid 稳定返回。仓库已按「补唯一次级键」范式修过三处（`load_active_cards`、
-`worlds/mod.rs` 公开阵容、`backpack/mod.rs` `my_memberships`）。下列是**同类但尚未修**的站点。
+常按 rowid 稳定返回。首轮审计出的约 30 处已全部处置（下表），处置状态 **`Implemented`**。
 
-> 🔴 **CI 全绿不能证明这些是对的。** 它们是非确定性的——绿只说明这一轮没抽中。
-> 本节是登记，不是「已解决」。修任一项都需评审：补次级键会改变现有返回顺序（两库皆然），
-> 而部分站点的正确排序键涉及产品语义（哪条算"最新"）。
+> 🔴 **「测试全绿」仍不是本节的证据。** 排序 bug 是非确定性的，绿只说明这一轮没抽中。
+> 本次的证据不是「跑绿了」，而是：**每处补的次级键都能构造出让旧 SQL 变红的用例**，
+> 且新增的 5 个用例已逐个验证过「回退到旧 SQL 即失败」（见下方「怎么验的」）。
+> 本节剩余的两项**不是排序问题**，是并发正确性问题，方案见文末。
 
-**P0 · 并列必然发生，且顺序进入模型输入 / 报告内容**
+**处置口径分三类**（不一刀切）：
 
-| 站点 | 排序 | 为什么必然并列 |
+1. **补唯一次级键** —— 排序语义本就清楚，只缺 tie-breaker。补主键或其他唯一列。
+2. **换用对的列** —— 排序键本身选错了，给错的列打补丁只会把错误固化。
+3. **不补假确定性** —— 表里根本没有能表达该语义的列时，补键只会把「不稳定的任意」
+   变成「稳定的任意」。这种要么改写入侧（迁移），要么保持原样并把原因写在代码里。
+
+#### 已修清单
+
+| 站点 | 类 | 处置 |
 |---|---|---|
-| `reports/mod.rs:123` `world_events` | `ORDER BY occurred_at ASC LIMIT 200` | `events::insert_events_tx` 整批事件**共用一个** `now_ms()`，一个 tick 的事件时间戳全同。表内已有每世界单调的 `sequence` 列可用 |
-| `runtime/mod.rs:2315` `interventions` | `ORDER BY created_at ASC` | 多条 whisper 按行序**拼接成字符串**进 Q-3 prompt，顺序变即模型输入变，破坏回放/golden 确定性 |
-| `backpack/mod.rs:155` `my_backpack` | `ORDER BY b.acquired_at DESC` | 缺次级键——正是 `:265` `my_memberships` 已修站点的**同胞，当时漏了**；结算一次发多件道具共用 `now_ms()` |
+| `reports/mod.rs` 日报素材 | **2** | `ORDER BY occurred_at ASC` → **`sequence ASC, id ASC`**。整批事件共用一个 `now_ms()`，`occurred_at` 批内恒为常量，排不动任何东西；`sequence` 才是世界内的因果序 |
+| `auth/mod.rs` 发码限频 | **2** | `ORDER BY created_at DESC LIMIT 1` → **`SELECT MAX(created_at)`**。这里要的是一个**值**不是一**行**，聚合口径下"行序"根本不存在 |
+| `runtime/mod.rs` 托梦投喂 | 1 | `+ id ASC`。多条 whisper 按行序拼接进 Q-3 prompt，行序变即模型输入变 |
+| `runtime/mod.rs` 携带道具物化 | 1 | `+ b.id`。产物进 `CharacterState.resources`，是引擎判定输入 |
+| `backpack/mod.rs` `my_backpack` | 1 | `+ b.id DESC`。`my_memberships` 已修站点的同胞，首轮漏了 |
+| `admin_api/dashboards.rs` 成本榜 | 1 | `+ world_id ASC`。按 `SUM()` 排序 ⇒ 零成本世界结构性全部并列，Rust 侧再切 `COST_TOP_N` ⇒ 榜单**成员**都是任意的 |
+| `notifications/mod.rs` outbox 重扫 | 1 | `+ id ASC`。`due_at` 是排定时刻，整批同值是常态；单键 + `LIMIT 500` ⇒ 待发超 500 时有饥饿风险 |
+| `progression/mod.rs` BE 死因 | 1 | `+ id ASC`。注释自称"唯一确定性事实源"，排序键并列即证伪该自称 |
+| `admin_api/users.rs` KYC 状态 | 1△ | `+ r.id DESC`。**保留了语义缺口**：该表无单调列，补键只保证「稳定」不保证「最新」；本列只进展示、不进判定，故先取确定性 |
+| `memorial/mod.rs` 我的印记 | 1 | `+ deceased_character_id ASC`（补齐唯一键 `(character_id, deceased_character_id)`） |
+| `social/mod.rs` ×5、`consents`、`interventions`、`invitations` ×2、`arena`、`livegate`、`assets` ×2、`admin_api/audit`、`admin_api/governance` ×2、`worlds::active_version_tx` | 1 | 一律补主键 `id` 作末位键 |
+| `worlds/mod.rs` `find_open_instance` | — | **误报，未改**。`world_series_instances` 主键 `(series_id, instance_no)`，查询已按 `series_id` 等值过滤 ⇒ `instance_no` 在结果集内唯一，本就是全序。已在源码注释里钉死结论，防下一个人"顺手补一个 id" |
 
-**P1 · 游标分页键不唯一 ⇒ 跨页静默丢行**（末行 `created_at` 当游标 + `created_at < cursor` 过滤，
-并列行跨页即永久丢失）：`notifications/mod.rs:293`、`reports/mod.rs:258`、`social/mod.rs:1785`。
+**游标分页三处（`notifications` / `reports` / `social` 举报队列）不是补键能修的**：
+末行 `created_at` 当游标 + `created_at < cursor` 的**严格小于**，在并列组横跨页边界时会把
+整组同值行**永久跳过**——这不是顺序抖动，是**数据丢失**，且两个库上都会发生
+（SQLite 只是每次丢同一条，更难被发现）。已改为**复合游标 keyset**
+`(created_at, id)`，工具与推导见 `server/src/pagination.rs` 模块头注释。
+**向后兼容**：新增可选入参 `cursorId`；不传时退化为原来的单列语义，逐字节等价，
+旧客户端零行为变化（用例直接断言了这一点）。响应新增 `nextCursorId`。
+举报队列那处后果最重：举报是安全通道，被跳过的一条运营**永远看不见** = 永远不会被处置。
 
-**P2 · `LIMIT n` 取到任意子集**（feature-gated 模块从未在 PG 跑过，优先）：`arena/mod.rs:270`、
-`livegate/mod.rs:413`、`consents/mod.rs:132`、`interventions/mod.rs:286`、`invitations/mod.rs:511/:553`、
-`notifications/mod.rs:175`（`due_at` 是排定时刻，整批同值是常态 ⇒ 超 500 待发时有**饥饿**风险）、
-`social/mod.rs:1159/:1346/:1409`。
+#### 怎么验的（这是本节唯一的证据，不是"CI 绿了"）
 
-**P3 · 全量返回但并列可能**：`reports/mod.rs:245`、`assets/mod.rs:359`、`assets/worlds.rs:669`、
-`admin_api/audit.rs:149`、`memorial/mod.rs:747`、`admin_api/governance.rs:40/:193`、
-`admin_api/dashboards.rs:288`（按 `SUM()` 聚合值排序，零成本世界**结构性全部并列**，
-Rust 侧再切 `COST_TOP_N=10` ⇒ 榜单**成员**都是任意的）、`runtime/mod.rs:1256`、`worlds/mod.rs:1541`。
+- 新增 5 个用例：`reports`×2、`backpack`×1、`social`×1、`auth`×1，另加 `pagination` 单元测试 2 个。
+- 每个用例的 fixture 都**构造成让旧 SQL 必然失败**，并逐个实测过：把 SQL 回退到改动前，
+  `highlights_follow_event_sequence_not_the_wall_clock` 得到 `[seq-3, seq-4, seq-2, seq-1]`、
+  `keyset_cursor_recovers_the_row...` 第二页为 0 行、
+  `backpack_ties_...` 得到升序而非降序——三处均确认变红，改回后变绿。
+- 双库全量：SQLite `883`（`billing,arena`）/ `805`（default）/ golden `14`，**数量与断言零变化**；
+  同一套用例在**一次性 Postgres 16 实例**上跑出**完全相同**的 `883` / `805`。
+  （PG 实例建在临时目录、跑完立即 `pg_ctl stop` + `rm -rf`，未在仓库或系统留任何数据目录。）
+- golden 基线与 `runtime/simulation/baseline.json` **一个字节未动**。
 
-**`LIMIT 1`「取最新那条」· 并列会改变系统实际采用的值**（不只是显示顺序）：
-`admin_api/users.rs:63`（KYC 状态，并列可能显示 `failed` 而实际 `verified`）、
-`progression/mod.rs:757`（写进 BE 传记的**死因**，注释自称"唯一确定性事实源"，并列即证伪）、
-`social/mod.rs:826/:1659`、`worlds/mod.rs:1233`（"哪个配置版本是 live"，目前 `dead_code`，latent）。
+#### 剩余两项（**并发正确性，不是排序**；需迁移 + 评审，本批次有意未动）
 
-**特殊：不得自行补假确定性** —— `auth/mod.rs:248/:304` `sms_challenges ORDER BY created_at DESC LIMIT 1`。
-该表无单调列、`id` 是 uuid v4；补次级键只能把「不稳定的任意」变成「稳定的任意」，语义上仍不是
-「最新那条」。`:304` 风险更高（决定校验哪条 OTP hash）。**需产品决定或加单调序列。**
+**① `world_events.sequence` 的分配没有并发安全**（风险更高的一项）
 
-**相邻风险（并发正确性，非排序）**：`world_events.sequence` 由事务内
+`events::insert_events_tx` 与 `events::persist_and_broadcast_public_event` 都用事务内
 `SELECT COALESCE(MAX(sequence),-1)+1` 读-改-写分配，而 `idx_world_events_world(world_id, sequence)`
-**非唯一**。SQLite 的单写者锁让它事实上串行；PG 在 READ COMMITTED 下不会。两个并发写者可分到
-同一 `sequence`，从而**反向把并列引入**所有依赖 `sequence` 唯一性的站点
-（`clips/mod.rs:36` 的"后来者胜"规则直接依赖它、`arena/mod.rs:240/:367`、`events/mod.rs:107`、`slo/mod.rs:253`）。
-加 `UNIQUE(world_id, sequence)` 可把静默的顺序损坏变成响亮的约束冲突——需迁移 + 评审。
+**非唯一**。SQLite 的单写者锁让它事实上串行；**PG 在 READ COMMITTED 下不会**——
+`SELECT MAX()` 不取任何锁，两个并发事务读到同一个 `MAX` 就会写出同号，且**静默提交**。
+
+- **竞态是真实可达的，不是理论**：`arena/mod.rs:85`（`arena` feature 下的礼物/赛事事件）
+  是玩家/运营触发的 HTTP 路径，与 `runtime::commit_tick` 的批量落库并行，二者写同一个世界。
+- **爆炸半径 = 反向把并列引入所有依赖 sequence 唯一性的站点**：`clips/mod.rs:36` 的"后来者胜"
+  高光规则、`arena/mod.rs:240/:367`、`slo/mod.rs:253`，最重的是 `events/mod.rs:107`
+  的 `VISIBLE_EVENTS_SQL`——它拿 `sequence > $cursor` 当 WS 断线补偿游标，撞号意味着
+  两条事件里有一条**永远不会补给重连的客户端**。
+- 🔴 **只加 `UNIQUE(world_id, sequence)` 是错的修法**：它把静默损坏换成 23505，而输的那一方
+  是**一整个 tick 的 commit 事务回滚**；且迁移在存量已有重复数据时会直接失败（= 服务起不来）。
+
+  **建议方案（可移植、无需 `FOR UPDATE`/`RETURNING`）**：加一张 `world_event_seq(world_id PK, next_seq)`，
+  在**同一事务内**按 `INSERT ... ON CONFLICT DO NOTHING` → `UPDATE ... SET next_seq = next_seq + n`
+  → `SELECT next_seq` 三步领号。正确性来自第二步的 `UPDATE` 拿**行级排他锁**：并发事务的
+  同一行 `UPDATE` 会阻塞到前者提交，再在**更新后**的值上叠加，无丢失更新；SQLite 那边写锁本就串行。
+  迁移里用 `SELECT world_id, MAX(sequence)+1 FROM world_events GROUP BY world_id` 回填。
+  待分配改造落地**之后**，唯一索引才可以作为兜底加上（仍需先扫存量重复）。
+  代价：该行锁持有到 tick 提交为止 ⇒ 同一世界的事件写入串行化——语义上本就该串行，
+  且 `commit_tick` 的事务在模型调用**之后**才开启、纯 DB 无外部 IO，故锁窗很短。
+  未在本批次落地的理由：改的是全仓最关键的写路径，而并发正确性**无法靠现有单连接测试池验证**
+  （`testkit` 的 PG 池 `max_connections(1)`），需要专门的并发压测 + 评审。
+
+**② `sms_challenges` 的「最新那条」（`auth/mod.rs:304`，登录时校验哪条 OTP hash）**
+
+该表无单调列、`id` 是 uuid v4。**已按第 3 类处置：不补假确定性，原样保留并在代码里写清原因。**
+同一站点的**限频**那半边（原 `:248`）已按第 2 类真正修掉——它只需要一个值，换成 `MAX()` 后
+"行序"不复存在。剩下的 `:304` 确实需要定位到具体一行，而并列的唯一来源是限频检查的 TOCTOU
+（两个并发请求都读到"无近期记录"，各插一行）——同样是**写入侧**问题。两条候选：
+(a) `UNIQUE(phone, created_at)` + 把冲突映射成 409 限频，让同毫秒并列**物理上不可能**，
+    于是 `created_at DESC` 天然成为全序（代价：迁移会在存量重复数据上失败，且把竞态从静默变成写错误）；
+(b) 给表加真正的单调序列列（与 ① 是同一道题，同样的代价）。
+两条都需要迁移，且整条短信通道当前是 Dev 桩（`DevSms`，按 §0.3 本就不可上线），
+故排在 ① 之后。**在此之前不得给它补 `id DESC` 充数。**
 
 ## 4. 验证基建三件套（优先于新增功能）
 

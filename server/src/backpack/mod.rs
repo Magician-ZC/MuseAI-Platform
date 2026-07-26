@@ -147,12 +147,15 @@ pub async fn grant_item(
 
 // ---------- GET /me/backpack ----------
 
+/// 🔴 次级键 `b.id` 不可省（同下方 `my_memberships`）：一次结算发多件道具走
+/// `grant_item_tx` 批量写入，整批**共用同一个 `now_ms()`**，`acquired_at` 并列是结构性必然
+/// 而非偶发。单键在 PG 上不定序；SQLite 恰好按 rowid 稳定，故这类顺序 bug 只跑 SQLite 永远看不见。
 async fn my_backpack(State(state): State<AppState>, user: AuthUser) -> Result<Json<Value>, ApiError> {
     let rows = sqlx::query(
         "SELECT b.id AS bp_id, b.status AS bp_status, b.acquired_world_id, b.carried_world_id, b.acquired_at, \
          i.id AS id, i.narrative, i.effect_tags, i.origin_world_template_id, i.cosmology_json, i.power_tier \
          FROM backpacks b JOIN items i ON i.id = b.item_id \
-         WHERE b.user_id = $1 AND b.status != 'consumed' ORDER BY b.acquired_at DESC",
+         WHERE b.user_id = $1 AND b.status != 'consumed' ORDER BY b.acquired_at DESC, b.id DESC",
     )
     .bind(&user.user_id)
     .fetch_all(&state.db)
@@ -608,6 +611,67 @@ mod tests {
         let state = test_state().await;
         let (s, _) = get_memberships(&state, None).await;
         assert_eq!(s, StatusCode::UNAUTHORIZED, "AuthUser 守卫：缺凭证应 401");
+    }
+
+    // ---------- PG 排序稳定性（docs/VALIDATION.md §3.3） ----------
+
+    /// 背包在 `acquired_at` 并列时按 `b.id DESC` 定序，**不靠 SQLite 的 rowid 巧合**。
+    ///
+    /// 一次结算发多件道具走同一个 `grant_item_tx` 批次，整批共用一个 `now_ms()` ⇒ `acquired_at`
+    /// 全同是结构性必然。本用例按 id **升序**插入（rowid 序 = 升序），断言下发是**降序**：
+    /// 只有 `ORDER BY ... , b.id DESC` 真正生效才可能成立，落库顺序帮不上忙。
+    /// 这与已修的 `my_memberships` 是同一条范式（当时漏了本站点）。
+    #[tokio::test]
+    async fn backpack_ties_on_acquired_at_are_broken_by_id_not_by_insertion_order() {
+        let state = test_state().await;
+        seed_user(&state.db, "u1").await;
+        let at = now_ms();
+        // 按 id 升序插入：bp_a → bp_b → bp_c（rowid 序与 id 序一致，二者不可区分才是陷阱）。
+        for suffix in ["a", "b", "c"] {
+            let item_id = format!("it_{suffix}");
+            sqlx::query(
+                "INSERT INTO items (id, narrative, effect_tags, origin_world_template_id, cosmology_json, \
+                 power_tier, created_at) VALUES ($1, '道具', '[]', 'tpl', '[]', 1, $2)",
+            )
+            .bind(&item_id)
+            .bind(at)
+            .execute(&state.db)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO backpacks (id, user_id, item_id, acquired_world_id, status, acquired_at) \
+                 VALUES ($1, 'u1', $2, 'w0', 'owned', $3)",
+            )
+            .bind(format!("bp_{suffix}"))
+            .bind(&item_id)
+            .bind(at) // 整批同毫秒：`acquired_at` 排不动任何东西
+            .execute(&state.db)
+            .await
+            .unwrap();
+        }
+
+        let app = crate::app::build_router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/me/backpack")
+                    .header("authorization", format!("Bearer {}", token(&state, "u1")))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let order: Vec<&str> =
+            v["items"].as_array().unwrap().iter().map(|i| i["backpackId"].as_str().unwrap()).collect();
+        assert_eq!(
+            order,
+            vec!["bp_c", "bp_b", "bp_a"],
+            "同 acquired_at 必须按 backpack id 降序定序；插入序/rowid 序是相反的，抄不到答案"
+        );
     }
 
     // ---------- 头像下发（红线：未过审绝不外泄） ----------

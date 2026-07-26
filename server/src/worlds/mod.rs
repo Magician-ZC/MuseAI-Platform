@@ -1228,9 +1228,15 @@ impl CreateWorldParams {
     }
 }
 
+/// 取某配置表当前 live 的版本号（`prompt_versions` / `model_routes`，两表同形状）。
+///
+/// 🔴 次级键 `id` 不可省：返回值是「哪个配置版本是 live」这一**被采用的事实**，不是显示顺序。
+/// `active` 列没有唯一约束（激活端点靠应用层把同 scope 其余行置 0），并列的 `created_at` 在 PG 上
+/// 不定序 ⇒ 同一世界两次建房可能钉住不同版本。当前 `dead_code`，故这是把 latent 的坑先填了。
 #[allow(dead_code)]
 async fn active_version_tx(tx: &mut Transaction<'_, Any>, table: &str) -> Result<Option<String>, ApiError> {
-    let sql = format!("SELECT version FROM {table} WHERE active = 1 ORDER BY created_at DESC LIMIT 1");
+    let sql =
+        format!("SELECT version FROM {table} WHERE active = 1 ORDER BY created_at DESC, id DESC LIMIT 1");
     let row = sqlx::query(&sql).fetch_optional(&mut **tx).await?;
     Ok(match row {
         Some(r) => Some(r.try_get("version")?),
@@ -1528,6 +1534,10 @@ pub(crate) async fn load_series_of_world(
 /// 判据 = `status IN ('open','running')` 且 active 成员数 < member_limit——与 join 的人数守卫
 /// **同一个口径**（成员计数条件逐字相同），故这里说"能进"与 join 真的能进不会打架。
 /// 号数升序 = 队列语义：低号先填满，不会让人散在一堆半空的房里。
+///
+/// 排序确定性：`world_series_instances` 主键是 `(series_id, instance_no)`，本查询已按 `series_id`
+/// 等值过滤 ⇒ `instance_no` 在结果集内**唯一**，`ORDER BY i.instance_no ASC` 本身就是全序，
+/// 无需次级键（PG 排序稳定性审计核查结论，勿再"顺手补一个 id"）。
 async fn find_open_instance(
     db: &AnyPool,
     series_id: &str,

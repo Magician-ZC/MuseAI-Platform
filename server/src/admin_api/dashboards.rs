@@ -283,9 +283,12 @@ pub(super) async fn metrics_overview(
     // ① 每局（每个世界实例）累计 token。去掉了历史上的 `LIMIT 10`：平台合计与每玩家均值必须覆盖
     //    全部世界才有定价意义；GROUP BY 本就要扫全表，多回传几行世界级聚合的代价可忽略，
     //    榜单仍只取头部 COST_TOP_N 条。
+    // 🔴 次级键 `world_id` 不可省：这是按 `SUM()` 聚合值排序，**零成本世界结构性全部并列**
+    //    （tokens 都是 0），而 Rust 侧随后切 `COST_TOP_N` 条 ⇒ 单键下榜单的**成员**都是任意的。
+    //    `world_id` 是 GROUP BY 键 ⇒ 每行唯一，补上即得全序。
     let cost_rows = sqlx::query(
         "SELECT world_id, CAST(COALESCE(SUM(cost_tokens), 0) AS BIGINT) AS tokens FROM world_ticks \
-         GROUP BY world_id ORDER BY tokens DESC",
+         GROUP BY world_id ORDER BY tokens DESC, world_id ASC",
     )
     .fetch_all(db)
     .await?;

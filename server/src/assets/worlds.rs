@@ -666,7 +666,7 @@ async fn publish(
 async fn list_mine(State(state): State<AppState>, user: AuthUser) -> Result<Response, ApiError> {
     let rows: Vec<(String, String, i64, Option<String>, String, i64, i64, i64)> = sqlx::query_as(
         "SELECT id, title, version, rights_declaration, moderation, withdrawn, star_rating, created_at \
-         FROM world_templates WHERE owner_id = $1 ORDER BY created_at DESC, version DESC",
+         FROM world_templates WHERE owner_id = $1 ORDER BY created_at DESC, version DESC, id DESC",
     )
     .bind(&user.user_id)
     .fetch_all(&state.db)

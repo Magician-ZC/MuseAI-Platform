@@ -1008,6 +1008,71 @@ async fn admin_report_queue_enforces_role_matrix() {
     }
 }
 
+/// 🔴 举报队列的复合游标不丢行（docs/VALIDATION.md §3.3 P1）。
+///
+/// 举报是安全通道：一条举报若被分页永久跳过，运营**永远看不到**它 = 永远不会被处置。
+/// 单列 `created_at` 游标 + `created_at < cursor` 的严格小于，在同毫秒并列组横跨页边界时
+/// 必然发生这件事（两个库皆然，SQLite 只是每次丢的是同一条所以更难被发现）。
+/// 播种 21 条同毫秒举报（默认页 20），断言两页并起来恰好是全集。
+#[tokio::test]
+async fn admin_report_queue_keyset_cursor_never_drops_a_report() {
+    let state = test_state().await;
+    base_world(&state).await;
+    open_flag(&state, "global", "").await;
+    let at = now_ms();
+    let mut all: Vec<String> = Vec::new();
+    for i in 0..21 {
+        let id = new_id("srp");
+        sqlx::query(
+            "INSERT INTO social_reports (id, reporter_user_id, subject_kind, subject_id, subject_user_id, \
+             world_id, category, detail, status, created_at) \
+             VALUES ($1, 'u1', 'character', $2, 'u2', 'w1', 'harassment', '', 'pending', $3)",
+        )
+        .bind(&id)
+        .bind(format!("c{i}"))
+        .bind(at) // 整批同毫秒
+        .execute(&state.db)
+        .await
+        .unwrap();
+        all.push(id);
+    }
+
+    let tk = admin_token(&state, "reviewer");
+    let ids_of = |v: &Value| -> Vec<String> {
+        v["reports"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap().to_string()).collect()
+    };
+
+    let (s, page1) = send(&state, "GET", "/api/admin/social/reports", &tk, None).await;
+    assert_eq!(s, StatusCode::OK);
+    let ids1 = ids_of(&page1);
+    assert_eq!(ids1.len(), 20, "首页满页（默认 page_size=20）");
+    let cursor = page1["nextCursor"].as_i64().unwrap();
+    let cursor_id = page1["nextCursorId"].as_str().unwrap().to_string();
+
+    // 旧客户端（只带 cursor）：第二页空 —— 第 21 条举报就此从队列里消失。
+    let (_, legacy) =
+        send(&state, "GET", &format!("/api/admin/social/reports?cursor={cursor}"), &tk, None).await;
+    assert!(ids_of(&legacy).is_empty(), "单列游标在并列组上必然空翻页（同时证明旧客户端零行为变化）");
+
+    // 复合游标：那一条必须回来，且与首页不重叠。
+    let (_, page2) = send(
+        &state,
+        "GET",
+        &format!("/api/admin/social/reports?cursor={cursor}&cursorId={cursor_id}"),
+        &tk,
+        None,
+    )
+    .await;
+    let ids2 = ids_of(&page2);
+    assert_eq!(ids2.len(), 1, "并列组被 id 精确切开，被跳过的那条举报必须出现");
+    let mut seen = ids1;
+    seen.extend(ids2);
+    seen.sort();
+    let mut expect = all;
+    expect.sort();
+    assert_eq!(seen, expect, "举报队列两页并起来必须是全集：安全通道不许丢行");
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // 「我们的角色一起死过」的派生口径
 // ═══════════════════════════════════════════════════════════════════════════

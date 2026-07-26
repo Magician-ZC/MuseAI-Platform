@@ -243,13 +243,20 @@ async fn challenge(
     }
 
     let now = now_ms();
-    // 同手机号 60s 限频
-    let last: Option<(i64,)> =
-        sqlx::query_as("SELECT created_at FROM sms_challenges WHERE phone = $1 ORDER BY created_at DESC LIMIT 1")
-            .bind(&phone)
-            .fetch_optional(&state.db)
-            .await?;
-    if let Some((last_at,)) = last {
+    // 同手机号 60s 限频。
+    //
+    // 🔴 写作 `MAX(created_at)` 而不是 `ORDER BY created_at DESC LIMIT 1`：这里要的是一个**值**
+    // （最近一次发码的时刻），不是某一**行**。`sms_challenges` 没有单调列、`id` 是 uuid v4，
+    // 同毫秒的两行谁排前面在 PG 上是任意的——但对本判断毫无影响，因为它们的 `created_at` 相等。
+    // 用聚合把这件事在**查询形状**上说清楚：无行可排 ⇒ 无排序稳定性问题可言。
+    // （给排序补一个 `id` 次级键只会把"不稳定的任意"变成"稳定的任意"，是**假确定性**：
+    //   uuid 大小与时间无关，选中的那行并不因此更"新"。见 docs/VALIDATION.md §3.3。）
+    // 无行时 `MAX()` 返回 NULL → `None`，与原 `fetch_optional` 的 None 分支同义。
+    let last: Option<i64> = sqlx::query_scalar("SELECT MAX(created_at) FROM sms_challenges WHERE phone = $1")
+        .bind(&phone)
+        .fetch_one(&state.db)
+        .await?;
+    if let Some(last_at) = last {
         if now - last_at < CHALLENGE_RATE_MS {
             return Err(ApiError::Conflict("请求过于频繁，请稍后再试".into()));
         }
@@ -300,6 +307,23 @@ async fn login(
     }
 
     let now = now_ms();
+    // ⚠️ **已知的不确定排序，有意不补次级键**（登记于 docs/VALIDATION.md §3.3）。
+    //
+    // 这里要的是「这个号最新那条验证码」——选中哪一行**就是拿去校验 OTP hash 的那一行**，
+    // 不是显示顺序。但 `sms_challenges` 里**没有任何单调列**可以表达"最新"：
+    // `created_at` 毫秒可并列、`id` 是 uuid v4（大小与时间无关）。
+    // 给它补 `id DESC` 只会把"不稳定的任意"换成"稳定的任意"——**假确定性**：
+    // 选中的仍不是语义上更新的那条，只是每次都选同一条错的。故本行保持原状，把问题留在明处。
+    //
+    // 并列唯一的产生路径是 `challenge` 端 60s 限频的 TOCTOU（两个并发请求都读到"无近期记录"，
+    // 各插一行）。那是**并发正确性**问题，不是排序问题，修法在写入侧（候选方案两条，见 §3.3）：
+    //   ① `UNIQUE(phone, created_at)` + 冲突映射为 409 限频 —— 让同毫秒并列在**物理上不可能**，
+    //      于是 `created_at DESC` 天然成为全序。代价：迁移在存量重复数据上会失败，
+    //      且把一次竞态从"静默"变成"写入报错"，在 auth 关键路径上需评审。
+    //   ② 给表加真正的单调序列列 —— 与 `world_events.sequence` 同一道题（`MAX+1` 读-改-写在
+    //      PG READ COMMITTED 下不串行），代价与风险同 §3.3「相邻风险」那条。
+    // 两条都是写入侧改造 + 迁移，且整条短信通道当前是 Dev 桩（`DevSms`，按 §0.3 本就不可上线），
+    // 故不在"补排序键"这一批次内动它。
     let challenge: Option<(String, String, i64, i64)> = sqlx::query_as(
         "SELECT id, code_hash, expires_at, consumed FROM sms_challenges WHERE phone = $1 ORDER BY created_at DESC LIMIT 1",
     )

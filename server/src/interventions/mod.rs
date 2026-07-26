@@ -283,7 +283,7 @@ async fn my_interventions(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let rows: Vec<(String, String, String, String, Option<String>, i64)> = sqlx::query_as(
         "SELECT id, kind, character_id, status, reject_reason, created_at FROM interventions \
-         WHERE world_id = $1 AND user_id = $2 ORDER BY created_at DESC LIMIT 50",
+         WHERE world_id = $1 AND user_id = $2 ORDER BY created_at DESC, id DESC LIMIT 50",
     )
     .bind(&world_id)
     .bind(&user.user_id)

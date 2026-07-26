@@ -37,7 +37,7 @@ pub(super) async fn list_prompts(
     if q.scope.is_some() {
         sql.push_str(&format!(" AND scope = {}", Placeholders::new().take()));
     }
-    sql.push_str(" ORDER BY scope ASC, created_at DESC");
+    sql.push_str(" ORDER BY scope ASC, created_at DESC, id DESC");
 
     let mut query = sqlx::query(&sql);
     if let Some(s) = &q.scope {
@@ -190,7 +190,7 @@ pub(super) async fn list_routes(
     require_role(&admin, &["operator"])?;
     let rows = sqlx::query(
         "SELECT id, version, routes_json, active, created_at FROM model_routes \
-         ORDER BY created_at DESC",
+         ORDER BY created_at DESC, id DESC",
     )
     .fetch_all(&state.db)
     .await?;

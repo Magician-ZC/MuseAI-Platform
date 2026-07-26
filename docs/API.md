@@ -258,10 +258,17 @@
 | GET | `/api/me/memberships` | JWT | 我在哪些世界里 |
 | GET | `/api/me/progression` | JWT | 历练与卡位（migration 0019） |
 | POST | `/api/me/card-slots/unlock` | JWT | 卡位解锁（默认 3，历练解锁至 6：500/1500/4000） |
-| GET | `/api/me/reports` | JWT | 日报列表 |
+| GET | `/api/me/reports?cursor=&cursorId=&date=` | JWT | 日报列表（`date=` 时为按日详情，不分页） |
 | GET | `/api/me/reports/{id}` | JWT | 日报详情 |
-| GET | `/api/me/notifications` | JWT | 通知列表 |
+| GET | `/api/me/notifications?cursor=&cursorId=` | JWT | 通知列表 |
 | GET/PUT | `/api/me/notification-preferences` | JWT | 通知偏好读写 |
+
+> **游标分页一律是复合游标 `(cursor, cursorId)`**（`/api/me/reports`、`/api/me/notifications`、
+> `/admin/social/reports`）。响应回 `nextCursor`（末行 `created_at`）+ `nextCursorId`（末行 `id`），
+> 下一页把**两个**都带上。只带 `cursor` 是**受支持的退化路径**（旧客户端零行为变化），
+> 但同毫秒并列行横跨页边界时会静默丢行——批量写入（一次结算多件道具、一个 tick 整批事件、
+> 一批同时排定的通知）共用同一个 `now_ms()`，并列是常态。理由与推导见
+> `server/src/pagination.rs` 模块头注释与 `docs/VALIDATION.md` §3.3。
 
 ### 新手动线（onboarding，migration 0031；总规格 §13【拍板 21】）
 
@@ -571,7 +578,7 @@ if 线：   从终局那一拍岔出去的、只属于你的一条平行线   �
 | GET/POST | `/me/social/blocks` | AuthUser | 我的黑名单 / 拉黑 `{characterId, worldId?, reason?}` |
 | DELETE | `/me/social/blocks/{id}` | AuthUser | 解除拉黑 |
 | POST | `/me/social/reports` | AuthUser | 举报 `{subjectKind, subjectId, category, detail?, worldId?}` |
-| GET | `/admin/social/reports?status=&cursor=` | AdminUser(reviewer/support) | 举报队列 |
+| GET | `/admin/social/reports?status=&cursor=&cursorId=` | AdminUser(reviewer/support) | 举报队列（复合游标，见 §4 说明；漏页 = 漏处置） |
 | POST | `/admin/social/reports/{id}/resolve` | AdminUser(reviewer/support) | 处置 `{action: actioned\|dismissed, reason}` |
 
 **运行时开关 `MUSE_SOCIAL_IDENTITY_UNLOCK`（默认关闭，经 `flags::is_enabled` 解析）。**

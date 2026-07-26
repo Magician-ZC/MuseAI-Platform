@@ -734,6 +734,11 @@ async fn memorial_detail(
 
 /// GET /me/memorial/marks —— 我的角色获得的「故人」印记
 /// （§12「你的死成为别人故事的一部分」的读取面）。
+///
+/// 排序键 = `(granted_at DESC, character_id ASC, deceased_character_id ASC)`：后两列正是唯一键
+/// `idx_memorial_marks_unique(character_id, deceased_character_id)`，故这是全序。
+/// 只到 `character_id` 不够——同一角色在一次结算里可同时获得多枚不同逝者的印记（`granted_at` 共用
+/// 同一个 `now_ms()`），并列在 PG 上不定序。
 async fn my_marks(State(state): State<AppState>, user: AuthUser) -> Result<Json<Value>, ApiError> {
     ensure_enabled()?;
     let rows = sqlx::query(
@@ -744,7 +749,7 @@ async fn my_marks(State(state): State<AppState>, user: AuthUser) -> Result<Json<
          LEFT JOIN cloud_characters mine ON mine.id = mm.character_id \
          LEFT JOIN cloud_characters gone ON gone.id = mm.deceased_character_id \
          LEFT JOIN worlds w ON w.id = mm.world_id \
-         WHERE mm.owner_id = $1 ORDER BY mm.granted_at DESC, mm.character_id ASC",
+         WHERE mm.owner_id = $1 ORDER BY mm.granted_at DESC, mm.character_id ASC, mm.deceased_character_id ASC",
     )
     .bind(&user.user_id)
     .fetch_all(&state.db)

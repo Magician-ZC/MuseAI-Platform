@@ -267,7 +267,7 @@ async fn get_report(
     // 环境事件（礼物 boon / 环境）——进战报，标注是否已应用到某回合。
     let env_rows = sqlx::query(
         "SELECT applied_tick, kind, payload_json, aggregated_count FROM arena_env_events \
-         WHERE world_id = $1 ORDER BY created_at ASC LIMIT 1000",
+         WHERE world_id = $1 ORDER BY created_at ASC, id ASC LIMIT 1000",
     )
     .bind(&world_id)
     .fetch_all(&state.db)

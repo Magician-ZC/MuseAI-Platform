@@ -410,7 +410,7 @@ async fn list_clips(
     }
     let rows: Vec<(String, String, String, String, i64)> = sqlx::query_as(
         "SELECT id, event_id, object_key, status, created_at FROM clip_jobs \
-         WHERE world_id = $1 ORDER BY created_at DESC LIMIT 100",
+         WHERE world_id = $1 ORDER BY created_at DESC, id DESC LIMIT 100",
     )
     .bind(&world_id)
     .fetch_all(&state.db)

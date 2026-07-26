@@ -109,6 +109,15 @@ pub async fn generate_report(
 /// ① principal 可见性——public 或 audience_json 含本 user（硬隔离）；
 /// ② 角色隔离——actors_json 含 character_id，确保一人多角色时各角色日报内容相异（§2.5 《你的角色昨日人生》）。
 /// best-effort：world_events 由 S2 落库，形状按 §9.4。
+///
+/// 🔴 **排序键是 `sequence` 而不是 `occurred_at`**（日窗过滤仍用 `occurred_at`）：
+/// `events::insert_events_tx` 给一个 tick 的整批事件写**同一个** `now_ms()`，
+/// 故 `occurred_at` 在批内全同——并列是结构性必然，不是偶发。而 `LIMIT 200` 会在并列处截断，
+/// 单键下"取哪 200 条"在 PG 上是任意的，且这 200 条直接决定日报正文。
+/// `world_events.sequence` 是同世界内单调递增的落库序（本查询已按 `world_id` 等值过滤），
+/// 正是这里要的因果序，且有 `idx_world_events_world(world_id, sequence)` 支撑。
+/// 末位再挂 `id`：该索引当前**非唯一**，并发分配理论上可撞号（见 docs/VALIDATION.md §3.3
+/// 「相邻风险」），补 `id` 让本站点的确定性不依赖那条尚未加固的不变量。
 async fn aggregate_visible(
     db: &sqlx::AnyPool,
     world_id: &str,
@@ -120,7 +129,7 @@ async fn aggregate_visible(
     let rows: Vec<(String, String, String, String, Option<String>, Option<String>, Option<String>, i64)> = sqlx::query_as(
         "SELECT id, event_type, visibility, actors_json, audience_json, public_projection_json, private_projections_json, occurred_at \
          FROM world_events WHERE world_id = $1 AND occurred_at >= $2 AND occurred_at < $3 \
-         AND moderation = 'approved' ORDER BY occurred_at ASC LIMIT 200",
+         AND moderation = 'approved' ORDER BY sequence ASC, id ASC LIMIT 200",
     )
     .bind(world_id)
     .bind(start)
@@ -221,6 +230,9 @@ pub fn router() -> Router<AppState> {
 struct ReportQuery {
     #[serde(default)]
     cursor: Option<i64>,
+    /// 复合游标的第二段（上一页末行的 `id`），见 `crate::pagination`。
+    #[serde(default, rename = "cursorId")]
+    cursor_id: Option<String>,
     #[serde(default)]
     date: Option<String>,
 }
@@ -242,7 +254,7 @@ async fn list_or_detail(
             .await?;
         let rows: Vec<(String, String, String, String, Option<i64>, i64)> = sqlx::query_as(
             "SELECT id, world_id, character_id, content_json, opened_at, created_at FROM daily_reports \
-             WHERE user_id = $1 AND report_day = $2 ORDER BY created_at DESC",
+             WHERE user_id = $1 AND report_day = $2 ORDER BY created_at DESC, id DESC",
         )
         .bind(&user.user_id)
         .bind(date)
@@ -252,17 +264,23 @@ async fn list_or_detail(
         return Ok(Json(json!({ "reports": reports })));
     }
 
-    // 列表（浏览，不算打开）。
+    // 列表（浏览，不算打开）。复合游标 `(created_at, id)`，见 `crate::pagination`：
+    // 一个用户当日在多个世界的日报由同一批生成，`created_at` 并列是常态，
+    // 单列游标会把横跨页边界的那组同值行整组丢掉。
     let rows: Vec<(String, String, String, String, Option<i64>, i64)> = sqlx::query_as(
         "SELECT id, world_id, character_id, report_day, opened_at, created_at FROM daily_reports \
-         WHERE user_id = $1 AND ($2 IS NULL OR created_at < $3) ORDER BY created_at DESC LIMIT 30",
+         WHERE user_id = $1 AND ($2 IS NULL OR created_at < $3 OR (created_at = $4 AND id < $5)) \
+         ORDER BY created_at DESC, id DESC LIMIT 30",
     )
     .bind(&user.user_id)
     .bind(q.cursor)
     .bind(q.cursor)
+    .bind(q.cursor)
+    .bind(crate::pagination::cursor_id_bound(q.cursor_id.as_deref()))
     .fetch_all(&state.db)
     .await?;
     let next = rows.last().map(|r| r.5);
+    let next_id = rows.last().map(|r| r.0.clone());
     let reports: Vec<_> = rows
         .into_iter()
         .map(|(id, world_id, character_id, report_day, opened_at, created_at)| {
@@ -276,7 +294,7 @@ async fn list_or_detail(
             })
         })
         .collect();
-    Ok(Json(json!({"reports": reports, "nextCursor": next})))
+    Ok(Json(json!({"reports": reports, "nextCursor": next, "nextCursorId": next_id})))
 }
 
 async fn open_report(
@@ -417,6 +435,144 @@ mod tests {
             .fetch_one(db)
             .await
             .unwrap()
+    }
+
+    // ---------- PG 排序稳定性（docs/VALIDATION.md §3.3） ----------
+
+    /// 日报素材的排序键是 `world_events.sequence`，**不是** `occurred_at`。
+    ///
+    /// fixture 有意做成**时钟倒挂**（`occurred_at` 随 sequence 递减）：这是唯一能把
+    /// "哪一列说了算"隔离出来的形状。真实成因不是时钟倒转，而是
+    /// `events::insert_events_tx` 给一个 tick 的整批事件写**同一个** `now_ms()` ——
+    /// `occurred_at` 批内全同，排不动任何东西，谁在前谁在后就交给了数据库的心情
+    /// （SQLite 恰好按索引序稳定返回，PG 不保证）。末两条同 `occurred_at` 就是这个真实形状。
+    ///
+    /// 旧口径 `ORDER BY occurred_at ASC` 在本 fixture 上会得到 4、3、2、1（或 3、4、2、1）；
+    /// 新口径必须得到 1、2、3、4 —— 世界内的因果序。
+    #[tokio::test]
+    async fn highlights_follow_event_sequence_not_the_wall_clock() {
+        let state = test_state().await;
+        seed_user(&state.db, "u1").await;
+        let base = day_bounds("2026-07-20").0;
+        // (sequence, occurred_at)：时钟递减；seq 3、4 共用一个时刻（同一 tick 的整批落库）。
+        for (seq, at) in [(1_i64, base + 4000), (2, base + 3000), (3, base + 1000), (4, base + 1000)] {
+            sqlx::query(
+                "INSERT INTO world_events (id, world_id, tick_no, sequence, domain_event_id, event_type, \
+                 actors_json, visibility, public_projection_json, moderation, ai_label, occurred_at) \
+                 VALUES ($1, 'w1', 1, $2, $3, 'dialogue', '[\"c1\"]', 'public', $4, 'approved', 1, $5)",
+            )
+            .bind(format!("ev{seq}"))
+            .bind(seq)
+            .bind(format!("de{seq}"))
+            .bind(json!({ "summary": format!("seq-{seq}") }).to_string())
+            .bind(at)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        }
+
+        let id = generate_report(&state, "w1", "u1", "c1", "2026-07-20").await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content_of(&state.db, &id).await).unwrap();
+        let order: Vec<&str> = v["highlights"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["summary"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            order,
+            vec!["seq-1", "seq-2", "seq-3", "seq-4"],
+            "日报素材必须按世界内单调的 sequence 排；occurred_at 是墙上时钟，一个 tick 内还是常量"
+        );
+    }
+
+    /// 复合游标 `(created_at, id)` 不丢行：同毫秒并列行横跨页边界时，第二页必须接得上。
+    ///
+    /// 播种 31 份 `created_at` **完全相同**的日报（一个用户在 31 个世界的当日日报由同一批生成，
+    /// 共用一个 `now_ms()`——这是常态不是巧合）。首页取 30 条，第 31 条恰好落在并列组的另一侧：
+    /// - 只回传 `cursor` 的旧客户端：`created_at < cursor` 严格小于 ⇒ 第二页空 ⇒ **那一条永远取不到**；
+    /// - 回传 `cursor` + `cursorId`：`(created_at = c AND id < cid)` 把并列组精确切开 ⇒ 取到且不重。
+    #[tokio::test]
+    async fn keyset_cursor_recovers_the_row_a_single_column_cursor_would_drop() {
+        let state = test_state().await;
+        seed_user(&state.db, "u1").await;
+        let at = crate::db::now_ms();
+        let mut all: Vec<String> = Vec::new();
+        for i in 0..31 {
+            let id = crate::db::new_id("rep");
+            sqlx::query(
+                "INSERT INTO daily_reports (id, world_id, user_id, character_id, report_day, content_json, created_at) \
+                 VALUES ($1, $2, 'u1', 'c1', $3, '{}', $4)",
+            )
+            .bind(&id)
+            .bind(format!("w{i}"))
+            .bind(format!("2026-07-{:02}", (i % 28) + 1))
+            .bind(at) // 整批同毫秒
+            .execute(&state.db)
+            .await
+            .unwrap();
+            all.push(id);
+        }
+
+        let tk = token(&state, "u1");
+        let app = crate::app::build_router(state.clone());
+        let get = |uri: String| {
+            let app = app.clone();
+            let tk = tk.clone();
+            async move {
+                let resp = app
+                    .oneshot(
+                        Request::builder()
+                            .method("GET")
+                            .uri(uri)
+                            .header("authorization", format!("Bearer {tk}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                let bytes = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+            }
+        };
+
+        let page1 = get("/api/me/reports".to_string()).await;
+        let ids1: Vec<String> = page1["reports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids1.len(), 30, "首页满页");
+        let cursor = page1["nextCursor"].as_i64().unwrap();
+        let cursor_id = page1["nextCursorId"].as_str().unwrap().to_string();
+        assert_eq!(cursor, at, "游标第一段 = 末行 created_at");
+
+        // ① 旧客户端（只带 cursor）：行为与本次改动前逐字节一致——第二页空，那一条丢了。
+        let legacy = get(format!("/api/me/reports?cursor={cursor}")).await;
+        assert_eq!(
+            legacy["reports"].as_array().unwrap().len(),
+            0,
+            "单列游标在并列组上必然空翻页——这正是要修的丢行，同时也证明旧客户端零行为变化"
+        );
+
+        // ② 复合游标：补回第 31 条，且与首页零重叠。
+        let page2 = get(format!("/api/me/reports?cursor={cursor}&cursorId={cursor_id}")).await;
+        let ids2: Vec<String> = page2["reports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids2.len(), 1, "并列组被 id 精确切开，剩下的那条必须出现");
+        assert!(ids2.iter().all(|id| !ids1.contains(id)), "两页不得重叠");
+        let mut seen = ids1;
+        seen.extend(ids2);
+        seen.sort();
+        let mut expect = all;
+        expect.sort();
+        assert_eq!(seen, expect, "两页并起来必须恰好是全集：不重不漏");
     }
 
     // ---------- N-3：私有投影不回退他人视角 ----------

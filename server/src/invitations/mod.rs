@@ -508,7 +508,7 @@ async fn list_sent(
     let rows: Vec<(String, String, String, i64, i64)> = sqlx::query_as(
         "SELECT id, invitee_character_id, status, expires_at, created_at FROM room_invitations \
          WHERE world_id = $1 AND inviter_user_id = $2 AND ($3 = 'all' OR status = $4) \
-         ORDER BY created_at DESC LIMIT 100",
+         ORDER BY created_at DESC, id DESC LIMIT 100",
     )
     .bind(&world_id)
     .bind(&user.user_id)
@@ -550,7 +550,7 @@ async fn list_received(
                 i.expires_at, i.created_at \
          FROM room_invitations i JOIN worlds w ON w.id = i.world_id \
          WHERE i.invitee_user_id = $1 AND ($2 = 'all' OR i.status = $3) \
-         ORDER BY i.created_at DESC LIMIT 100",
+         ORDER BY i.created_at DESC, i.id DESC LIMIT 100",
     )
     .bind(&user.user_id)
     .bind(&filter)

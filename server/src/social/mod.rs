@@ -813,6 +813,11 @@ async fn owner_of(db: &AnyPool, character_id: &str) -> Result<Option<(String, St
 }
 
 /// 一对角色在某世界的解锁状态（我方视角）。无记录 → `"none"`。
+///
+/// 唯一键 `idx_social_unlock_pair(world_id, requester_character_id, target_character_id)` 保证
+/// 每个方向至多一行，故这里最多命中 2 行（A→B 与 B→A）。两行 `created_at` 并列时（双方同毫秒
+/// 互发）单键选谁是任意的，且选中哪行会改变返回的 `status`/`requester`——**是被采用的值，不只是显示顺序**。
+/// 补 `id DESC` 使其确定。
 async fn unlock_status_for(
     db: &AnyPool,
     world_id: &str,
@@ -823,7 +828,7 @@ async fn unlock_status_for(
         "SELECT id, status, requester_character_id FROM social_unlock_requests \
          WHERE world_id = $1 AND ((requester_character_id = $2 AND target_character_id = $3) \
                               OR (requester_character_id = $4 AND target_character_id = $5)) \
-         ORDER BY created_at DESC LIMIT 1",
+         ORDER BY created_at DESC, id DESC LIMIT 1",
     )
     .bind(world_id)
     .bind(mine)
@@ -1156,7 +1161,7 @@ async fn list_incoming_requests(
         "SELECT id, world_id, requester_user_id, requester_character_id, status, expires_at, created_at \
          FROM social_unlock_requests \
          WHERE target_user_id = $1 AND ($2 = 'all' OR status = $3) \
-         ORDER BY created_at DESC LIMIT $4",
+         ORDER BY created_at DESC, id DESC LIMIT $4",
     )
     .bind(&user.user_id)
     .bind(&filter)
@@ -1343,7 +1348,7 @@ async fn list_identities(
         "SELECT id, world_id, requester_user_id, requester_character_id, target_user_id, \
                 target_character_id, responded_at FROM social_unlock_requests \
          WHERE status = 'accepted' AND (requester_user_id = $1 OR target_user_id = $2) \
-         ORDER BY responded_at DESC LIMIT $3",
+         ORDER BY responded_at DESC, id DESC LIMIT $3",
     )
     .bind(&user.user_id)
     .bind(&user.user_id)
@@ -1406,7 +1411,7 @@ async fn list_blocks(State(state): State<AppState>, user: AuthUser) -> Result<Js
     ensure_enabled(&state.db, Some(&user.user_id), None).await?;
     let rows: Vec<(String, String, String, String, i64)> = sqlx::query_as(
         "SELECT id, blocked_character_id, world_id, reason, created_at FROM social_blocks \
-         WHERE blocker_user_id = $1 ORDER BY created_at DESC LIMIT $2",
+         WHERE blocker_user_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2",
     )
     .bind(&user.user_id)
     .bind(page_size())
@@ -1656,7 +1661,7 @@ async fn create_report(
     let recent: Option<(String, String, i64)> = sqlx::query_as(
         "SELECT id, status, created_at FROM social_reports \
          WHERE reporter_user_id = $1 AND subject_kind = $2 AND subject_id = $3 AND created_at >= $4 \
-         ORDER BY created_at DESC LIMIT 1",
+         ORDER BY created_at DESC, id DESC LIMIT 1",
     )
     .bind(&user.user_id)
     .bind(&subject_kind)
@@ -1764,10 +1769,17 @@ struct ReportListQuery {
     status: Option<String>,
     #[serde(default)]
     cursor: Option<i64>,
+    /// 复合游标的第二段（上一页末行的 `id`），见 `crate::pagination`。
+    #[serde(default, rename = "cursorId")]
+    cursor_id: Option<String>,
 }
 
 /// 举报队列（运营）。这里**可以**看到 `subjectUserId`——处置需要它，且 admin 面本就是特权面；
 /// 玩家面一律不下发（见 `create_report`）。
+///
+/// 🔴 复合游标 `(created_at, id)`（见 `crate::pagination`）：单列游标下，同毫秒到达的一批举报
+/// 若横跨页边界，被跳过的那几条**不会出现在队列的任何一页**——运营看不见 = 永远不会被处置。
+/// 这是本仓所有游标分页里后果最重的一处（举报是安全通道，漏一条就是漏一次处置）。
 async fn list_reports_admin(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -1781,18 +1793,22 @@ async fn list_reports_admin(
         sqlx::query_as(
             "SELECT id, reporter_user_id, subject_kind, subject_id, subject_user_id, world_id, \
                     category, detail, status, created_at, resolved_at FROM social_reports \
-             WHERE ($1 = 'all' OR status = $2) AND ($3 IS NULL OR created_at < $4) \
-             ORDER BY created_at DESC LIMIT $5",
+             WHERE ($1 = 'all' OR status = $2) \
+               AND ($3 IS NULL OR created_at < $4 OR (created_at = $5 AND id < $6)) \
+             ORDER BY created_at DESC, id DESC LIMIT $7",
         )
         .bind(&filter)
         .bind(&filter)
         .bind(q.cursor)
         .bind(q.cursor)
+        .bind(q.cursor)
+        .bind(crate::pagination::cursor_id_bound(q.cursor_id.as_deref()))
         .bind(page_size())
         .fetch_all(&state.db)
         .await?;
 
     let next = rows.last().map(|r| r.9);
+    let next_id = rows.last().map(|r| r.0.clone());
     let reports: Vec<Value> = rows
         .into_iter()
         .map(
@@ -1825,7 +1841,7 @@ async fn list_reports_admin(
             },
         )
         .collect();
-    Ok(Json(json!({ "reports": reports, "nextCursor": next })))
+    Ok(Json(json!({ "reports": reports, "nextCursor": next, "nextCursorId": next_id })))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

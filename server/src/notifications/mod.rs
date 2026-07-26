@@ -172,7 +172,12 @@ fn is_essential_kind(kind: &str) -> bool {
 pub async fn rescan_pending(state: &AppState) -> Result<u64, ApiError> {
     let now = crate::db::now_ms();
     let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT id FROM notification_outbox WHERE status = 'pending' AND due_at <= $1 ORDER BY due_at ASC LIMIT 500",
+        // 🔴 次级键 `id` 不可省：`due_at` 是**排定时刻**，一批同时排定的通知整批同值是常态而非偶发。
+        // 单键 + `LIMIT 500` 在 PG 上等于「任取 500 条」——超 500 条待发时，同一批里哪些被推、
+        // 哪些被留下每轮都可能不同，剩下的那些存在**饥饿**风险（每轮都可能被跳过）。
+        // 补 `id ASC` 后取的是同一个确定子集，投递完即离开 pending 集，下一轮必然轮到后面的。
+        "SELECT id FROM notification_outbox WHERE status = 'pending' AND due_at <= $1 \
+         ORDER BY due_at ASC, id ASC LIMIT 500",
     )
     .bind(now)
     .fetch_all(&state.db)
@@ -281,6 +286,9 @@ async fn put_prefs(
 struct ListQuery {
     #[serde(default)]
     cursor: Option<i64>,
+    /// 复合游标的第二段（上一页末行的 `id`）。见 [`keyset`]。
+    #[serde(default, rename = "cursorId")]
+    cursor_id: Option<String>,
 }
 
 async fn list_notifications(
@@ -290,15 +298,19 @@ async fn list_notifications(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let rows: Vec<(String, String, String, String, i64)> = sqlx::query_as(
         "SELECT id, kind, payload_json, status, created_at FROM notification_outbox \
-         WHERE user_id = $1 AND ($2 IS NULL OR created_at < $3) ORDER BY created_at DESC LIMIT 30",
+         WHERE user_id = $1 AND ($2 IS NULL OR created_at < $3 OR (created_at = $4 AND id < $5)) \
+         ORDER BY created_at DESC, id DESC LIMIT 30",
     )
     .bind(&user.user_id)
     .bind(q.cursor)
     .bind(q.cursor)
+    .bind(q.cursor)
+    .bind(crate::pagination::cursor_id_bound(q.cursor_id.as_deref()))
     .fetch_all(&state.db)
     .await?;
 
     let next = rows.last().map(|r| r.4);
+    let next_id = rows.last().map(|r| r.0.clone());
     let items: Vec<_> = rows
         .into_iter()
         .map(|(id, kind, payload, status, created)| {
@@ -311,7 +323,7 @@ async fn list_notifications(
             })
         })
         .collect();
-    Ok(Json(json!({"notifications": items, "nextCursor": next})))
+    Ok(Json(json!({"notifications": items, "nextCursor": next, "nextCursorId": next_id})))
 }
 
 // ---------- 静默时段 ----------

@@ -146,7 +146,7 @@ pub(super) async fn detail(
             // 同作者历史：同 owner 的其他云端角色（不含当前主体），供判断作者一贯性。
             let hist = sqlx::query(
                 "SELECT id, version, moderation, created_at FROM cloud_characters \
-                 WHERE owner_id = $1 AND id != $2 ORDER BY created_at DESC, version DESC",
+                 WHERE owner_id = $1 AND id != $2 ORDER BY created_at DESC, version DESC, id DESC",
             )
             .bind(&owner_id)
             .bind(&subject_id)

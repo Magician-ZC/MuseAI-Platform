@@ -57,10 +57,15 @@ pub(super) async fn list_users(
     let page = clamp_limit(q.limit);
     let term = q.query.as_deref().map(str::trim).filter(|s| !s.is_empty());
 
+    // 🔴 相关子查询的 `id DESC` 次级键不可省：并列时选中哪一行**就是本列下发的值**
+    // （同毫秒的两条 refs 一条 `verified` 一条 `failed` → 运营看到的状态是任意的）。
+    // 补键把"不确定的任意"变成"确定的一条"；但 `identity_verification_refs` 没有单调列、
+    // `id` 是 uuid v4，故它保证的是**稳定**而非语义上的"最新"——真要"最新"需给该表加单调序列。
+    // 本列只进 admin 列表展示，不参与任何判定，故先取确定性；口径升级另议（登记于 §3.3）。
     let mut sql = String::from(
         "SELECT id, phone, email, nickname, age_declared, role, status, created_at, \
          (SELECT status FROM identity_verification_refs r WHERE r.user_id = users.id \
-          ORDER BY created_at DESC LIMIT 1) AS verification_status \
+          ORDER BY r.created_at DESC, r.id DESC LIMIT 1) AS verification_status \
          FROM users WHERE 1=1",
     );
     // 发号顺序 = 下面 bind 的顺序（term 段 4 个、cursor 段 3 个、LIMIT 1 个）；

@@ -356,7 +356,7 @@ async fn publish(
 /// GET /assets/characters/mine：我的云端版本列表（owner 隔离，含审核态与历练值）。
 async fn list_mine(State(state): State<AppState>, user: AuthUser) -> Result<Response, ApiError> {
     let rows: Vec<(String, String, i64, String, String, i64, i64, Option<String>, Option<String>, i64)> = sqlx::query_as(
-        "SELECT id, local_card_id, version, rights_declaration, moderation, withdrawn, created_at, avatar_url, avatar_moderation, mileage FROM cloud_characters WHERE owner_id = $1 ORDER BY created_at DESC, version DESC",
+        "SELECT id, local_card_id, version, rights_declaration, moderation, withdrawn, created_at, avatar_url, avatar_moderation, mileage FROM cloud_characters WHERE owner_id = $1 ORDER BY created_at DESC, version DESC, id DESC",
     )
     .bind(&user.user_id)
     .fetch_all(&state.db)

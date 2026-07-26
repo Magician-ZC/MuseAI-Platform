@@ -116,6 +116,43 @@ async fn challenge_rate_limited_within_60s() {
     assert_eq!(st2, StatusCode::CONFLICT, "60s 内重复发码应被限频");
 }
 
+/// 限频取的是 `MAX(created_at)` 这个**值**，不是"某一行"（docs/VALIDATION.md §3.3）。
+///
+/// `sms_challenges` 没有单调列、`id` 是 uuid v4，"排序取第一行"在 PG 上并列即任意。
+/// 本用例把**新**的那条先插、**旧**的那条后插：任何"取某一行"的实现（无论按 rowid、
+/// 按插入序还是按不定序的并列）都有取到旧行的风险，取到旧行 = 限频被绕过（返回 200）。
+/// 聚合口径不受行序影响，必须稳定 409。
+#[tokio::test]
+async fn challenge_rate_limit_reads_the_max_timestamp_not_an_arbitrary_row() {
+    let (_app, state) = build_app().await;
+    let phone = "13800000002";
+    let now = crate::db::now_ms();
+    // 顺序刻意反着来：先插「刚刚」，再插「一小时前」。
+    for (suffix, created_at) in [("recent", now - 1_000), ("stale", now - 3_600_000)] {
+        sqlx::query(
+            "INSERT INTO sms_challenges (id, phone, code_hash, expires_at, consumed, created_at) \
+             VALUES ($1, $2, 'hash', $3, 0, $4)",
+        )
+        .bind(format!("chal_{suffix}"))
+        .bind(phone)
+        .bind(created_at + 300_000)
+        .bind(created_at)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+
+    let app = crate::app::build_router(state.clone());
+    let (st, body) = send(&app, "POST", "/api/auth/challenge", None, None, Some(json!({ "phone": phone }))).await;
+    assert_eq!(st, StatusCode::CONFLICT, "最近一次发码在 1 秒前 → 必须限频，与行序无关。body={body:?}");
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sms_challenges WHERE phone = $1")
+        .bind(phone)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(n, 2, "被限频就不应再落一条 challenge");
+}
+
 #[tokio::test]
 async fn login_rejects_wrong_code() {
     let (app, _s) = build_app().await;

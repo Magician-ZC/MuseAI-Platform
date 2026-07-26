@@ -44,6 +44,8 @@ mod notifications;
 // 新手动线（总规格 §13【拍板 21】）：预制卡库 + 单人微本模板 + 新人礼包发放。
 // 默认关闭的运营开关 `MUSE_ONBOARDING`；礼包只发卡 + 建房，入场仍走 worlds::join_world 的全部校验。
 mod onboarding;
+// 游标分页的复合键（keyset）：单列游标在同毫秒并列行横跨页边界时会**静默丢行**，见模块头注释。
+mod pagination;
 // 波次 2：历练值 + 卡位制（成长值只作准入与解锁，绝不进引擎决策）。
 mod progression;
 mod providers;

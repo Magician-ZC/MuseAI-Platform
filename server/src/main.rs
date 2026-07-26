@@ -2,6 +2,11 @@
 
 mod admin_api;
 mod admission;
+// R3 OOC 注解权（总规格 §7「人设保险（三级出口）」第 2 级）：单拍 OOC 申诉 →
+// **世界事实不改**，私人传记可加内心批注；复核确认模型错误则补偿托梦配额。
+// 默认关闭的运行时开关 `MUSE_OOC_ANNOTATIONS`；它同时是 VALIDATION §4.2「OOC 申诉率」
+// 这一项 SLO 的唯一数据源（此前八项里唯一算不出来的那项），也是 T1 门槛的测量手段。
+mod annotations;
 mod app;
 mod assembly;
 mod assets;

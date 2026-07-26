@@ -4,7 +4,7 @@
 //! 回灌进 `worlds.narrative_state_json`——那会让引擎读到结算侧数值，直接违反「不卖胜负与数值平权」
 //! （同 `world_contributions` 单独建表的理由，见迁移 0025 注释）。
 //!
-//! **八项 SLO 里只有四项现在算得出来**（数据可得性核实于 2026-07-26，见 VALIDATION §4.2 那张表）：
+//! **八项 SLO 现在有六项算得出来**（数据可得性核实于 2026-07-26，见 VALIDATION §4.2 那张表）：
 //!
 //! | 指标 | 本模块 | 数据源 |
 //! |---|---|---|
@@ -12,7 +12,7 @@
 //! | 角色最长连续无有效戏份拍数 | ✅ | `world_events.actors_json` × `world_ticks` 拍域 ∩ `world_members` |
 //! | 强制收尾率 | ✅ | `audit_logs(action='world.ended')` 的 reason 前缀，分母 `worlds.status='ended'` |
 //! | 同角色二次入世率 | ✅ | `world_members` 的 `COUNT(DISTINCT world_id) >= 2`，分母 `cloud_characters.withdrawn=0` |
-//! | OOC 申诉率 | ❌ 无数据源 | 见 `UNAVAILABLE_METRICS`：`moderation_appeals` 是内容风控申诉，与「演得不像」零关系 |
+//! | OOC 申诉率 | ✅ 可算（2026-07-26） | `ooc_appeals`（迁移 0037，R3 OOC 注解权）。🔴 **不是** `moderation_appeals`——那是内容风控申诉，与「演得不像」零关系 |
 //! | 剧情重复率 | ❌ 无数据源 | fact 文本已进投影，但**相似度口径未拍板**（用什么算法、多相似算重复） |
 //! | 状态-文本矛盾率 | ✅ 可算（2026-07-26） | `world_tick_critic`（迁移 0030）；每个已提交 tick 恒落一行故分母可信 |
 //! | 用户跳过/退出率 | （不在本模块）| 退出侧已可算：`world_members.left_at`（迁移 0030）在 leave 时写入；
@@ -277,6 +277,9 @@ fn parse_actors(raw: &str) -> Vec<String> {
 const DEFAULT_ATTENTION_GINI_MAX: f64 = 0.35;
 /// 「连续 N 拍无有效戏份」的告警档位（拍）。VALIDATION §4.2 只写「连续 N 拍」，N 本就是运营参数。
 const DEFAULT_SILENT_STREAK_MAX: i64 = 3;
+/// T1 门槛：OOC/裁决不公申诉 **<10%/阶段**（VALIDATION §2 · T1 原文数值）。
+/// 同基尼门槛，这是**当前默认门槛**而非物理常量——预注册纪律要求"开测前可改、开测后冻结"。
+const DEFAULT_OOC_APPEAL_RATE_MAX: f64 = 0.10;
 /// SLO 观测窗口默认天数（滚动窗口；成本趋势用 7 天是"看走势"，叙事质量看的是"这一批世界演得怎么样"）。
 pub(crate) const DEFAULT_SLO_WINDOW_DAYS: i64 = 30;
 /// 单个逐行扫描指标的行数上限。超过即**跳过该指标并明说原因**，不硬算——保护被轮询的后台端点。
@@ -308,6 +311,8 @@ pub(crate) struct SloConfig {
     pub window_end: i64,
     /// 基尼门槛（T2）。
     pub gini_max: f64,
+    /// OOC 申诉率门槛（T1「<10%/阶段」）。
+    pub ooc_appeal_rate_max: f64,
     /// 连续无戏份告警档位（拍）。
     pub silent_streak_max: i64,
     /// 单指标扫描行数上限。
@@ -315,13 +320,18 @@ pub(crate) struct SloConfig {
 }
 
 impl SloConfig {
-    /// env 覆盖 + 默认值。`MUSE_SLO_GINI_MAX` / `MUSE_SLO_SILENT_STREAK_TICKS` / `MUSE_SLO_SCAN_ROW_CAP`。
+    /// env 覆盖 + 默认值。`MUSE_SLO_GINI_MAX` / `MUSE_SLO_SILENT_STREAK_TICKS` /
+    /// `MUSE_SLO_SCAN_ROW_CAP` / `MUSE_SLO_OOC_APPEAL_RATE_MAX`。
     pub(crate) fn from_env(days: i64, window_start: i64, window_end: i64) -> Self {
         Self {
             days,
             window_start,
             window_end,
             gini_max: env_f64("MUSE_SLO_GINI_MAX", DEFAULT_ATTENTION_GINI_MAX),
+            ooc_appeal_rate_max: env_f64(
+                "MUSE_SLO_OOC_APPEAL_RATE_MAX",
+                DEFAULT_OOC_APPEAL_RATE_MAX,
+            ),
             silent_streak_max: env_i64("MUSE_SLO_SILENT_STREAK_TICKS", DEFAULT_SILENT_STREAK_MAX),
             scan_row_cap: env_i64("MUSE_SLO_SCAN_ROW_CAP", DEFAULT_SCAN_ROW_CAP),
         }
@@ -802,22 +812,216 @@ async fn contradiction_block(db: &AnyPool, cfg: &SloConfig) -> Result<Value, Api
     }))
 }
 
+/// OOC 申诉率：**VALIDATION §2 T1 门槛「OOC/裁决不公申诉 <10%/阶段」的测量实现**。
+///
+/// 数据源 `ooc_appeals`（迁移 0037，R3「OOC 注解权」）。此前这一项是八项 SLO 里**唯一未解**的：
+/// 🔴 全仓唯一的申诉表 `moderation_appeals` 是**内容风控申诉**（只受理 rejected 的卡/头像、
+/// 每主体终身一次），与「角色演得不像 / 裁决不公」零关系，**不得拿来充数**——
+/// 拿它算出来的数与本指标语义完全无关，比没有数更坏。
+///
+/// ════════════════════════════════════════════════════════════════════════════
+/// 口径（分子 / 分母 / 窗口 / 无数据）
+/// ════════════════════════════════════════════════════════════════════════════
+///
+/// 门槛原文的单位是「**/阶段**」，而托梦配额的既有口径是「**一个 world 实例 = 一个阶段**」
+/// （`interventions::dream_quota_per_stage` 上方注释）。本指标沿用同一口径，于是：
+///
+/// - **分母** = 窗口内**真正演过戏的**世界里的「角色 × 世界(阶段)」对数。
+///   「演过戏」= 该世界在窗口内有 `world_ticks.status='done' AND cost_tokens > 0` 的拍
+///   （与 `world_silent_streaks` 的拍域口径一致：终局短路拍 / 跳过拍没有回合，不构成可申诉的对象）。
+///   没演过戏的世界里没有可申诉的东西，把它们算进分母只会**稀释**申诉率，
+///   让一个本该报警的数看起来很安全。
+///   `world_members` 的行即「玩家角色 × 世界」（NPC 不入该表，与 `world_contributions` 不同，
+///   所以这里**不需要**像基尼那样再取交集）。
+/// - **分子** = 窗口内新建的申诉，按 `(world_id, character_id)` **去重**后的对数。
+///   去重是必须的：一个人对同一个世界的 5 拍各提一次，是**一个角色不满意**，不是 5 个。
+///   不去重会让分子超过分母，得到 >100% 的申诉率。分子另加与分母**同样的两个 EXISTS 过滤**，
+///   保证 `分子 ≤ 分母` 恒成立（窗口边界上申诉在窗内、拍在窗外的情形被一致地排除）。
+/// - **窗口** = `SloConfig` 的 `[window_start, window_end)`，与基尼/无戏份/矛盾率同一把尺。
+///   申诉按 `created_at` 落窗，世界按「窗口内是否演过戏」落窗。
+/// - **辅助数**（不进 `value`，但进响应）：原始申诉条数、按类别（ooc / unfair_ruling）分布、
+///   按复核状态分布、**坐实率**（confirmed / 已复核）与补偿发放量。
+///   🔴 申诉率与坐实率必须分开看：前者是「多少人不满」（T1 门槛盯的就是它），
+///   后者是「其中多少确实是模型的错」。把两者混成一个数会同时丢掉两个信号。
+///
+/// ════════════════════════════════════════════════════════════════════════════
+/// 🔴 三种「没有数」的状态必须分得开
+/// ════════════════════════════════════════════════════════════════════════════
+///
+/// | 情形 | status | value | 后台显示 |
+/// |---|---|---|---|
+/// | 申诉入口从未对任何人开放（开关默认关闭） | `entry_not_open` | `null` | `—` |
+/// | 入口开着，但窗口内没有任何世界演过戏 | `no_data_in_window` | `null` | `—` |
+/// | 入口开着、演过戏、**没人申诉** | `ok` | `0.0` | `0%` |
+///
+/// 第一行是本指标特有的坑，也是它最容易骗人的地方：本功能**默认关闭**，此时窗口内一条申诉
+/// 都不会有。若直接报 `0%`，运营看板上会出现「OOC 申诉率 0%」——一个看起来棒极了、
+/// 实际上什么都没测的数，而 T1 恰恰要拿这个数决定「继续 / 调整 / 停止」。
+/// 「入口没开」与「没人申诉」是完全不同的两件事，绝不能长成同一个样子。
+/// 判定见 `annotations::entry_ever_open`（fail-safe 方向是「没开过」→ 报 `—` 而不是 `0%`）。
+async fn ooc_appeal_block(db: &AnyPool, cfg: &SloConfig) -> Result<Value, ApiError> {
+    // 🔴 先判入口是否开过：入口没开时后面的 0 全都没有意义。
+    if !crate::annotations::entry_ever_open(db).await {
+        return Ok(json!({
+            "metric": "oocAppealRate",
+            "title": "OOC 申诉率",
+            "status": "entry_not_open",
+            "value": Value::Null,
+            "notes": [
+                "OOC 申诉入口（运行时开关 MUSE_OOC_ANNOTATIONS）从未对任何人开放，窗口内不可能有申诉。",
+                "🔴 这是「没测过」不是「没人申诉」：后台必须显示 —，显示 0% 即为误报（T1 门槛会据此误判为通过）。",
+                "开放方式：运营后台 POST /admin/flags 写一条 enabled=1 的记录（global / world / user 三档任选）。",
+            ],
+        }));
+    }
+
+    // 分母：窗口内真正演过戏的世界里的「角色 × 世界(阶段)」对。
+    let member_stages: i64 = sqlx::query(
+        "SELECT CAST(COUNT(*) AS BIGINT) AS n FROM world_members wm \
+         WHERE EXISTS ( \
+             SELECT 1 FROM world_ticks wt WHERE wt.world_id = wm.world_id \
+               AND wt.status = 'done' AND wt.cost_tokens > 0 \
+               AND wt.created_at >= ? AND wt.created_at < ? \
+         )",
+    )
+    .bind(cfg.window_start)
+    .bind(cfg.window_end)
+    .fetch_one(db)
+    .await?
+    .try_get("n")?;
+
+    // 分子：窗口内申诉去重到 (world_id, character_id)，并施加与分母同样的两个 EXISTS。
+    let pairs_appealed: i64 = sqlx::query(
+        "SELECT CAST(COUNT(*) AS BIGINT) AS n FROM ( \
+             SELECT a.world_id, a.character_id FROM ooc_appeals a \
+             WHERE a.created_at >= ? AND a.created_at < ? \
+               AND EXISTS ( \
+                   SELECT 1 FROM world_members wm WHERE wm.world_id = a.world_id \
+                     AND wm.cloud_character_id = a.character_id \
+               ) \
+               AND EXISTS ( \
+                   SELECT 1 FROM world_ticks wt WHERE wt.world_id = a.world_id \
+                     AND wt.status = 'done' AND wt.cost_tokens > 0 \
+                     AND wt.created_at >= ? AND wt.created_at < ? \
+               ) \
+             GROUP BY a.world_id, a.character_id \
+         ) t",
+    )
+    .bind(cfg.window_start)
+    .bind(cfg.window_end)
+    .bind(cfg.window_start)
+    .bind(cfg.window_end)
+    .fetch_one(db)
+    .await?
+    .try_get("n")?;
+
+    // 辅助分布：按复核状态 / 按异议类别（一次 GROUP BY 各一条，无 N+1）。
+    let mut by_status: BTreeMap<String, i64> = BTreeMap::new();
+    let mut appeals_total: i64 = 0;
+    for r in sqlx::query(
+        "SELECT status, CAST(COUNT(*) AS BIGINT) AS n FROM ooc_appeals \
+         WHERE created_at >= ? AND created_at < ? GROUP BY status",
+    )
+    .bind(cfg.window_start)
+    .bind(cfg.window_end)
+    .fetch_all(db)
+    .await?
+    {
+        let k: String = r.try_get("status")?;
+        let n: i64 = r.try_get("n")?;
+        appeals_total += n;
+        by_status.insert(k, n);
+    }
+
+    let mut by_reason: BTreeMap<String, i64> = BTreeMap::new();
+    for r in sqlx::query(
+        "SELECT reason_code, CAST(COUNT(*) AS BIGINT) AS n FROM ooc_appeals \
+         WHERE created_at >= ? AND created_at < ? GROUP BY reason_code",
+    )
+    .bind(cfg.window_start)
+    .bind(cfg.window_end)
+    .fetch_all(db)
+    .await?
+    {
+        by_reason.insert(r.try_get("reason_code")?, r.try_get("n")?);
+    }
+
+    // 补偿发放量（复核确认模型错误的产物；不是资产，只是「说话的机会」）。
+    let comp = sqlx::query(
+        "SELECT CAST(COUNT(*) AS BIGINT) AS rows_n, CAST(COALESCE(SUM(grants), 0) AS BIGINT) AS grants_n \
+         FROM dream_quota_compensations WHERE created_at >= ? AND created_at < ?",
+    )
+    .bind(cfg.window_start)
+    .bind(cfg.window_end)
+    .fetch_one(db)
+    .await?;
+    let comp_rows: i64 = comp.try_get("rows_n")?;
+    let comp_grants: i64 = comp.try_get("grants_n")?;
+
+    // 🔴 状态字面量取 `confirmed` 而非 `upheld`：`moderation_appeals` 里的 `upheld` 意思是
+    // 「维持原判」= 申诉被驳回，与这里的「申诉成立」正好相反。同词反义是看板上最容易算反的坑。
+    let confirmed = by_status.get("confirmed").copied().unwrap_or(0);
+    let dismissed = by_status.get("dismissed").copied().unwrap_or(0);
+    let resolved = confirmed + dismissed;
+    // 坐实率：已复核里确认模型错误的占比。一条都没复核 → null（"还没人看过"不是"全都不成立"）。
+    let confirmed_rate =
+        if resolved > 0 { json!(confirmed as f64 / resolved as f64) } else { Value::Null };
+
+    // 窗口内没有任何世界演过戏 → 零样本，不是「申诉率 0」。
+    if member_stages == 0 {
+        return Ok(json!({
+            "metric": "oocAppealRate",
+            "title": "OOC 申诉率",
+            "status": "no_data_in_window",
+            "value": Value::Null,
+            "memberStagesCounted": 0,
+            "appealsTotal": appeals_total,
+            "notes": [
+                "窗口内没有任何世界跑过计费拍 —— 分母为零样本，「没测过」不是「申诉率 0」。",
+                "分母口径 = 窗口内有 done 且 cost_tokens>0 的拍的世界 × 其 world_members 行。",
+            ],
+        }));
+    }
+
+    Ok(json!({
+        "metric": "oocAppealRate",
+        "title": "OOC 申诉率",
+        "status": "ok",
+        "value": pairs_appealed as f64 / member_stages as f64,
+        "thresholdMax": cfg.ooc_appeal_rate_max,
+        "overThreshold": (pairs_appealed as f64 / member_stages as f64) >= cfg.ooc_appeal_rate_max,
+        "memberStagesCounted": member_stages,
+        "charactersAppealed": pairs_appealed,
+        "appealsTotal": appeals_total,
+        "byStatus": Value::Object(by_status.iter().map(|(k, v)| (k.clone(), json!(v))).collect()),
+        "byReasonCode": Value::Object(by_reason.iter().map(|(k, v)| (k.clone(), json!(v))).collect()),
+        "confirmedRate": confirmed_rate,
+        "compensationsGranted": comp_rows,
+        "compensationWhispersGranted": comp_grants,
+        "notes": [
+            "T1 门槛「OOC/裁决不公申诉 <10%/阶段」的直接实现；阶段口径 = 一个 world 实例（同托梦配额）。",
+            "分母 = 窗口内演过戏（done 且 cost_tokens>0）的世界 × 其 world_members 行（NPC 不入该表，无需取交集）。",
+            "分子 = 窗口内申诉按 (worldId, characterId) 去重后的对数 —— 同一角色对多拍申诉算一次「这个角色不满意」。",
+            "分子施加与分母相同的两个 EXISTS 过滤，故 分子 ≤ 分母 恒成立，不会出现 >100% 的申诉率。",
+            "🔴 申诉率 ≠ 坐实率：value 是「多少人不满」（T1 门槛盯的），confirmedRate 是「其中多少确实是模型的错」。",
+            "🔴 申诉不改写任何世界线数据；confirmed 的含义是「承认这一拍演砸了」，不是「这一拍没发生过」（§0.3）。",
+        ],
+    }))
+}
+
 // ============================================================================
-// §5 🔴 不可算的三项：显式标注「无数据源」，绝不显示 0 或空
+// §5 🔴 不可算的项：显式标注「无数据源」，绝不显示 0 或空
 // ============================================================================
 
-/// 三项目前**没有数据源**的 SLO：`(metric, title, 为什么算不了, 补齐它需要什么)`。
+/// 目前**没有数据源**的 SLO：`(metric, title, 为什么算不了, 补齐它需要什么)`。
 ///
 /// 🔴 它们与"值为 0"是两回事：0 意味着"测了、没发生"，而这里是"根本没测"。后台必须显示 `—`。
 /// 每次有人补上其中一项的数据源，就把它从本表挪进 §4，并同步改 VALIDATION §4.2 那张可得性表。
+///
+/// 历次转正：`stateTextContradictionRate`（2026-07-26，迁移 0030 CriticReport 落库）·
+/// `oocAppealRate`（2026-07-26，迁移 0037 OOC 注解权）。**清单缩短是数据源到位的预期结果**，
+/// 不是断言被放宽——转正后各自有专门的红线用例守「不许悄悄退回标注」。
 const UNAVAILABLE_METRICS: &[(&str, &str, &str, &str)] = &[
-    (
-        "oocAppealRate",
-        "OOC 申诉率",
-        "全仓唯一申诉表 moderation_appeals 是**内容风控申诉**（只受理 rejected 的卡/头像、每主体终身一次），\
-         与「角色演得不像 / 裁决不公」零关系；把它当 OOC 申诉读会得到一个完全无关的数。",
-        "需新建叙事质量反馈表 + 客户端「这段演得不像」入口（VALIDATION §4.2 标注的唯一真新建件）。",
-    ),
     (
         "plotRepetitionRate",
         "剧情重复率",
@@ -853,9 +1057,10 @@ fn unavailable_blocks() -> BTreeMap<String, Value> {
 // §6 对外入口
 // ============================================================================
 
-/// 叙事质量 SLO 总装。**纯只读**：七个指标（四可算 + 三显式标注无数据源）一次返回。
+/// 叙事质量 SLO 总装。**纯只读**：七个指标（六可算 + 一项显式标注无数据源）一次返回。
 ///
-/// 查询预算：基尼 1 条 + 无戏份 3 条 + 强制收尾 3 条（含 2 条标量）+ 二次入世 3 条 = **10 条**，
+/// 查询预算：基尼 1 条 + 无戏份 3 条 + 强制收尾 3 条（含 2 条标量）+ 二次入世 3 条 +
+/// 矛盾率 1 条 + OOC 申诉率 5 条（+ 入口开关判定 ≤2 条）= **约 18 条**，
 /// 与世界数/成员数无关（不存在按世界逐个发 SQL 的 N+1）。逐行扫描的两项带 `LIMIT cap+1` 溢出探测。
 pub(crate) async fn narrative_slo(db: &AnyPool, cfg: &SloConfig) -> Result<Value, ApiError> {
     let mut metrics: BTreeMap<String, Value> = BTreeMap::new();
@@ -865,6 +1070,9 @@ pub(crate) async fn narrative_slo(db: &AnyPool, cfg: &SloConfig) -> Result<Value
     metrics.insert("repeatEntryRate".into(), repeat_entry_block(db).await?);
     // 2026-07-26：CriticReport 落库（迁移 0030）后本项从「无数据源」转为可算。
     metrics.insert("stateTextContradictionRate".into(), contradiction_block(db, cfg).await?);
+    // 2026-07-26：OOC 注解权落地（迁移 0037）后本项从「无数据源」转为可算——
+    // 它是 §4.2 那张表里最后一个「唯一未解」，也是 T1 门槛唯一的测量手段。
+    metrics.insert("oocAppealRate".into(), ooc_appeal_block(db, cfg).await?);
     metrics.extend(unavailable_blocks());
 
     let unavailable: Vec<&str> = UNAVAILABLE_METRICS.iter().map(|(m, ..)| *m).collect();
@@ -878,6 +1086,7 @@ pub(crate) async fn narrative_slo(db: &AnyPool, cfg: &SloConfig) -> Result<Value
             "attentionGiniMax": cfg.gini_max,
             "silentStreakTicks": cfg.silent_streak_max,
             "scanRowCap": cfg.scan_row_cap,
+            "oocAppealRateMax": cfg.ooc_appeal_rate_max,
         },
         "metrics": Value::Object(metrics.into_iter().collect()),
         "unavailable": unavailable,
@@ -889,7 +1098,8 @@ pub(crate) async fn narrative_slo(db: &AnyPool, cfg: &SloConfig) -> Result<Value
             "有效戏份口径 = event_type ∈ {action, dialogue}；consent_request 等流程事件不算戏份（被同意门拦下的那一拍恰恰什么也没演成）。",
             "actors_json 走规范化 JSON 解析而非 LIKE 子串匹配（LIKE 会让 li 被 lixia 蹭到戏份）。",
             "日界为 UTC，由 dashboards::utc_day_start_ms + DAY_MS 在 Rust 侧算成毫秒区间传入；SQL 不含任何方言日期函数。",
-            "门槛与扫描上限可配（MUSE_SLO_GINI_MAX / MUSE_SLO_SILENT_STREAK_TICKS / MUSE_SLO_SCAN_ROW_CAP），VALIDATION §0.2 参数化。",
+            "门槛与扫描上限可配（MUSE_SLO_GINI_MAX / MUSE_SLO_SILENT_STREAK_TICKS / MUSE_SLO_SCAN_ROW_CAP / MUSE_SLO_OOC_APPEAL_RATE_MAX），VALIDATION §0.2 参数化。",
+            "🔴 oocAppealRate 有三态：entry_not_open（入口没开过，—）/ no_data_in_window（零样本，—）/ ok（真数，可以是 0%）。三者不可混同。",
             "扫描行数超过 scanRowCap 的指标返回 skipped_too_large 而不是残缺数——保护被轮询的后台端点。",
         ],
     }))

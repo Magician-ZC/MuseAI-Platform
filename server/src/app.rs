@@ -53,6 +53,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::subplot::router())
         .merge(crate::memorial::router())
         .merge(crate::onboarding::router())
+        .merge(crate::annotations::router())
         .merge(crate::admin_api::router());
 
     #[cfg(feature = "arena")]

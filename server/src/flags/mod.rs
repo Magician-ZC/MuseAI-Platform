@@ -199,6 +199,16 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
         wired: false,
     },
     FlagDef {
+        name: "MUSE_OOC_ANNOTATIONS",
+        default_enabled: false,
+        owner: "annotations",
+        desc: "OOC 注解权（单拍申诉 + 私人批注 + 复核补偿托梦配额）。总规格 §7 人设保险第 2 级；\
+               同时是 VALIDATION §4.2「OOC 申诉率」SLO 的唯一数据源与 T1 门槛的测量手段",
+        // 🔵 本模块**从一开始就经本体系解析**（不是先 env 再迁移）：它是 R3 新建件，
+        // 没有需要保留的历史 env 语义，直接接线是最省事的一次。
+        wired: true,
+    },
+    FlagDef {
         name: "MUSE_SAFETY_LEXICON",
         // 🔴 唯一默认为「开」的开关：审核链。关掉它 = 放行敏感词，
         // 所以对它而言「安全的那一侧」是开着，fail-closed 返回 true 才是 fail-**safe**。

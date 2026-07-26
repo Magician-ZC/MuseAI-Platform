@@ -2358,8 +2358,13 @@ async fn metrics_overview_exposes_narrative_slo_four_computable_metrics() {
     assert_eq!(r["repeatEntryRate"], 0.5);
 }
 
-/// 🔴 三项没有数据源的 SLO 必须在后台响应里**如实标注**：status=no_data_source + value=null，
+/// 🔴 仍无数据源的 SLO 必须在后台响应里**如实标注**：status=no_data_source + value=null，
 /// 并说清为什么算不了。后台显示 `—` 与显示 `0%` 是两个完全不同的经营判断。
+///
+/// 清单从三项缩到一项是**数据源逐个到位的预期结果**，不是断言被放宽：
+/// `stateTextContradictionRate`（迁移 0030 CriticReport 落库）与
+/// `oocAppealRate`（迁移 0037 OOC 注解权）先后转正，本用例对两者改为断言
+/// 「不得再标无数据源」+「内容风控申诉仍不可冒充 OOC 申诉」。
 #[tokio::test]
 async fn narrative_slo_marks_remaining_metrics_as_no_data_source() {
     let state = test_state().await;
@@ -2374,7 +2379,7 @@ async fn narrative_slo_marks_remaining_metrics_as_no_data_source() {
     assert_eq!(st, StatusCode::OK);
     let slo = &m["narrativeSlo"];
 
-    let expected = ["oocAppealRate", "plotRepetitionRate"];
+    let expected = ["plotRepetitionRate"];
     let listed: Vec<&str> =
         slo["unavailable"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
     assert_eq!(listed, expected);
@@ -2385,13 +2390,25 @@ async fn narrative_slo_marks_remaining_metrics_as_no_data_source() {
         assert!(!x["reason"].as_str().unwrap().is_empty(), "{key} 必须说清为什么算不了");
         assert!(!x["blockedBy"].as_str().unwrap().is_empty(), "{key} 必须说清补齐它需要什么");
     }
-    // 内容风控申诉确实存在，但 OOC 申诉率照样是「无数据源」——两张表不可互相冒充。
+
+    // 🔴 内容风控申诉确实存在，但它**不是** OOC 申诉的数据源——两张表永远不可互相冒充。
+    // 转正后这条命题的检验方式变了但强度没降：OOC 申诉率现在读 `ooc_appeals`，
+    // 那张表里一条也没有，且注解权开关从未开过 → 必须报 `entry_not_open` + value=null，
+    // 绝不能因为 `moderation_appeals` 里有一行就算出任何数。
     assert_eq!(
         count(&state, "SELECT COUNT(*) AS n FROM moderation_appeals").await,
         1,
         "前提：库里确实有一条内容风控申诉"
     );
-    assert!(slo["metrics"]["oocAppealRate"]["reason"].as_str().unwrap().contains("moderation_appeals"));
+    let ooc = &slo["metrics"]["oocAppealRate"];
+    assert_ne!(ooc["status"], "no_data_source", "数据源已到位（迁移 0037），不得再标无数据源：{ooc}");
+    assert_eq!(ooc["status"], "entry_not_open", "入口默认关闭 → 「没测过」而不是 0%：{ooc}");
+    assert!(ooc["value"].is_null(), "🔴 内容风控申诉不得让 OOC 申诉率算出任何数：{ooc}");
+    assert_eq!(
+        count(&state, "SELECT COUNT(*) AS n FROM ooc_appeals").await,
+        0,
+        "OOC 申诉表与内容风控申诉表是两张互不相干的表"
+    );
 }
 
 /// 空平台：SLO 段不除零、不报错、不 panic，四项可算指标一律 ok 且计数为 0。
@@ -2426,12 +2443,12 @@ async fn narrative_slo_window_clamps_and_can_be_skipped_for_polling() {
     let (_, m) = get(&app, "/api/admin/metrics/overview?sloDays=9999", Some(&admin)).await;
     assert_eq!(m["narrativeSlo"]["windowDays"], 365, "上限 clamp 到 365");
 
-    // 减负开关：跳过态自成一档，仍如实列出三项无数据源指标。
+    // 减负开关：跳过态自成一档，仍如实列出剩余的无数据源指标。
     let (st, m) = get(&app, "/api/admin/metrics/overview?slo=0", Some(&admin)).await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(m["narrativeSlo"]["status"], "skipped_by_request");
     assert_eq!(m["narrativeSlo"]["metrics"].as_object().unwrap().len(), 0);
-    assert_eq!(m["narrativeSlo"]["unavailable"].as_array().unwrap().len(), 2);
+    assert_eq!(m["narrativeSlo"]["unavailable"].as_array().unwrap().len(), 1);
     // 其余看板段不受影响。
     assert!(m["cost"]["centsPer1kTokens"].as_i64().unwrap() > 0);
 }

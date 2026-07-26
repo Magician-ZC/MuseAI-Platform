@@ -1,9 +1,10 @@
 //! 叙事质量 SLO 单测（sqlite::memory + 真实迁移）。
 //!
-//! 覆盖：四个可算指标的聚合正确性 · 🔴 NPC 不得污染基尼（红线口径）· 有效戏份口径
+//! 覆盖：可算指标的聚合正确性 · 🔴 NPC 不得污染基尼（红线口径）· 有效戏份口径
 //! （consent_request 不算戏）· actors_json 规范化解析（`li` 不被 `lixia` 蹭戏）·
-//! 未知 reason 保守计入强制收尾 · 空库不除零不报错 · 三项不可算指标返回明确无数据源标记 ·
-//! 扫描上限触发时"明说跳过"而不是给残缺数。
+//! 未知 reason 保守计入强制收尾 · 空库不除零不报错 · 剩余不可算指标返回明确无数据源标记 ·
+//! 扫描上限触发时"明说跳过"而不是给残缺数 ·
+//! **OOC 申诉率三态**（入口没开 / 窗口零样本 / 真的 0%）与分子分母口径。
 //!
 //! 指标**纯函数**本身的口径单测留在 `runtime::golden`（`gini_coefficient_*` /
 //! `max_silent_streaks_*` / `conclusion_classification_*`）——那是黄金世界回归的口径基线，
@@ -42,9 +43,78 @@ fn cfg() -> SloConfig {
         window_start: T0,
         window_end: T0 + 7 * DAY_MS,
         gini_max: 0.35,
+        ooc_appeal_rate_max: 0.10,
         silent_streak_max: 3,
         scan_row_cap: 50_000,
     }
+}
+
+// ---------------- OOC 申诉率专用播种助手 ----------------
+
+/// 打开 OOC 注解权开关（写一条 `runtime_flags` 全局记录）。
+///
+/// 🔴 用 DB 记录而不是 env：本指标的「入口开过没有」判定就是读这张表 + env 兜底，
+/// 而 env 是**进程级**的，与并发跑的其它用例互相污染。写 DB 记录只影响本用例自己的内存库。
+async fn open_ooc_entry(db: &AnyPool, scope: &str, target: &str) {
+    sqlx::query(
+        "INSERT INTO runtime_flags (id, flag, scope, target_id, enabled, starts_at, ends_at, \
+         updated_by, updated_at, reason, created_at) \
+         VALUES (?, 'MUSE_OOC_ANNOTATIONS', ?, ?, 1, 0, 0, 'test', ?, 'slo 用例', ?)",
+    )
+    .bind(format!("rf_{scope}_{target}"))
+    .bind(scope)
+    .bind(target)
+    .bind(IN_WINDOW)
+    .bind(IN_WINDOW)
+    .execute(db)
+    .await
+    .unwrap();
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn ins_ooc_appeal(
+    db: &AnyPool,
+    id: &str,
+    world: &str,
+    tick_no: i64,
+    character: &str,
+    reason_code: &str,
+    status: &str,
+    created_at: i64,
+) {
+    sqlx::query(
+        "INSERT INTO ooc_appeals (id, world_id, tick_no, character_id, user_id, reason_code, \
+         reason_text, status, reviewer_id, review_reason, reviewed_at, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, '演得不像', ?, '', '', 0, ?)",
+    )
+    .bind(id)
+    .bind(world)
+    .bind(tick_no)
+    .bind(character)
+    .bind(format!("u_{character}"))
+    .bind(reason_code)
+    .bind(status)
+    .bind(created_at)
+    .execute(db)
+    .await
+    .unwrap();
+}
+
+async fn ins_compensation(db: &AnyPool, id: &str, appeal: &str, world: &str, character: &str, grants: i64) {
+    sqlx::query(
+        "INSERT INTO dream_quota_compensations (id, appeal_id, world_id, character_id, user_id, \
+         grants, granted_by, reason, created_at) VALUES (?, ?, ?, ?, ?, ?, 'admin1', '确认模型错误', ?)",
+    )
+    .bind(id)
+    .bind(appeal)
+    .bind(world)
+    .bind(character)
+    .bind(format!("u_{character}"))
+    .bind(grants)
+    .bind(IN_WINDOW)
+    .execute(db)
+    .await
+    .unwrap();
 }
 
 const IN_WINDOW: i64 = T0 + DAY_MS;
@@ -431,7 +501,7 @@ async fn repeat_entry_rate_counts_characters_in_two_or_more_worlds() {
 // 🔴 不可算的三项 + 无数据边界
 // ============================================================================
 
-/// 三项没有数据源的 SLO 必须**显式标注**：`status=no_data_source` + `value=null` +
+/// 没有数据源的 SLO 必须**显式标注**：`status=no_data_source` + `value=null` +
 /// 说得清"为什么算不了""补它要什么"。绝不允许退化成 0 或空对象——后台显示 `—` 与显示 `0%`
 /// 是两个完全不同的经营判断。
 #[tokio::test]
@@ -439,9 +509,11 @@ async fn unavailable_metrics_are_marked_not_zeroed() {
     let db = test_db().await;
     let slo = narrative_slo(&db, &cfg()).await.unwrap();
 
-    // stateTextContradictionRate 已于 2026-07-26 随 CriticReport 落库（迁移 0030）转为可算，
-    // 从本清单移出——清单缩短是数据源到位的**预期结果**，不是断言被放宽。
-    let expected = ["oocAppealRate", "plotRepetitionRate"];
+    // 清单两次缩短，都是**数据源到位的预期结果**，不是断言被放宽：
+    //   - stateTextContradictionRate：2026-07-26 随 CriticReport 落库（迁移 0030）转正；
+    //   - oocAppealRate：2026-07-26 随 OOC 注解权落地（迁移 0037）转正。
+    // 两项各自另有「不许悄悄退回 no_data_source」的红线断言（见本文件下方）。
+    let expected = ["plotRepetitionRate"];
     let listed: Vec<&str> =
         slo["unavailable"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
     assert_eq!(listed, expected, "无数据源清单必须完整且稳定");
@@ -455,18 +527,194 @@ async fn unavailable_metrics_are_marked_not_zeroed() {
         assert!(x.get("rate").is_none() && x.get("count").is_none(), "{key} 不得混入任何看起来像数的字段");
     }
 
-    // OOC 申诉率的原因必须点名 moderation_appeals 是内容风控申诉（这是最容易被误用的表）。
-    assert!(m(&slo, "oocAppealRate")["reason"].as_str().unwrap().contains("moderation_appeals"));
-    // 状态-文本矛盾率：CriticReport 已于 2026-07-26 落库（迁移 0030），本项**已脱离无数据源清单**。
-    // 这条断言守的是「转正后不许回退成 no_data_source」——数据源没了要么修数据源，不许悄悄退回标注。
-    let contradiction = m(&slo, "stateTextContradictionRate");
-    assert_ne!(
-        contradiction["status"], "no_data_source",
-        "CriticReport 已落库，本项不得再标无数据源：{contradiction}"
-    );
+    // 两项已转正的指标：守「转正后不许回退成 no_data_source」——
+    // 数据源没了要么修数据源，不许悄悄退回标注。
+    for key in ["stateTextContradictionRate", "oocAppealRate"] {
+        let x = m(&slo, key);
+        assert_ne!(x["status"], "no_data_source", "{key} 数据源已到位，不得再标无数据源：{x}");
+        assert!(
+            x.get("reason").is_none() && x.get("blockedBy").is_none(),
+            "已可算的指标不该带 reason/blockedBy（那是无数据源专用字段）：{x}"
+        );
+    }
+}
+
+// ============================================================================
+// OOC 申诉率（VALIDATION §4.2 最后一项「唯一未解」，迁移 0037 补齐）
+// ============================================================================
+
+/// 🔴 **入口没开 ≠ 没人申诉**。
+///
+/// 本功能默认关闭，此时窗口内一条申诉都不会有。若直接报 0%，看板上会出现「OOC 申诉率 0%」——
+/// 一个看起来棒极了、实际上什么都没测的数，而 T1 恰恰要拿这个数决定继续/调整/停止。
+#[tokio::test]
+async fn ooc_appeal_rate_reports_entry_not_open_instead_of_zero() {
+    let db = test_db().await;
+    // 有世界、有跑过的拍、有成员——分母完全成立，只是入口从未开过。
+    ins_world(&db, "o_w1", "running").await;
+    ins_member(&db, "o_w1", "o_a").await;
+    ins_tick(&db, "o_w1", 1, "done", 100, IN_WINDOW).await;
+
+    let slo = narrative_slo(&db, &cfg()).await.unwrap();
+    let x = m(&slo, "oocAppealRate");
+    assert_eq!(x["status"], "entry_not_open", "入口没开过必须明说，而不是报 0%：{x}");
+    assert!(x["value"].is_null(), "🔴 value 必须是 null，绝不能是 0：{x}");
     assert!(
-        contradiction.get("reason").is_none() && contradiction.get("blockedBy").is_none(),
-        "已可算的指标不该带 reason/blockedBy（那是无数据源专用字段）：{contradiction}"
+        x["notes"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().contains("没测过")),
+        "必须写清这是「没测过」：{x}"
+    );
+}
+
+/// 入口开着、演过戏、**没人申诉** → 真的 0%（`status=ok` + `value=0.0`）。
+/// 这与上一个用例的 `entry_not_open` 是两个必须分得开的状态。
+#[tokio::test]
+async fn ooc_appeal_rate_zero_is_a_real_zero_once_entry_is_open() {
+    let db = test_db().await;
+    open_ooc_entry(&db, "global", "").await;
+    ins_world(&db, "o_w1", "running").await;
+    ins_member(&db, "o_w1", "o_a").await;
+    ins_member(&db, "o_w1", "o_b").await;
+    ins_tick(&db, "o_w1", 1, "done", 100, IN_WINDOW).await;
+
+    let slo = narrative_slo(&db, &cfg()).await.unwrap();
+    let x = m(&slo, "oocAppealRate");
+    assert_eq!(x["status"], "ok");
+    assert_eq!(x["value"], 0.0, "开着入口、演过戏、没人申诉 = 真的 0%");
+    assert_eq!(x["memberStagesCounted"], 2);
+    assert_eq!(x["charactersAppealed"], 0);
+}
+
+/// 窗口内零样本（没有任何世界演过戏）→ `no_data_in_window`，与「没人申诉」分得开。
+#[tokio::test]
+async fn ooc_appeal_rate_distinguishes_empty_window_from_nobody_appealing() {
+    let db = test_db().await;
+    open_ooc_entry(&db, "global", "").await;
+    ins_world(&db, "o_w1", "running").await;
+    ins_member(&db, "o_w1", "o_a").await;
+    // 唯一那一拍落在窗口之前 → 窗口内零样本。
+    ins_tick(&db, "o_w1", 1, "done", 100, BEFORE_WINDOW).await;
+
+    let slo = narrative_slo(&db, &cfg()).await.unwrap();
+    let x = m(&slo, "oocAppealRate");
+    assert_eq!(x["status"], "no_data_in_window");
+    assert!(x["value"].is_null(), "零样本必须是 null：{x}");
+    assert_eq!(x["memberStagesCounted"], 0);
+}
+
+/// 🔴 **分子分母都算得对**：造数据逐个断言。
+///
+/// 布景：两个世界各 2 名成员（分母 4），其中 o_a 对 w1 的两拍各申诉一次（去重后算 1），
+/// o_c 对 w2 申诉一次（1）→ 分子 2，申诉率 50%。
+#[tokio::test]
+async fn ooc_appeal_rate_computes_numerator_and_denominator() {
+    let db = test_db().await;
+    open_ooc_entry(&db, "global", "").await;
+    for w in ["o_w1", "o_w2"] {
+        ins_world(&db, w, "ended").await;
+        ins_tick(&db, w, 1, "done", 100, IN_WINDOW).await;
+        ins_tick(&db, w, 2, "done", 100, IN_WINDOW).await;
+    }
+    ins_member(&db, "o_w1", "o_a").await;
+    ins_member(&db, "o_w1", "o_b").await;
+    ins_member(&db, "o_w2", "o_c").await;
+    ins_member(&db, "o_w2", "o_d").await;
+
+    // 同一角色对同一世界的两拍各申诉一次 —— 去重后只算「一个角色不满意」。
+    ins_ooc_appeal(&db, "oa1", "o_w1", 1, "o_a", "ooc", "confirmed", IN_WINDOW).await;
+    ins_ooc_appeal(&db, "oa2", "o_w1", 2, "o_a", "ooc", "pending", IN_WINDOW).await;
+    ins_ooc_appeal(&db, "oa3", "o_w2", 1, "o_c", "unfair_ruling", "dismissed", IN_WINDOW).await;
+    ins_compensation(&db, "dqc1", "oa1", "o_w1", "o_a", 1).await;
+
+    let slo = narrative_slo(&db, &cfg()).await.unwrap();
+    let x = m(&slo, "oocAppealRate");
+    assert_eq!(x["status"], "ok");
+    assert_eq!(x["memberStagesCounted"], 4, "分母 = 演过戏的世界 × 在场角色");
+    assert_eq!(x["charactersAppealed"], 2, "分子按 (world, character) 去重");
+    assert_eq!(x["appealsTotal"], 3, "原始条数仍如实给出（与去重后的分子并列）");
+    assert_eq!(x["value"], 0.5);
+    assert!(x["overThreshold"].as_bool().unwrap(), "50% 远超 T1 门槛 10%");
+    assert_eq!(x["thresholdMax"], 0.1, "门槛来自 SloConfig（可 env 覆盖，§0.2 参数化）");
+
+    // 分类与状态分布：T1 之后要看「人设问题 vs 规则问题」的比例，两类必须分开计数。
+    assert_eq!(x["byReasonCode"]["ooc"], 2);
+    assert_eq!(x["byReasonCode"]["unfair_ruling"], 1);
+    assert_eq!(x["byStatus"]["confirmed"], 1);
+    assert_eq!(x["byStatus"]["pending"], 1);
+    assert_eq!(x["byStatus"]["dismissed"], 1);
+    // 坐实率 = 1 confirmed / 2 已复核。申诉率与坐实率是两个数，不可混为一谈。
+    assert_eq!(x["confirmedRate"], 0.5);
+    assert_eq!(x["compensationsGranted"], 1);
+    assert_eq!(x["compensationWhispersGranted"], 1);
+}
+
+/// 分子恒 ≤ 分母：窗口边界与「已退场角色」等情形都不许算出 >100% 的申诉率。
+#[tokio::test]
+async fn ooc_appeal_rate_never_exceeds_one() {
+    let db = test_db().await;
+    open_ooc_entry(&db, "global", "").await;
+    ins_world(&db, "o_w1", "ended").await;
+    ins_member(&db, "o_w1", "o_a").await;
+    ins_tick(&db, "o_w1", 1, "done", 100, IN_WINDOW).await;
+
+    // 三条申诉：一条正常；一条来自**从未在场**的角色（脏数据）；一条落在窗口之外。
+    ins_ooc_appeal(&db, "oa1", "o_w1", 1, "o_a", "ooc", "pending", IN_WINDOW).await;
+    ins_ooc_appeal(&db, "oa2", "o_w1", 1, "o_ghost", "ooc", "pending", IN_WINDOW).await;
+    ins_ooc_appeal(&db, "oa3", "o_w1", 2, "o_a", "ooc", "pending", BEFORE_WINDOW).await;
+
+    let slo = narrative_slo(&db, &cfg()).await.unwrap();
+    let x = m(&slo, "oocAppealRate");
+    assert_eq!(x["memberStagesCounted"], 1);
+    assert_eq!(x["charactersAppealed"], 1, "幽灵角色被 world_members 的 EXISTS 过滤掉");
+    assert_eq!(x["value"], 1.0);
+    assert!(x["value"].as_f64().unwrap() <= 1.0, "🔴 申诉率不可能大于 100%");
+}
+
+/// 按世界灰度（global 关、某个世界开）时，入口判定必须成立——
+/// 否则「申诉进得来、SLO 却说入口没开」，指标与现实脱节。
+#[tokio::test]
+async fn ooc_appeal_rate_entry_detection_covers_world_scoped_rollout() {
+    let db = test_db().await;
+    open_ooc_entry(&db, "world", "o_w1").await;
+    ins_world(&db, "o_w1", "running").await;
+    ins_member(&db, "o_w1", "o_a").await;
+    ins_tick(&db, "o_w1", 1, "done", 100, IN_WINDOW).await;
+
+    let slo = narrative_slo(&db, &cfg()).await.unwrap();
+    let x = m(&slo, "oocAppealRate");
+    assert_eq!(x["status"], "ok", "有任何一条 enabled=1 的灰度记录即算入口开过：{x}");
+    assert_eq!(x["value"], 0.0);
+}
+
+/// 🔴 `moderation_appeals`（内容风控申诉）**不得冒充** OOC 申诉：
+/// 库里有内容风控申诉，OOC 申诉率照样看 `ooc_appeals`，两张表零关系。
+#[tokio::test]
+async fn ooc_appeal_rate_never_reads_moderation_appeals() {
+    let db = test_db().await;
+    open_ooc_entry(&db, "global", "").await;
+    ins_world(&db, "o_w1", "running").await;
+    ins_member(&db, "o_w1", "o_a").await;
+    ins_tick(&db, "o_w1", 1, "done", 100, IN_WINDOW).await;
+    sqlx::query(
+        "INSERT INTO moderation_appeals (id, subject_kind, subject_id, owner_id, appeal_text, \
+         status, created_at) VALUES ('map1', 'character', 'ch_x', 'u_x', '求复审', 'open', ?)",
+    )
+    .bind(IN_WINDOW)
+    .execute(&db)
+    .await
+    .unwrap();
+
+    let slo = narrative_slo(&db, &cfg()).await.unwrap();
+    let x = m(&slo, "oocAppealRate");
+    assert_eq!(x["appealsTotal"], 0, "🔴 内容风控申诉绝不能被算进 OOC 申诉率");
+    assert_eq!(x["value"], 0.0);
+
+    // 源码级：本模块的 OOC 口径实现里不得出现 moderation_appeals。
+    let src = include_str!("mod.rs");
+    let ooc_section = src.split("async fn ooc_appeal_block").nth(1).unwrap();
+    let ooc_section = ooc_section.split("§5 🔴 不可算").next().unwrap();
+    assert!(
+        !ooc_section.contains("FROM moderation_appeals"),
+        "🔴 OOC 申诉率的实现里出现了 moderation_appeals —— 那是内容风控申诉，与「演得不像」零关系"
     );
 }
 
@@ -557,7 +805,8 @@ fn skipped_by_request_is_a_distinct_state() {
     assert_eq!(v["status"], "skipped_by_request");
     assert_eq!(v["windowDays"], 30);
     assert_eq!(v["metrics"].as_object().unwrap().len(), 0);
-    assert_eq!(v["unavailable"].as_array().unwrap().len(), 2);
+    // 清单长度随数据源到位而缩短（3 → 2 → 1）：contradiction（0030）与 oocAppealRate（0037）已转正。
+    assert_eq!(v["unavailable"].as_array().unwrap().len(), 1);
 }
 
 /// 参数化：门槛与上限来自 env（VALIDATION §0.2 禁写死），且回显在响应里可自证。

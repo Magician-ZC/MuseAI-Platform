@@ -233,7 +233,12 @@ fn red_line_only_safety_chain_defaults_on() {
         }
     }
     // 迁移 0036 不插种子数据 —— 登记表非空但数据表为空，是「有开关体系 ≠ 功能被打开」的形状。
-    assert_eq!(KNOWN_FLAGS.len(), 9, "登记表应覆盖现有 9 个 env 开关");
+    //
+    // 计数 9 → 10：R3 的 `MUSE_OOC_ANNOTATIONS`（OOC 注解权，总规格 §7 人设保险第 2 级）
+    // **从建成之日起就经本体系解析**（`wired: true`，无历史 env 语义要保留）。
+    // 这是登记表**新增了一个默认关闭的开关**，不是断言被放宽——上面那个循环仍逐条钉死
+    // 「除审核链外默认值必须为 false」，新开关同样在其中。
+    assert_eq!(KNOWN_FLAGS.len(), 10, "登记表应覆盖 9 个存量 env 开关 + R3 新建的 MUSE_OOC_ANNOTATIONS");
 }
 
 /// 迁移本身不得插入任何记录（种子数据 = 静默开闸）。
@@ -889,13 +894,21 @@ async fn list_endpoint_reports_effective_global_state() {
             assert_eq!(f["globalSource"]["kind"], json!("default"));
         }
     }
-    // 只有参考接线的那一个 wired=true。
+    // 已接线本体系的开关。清单只增不减，且**每加一个都要在这里显式登记**——
+    // 它是「哪些开关的 DB 记录真的会生效」的唯一清单，漏登记 = 运营点了没反应。
+    //   - `MUSE_ONBOARDING`：0036 批次的参考接线（存量 env 开关的迁移样板）；
+    //   - `MUSE_OOC_ANNOTATIONS`：R3 新建件，无历史 env 语义要保留，建成即接线。
+    // 其余 8 个存量开关仍是纯 env，迁移清单见 `flags::MIGRATION_NOTES`。
     let wired: Vec<&str> = arr
         .iter()
         .filter(|f| f["wired"] == json!(true))
         .map(|f| f["name"].as_str().unwrap())
         .collect();
-    assert_eq!(wired, vec![F], "本批次只接线了 MUSE_ONBOARDING");
+    assert_eq!(
+        wired,
+        vec![F, "MUSE_OOC_ANNOTATIONS"],
+        "已接线清单：0036 的参考接线 + R3 新建的 OOC 注解权"
+    );
     assert!(b["records"].as_array().unwrap().is_empty());
 }
 

@@ -10,7 +10,7 @@
 
 | 模块 | feature | 说明 |
 |---|---|---|
-| auth / assets / worlds / events / interventions / consents / invitations / notifications / reports / backpack / chapters / progression / subplot / memorial / onboarding / admin_api | 默认 | 默认构建即含 |
+| auth / assets / worlds / events / interventions / consents / invitations / notifications / reports / backpack / chapters / progression / subplot / memorial / onboarding / annotations / admin_api | 默认 | 默认构建即含 |
 | arena / livegate | `arena` | 赛事房与直播礼物网关 |
 | billing | `billing` | 计费闭环 |
 | shop | `billing` 或 `arena` | 依赖复式账本，与 ledger 同门控（`app.rs:61`） |
@@ -26,9 +26,10 @@
 - 🔴 **fail-closed**：查库失败 / 记录损坏（作用域非法、`enabled` 非 0-1、时间窗反转）→
   返回该开关声明的默认值，**且不再回落 env**。「安全」指不扩大用户可见范围的那一侧——
   8 个未验证开关是**关**，`MUSE_SAFETY_LEXICON`（审核链）是**开**（继续过滤）。
-- **本批次只接线 `MUSE_ONBOARDING` 一个**（参考接线，支持按用户灰度 = VALIDATION §2 T0
-  「邀请制 ≤100 人」的执行手段）。其余 8 个仍是纯 env，登记表里 `wired=false`，
-  迁移清单见 `flags::MIGRATION_NOTES`。
+- **已接线本体系的开关有两个**：`MUSE_ONBOARDING`（0036 批次的参考接线，支持按用户灰度 =
+  VALIDATION §2 T0「邀请制 ≤100 人」的执行手段）与 `MUSE_OOC_ANNOTATIONS`（0037 R3 新建件，
+  无历史 env 语义要保留，建成即接线，支持按世界灰度）。其余 8 个存量开关仍是纯 env，
+  登记表里 `wired=false`，迁移清单见 `flags::MIGRATION_NOTES`。
 
 **各模块运行时开关现状**（与 feature 门控正交，同样"未验证功能默认关闭"）：`invitations` 全部端点由
 `MUSE_ROOM_INVITATIONS` 控制，**默认关闭 → 404**；`onboarding`（新手动线）全部端点由
@@ -37,7 +38,8 @@
 （副本卡的消费端，无独立端点）由 `MUSE_CONTAINER_ASSEMBLY` 控制，**默认关闭 → 建模板期拒绝声明
 `subplotCardRefs`，装配期忽略容器字段走原路径**；`memorial`（传世卡 · 遗作馆）全部端点
 **与封卷本身**由 `MUSE_MEMORIAL` 控制，**默认关闭 → 端点 404 且不发生任何封卷**；世界的生死状档由
-`MUSE_LETHALITY_DEATHMATCH` 控制，默认关闭 → 读取侧降级为同意制。
+`MUSE_LETHALITY_DEATHMATCH` 控制，默认关闭 → 读取侧降级为同意制；`annotations`（OOC 注解权）
+全部端点由 `MUSE_OOC_ANNOTATIONS` 控制，**默认关闭 → 六端点全 404 且一行都不落库**。
 
 ---
 
@@ -180,7 +182,7 @@
 > 与**传世卡**（§12，migration 0034，`memorial/`）是两件事：那是**角色**死后的封卷（遗作馆陈列），
 > 这是**世界**崩塌后的封卷。两者各自独立建表、互不读写。
 
-## 4. 玩家账户（me / backpack / progression / subplot / memorial / onboarding / reports / notifications）
+## 4. 玩家账户（me / backpack / progression / subplot / memorial / onboarding / annotations / reports / notifications）
 
 | 方法 | 路径 | 鉴权 | 说明 |
 |---|---|---|---|
@@ -338,6 +340,69 @@
 > **总历练把传世卡也算进去**（`WHERE withdrawn = 0 OR memorial_status = 'sealed'`）。
 > 该判断与改动均在 `progression/` 内，本批次未越界修改，留给该模块的负责人裁定。
 
+### OOC 注解权（annotations，migration 0037；总规格 §7「人设保险（三级出口）」**第 2 级**）
+
+> 规格原文：**事中·注解权**：单拍 OOC 申诉——世界事实不改，**私人传记可加内心批注**；
+> 复核确认模型错误则补偿托梦配额。**事实归世界，解释权归玩家。**
+
+```text
+世界说：他在城门口退了一步。          ← world_events，公共事实，永不改写
+玩家写：他不是怕，他在等那个人先走。  ← character_annotations，私人解释，只他自己看得见
+```
+
+| 方法 | 路径 | 鉴权 | 说明 |
+|---|---|---|---|
+| POST | `/api/worlds/{id}/ooc-appeals` | JWT | 提 OOC 申诉（可附内心批注）。**幂等**：同一 `(worldId, tickNo, characterId)` 只受理一次，重复提交回既有那条 + `created:false`。**开关默认关闭** |
+| GET | `/api/me/ooc-appeals?status=&limit=&offset=` | JWT | 我的申诉（含批注、复核结果、托梦补偿）。硬边界 `WHERE user_id = 本人` |
+| PUT | `/api/me/ooc-appeals/{id}/annotation` | JWT | 加/改内心批注（可在申诉之后补写）；`body` 空串 = 清空。改别人的一律 **404**（不是 403） |
+| GET | `/api/me/characters/{id}/annotations` | JWT | 我的角色传记批注（私人解释层）。卡非本人 → 404 |
+| GET | `/api/admin/ooc-appeals?status=&limit=&offset=` | **reviewer** | 复核队列（默认 `status=pending`） |
+| POST | `/api/admin/ooc-appeals/{id}/review` | **reviewer** | 复核。`decision` = `confirm_model_error`（确认模型错误 → 补偿托梦配额）\| `dismiss`；`reason` 必填 ≤500 字 |
+
+请求体（提申诉）：
+
+```jsonc
+{
+  "tickNo": 12,                     // 必须是已落定的拍（world_ticks.status='done'），否则 400
+  "characterId": "cc_1",            // 必须是本人在该世界的卡（world_members 有行），否则 RiskBlocked
+  "reasonCode": "ooc",              // ooc | unfair_ruling（正对 T1 门槛「OOC/裁决不公」两个词），未知值 400
+  "reasonText": "他不会在城门口退这一步",   // 必填 ≤500 字
+  "annotation": "他不是怕，他在等那个人先走。"  // 可选 ≤1000 字，只对本人可见
+}
+```
+
+| 项 | 取值 |
+|---|---|
+| 运营开关 | `MUSE_OOC_ANNOTATIONS`，**默认关闭**，经 `flags::is_enabled` 解析（解析链 user > world > global > env > 默认）。关闭时六个端点全 404 **且一行都不落库**。⚠️ **推荐灰度作用域是 user 或 global**：只按 world 灰度时玩家能提申诉但读不到 `/me/ooc-appeals`（那三个端点无 world 坐标）；world 作用域适合「临时关掉某个出问题世界的入口」这种收窄动作 |
+| 🔴 世界事实不改（§0.3） | 申诉/批注/复核**不写** `worlds` · `world_events` · `world_ticks` · `world_members` · `world_contributions` · `consent_requests` · `interventions` · `backpacks` · `cloud_characters` · `world_biographies` 中的任何一行。红线用例 `red_line_appeal_and_review_leave_worldline_byte_identical` 对这十张表做**逐字节快照比对**（不是源码级近似），另有源码级 `red_line_never_rewrites_worldline` |
+| 🔴 承认错误 ≠ 回滚事实 | `confirmed` 的含义是「我们承认这一拍演砸了」，**不是**「这一拍没发生过」。响应恒带 `worldFactChanged:false` / `worldlineChanged:false`，免得前端把「申诉成立」渲染成「这一拍被撤销」 |
+| 🔴 批注为何无法冒充事实 | ① 独立表独立行（`character_annotations`，与 `world_events` 无外键/视图/UNION 读路径）；② 每行都有 `owner_id NOT NULL`，而世界事实表**没有 owner 列**——有主人的数据在形状上就不是「世界说的话」；③ 引擎零读取路径（`runtime`/`crates` 对三张新表零引用，grep 级断言），批注永不进 `RoundInput.state`；④ 读取面自带 `layer="annotation"` + `isWorldFact=false`，世界事实走 `/api/worlds/{id}/events`，两条管道各出各的 |
+| 🔴 状态命名 | `pending` / **`confirmed`**（申诉成立）/ `dismissed`。刻意**不用 `upheld`**：`moderation_appeals` 里的 `upheld` 意思是「维持原判」= 申诉被驳回，与此处正好相反，同词反义是看板上最容易算反的坑 |
+| 🔴 社交防火墙（§14） | 批注**只对本人可见**且**不出真人身份**：`owner_id` 只用于 SQL 过滤，从不出现在任何响应体里；申诉列表按 `user_id` 硬隔离；越权一律 404（403 等于承认该条存在）。复核回执只给 `reviewerAssigned` 布尔，不给复核人 id |
+| 托梦补偿（§8 配额） | 确认模型错误 → `dream_quota_compensations` 落一条（`grants` 条数，`MUSE_OOC_COMPENSATION_WHISPERS` 默认 **1**、上限 10）。🔴 **不往 `interventions` 插行/改行**：那等于伪造玩家从未发过的托梦，或抹掉「已被引擎消费」这个已落定的事实。补偿只提供**加数**——有效配额 = `dream_quota_per_stage()` + `SUM(grants)`，`interventions` 的 `COUNT(*) ... status IN ('accepted','applied')` **一个字符不用改** |
+| 🔵 接线待办 | 兑现补偿需 **`interventions` 的负责人改 2 行**：`let bonus = crate::annotations::dream_quota_bonus(&state.db, &world_id, &req.character_id).await;` + `if used >= dream_quota_per_stage() + bonus`。无表结构变化、无计数 SQL 变化、无拒绝语义变化。附带建议：`/worlds/{id}/interventions/mine` 把 quota 拆成 `base`/`bonus`/`total`。**在该行接上之前补偿已真实入账、可查、可审计**，只是尚未在托梦受理处兑现 |
+| 幂等 | 两层：① `Idempotency-Key`（同一次点击的 HTTP 重试）；② **DB 唯一键** `(world_id, tick_no, character_id)`——换 key 再点也只读回既有那条。复核另有**状态 CAS**（`WHERE status='pending'`，重复 409）+ 补偿表 `appeal_id` 唯一索引双闸 |
+| 审计 | 复核是运营改判，`audit_logs` 落 `ooc_appeal.confirmed` / `ooc_appeal.dismissed`，`subject = ooc_appeal:{id}`，reason 含 `状态\|world\|tick\|character\|compensation=N\|复核理由`。**与状态更新、补偿写入同一事务**——不存在「改判了但审计没落」的中间态 |
+| 机审 | 批注走 `safety::moderate_and_queue`（Pending 自动进 `audit_queue` 人审）。**私密不豁免机审**：私密只决定「谁能看」，不决定「平台是否为它负责」。无论裁决都落库，读取面仅 `approved` 才给正文（否则 `body:null` + `withheld:true`），人审改判后自动恢复 |
+| 复核队列可见性 | 走 `entry_ever_open`（入口曾对**任何人**开放过即可复核）而非全局解析——否则按世界灰度时「申诉进得来、复核进不去」，队列直接卡死 |
+| **SLO 接线** | 本表是 `slo::ooc_appeal_block` 的唯一数据源，使 VALIDATION §4.2 八项里最后一项「唯一未解」的 **OOC 申诉率**转为可算，T1 门槛「OOC/裁决不公申诉 <10%/阶段」第一次具备判定手段。口径见下 |
+
+**SLO「OOC 申诉率」口径**（`GET /api/admin/metrics/overview` → `narrativeSlo.metrics.oocAppealRate`）：
+
+| 项 | 定义 |
+|---|---|
+| 分母 | 窗口内**演过戏**的世界（有 `world_ticks.status='done' AND cost_tokens>0` 的拍）× 其 `world_members` 行 = 「角色 × 阶段」对。阶段口径 = 一个 world 实例（与托梦配额一致）。NPC 不入 `world_members`，无需像基尼那样取交集 |
+| 分子 | 窗口内新建申诉按 `(worldId, characterId)` **去重**后的对数（同一角色对多拍申诉 = 一个角色不满意，不是多个）。分子施加与分母**相同的两个 EXISTS**，故 分子 ≤ 分母 恒成立 |
+| 三态 | `entry_not_open`（入口从未开放，value=null，显示 `—`）/ `no_data_in_window`（窗口内零样本，value=null，`—`）/ `ok`（真数，**可以是 0.0**）。🔴 三者不可混同：本功能默认关闭，若直接报 0% 会得到「一个看起来棒极了、实际上什么都没测的数」，而 T1 恰恰要拿它决定继续/调整/停止 |
+| 辅助数 | `appealsTotal`（原始条数）· `byReasonCode`（ooc vs unfair_ruling，两类的改法完全不同）· `byStatus` · **`confirmedRate`**（坐实率 = confirmed / 已复核，一条没复核 → null）· 补偿发放量 |
+| 🔴 申诉率 ≠ 坐实率 | `value` 是「多少人不满」（T1 门槛盯的），`confirmedRate` 是「其中多少确实是模型的错」。混成一个数会同时丢掉两个信号 |
+| 门槛 | `MUSE_SLO_OOC_APPEAL_RATE_MAX`，默认 **0.10**（T1 原文数值，作为默认值而非常量语义——预注册纪律「开测前可改、开测后冻结」） |
+
+> 🔴 **`moderation_appeals` 不可冒充**：那是**内容风控申诉**（只受理 rejected 的卡/头像、每主体终身一次），
+> 与「角色演得不像 / 裁决不公」零关系。库里有内容风控申诉时 `oocAppealRate` 照样只读 `ooc_appeals`，
+> 由 `slo::tests::ooc_appeal_rate_never_reads_moderation_appeals` 与
+> `admin_api::tests::narrative_slo_marks_remaining_metrics_as_no_data_source` 双向锁死。
+
 ## 5. 计费与商城（billing / shop）
 
 | 方法 | 路径 | 鉴权 | feature | 说明 |
@@ -399,6 +464,8 @@
 | GET | `/api/admin/flags/resolve?flag=&userId=&worldId=` | operator | **dry-run**：该开关对这个人/这个世界解析成什么、来自哪一层（`db`/`env`/`default`/`failClosed`），含被时间窗跳过的记录。复盘主力工具 |
 | POST | `/api/admin/flags` | **admin 专属** | 设置一条（upsert，唯一键 `flag+scope+targetId`）。见下方「运行时开关」小节 |
 | DELETE | `/api/admin/flags/{id}?reason=` | **admin 专属** | 删除一条 = 该目标**回落到更宽作用域 / env**（不是强制关闭）。回执 `fallsBackTo` 直接告知删完变成什么 |
+| GET | `/api/admin/ooc-appeals?status=` | **reviewer** | OOC 申诉复核队列（migration 0037）。见 §4「OOC 注解权」 |
+| POST | `/api/admin/ooc-appeals/{id}/review` | **reviewer** | OOC 申诉复核（改判类，与内容风控申诉同档）。确认模型错误 → 补偿托梦配额；落 `audit_logs` |
 | GET | `/api/admin/risk-events` | operator, reviewer, support | 风控事件 |
 | GET | `/api/admin/data-requests` | support | 数据主体请求 |
 | POST | `/api/admin/data-requests/{id}/run` | support | 执行数据请求 |
@@ -442,7 +509,7 @@
 
 ```bash
 # 路由与方法
-grep -rhoE '\.route\("[^"]+"' server/src | wc -l           # 103 条 route 声明（0036 后）
+grep -rhoE '\.route\("[^"]+"' server/src | wc -l           # 109 条 route 声明（0037 后）
 # admin 角色矩阵
 grep -rn "require_role" server/src/admin_api/*.rs
 ```

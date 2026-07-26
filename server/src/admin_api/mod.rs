@@ -5,6 +5,9 @@
 //!   引导：    POST /admin/dev-login（dev 引导登录 → admin token）
 //!   用户管理：GET /admin/users?query=&cursor=、POST /admin/users/{id}/ban|unban
 //!   内容审核：GET /admin/audit-queue?status=、POST /admin/audit-queue/{id}/approve|reject（回写主体 moderation）
+//!            POST /admin/audit-queue/{id}/reinstate（**admin 专属**，理由必填）——`world_event` 主体
+//!            被人审驳回后的放行台阶。approve 只推翻**机器**收紧；推翻**人审终判**抬到 admin 档，
+//!            两档不共用一个按钮（口径同 0044 的 restricted/removed）。见 audit.rs 模块头
 //!   申诉复审：GET /admin/appeals?status=、POST /admin/appeals/{id}/resolve（overturn/uphold，唯一改判路径）
 //!   已过审内容处置：GET /admin/content/takedowns?state=&kind=、GET /admin/content/{kind}/{id}、
 //!            POST /admin/content/{kind}/{id}/recheck|takedown|restore（migration 0044）
@@ -87,6 +90,7 @@ pub fn router() -> Router<AppState> {
         .route("/admin/audit-queue/{id}", get(audit::detail))
         .route("/admin/audit-queue/{id}/approve", post(audit::approve))
         .route("/admin/audit-queue/{id}/reject", post(audit::reject))
+        .route("/admin/audit-queue/{id}/reinstate", post(audit::reinstate))
         // 申诉复审（内容风控申诉：机审/人审驳回后的唯一改判路径）
         .route("/admin/appeals", get(audit::list_appeals))
         .route("/admin/appeals/{id}/resolve", post(audit::resolve_appeal))

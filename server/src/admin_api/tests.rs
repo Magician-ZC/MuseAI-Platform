@@ -398,6 +398,357 @@ async fn audit_detail_role_gate_and_not_found() {
     assert_eq!(get(&app, "/api/admin/audit-queue/nope", Some(&admin_token(&state))).await.0, StatusCode::NOT_FOUND);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// world_event 主体的裁决回写（migration 0047）
+//
+// 缺口：§15 第 2/3 层把运行时事件送进人审队列，但此前没有回写分支——点「通过」是静默空操作，
+// 事件永久停在 pending。第 3 层 fail-closed（provider 每抖动一次就收紧一批并无条件入队）把
+// 这个缺口放大成了运营侧的实际风险。下面的用例覆盖：正文零改写 / 跨世界不误伤 /
+// 「机器收紧 vs 人工驳回」的判据与两档权限 / 存量行 fail-closed。
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 一段**故意难看**的正文：含零宽符、BOM、emoji、换行与尾随空格。口径同第 3 层的 `NASTY`——
+/// 任何打码、归一化、trim、重新序列化都会让它变形，于是「正文一个字节没动」在断言里可证。
+const WE_NASTY: &str = "她冷笑：「你这个傻\u{200B}逼，滚。」\n——落款：某人 🗡 \u{FEFF}末尾还有空格   ";
+
+/// 落一条世界事件（正文三列都塞上 `WE_NASTY`，供逐字节比对）。
+async fn ins_world_event(state: &AppState, id: &str, world: &str, deid: &str, moderation: &str) {
+    sqlx::query(
+        "INSERT INTO world_events (id, world_id, tick_no, sequence, domain_event_id, event_type, \
+         actors_json, visibility, public_projection_json, private_projections_json, arbiter_note, \
+         moderation, occurred_at) \
+         VALUES ($1, $2, 0, 0, $3, 'dialogue', '[\"c1\"]', 'public', $4, $5, $6, $7, $8)",
+    )
+    .bind(id)
+    .bind(world)
+    .bind(deid)
+    .bind(json!({ "summary": WE_NASTY }).to_string())
+    .bind(json!([{ "audiencePrincipalIds": ["u1"], "summary": WE_NASTY }]).to_string())
+    .bind(WE_NASTY)
+    .bind(moderation)
+    .bind(now_ms())
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+/// 落一条 `world_event` 队列行。`world` 为 `None` 时模拟 0047 之前的存量行（`subject_world_id` NULL）。
+async fn ins_we_queue(state: &AppState, qid: &str, deid: &str, world: Option<&str>, status: &str) {
+    sqlx::query(
+        "INSERT INTO audit_queue (id, subject_kind, subject_id, subject_world_id, machine_verdict, \
+         machine_hits, status, created_at) \
+         VALUES ($1, 'world_event', $2, $3, 'pending', '{\"layer\":3}', $4, $5)",
+    )
+    .bind(qid)
+    .bind(deid)
+    .bind(world)
+    .bind(status)
+    .bind(now_ms())
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+/// 事件的审核态 + 正文三列（正文用元组一起取，比对时一次到位）。
+async fn we_row(state: &AppState, id: &str) -> (String, Option<String>, Option<String>, Option<String>) {
+    let r = sqlx::query(
+        "SELECT moderation, public_projection_json, private_projections_json, arbiter_note \
+         FROM world_events WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    (
+        r.try_get("moderation").unwrap(),
+        r.try_get("public_projection_json").unwrap(),
+        r.try_get("private_projections_json").unwrap(),
+        r.try_get("arbiter_note").unwrap(),
+    )
+}
+
+async fn queue_status(state: &AppState, qid: &str) -> String {
+    sqlx::query("SELECT status FROM audit_queue WHERE id = $1")
+        .bind(qid)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+        .try_get("status")
+        .unwrap()
+}
+
+/// 🔴 放宽只改可见性：`moderation` 从 pending → approved，正文三列**逐字节不变**。
+#[tokio::test]
+async fn world_event_approve_relaxes_visibility_and_leaves_the_body_byte_identical() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    ins_world_event(&state, "e1", "w1", "patch-0-ev-0", "pending").await;
+    ins_we_queue(&state, "aq_we", "patch-0-ev-0", Some("w1"), "open").await;
+
+    let before = we_row(&state, "e1").await;
+    assert_eq!(before.0, "pending");
+
+    let (st, body) =
+        post(&app, "/api/admin/audit-queue/aq_we/approve?reason=误伤", Some(&role_token(&state, "reviewer")), json!({}))
+            .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+    assert_eq!(body["relaxed"], json!(true));
+    assert_eq!(body["tightened"], json!(false));
+    assert_eq!(body["previousModeration"], "pending");
+    assert_eq!(body["moderation"], "approved");
+    assert_eq!(body["eventId"], "e1");
+    assert_eq!(body["subjectWorldId"], "w1");
+    assert_eq!(body["tier"], "reviewer");
+    assert_eq!(body["bodyRewritten"], json!(false));
+
+    let after = we_row(&state, "e1").await;
+    assert_eq!(after.0, "approved", "🔴 放宽没有落地 —— 那正是本批次要修的「点了通过什么都没发生」");
+    // 🔴 §0.3：正文三列逐字节相等（零宽符 / BOM / 尾随空格全都还在）。
+    assert_eq!(before.1.as_deref().map(str::as_bytes), after.1.as_deref().map(str::as_bytes), "公共投影被改写");
+    assert_eq!(before.2.as_deref().map(str::as_bytes), after.2.as_deref().map(str::as_bytes), "私有投影被改写");
+    assert_eq!(before.3.as_deref().map(str::as_bytes), after.3.as_deref().map(str::as_bytes), "仲裁备注被改写");
+    assert!(after.1.as_deref().unwrap().contains('\u{200B}'), "零宽符还在 = 没被任何归一化管线碰过");
+    assert!(after.3.as_deref().unwrap().contains('\u{FEFF}'), "BOM 还在");
+
+    // 队列行闭合 + 留痕两条（audit_logs 与 risk_events 与状态改动同事务）。
+    assert_eq!(queue_status(&state, "aq_we").await, "approved");
+    assert_eq!(
+        count(&state, "SELECT COUNT(*) AS n FROM audit_logs WHERE action='audit.approved' AND subject='world_event:patch-0-ev-0'").await,
+        1
+    );
+    assert_eq!(
+        count(&state, "SELECT COUNT(*) AS n FROM risk_events WHERE kind='world_event_moderation' AND world_id='w1'").await,
+        1,
+        "🔴 放宽比收紧敏感，必须留风控痕（走 safety::record_risk_tx，不开侧门）"
+    );
+}
+
+/// 🔴 跨世界不误伤：`domain_event_id` 由引擎按 `patch-{revision}-ev-{seq}` 生成，两个世界逐字重名。
+/// 放宽按 `world_events.id` 主键点名一行，另一个世界里同名的那条**必须一动不动**。
+#[tokio::test]
+async fn world_event_relax_never_touches_a_same_named_event_in_another_world() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    ins_world_event(&state, "e_w1", "w1", "patch-0-ev-0", "pending").await;
+    ins_world_event(&state, "e_w2", "w2", "patch-0-ev-0", "pending").await;
+    ins_we_queue(&state, "aq_w1", "patch-0-ev-0", Some("w1"), "open").await;
+
+    let (st, body) =
+        post(&app, "/api/admin/audit-queue/aq_w1/approve", Some(&admin_token(&state)), json!({})).await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+    assert_eq!(body["eventId"], "e_w1");
+
+    assert_eq!(we_row(&state, "e_w1").await.0, "approved");
+    assert_eq!(
+        we_row(&state, "e_w2").await.0,
+        "pending",
+        "🔴 另一个世界里同名的事件被顺带放行了 —— 放宽方向上的跨世界误伤是内容安全事故"
+    );
+}
+
+/// 🔴 判据与两档权限：机器收紧由 reviewer 推翻；**人审驳回过**的事件 reviewer 一律 409，
+/// 只有 admin 走 reinstate 能放行，且原来那条驳回记录（判据本身）不得被抹掉。
+#[tokio::test]
+async fn world_event_reviewer_cannot_overturn_a_human_rejection_but_admin_can() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let reviewer = role_token(&state, "reviewer");
+    ins_world_event(&state, "e1", "w1", "patch-1-ev-0", "pending").await;
+    ins_we_queue(&state, "aq1", "patch-1-ev-0", Some("w1"), "open").await;
+
+    // ① 人审驳回：事件早已不外发，故数据面不变；终判落在队列行上。
+    let (st, body) =
+        post(&app, "/api/admin/audit-queue/aq1/reject?reason=确属违规", Some(&reviewer), json!({})).await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+    assert_eq!(body["tightened"], json!(false), "机器入队前已收紧，驳回不需要再改数据面");
+    assert_eq!(body["moderation"], "pending", "回执给的是真实值，不是「点了就当成 rejected」");
+    assert_eq!(we_row(&state, "e1").await.0, "pending");
+    assert_eq!(queue_status(&state, "aq1").await, "rejected");
+
+    // ② 机器又收紧了一次（新一条队列行）。reviewer 想放行 → 409：推翻人不是队列的本职。
+    ins_we_queue(&state, "aq2", "patch-1-ev-0", Some("w1"), "open").await;
+    let (st, body) = post(&app, "/api/admin/audit-queue/aq2/approve", Some(&reviewer), json!({})).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{body:?}");
+    assert_eq!(we_row(&state, "e1").await.0, "pending", "🔴 被拒的裁决不得有任何副作用");
+    assert_eq!(queue_status(&state, "aq2").await, "open", "被拒时队列行也不该被标成已审");
+
+    // ③ admin 走更高台阶 → 放行。
+    let (st, body) = post(
+        &app,
+        "/api/admin/audit-queue/aq2/reinstate",
+        Some(&admin_token(&state)),
+        json!({ "reason": "复核后认定为误判，予以恢复" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+    assert_eq!(body["tier"], "admin");
+    assert_eq!(body["relaxed"], json!(true));
+    assert_eq!(body["humanRejectedBefore"], json!(true));
+    assert_eq!(we_row(&state, "e1").await.0, "approved");
+    assert_eq!(queue_status(&state, "aq2").await, "approved");
+
+    // 🔴 判据本身（aq1 那条驳回记录）不得被 reinstate 抹掉——抹掉等于亲手拆了 tier-2 台阶。
+    assert_eq!(queue_status(&state, "aq1").await, "rejected");
+    assert_eq!(
+        count(&state, "SELECT COUNT(*) AS n FROM audit_logs WHERE action='audit.world_event_reinstate'").await,
+        1
+    );
+}
+
+/// reinstate 的三道门：admin 专属 / 理由必填 / 只受理 world_event 主体。
+#[tokio::test]
+async fn world_event_reinstate_is_admin_only_reason_required_and_world_event_only() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+    ins_world_event(&state, "e1", "w1", "patch-2-ev-0", "pending").await;
+    ins_we_queue(&state, "aq1", "patch-2-ev-0", Some("w1"), "rejected").await;
+    sqlx::query(
+        "INSERT INTO audit_queue (id, subject_kind, subject_id, machine_verdict, status, created_at) \
+         VALUES ('aq_ch','character','ch1','flagged','rejected',$1)",
+    )
+    .bind(now_ms())
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    // reviewer 不够格（可逆动作给 reviewer，推翻终判抬到 admin —— 口径同 0044 的两档）。
+    let (st, _) = post(
+        &app,
+        "/api/admin/audit-queue/aq1/reinstate",
+        Some(&role_token(&state, "reviewer")),
+        json!({ "reason": "放我过去" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    assert_eq!(we_row(&state, "e1").await.0, "pending");
+
+    // 理由必填。
+    let (st, _) =
+        post(&app, "/api/admin/audit-queue/aq1/reinstate", Some(&admin), json!({ "reason": "   " })).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // 其余主体有各自的既有改判路径，不在这里开第二条。
+    let (st, body) =
+        post(&app, "/api/admin/audit-queue/aq_ch/reinstate", Some(&admin), json!({ "reason": "理由" })).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert!(format!("{body:?}").contains("appeals"), "错误信息要指出正确的路：{body:?}");
+
+    // 队列行不存在 → 404。
+    let (st, _) =
+        post(&app, "/api/admin/audit-queue/nope/reinstate", Some(&admin), json!({ "reason": "理由" })).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // 已通过的队列行没有可 reinstate 的驳回 → 409。
+    ins_we_queue(&state, "aq_ok", "patch-2-ev-0", Some("w1"), "approved").await;
+    let (st, _) =
+        post(&app, "/api/admin/audit-queue/aq_ok/reinstate", Some(&admin), json!({ "reason": "理由" })).await;
+    assert_eq!(st, StatusCode::CONFLICT);
+}
+
+/// 驳回一条**仍在外发**的事件（另一条队列行放行过它）→ 收紧，形状同机器棘轮（从 approved 出发）。
+/// 这一格保证 reject 永远不是静默空操作。
+#[tokio::test]
+async fn world_event_reject_tightens_an_event_that_is_still_live() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    ins_world_event(&state, "e1", "w1", "patch-3-ev-0", "approved").await;
+    ins_we_queue(&state, "aq1", "patch-3-ev-0", Some("w1"), "open").await;
+
+    let before = we_row(&state, "e1").await;
+    let (st, body) = post(
+        &app,
+        "/api/admin/audit-queue/aq1/reject?reason=复核后确认违规",
+        Some(&role_token(&state, "reviewer")),
+        json!({}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+    assert_eq!(body["tightened"], json!(true));
+    assert_eq!(body["moderation"], "rejected");
+
+    let after = we_row(&state, "e1").await;
+    assert_eq!(after.0, "rejected");
+    // 收紧同样不碰正文。
+    assert_eq!(before.1.as_deref().map(str::as_bytes), after.1.as_deref().map(str::as_bytes));
+    assert_eq!(before.3.as_deref().map(str::as_bytes), after.3.as_deref().map(str::as_bytes));
+    // 驳回理由回显给用户侧 status 端点的那一列照旧写。
+    let reason: Option<String> = sqlx::query("SELECT reject_reason FROM audit_queue WHERE id='aq1'")
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+        .try_get("reject_reason")
+        .unwrap();
+    assert_eq!(reason.as_deref(), Some("复核后确认违规"));
+}
+
+/// 🔴 0047 之前入队的存量行（`subject_world_id` NULL）两处都 fail-closed：
+/// ① 定位不唯一 → 拒绝，绝不猜是哪个世界；② 判据算不出世界 → 一律当作「被人驳回过」。
+#[tokio::test]
+async fn legacy_queue_rows_without_a_world_fail_closed_on_lookup_and_on_verdict() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+    let reviewer = role_token(&state, "reviewer");
+
+    // ① 同名事件横跨两个世界 + 存量队列行无世界维度 → 409，两条事件都不动。
+    ins_world_event(&state, "e_a", "wa", "patch-0-ev-0", "pending").await;
+    ins_world_event(&state, "e_b", "wb", "patch-0-ev-0", "pending").await;
+    ins_we_queue(&state, "aq_legacy", "patch-0-ev-0", None, "open").await;
+    let (st, _) = post(&app, "/api/admin/audit-queue/aq_legacy/approve", Some(&admin), json!({})).await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    assert_eq!(we_row(&state, "e_a").await.0, "pending");
+    assert_eq!(we_row(&state, "e_b").await.0, "pending");
+
+    // ② 存量的**驳回**行（无世界维度）必须仍然挡住 reviewer 档：
+    //    写成 `subject_world_id = $3` 会静默漏掉它，于是被人驳回过的事件被悄悄放行。
+    ins_world_event(&state, "e_c", "wc", "patch-9-ev-0", "pending").await;
+    ins_we_queue(&state, "aq_legacy_rej", "patch-9-ev-0", None, "rejected").await;
+    ins_we_queue(&state, "aq_new", "patch-9-ev-0", Some("wc"), "open").await;
+    let (st, _) = post(&app, "/api/admin/audit-queue/aq_new/approve", Some(&reviewer), json!({})).await;
+    assert_eq!(st, StatusCode::CONFLICT, "🔴 判不出是谁驳的就不许在 reviewer 档放行");
+    assert_eq!(we_row(&state, "e_c").await.0, "pending");
+
+    // admin 档仍可放行（台阶在，不是死路）。
+    let (st, body) = post(
+        &app,
+        "/api/admin/audit-queue/aq_new/reinstate",
+        Some(&admin),
+        json!({ "reason": "人工核对世界维度后确认为误判" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+    assert_eq!(we_row(&state, "e_c").await.0, "approved");
+}
+
+/// 审核详情把事件本身摆出来：没有它，工作台上只有一行 `world_event` + 一个 `{"layer":3}`，
+/// 人审在**盲审**（理由与位图分支的 `subjectImageUrl` 逐字相同）。
+#[tokio::test]
+async fn world_event_detail_shows_the_event_so_review_is_not_blind() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    ins_world_event(&state, "e1", "w1", "patch-4-ev-0", "pending").await;
+    ins_we_queue(&state, "aq_rej", "patch-4-ev-0", Some("w1"), "rejected").await;
+    ins_we_queue(&state, "aq1", "patch-4-ev-0", Some("w1"), "open").await;
+
+    let (st, body) = get(&app, "/api/admin/audit-queue/aq1", Some(&role_token(&state, "reviewer"))).await;
+    assert_eq!(st, StatusCode::OK, "{body:?}");
+    assert_eq!(body["subjectWorldId"], "w1");
+    assert_eq!(body["subjectEvent"]["eventId"], "e1");
+    assert_eq!(body["subjectEvent"]["worldId"], "w1");
+    assert_eq!(body["subjectEvent"]["moderation"], "pending");
+    assert!(body["subjectEvent"]["publicProjection"].as_str().unwrap().contains("傻"), "人审要看的正是原文");
+    assert_eq!(body["subjectEvent"]["arbiterNote"].as_str().unwrap(), WE_NASTY);
+    // 台阶在工作台上就可见：这一行该点 approve 还是该走 reinstate，不必点了才 409。
+    assert_eq!(body["subjectEvent"]["humanRejectedBefore"], json!(true));
+
+    // 定位不到时如实说明，队列行仍要打得开（否则连关掉它都做不到）。
+    ins_we_queue(&state, "aq_orphan", "patch-404-ev-0", Some("w1"), "open").await;
+    let (st, body) = get(&app, "/api/admin/audit-queue/aq_orphan", Some(&admin_token(&state))).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(body["subjectEvent"]["unresolved"].is_string(), "{body:?}");
+}
+
 // ---------------- 模板创建 + 审核回写 ----------------
 
 #[tokio::test]

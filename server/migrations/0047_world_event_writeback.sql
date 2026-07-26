@@ -1,0 +1,56 @@
+-- MuseAI 平台库 0047：人审对 `world_event` 主体的**回写坐标**（补 `audit_queue` 缺的那一列）。
+--
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 补的是哪个缺口
+-- ═══════════════════════════════════════════════════════════════════════════
+-- §15 第 2 层（词库，高危命中）与第 3 层（语义复核，migration 0046）都会把运行时事件
+-- 送进 `audit_queue`（`subject_kind = 'world_event'`），但 `admin_api::audit::writeback_target`
+-- 对这个主体一直返回 `None` —— 人审在工作台上点「通过」**什么都不会发生**，事件永久停在
+-- `world_events.moderation = 'pending'`。第 3 层是 fail-closed 的（provider 每抖动一次就把那一拍
+-- 收紧并无条件入队），于是这个缺口从「偶发」变成了「每次 provider 抖动都会攒一批永久卡住的内容」。
+--
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 🔴 为什么必须加一列，而不是直接拿 `subject_id` 去 UPDATE
+-- ═══════════════════════════════════════════════════════════════════════════
+-- `audit_queue.subject_id` 对 `world_event` 存的是 **`domain_event_id`**，而它由引擎按
+-- `format!("{patch_id}-ev-{seq}")`（`patch_id = format!("patch-{base_revision}")`）生成 ——
+-- **确定性、且不含世界维度**。于是两个不同世界在同一 revision 上产出的事件
+-- **`domain_event_id` 逐字相同**（例如两个新世界的第一拍都会有 `patch-0-ev-0`）。
+--
+-- 这意味着：
+--
+--   UPDATE world_events SET moderation = 'approved' WHERE domain_event_id = $1
+--
+-- 会把**别的世界里同名的、正被拦下的事件一并放行**。放宽方向上的跨世界误伤是内容安全事故，
+-- 不是排序瑕疵，所以本迁移把世界维度补成一等列，回写侧改为
+-- 「先按 (world_id, domain_event_id) 定位到 `world_events.id` 主键，再按主键点名改一行」。
+--
+-- ⚠️ 存量行（0047 之前入队的）该列为 NULL，无法反查世界。回写侧对 NULL 的处理是
+-- **保守**的：退化为按 `domain_event_id` 全库定位，命中多于一行即拒绝（409），绝不猜。
+-- 同理，「这条事件此前有没有被人工驳回过」的判据查询对 NULL 一律**算作命中**
+-- （fail-closed：判不出是谁驳的，就不许在 reviewer 档上放宽，只能走 admin 档）。
+--
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 🔴 本迁移不动任何世界线表，一列都不加
+-- ═══════════════════════════════════════════════════════════════════════════
+-- §0.3 公共事实不可回滚。放宽改变的是**可见性**（`world_events.moderation` 一列），
+-- 事件正文（`public_projection_json` / `private_projections_json` / `arbiter_note`）
+-- 一个字节都不动 —— 与第 3 层收紧路径同一条边界，由红线用例逐字节守死。
+--
+-- 「机器收紧 vs 人工驳回」的判据也**不新增列**：`audit_queue.status` 本来就是人审动作的台账
+-- （机器只写 `status='open'`，只有 `admin_api::audit::review` 会把它写成 `'approved'`/`'rejected'`），
+-- 因此「该事件被人工驳回过」⟺ 存在一行 `subject_kind='world_event' AND status='rejected'`。
+-- 新造一列 provenance 反而会与这张既有台账形成两个事实源。
+--
+-- 双库可移植（db.rs 约定）：TEXT 可空列；`ALTER TABLE ... ADD COLUMN`（无默认值、无约束）
+-- 与 `CREATE INDEX` 在 SQLite 与 Postgres 上语义一致；无方言特性（无 JSONB / serial / NOW()）。
+
+-- world_event 主体的世界维度。其余主体（character / character_avatar / world_cover /
+-- template / world_template）恒为 NULL —— 它们的 subject_id 本身就是全库唯一主键。
+ALTER TABLE audit_queue ADD COLUMN subject_world_id TEXT;
+
+-- 两个高频查询共用：
+--   ① 运营再审的幂等探测（`safety::queue_recheck_inner`：同主体是否已有 open 行）；
+--   ② 本批次新增的「人工驳回判据」（同主体是否存在 status='rejected' 行）。
+-- 既有索引只有 `audit_queue(status)`，两者都得全表扫。
+CREATE INDEX idx_audit_queue_subject ON audit_queue(subject_kind, subject_id, status);

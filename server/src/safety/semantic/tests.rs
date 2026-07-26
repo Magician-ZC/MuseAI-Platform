@@ -3,6 +3,8 @@
 //! 覆盖清单，按重要性排：
 //!   · 🔴 **正文逐字节不变**（只收紧 `moderation` 一列）——`red_line_recheck_never_rewrites_event_text`
 //!   · 🔴 **单向棘轮**（不放宽、不覆盖更严裁决）——`red_line_tightening_is_one_way_only`
+//!   · 🔴 **`world_events` 写入路径全仓盘点**（收紧只能从 approved 出发；放宽唯一且守卫齐全）
+//!     ——`red_line_world_events_has_one_ratchet_and_one_guarded_relax`（migration 0047 后扩写）
 //!   · 🔴 **provider 故障 fail-closed**（先重试、到顶收紧）——`red_line_provider_outage_fails_closed_not_open`
 //!   · 🔴 **关闭时逐字节等同接线前**——`disabled_is_byte_identical_to_before_wiring`
 //!   · 🔴 **不开事务 / 不越过 safety 既有入口写 risk_events、audit_queue**（源码级扫描）
@@ -783,26 +785,173 @@ fn red_line_never_opens_a_transaction() {
     }
 }
 
-/// 🔴 对 `world_events` 的**唯一**写入是那条只改 `moderation` 的收紧语句。
-#[test]
-fn red_line_only_write_to_world_events_is_the_moderation_ratchet() {
-    let code = strip_comments(include_str!("mod.rs"));
-    for forbidden in ["INSERT INTO world_events", "DELETE FROM world_events"] {
-        assert!(!code.contains(forbidden), "🔴 第 3 层写/删了世界事实：{forbidden}");
+/// 递归收集 `server/src` 下的**生产**源码，返回 `(相对路径, 去注释后的源码)`。
+///
+/// 跳过 `tests.rs` / `testkit.rs`，并在内联的 `mod tests {` 处截断（`mod tests;` 是外置
+/// 文件的声明，不能截——那会把整个模块的生产代码一起丢掉，让扫描形同虚设）。
+/// 遍历前排序：断言的失败信息不随文件系统顺序抖动。
+fn production_sources() -> Vec<(String, String)> {
+    fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String, String)>) {
+        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("读目录 {dir:?} 失败：{e}"))
+            .map(|e| e.expect("目录项").path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                walk(&path, root, out);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            if name == "tests.rs" || name == "testkit.rs" {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("读 {path:?}：{e}"));
+            let src = match src.find("\nmod tests {") {
+                Some(i) => src[..i].to_string(),
+                None => src,
+            };
+            let rel = path.strip_prefix(root).expect("相对路径").to_string_lossy().replace('\\', "/");
+            out.push((rel, strip_comments(&src)));
+        }
     }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut out = Vec::new();
+    walk(&root, &root, &mut out);
+    assert!(out.len() > 50, "🔴 源码遍历只收到 {} 个文件，扫描口径坏了", out.len());
+    out
+}
+
+/// 抽出一段源码里所有 `UPDATE world_events ...` 语句（到字符串字面量结束为止），
+/// 并把跨行续写（`\` + 换行 + 缩进）折叠成单行，便于按形状断言。
+fn world_event_updates(code: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    while let Some(i) = code[from..].find("UPDATE world_events") {
+        let start = from + i;
+        let end = code[start..].find('"').map(|k| start + k).unwrap_or(code.len());
+        out.push(code[start..end].replace('\\', " ").split_whitespace().collect::<Vec<_>>().join(" "));
+        from = end.max(start + 1);
+    }
+    out
+}
+
+/// 🔴 **`world_events` 上允许存在的写入路径，逐条钉死形状**（原名
+/// `red_line_only_write_to_world_events_is_the_moderation_ratchet`；migration 0047 之后
+/// 这张表有了第二个方向，故一并改名与扩写，**不是**放宽了检查）。
+///
+/// 扫的是**全仓生产代码**，不再只扫第 3 层那一个文件——放宽路径落在 `admin_api::audit` 里，
+/// 只扫本模块等于把新开的那条路径放到红线之外。三条不变式：
+///
+/// 1. **正文零改写**（§0.3）：每条语句的 `SET` 列表**只有 `moderation` 一列**。
+/// 2. **收紧只能从 `'approved'` 出发**：非放宽语句的 `WHERE` 必须钉着 `moderation = 'approved'`
+///    （单向棘轮：不覆盖更严的既有裁决，也不从中途状态乱跳）。
+/// 3. **放宽全仓只有一条**，且带明确守卫：`SET` 写字面量 `'approved'`（不是绑定值）、
+///    按主键 `id` 点名一行（不按跨世界重名的 `domain_event_id`）、CAS 到读到的当前态、
+///    起点白名单 `IN ('pending','rejected')` 写死在 SQL 里（于是不会自我放宽、
+///    也不会复活将来可能出现的哨兵值）。
+///
+/// 新增任何一条 `UPDATE world_events` 都会让本用例红——那正是它存在的意义：
+/// 这张表上的写入路径必须逐条经过评审，不许悄悄长出第四条。
+#[test]
+fn red_line_world_events_has_one_ratchet_and_one_guarded_relax() {
+    /// 第 3 层的机器棘轮（`safety::semantic::tighten`）。
+    const RATCHET: &str =
+        "UPDATE world_events SET moderation = $1 WHERE id = $2 AND moderation = 'approved'";
+    /// 人审驳回一条仍在外发的事件（`admin_api::audit`）。形状与棘轮同类：从 approved 出发。
+    const HUMAN_TIGHTEN: &str =
+        "UPDATE world_events SET moderation = 'rejected' WHERE id = $1 AND moderation = 'approved'";
+    /// 🔴 全仓唯一的放宽语句（`admin_api::audit`）。
+    const RELAX: &str = "UPDATE world_events SET moderation = 'approved' WHERE id = $1 AND moderation = $2 AND moderation IN ('pending', 'rejected')";
+    /// 放宽方向的判别式：`SET` 直接写 `'approved'` 字面量。
+    const RELAX_HEAD: &str = "UPDATE world_events SET moderation = 'approved'";
+
+    let sources = production_sources();
+    let mut found: Vec<(String, String)> = Vec::new();
+    for (file, code) in &sources {
+        for sql in world_event_updates(code) {
+            found.push((file.clone(), sql));
+        }
+    }
+
+    // ── 全仓盘点：三条，一条不多 ────────────────────────────────────────────
+    let inventory: Vec<String> = found.iter().map(|(f, s)| format!("\n  {f}: {s}")).collect();
     assert_eq!(
-        code.matches("UPDATE world_events").count(),
-        1,
-        "🔴 对 world_events 的写入语句必须有且只有一条"
+        found.len(),
+        3,
+        "🔴 `world_events` 的写入路径必须逐条评审。当前扫到 {} 条：{}",
+        found.len(),
+        inventory.join("")
     );
+
+    // ── 不变式 ①②③ 逐条施加在每一条语句上 ──────────────────────────────────
+    let mut relaxes: Vec<&(String, String)> = Vec::new();
+    for entry in &found {
+        let (file, sql) = entry;
+        // ① SET 列表只有 moderation 一列 → 正文一个字节不动。
+        let set = sql
+            .split(" SET ")
+            .nth(1)
+            .and_then(|s| s.split(" WHERE ").next())
+            .unwrap_or_else(|| panic!("🔴 {file} 的语句没有 SET/WHERE 结构：{sql}"));
+        assert!(
+            set.starts_with("moderation = ") && !set.contains(','),
+            "🔴 {file} 改写了 moderation 之外的列（正文即世界事实，§0.3）：SET {set}"
+        );
+        // 按主键点名一行：`domain_event_id` 跨世界重名，按它写会误伤别的世界。
+        assert!(sql.contains("WHERE id = $"), "🔴 {file} 未按主键定位要改的行：{sql}");
+
+        if sql.starts_with(RELAX_HEAD) {
+            relaxes.push(entry);
+        } else {
+            // ② 收紧只能从 approved 出发（单向棘轮不得被削弱）。
+            assert!(
+                sql.contains(" AND moderation = 'approved'"),
+                "🔴 {file} 的收紧语句没有钉住起点 approved —— 它可能覆盖更严的既有裁决：{sql}"
+            );
+        }
+    }
+
+    // ── ③ 放宽有且只有一条，且守卫齐全 ──────────────────────────────────────
+    assert_eq!(relaxes.len(), 1, "🔴 放宽路径必须全仓唯一，扫到 {} 条：{relaxes:?}", relaxes.len());
+    let (relax_file, relax_sql) = relaxes[0];
+    assert_eq!(relax_file, "admin_api/audit.rs", "🔴 放宽路径挪出了人审回写模块：{relax_file}");
+    assert_eq!(
+        relax_sql, RELAX,
+        "🔴 放宽语句的守卫被改动了。它必须同时满足：SET 写字面量 'approved'（方向不可由绑定值决定）、\
+         CAS 到读到的当前态（AND moderation = $2）、起点白名单写死在 SQL 里\
+         （AND moderation IN ('pending', 'rejected') —— 白名单而非 `<> 'approved'` 黑名单，\
+         后者在列为 NULL 时会静默命中 0 行，且会随将来新增的哨兵值失效）"
+    );
+
+    // ── 两条收紧语句按文件逐字复核（避免「形状对了但换了个地方」） ──────────
+    for (file, sql) in [("safety/semantic/mod.rs", RATCHET), ("admin_api/audit.rs", HUMAN_TIGHTEN)] {
+        assert!(
+            found.iter().any(|(f, s)| f == file && s == sql),
+            "🔴 {file} 里那条收紧语句不见了或被改写：应为 {sql}"
+        );
+    }
+
+    // ── 第 3 层本模块：不写不删事件行，且**永不写 approved** ────────────────
+    let l3 = strip_comments(include_str!("mod.rs"));
+    for forbidden in ["INSERT INTO world_events", "DELETE FROM world_events"] {
+        assert!(!l3.contains(forbidden), "🔴 第 3 层写/删了世界事实：{forbidden}");
+    }
     assert!(
-        code.contains(
-            "UPDATE world_events SET moderation = $1 WHERE id = $2 AND moderation = 'approved'"
-        ),
-        "🔴 SET 列表里只能有 moderation（正文不改写），WHERE 里必须钉着 approved（单向棘轮）"
+        l3.contains("debug_assert_ne!(verdict, ModerationVerdict::Approved"),
+        "🔴 第 3 层的收紧口丢了「绝不写 approved」的断言 —— 它的 SET 是绑定值，方向只由调用方保证"
     );
     // 读是允许且必须的（候选装载要从这里取）。
-    assert!(code.contains("FROM world_events"));
+    assert!(l3.contains("FROM world_events"));
+
+    // ── 人审回写模块：只改可见性，不碰事件行本身 ──────────────────────────
+    let review = strip_comments(include_str!("../../admin_api/audit.rs"));
+    for forbidden in ["INSERT INTO world_events", "DELETE FROM world_events"] {
+        assert!(!review.contains(forbidden), "🔴 人审回写写/删了世界事实：{forbidden}");
+    }
 }
 
 /// 🔴 风控留痕与人审入队一律走 `safety` 既有入口，本模块不另开写入路径。

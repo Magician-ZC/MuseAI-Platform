@@ -20,6 +20,11 @@
 //!    理由：运行时每 tick 每事件都可能命中，若比照 ① 逐条入队，人审队列会被淹到不可用——
 //!    「记险不入队」保证留痕完整、队列可用，人审仍可从 risk_events 反查。
 //!
+//!    ℹ️ 入队之后的**出口**在 `admin_api::audit`：`world_event` 主体的裁决回写（migration 0047）。
+//!    它是 `world_events.moderation` 上**唯一的放宽路径**，权限分两档（reviewer 推翻机器 /
+//!    admin 推翻人审终判），判据取自 `audit_queue.status`。此前该主体没有回写分支，
+//!    人审点「通过」是一次静默空操作，内容会永久停在 `pending`。
+//!
 //!    2b. `semantic`（子模块）：同一批运行时产出的 **§15 第 3 层**（语义分类）**异步**复核。
 //!    它与 ② 是**同一条运行时链路的两段**，不是第四个入口：② 在 tick 事务内同步跑纯本地词表，
 //!    `semantic` 在 **tick 提交之后、事务之外**跑网络调用 `check_text`，非 Approved 时把
@@ -380,6 +385,7 @@ pub async fn moderate_runtime_projection(
         if runtime_audit_admits(severity) {
             insert_runtime_audit(
                 &mut **tx,
+                world_id,
                 &pe.domain_event_id,
                 RUNTIME_BLOCK_VERDICT,
                 &serde_json::to_string(&hits).unwrap_or_else(|_| "[]".into()),
@@ -401,8 +407,15 @@ pub async fn moderate_runtime_projection(
 ///
 /// 泛型于 `Executor` 是为了同时服务两个调用点：第 2 层在 tick 事务内（`&mut **tx`），
 /// 第 3 层在事务外（`&AnyPool`）。**能力边界不变**：写入仍然只发生在 `safety` 模块里。
+///
+/// 🔴 **`world_id` 不是可选的元信息，是回写路径的定位坐标**（migration 0047）。
+/// `subject_id` 存的是 `domain_event_id`，而引擎按 `patch-{base_revision}-ev-{seq}` 生成它——
+/// 确定性、不含世界维度，于是两个世界在同一 revision 上的事件 id 逐字相同。人审回写若只拿
+/// `domain_event_id` 去 UPDATE，会把**别的世界里同名的、正被拦下的事件一并放行**。
+/// 详见 `admin_api::audit::resolve_world_event`。
 async fn insert_runtime_audit<'e, E>(
     exec: E,
+    world_id: &str,
     domain_event_id: &str,
     verdict: ModerationVerdict,
     machine_hits_json: &str,
@@ -410,13 +423,15 @@ async fn insert_runtime_audit<'e, E>(
 where
     E: sqlx::Executor<'e, Database = sqlx::Any>,
 {
+    // 占位符按 SQL 文本顺序发号、严格升序不复用，且与下面的 bind 顺序一一对应。
     sqlx::query(
-        "INSERT INTO audit_queue (id, subject_kind, subject_id, machine_verdict, machine_hits, status, created_at) \
-         VALUES ($1, $2, $3, $4, $5, 'open', $6)",
+        "INSERT INTO audit_queue (id, subject_kind, subject_id, subject_world_id, machine_verdict, machine_hits, status, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, 'open', $7)",
     )
     .bind(crate::db::new_id("aq"))
-    .bind("world_event")
+    .bind(WORLD_EVENT_SUBJECT)
     .bind(domain_event_id)
+    .bind(world_id)
     .bind(verdict_str(verdict))
     .bind(machine_hits_json)
     .bind(crate::db::now_ms())
@@ -424,6 +439,12 @@ where
     .await?;
     Ok(())
 }
+
+/// 运行时世界事件在人审队列里的 `subject_kind`。
+///
+/// 🔴 全仓唯一字面量：入队侧（本文件）与回写侧（`admin_api::audit`）共用它。两处各写一份的话，
+/// 哪天改了其中一处，入队照旧而回写静默失配——表现正是本批次要修的那个缺陷「点了通过什么都没发生」。
+pub const WORLD_EVENT_SUBJECT: &str = "world_event";
 
 pub async fn record_risk(
     db: &sqlx::AnyPool,

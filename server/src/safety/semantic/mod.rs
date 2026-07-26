@@ -127,11 +127,21 @@
 //! 又会把 provider 的每一次抖动放大成世界叙事的空洞。**先重试、再收紧**是这两难里唯一
 //! 不牺牲方向的解。重试次数 / 退避 / 超时全部参数化（§0.2）。
 //!
-//! ⚠️ **遗留（如实登记，本批次不修）**：`admin_api::audit::writeback_target` 对
-//! `world_event` 主体返回 `None`——人审在队列里点「通过」**不会**把 `world_events.moderation`
-//! 写回 `approved`。这是第 2 层就存在的既有缺口（L2 的高危命中同样入这个队列），
-//! 第 3 层只是让它更容易被触发。补它需要在 `world_events` 上开一条**放宽**路径，
-//! 那是红线邻近改动、应当单独评审，故不夹带在本批次里。
+//! ✅ **已闭合（原登记为遗留）**：`admin_api::audit` 此前对 `world_event` 主体没有回写分支——
+//! 人审在队列里点「通过」不会把 `world_events.moderation` 写回 `approved`，而本层是
+//! fail-closed 的（provider 每抖动一次就收紧一批并无条件入队），于是内容会**永久卡在 `pending`**。
+//! migration 0047 补上了那条路径：
+//!
+//! - **放宽是第二条写路径，全仓只有一条**，形状为
+//!   `UPDATE world_events SET moderation = 'approved' WHERE id = $1 AND moderation = $2
+//!    AND moderation IN ('pending', 'rejected')`
+//!   ——`SET` 仍只有 `moderation` 一列（正文零改写），起点白名单写死在 SQL 里
+//!   （因此永不从 `'approved'` 自我放宽，也永不复活 `'takedown'`），并按 `world_events.id`
+//!   **主键**点名一行（`domain_event_id` 跨世界重名，见 0047 文件头）。
+//! - **权限两档**：reviewer 只能推翻**机器**收紧；被人审驳回过的事件只能由 admin 走
+//!   `POST /admin/audit-queue/{id}/reinstate`（口径抄 0044 的 restricted/removed 两档）。
+//! - 本层的棘轮**一个字符都没改**：仍是「只从 `approved` 出发收紧」。两条路径的形状由
+//!   源码级红线用例 `red_line_world_events_has_one_ratchet_and_one_guarded_relax` 一并锁死。
 //!
 //! ════════════════════════════════════════════════════════════════════════════
 //! 抽样：公开全量、私有抽样，且**确定性**
@@ -473,6 +483,7 @@ pub(crate) async fn run_recheck(state: &AppState, job: &RecheckJob) -> Result<Ru
                     if super::runtime_audit_admits(sev) {
                         super::insert_runtime_audit(
                             &state.db,
+                            &job.world_id,
                             &c.domain_event_id,
                             verdict,
                             &machine_hits(verdict, None, stub),
@@ -536,6 +547,7 @@ pub(crate) async fn run_recheck(state: &AppState, job: &RecheckJob) -> Result<Ru
                     // 「无论裁决如何都入队」的推理。
                     super::insert_runtime_audit(
                         &state.db,
+                        &job.world_id,
                         &c.domain_event_id,
                         ModerationVerdict::Pending,
                         &machine_hits(

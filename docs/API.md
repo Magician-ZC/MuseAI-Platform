@@ -702,7 +702,8 @@ if 线：   从终局那一拍岔出去的、只属于你的一条平行线   �
 | POST | `/api/admin/users/{id}/ban`·`/unban` | support | 封禁/解封 |
 | GET | `/api/admin/audit-queue` | reviewer | 审核队列 |
 | GET | `/api/admin/audit-queue/{id}` | reviewer | 审核详情 |
-| POST | `/api/admin/audit-queue/{id}/approve`·`/reject` | reviewer | 审核裁定（回写主体 moderation） |
+| POST | `/api/admin/audit-queue/{id}/approve`·`/reject` | reviewer | 审核裁定（回写主体 moderation）。`world_event` 主体走专用回写，见下「运行时世界事件的裁决回写」|
+| POST | `/api/admin/audit-queue/{id}/reinstate` | **admin 专属** | 推翻**人审终判**、放行一条运行时世界事件。body `{reason}` 必填 1-500 字。只受理 `world_event` 主体（其余主体的改判走 `/admin/appeals/{id}/resolve` 或 `/admin/content/{kind}/{id}/restore`）|
 | GET | `/api/admin/appeals` | reviewer | 申诉列表 |
 | POST | `/api/admin/appeals/{id}/resolve` | reviewer | 申诉复审（overturn/uphold，**唯一改判路径**） |
 | GET | `/api/admin/content/takedowns?state=&kind=&cursor=&limit=` | reviewer | 已过审内容处置台账（复合游标 `createdAt:id`）。`state` ∈ `restricted`/`removed`/`restored`/`all`；未知 `state`/`kind` → 400（空列表会被读成「这类内容没被处置过」）|
@@ -712,6 +713,27 @@ if 线：   从终局那一拍岔出去的、只属于你的一条平行线   �
 | POST | `/api/admin/content/{kind}/{id}/restore` | reviewer | **恢复**：写回台账里的 `prevModeration`。仅 `restricted` 可恢复，`removed` 恒 409 |
 | GET | `/api/admin/content/appeals?status=&kind=&cursor=&limit=` | reviewer | **处置申诉**队列（复合游标 `createdAt:id`）。`status` ∈ `pending`/`upheld`/`overturned`/`all`。每条附 `disposal` 段（处置台账全行，**含运营内部理由**——后台面才有）|
 | POST | `/api/admin/content/appeals/{id}/resolve` | reviewer | 处置申诉裁决 `{decision: uphold\|overturn, reason}`。`overturn` **走 `restore` 那一段实现**（写回 `prevModeration` + 台账翻 `restored`），不直接写 `approved`。`reason` 是**写给作者的答复**，会回显 |
+
+### 运行时世界事件的裁决回写（`world_event` 主体，migration 0047）
+
+§15 第 2 层（词库高危命中）与第 3 层（语义复核）把运行时投影事件送进 `audit_queue`
+（`subject_kind='world_event'`），但此前 `admin_api::audit` 对该主体**没有回写分支**——人审点
+「通过」是一次静默空操作，事件永久停在 `pending`。第 3 层 fail-closed（provider 每抖动一次就收紧
+一批并无条件入队）把这个缺口放大成了运营侧的实际风险。实现 `server/src/admin_api/audit.rs`，
+后台在内容审核 → 审核队列的详情抽屉。
+
+| 约束 | 口径 |
+|---|---|
+| 🔴 §0.3 正文零改写 | 回写只改 `world_events.moderation` 一列（**可见性**），事件正文（`public_projection_json` / `private_projections_json` / `arbiter_note`）一个字节不动。回执 `bodyRewritten:false` 自述，用例逐字节快照（含零宽符 / BOM）守死 |
+| 🔴 写入路径盘点 | `world_events` 全仓只有 3 条 `UPDATE`：第 3 层机器棘轮、人审驳回收紧（两条**都从 `'approved'` 出发**）、以及**唯一一条放宽**。放宽形状 `SET moderation = 'approved' WHERE id = $1 AND moderation = $2 AND moderation IN ('pending','rejected')`——SET 写字面量（方向不由绑定值决定）、按主键点名一行、CAS 到读到的当前态、起点**白名单**写死在 SQL（不用 `<> 'approved'` 黑名单：NULL 下静默命中 0 行，且会随将来新增的哨兵值失效）。源码级红线用例 `red_line_world_events_has_one_ratchet_and_one_guarded_relax` 全仓扫描，多一条即红 |
+| 🔴 定位坐标 | `subject_id` 存的是 `domain_event_id`，而引擎按 `patch-{base_revision}-ev-{seq}` 生成它——**确定性、不含世界维度**，两个世界在同一 revision 上逐字重名。故 0047 给 `audit_queue` 加 `subject_world_id`，回写先按 `(world_id, domain_event_id)` 定位主键再改。存量行该列为 NULL → 退化为全库定位，**命中多于一行即 409，绝不猜** |
+| 🔴 权限两档 | 口径抄 0044（`restricted` reviewer 可逆 / `removed` admin 专属）。`approve` = 推翻**机器**收紧，`reviewer`；被人审驳回过的事件 `approve` 恒 409，只能走 `reinstate`（**admin 专属 + 理由必填**）。两档不共用一个按钮 |
+| 判据 | 「机器收紧 vs 人工驳回」直接读 `audit_queue.status`，**不新增 provenance 列**：机器入队只写 `'open'`，只有人审裁决会写 `'approved'`/`'rejected'`。⚠️ NULL 安全：存量行 `subject_world_id IS NULL` 时判据**算作命中**（fail-closed，逼它走 admin 档），写成 `(subject_world_id IS NULL OR subject_world_id = $3)` |
+| reject 方向 | 事件当前 `'approved'`（被另一条队列行放行过）→ 收紧为 `'rejected'`；当前已是 `pending`/`rejected` → **不改数据面**（机器入队前必定已收紧，两态在所有读取面上等价）。人审终判落在队列行 `status='rejected'` 上，它**使该事件从此不能再由 reviewer 档放行**——有实际效力，不是空操作。回执 `tightened` + 真实 `moderation` 如实说明 |
+| reinstate 不抹判据 | 已是 `rejected` 的队列行，`reinstate` **不改它的 status**：那一行正是 tier-2 台阶的判据，覆盖它等于亲手拆掉台阶，也会抹掉「有人驳回过」这段处置历史 |
+| 留痕 | `audit_logs`（`audit.approved` / `audit.rejected` / `audit.world_event_reinstate`）+ `risk_events`（`world_event_moderation`，经 `safety::record_risk_tx`，本模块不直写）。三段副作用（`world_events` / `audit_queue` / 留痕）**同一事务** |
+| 人审不盲审 | `GET /admin/audit-queue/{id}` 对该主体附 `subjectEvent`（事件正文 + 世界/拍/序号 + `humanRejectedBefore`），理由与位图主体的 `subjectImageUrl` 逐字相同。定位不到时给 `subjectEvent.unresolved` 如实说明，队列行仍打得开 |
+| 状态语言 | **Implemented**（§0.3 七档）。回写路径与两档权限已实现并被用例覆盖；尚未在真实运营流程上验证 |
 
 ### 已过审内容处置（migration 0044）
 

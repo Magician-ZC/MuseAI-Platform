@@ -172,16 +172,22 @@ cd server && MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo ru
 
 ## 7. 冒烟验证
 
-全绿基线(**校验于 2026-07-26**,数字随开发增长——对不上先确认是新增测试还是漏跑):
+全绿基线(**校验于 2026-07-27**,数字随开发增长——对不上先确认是新增测试还是漏跑):
+
+> 🔴 **这里是全仓唯一维护基线数字的地方。** `CLAUDE.md` 与 `docs/VALIDATION.md` 都已改成
+> 指向本节、不再各留一份副本——此前四处各写各的,结果全部过期(CLAUDE.md 一度停在
+> 464/542/244,实际已是 853/931/287),而**一个看起来精确却是错的基线比没有更糟**:
+> 它会让人把「数字对不上」误判成「我把测试跑挂了」。改这几个数时只改这一处。
 
 ```bash
 # 引擎 + 后端 + 桌面壳
-cargo test --manifest-path crates/muse-engine/Cargo.toml          # 237 passed
-(cd server && cargo test)                                          # 422 passed(default,含黄金世界回归 12 项)
-(cd server && cargo test --features billing,arena)                 # 500 passed
-cargo test --manifest-path src-tauri/Cargo.toml                    # 208 passed
+cargo test --manifest-path crates/muse-engine/Cargo.toml          # 287 passed
+(cd server && cargo test)                                          # 853 passed(default,含黄金世界回归)
+(cd server && cargo test --features billing,arena)                 # 931 passed
+(cd server && cargo test golden)                                   # 14 passed(12 项 runtime::golden::* + 2 项录放 round-trip)
+cargo test --manifest-path src-tauri/Cargo.toml                    # 216 passed
 # 前端 + 后台
-npm run test                                                       # 481 passed / 79 files
+npm run test                                                       # 497 passed / 80 files
 npx tsc --noEmit                                                   # 0 错误
 (cd admin && npx tsc --noEmit && npm run build)                    # 0 错误 + 产出 dist
 ```

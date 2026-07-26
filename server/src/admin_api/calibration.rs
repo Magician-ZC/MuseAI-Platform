@@ -23,10 +23,11 @@
 //! | 分配层 | **Implemented** | `assembly::assign_identities`（内核匹配 + `DOMAIN_IDENTITY` 种子），结果钉进 `assembled_json` |
 //! | 叙事感知层 | **Implemented** | `runtime::load_identity_display_names` 读回 → 他人 brief `唐三（户部主事）` + 本人 `self_identities`，进引擎 prompt 上下文 |
 //! | 数值层 | **设计上永不生效** | §0.1 平权红线：身份不改判定 / 不改发奖 / 不开权限 / 不调难度 / 不改准入。戏份靠玩出来 |
-//! | 校准闭环 | **缺失** | 全仓**没有**任何指标度量「身份池调整 → 戏份分布变化」。SLO 的注意力基尼按 `character_id` 聚合，与身份 id 无关 |
+//! | 校准闭环 | **Implemented**（2026-07-27） | `slo::calibration` 的身份维读数：按身份 id 分组的「相对均分倍率」（均值 / 中位数 / 零分观察数 + 各身份之间的集中度基尼），落在 `/admin/metrics/overview` 的 `narrativeSlo.calibration`。🔴 **只读，绝不回灌引擎** |
 //!
-//! 所以本页能回答的是「**分配结果长什么样、是否失衡**」，**不能**回答「这样分配是不是更好」。
-//! 后者要先把身份维接进质量指标（`slo/`），那是另一件事。
+//! 所以本页能回答的是「**分配结果长什么样、是否失衡**」；「这样分配之后戏份分布如何」现在有读数了
+//! （见上表最后一行），但**读数建成 ≠ 闭环已验证**——闭环成立要等运营真的用它调过参、
+//! 并在下一批世界上看到因果。本页仍然不下「配得对不对」的判语。
 //!
 //! # 🔴 境界档的真实效力：叙事层已接通，校准闭环仍是空的
 //!
@@ -36,11 +37,12 @@
 //! | 钉住层 | **Implemented** | 装配时原样钉进 `assembled_json./assembly/realmTier`（零抽样、不占 RNG 域） |
 //! | 叙事感知层 | **Integrated** | `runtime::parse_realm_costume` 读回 `briefing` + `flavorNotes` → `RoundInput.realm_costume` → 引擎 `call_director` 的入场导演设局 prompt（§6「入场导演统一设定」）。**只有这两个字段进模型上下文** |
 //! | 数值层 | **设计上永不生效** | §6「跨体系靠风味翻译，不靠数值换算」+ §0.1 平权：`RealmTier` 结构里一个数字都没有，有测试锁；接进叙事层后同样只改描写，不进任何判定域（`realm_tier_reaches_only_the_director_prompt`） |
-//! | 校准闭环 | **缺失** | 没有任何指标度量「换境界档 → 叙事变化」 |
+//! | 校准闭环 | **Implemented**（2026-07-27） | `slo::calibration` 的戏服维读数：按钉住的境界档分桶的世界质量三指标（完读率 / 阻断率 / 结局分布）。🔴 **跨世界对比**——境界档全员统一，没有组内分布可看 |
 //!
 //! 所以境界档这一维现在能回答「**配了没有、各阶是不是在换、实例钉住没有、玩家那一篇会不会
-//! 被这样描写**」，仍**不能**回答「这件戏服配得对不对」——后者要先有指标。
-//! 前端 `EffectPanel` 必须把这五层原样渲染。
+//! 被这样描写**」，外加「**穿这件戏服的那批世界，质量三指标长什么样**」。
+//! 但**读数建成 ≠ 闭环已验证**：没有运营真的据此调过档、也没有下一批世界佐证因果，
+//! 所以这一维**仍然不下**「这件戏服配得对不对」的判语。前端 `EffectPanel` 必须把这五层原样渲染。
 //!
 //! # 双库可移植 SQL（db.rs 约定）
 //!
@@ -830,11 +832,14 @@ pub(super) async fn template_identity_pool(
             "assignmentLayer": "Implemented",
             "narrativeLayer": "Implemented",
             "numericLayer": "NeverByDesign",
-            "calibrationLoop": "Missing",
+            // 2026-07-27：`slo::calibration` 的身份维读数上线后，本层从 Missing 转为 Implemented。
+            // 🔴 七档天花板就在这里：读数只是**能测了**，不是「已验证配得对」——
+            // 后者要等运营真的据此调过参并在下一批世界上看到因果（Validated）。谁想往上抬先补那条证据。
+            "calibrationLoop": "Implemented",
             // 🔴 下发文案一律**纯文本**：前端把它当普通字符串渲染，写 Markdown 星号只会在界面上
             // 露出两个字面的 `**`（已在验收中出现过一次）。强调一律用中文引号「」。
             "summary": "身份 = 开局站位。分配层与叙事感知层都已落地（他人称谓「唐三（户部主事）」+ 本人 self_identities 进引擎上下文），但按 §0.1 平权红线「永不进数值层」：不改判定、不改发奖、不开权限、不调难度、不改准入。",
-            "warning": "本页只呈现分配结果，不构成效果验证：全仓没有任何指标度量「身份池调整 → 戏份分布变化」（SLO 的叙事注意力基尼按 character_id 聚合，与身份 id 无关）。调整身份池后请以仿真试跑 + 世界质量回归判断影响，不要拿本页的分布图当「调好了」的证据。",
+            "warning": "本页只呈现分配结果，不构成效果验证。「身份池调整 → 戏份分布变化」的读数在 GET /admin/metrics/overview 的 narrativeSlo.calibration.dimensions.identityShareBalance：它按身份 id 分组，给出每个身份的「相对均分倍率」均值与零分观察数（SLO 的叙事注意力基尼按 character_id 聚合，答不了这个问题）。🔴 那份读数是只读观测，不回灌引擎，也不给「配得对不对」的判语——调整身份池后仍须以仿真试跑 + 世界质量回归判断影响，不要拿本页的分布图当「调好了」的证据。",
         },
         "editable": false,
         "editPath": "身份池的唯一写入路径是模板骨架：POST /admin/world-templates 的 skeletonJson.identityPool（新建模板）。本端点只读，不提供在线改配额 / 改主题词。已开出的世界其分配在装配时即钉死在 assembled_json，改模板不会回溯改写既有实例。",
@@ -964,11 +969,14 @@ fn realm_tier_effect() -> Value {
         "pinningLayer": "Implemented",
         "narrativeLayer": "Integrated",
         "numericLayer": "NeverByDesign",
-        "calibrationLoop": "Missing",
+        // 2026-07-27：`slo::calibration` 的戏服维读数上线后，本层从 Missing 转为 Implemented。
+        // 🔴 它的形状与身份维**刻意不同**：境界档全员统一（§6），没有组内分布，只能跨世界对比。
+        // 同样只到 Implemented：能测了 ≠ 已验证配得对。
+        "calibrationLoop": "Implemented",
         // 🔴 下发文案一律**纯文本**：前端把它当普通字符串渲染，写 Markdown 星号只会在界面上
         // 露出两个字面的 `**`。强调一律用中文引号「」。
         "summary": "境界档 = 世界发给全员的同一件戏服（总规格 §6「境界跟着副本走，不跟着角色走」）。它全员统一、无配额、装配层零抽样，只是把模板声明原样钉进实例 assembled_json，再由 runtime 把其中的 briefing 与 flavorNotes 喂给每拍的入场导演。与身份池正相反：身份各不相同，境界人人一样。",
-        "warning": "叙事感知层已接通，但只接通了「描写」这一头：七个字段里只有 briefing 与 flavorNotes 进入引擎的入场导演 prompt，改变的是这一篇被怎么写（大家什么水位、招式译成什么风味）；id 与 label 只用于本页展示与审计，cosmology 与 genre 只是取值域标注，conflictIntensity 刻意不进模型上下文——世界是否致命由建房参数 lethality 独立决定，与它无关。境界档一个数字都没有，也永远不改判定、发奖、权限、难度与准入。另外没有任何指标度量「换一件戏服，叙事真的变了吗」，所以本页仍然回答不了「这件戏服配得对不对」。",
+        "warning": "叙事感知层已接通，但只接通了「描写」这一头：七个字段里只有 briefing 与 flavorNotes 进入引擎的入场导演 prompt，改变的是这一篇被怎么写（大家什么水位、招式译成什么风味）；id 与 label 只用于本页展示与审计，cosmology 与 genre 只是取值域标注，conflictIntensity 刻意不进模型上下文——世界是否致命由建房参数 lethality 独立决定，与它无关。境界档一个数字都没有，也永远不改判定、发奖、权限、难度与准入。「换一件戏服，那批世界演得怎么样」的读数在 GET /admin/metrics/overview 的 narrativeSlo.calibration.dimensions.realmTierWorldQuality：按钉住的戏服分桶，各桶各自报完读率 / 阻断率 / 结局分布，另留没钉戏服的世界作对照桶。🔴 那是跨世界对比不是组内分布（境界档全员统一，组内分布恒为退化），且只给分维度的事实、不给综合评分，所以本页仍然不回答「这件戏服配得对不对」。",
     })
 }
 
@@ -1443,11 +1451,11 @@ mod tests {
     }
 
     /// 🔴 效力自述：叙事感知层已接通（`Integrated`），数值层必须**永远**是 `NeverByDesign`，
-    /// 校准闭环仍是 `Missing`。
+    /// 校准闭环 = `Implemented`（**读数建成，闭环未验证**）。
     ///
-    /// 七档语言（VALIDATION §0.3）在此的边界：接通 = `Integrated`，**不是** `Validated`
-    /// 更不是 `Enabled` —— 没有任何真实用户数据证明「这样穿戏服更好」。谁把它往上抬，
-    /// 先去补 `slo/` 里那条度量「换戏服 → 叙事变化」的指标（`calibrationLoop` 转绿才配）。
+    /// 七档语言（VALIDATION §0.3）在此的边界：接通 = `Integrated`，读数建成 = `Implemented`，
+    /// **都不是** `Validated` 更不是 `Enabled` —— 没有任何真实用户数据证明「这样穿戏服更好」。
+    /// 谁想把 `calibrationLoop` 往上抬，先拿出「运营据此调过档 + 下一批世界的因果证据」。
     #[test]
     fn realm_tier_effect_states_narrative_layer_is_integrated() {
         let e = realm_tier_effect();
@@ -1458,7 +1466,10 @@ mod tests {
             "runtime::parse_realm_costume → RoundInput.realm_costume → 入场导演 prompt"
         );
         assert_eq!(e["numericLayer"], "NeverByDesign", "§6 跨体系靠风味翻译，不靠数值换算");
-        assert_eq!(e["calibrationLoop"], "Missing", "没有指标度量「换戏服 → 叙事变化」，不许标更高");
+        assert_eq!(
+            e["calibrationLoop"], "Implemented",
+            "slo::calibration 的戏服维读数已建成；但它只是「能测了」，不许标到 Validated"
+        );
         // 🔴 七档天花板：接通之后最多到 Integrated，任何一层都不许出现「已验证 / 可上线」口径。
         for k in ["declarationLayer", "pinningLayer", "narrativeLayer", "numericLayer", "calibrationLoop"] {
             let v = e[k].as_str().unwrap();

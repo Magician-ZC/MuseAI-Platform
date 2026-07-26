@@ -1270,10 +1270,10 @@ async fn ifline_cost_admin(
         "costTokensByIflineCreatedAt": lines.try_get::<i64, _>("total").unwrap_or(0),
         "layer": "ifline",
         "dashboardIntegration": {
-            "mainDashboardIncludesIfline": false,
-            "why": "主看板只 SUM world_ticks.cost_tokens；if 线的拍**不能**落 world_ticks——那是世界线的表，落进去会把 if 线接回 commit_tick → end_world_tx → settle_* 那条自动结算链路，踩穿「付费只买体验容量」。",
-            "howToIntegrate": "在 admin_api::dashboards 的成本聚合里并上：SELECT SUM(cost_tokens) FROM ifline_beats WHERE created_at >= $1 AND created_at < $2（索引 idx_ifline_beats_created 已建好）。",
-            "status": "本批次未接：dashboards.rs 由并行批次在改，跨批次抢改会把两边的账都搅乱。已登记在 docs/VALIDATION.md 的遗留栏。",
+            "mainDashboardIncludesIfline": true,
+            "where": "GET /api/admin/metrics/overview 的 cost.ifline（allTime 与 window 两个口径）+ cost.combined（世界线 + if 线合计）。",
+            "why": "if 线的拍**不能**落 world_ticks——那是世界线的表，落进去会把 if 线接回 commit_tick → end_world_tx → settle_* 那条自动结算链路，踩穿「付费只买体验容量」。所以两者在数据层分开，成本口径也分开列，而不是混进 world_ticks 的聚合里。",
+            "note": "主看板的 cost.total 仍是**世界线**口径（既有字段语义不改，否则历史对账全部失效）；平台总开销看 cost.combined。本端点保留，用于按时间窗细查 if 线自身开销。",
         },
         "notes": [
             "🔴 这里的数字是**花出去的算力**，不是发下来的收益。if 线没有任何产出型数值列。",

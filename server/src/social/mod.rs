@@ -23,7 +23,9 @@
 //! POST   /me/social/blocks                          拉黑 {characterId, reason?}
 //! DELETE /me/social/blocks/{id}                     解除拉黑
 //! POST   /me/social/reports                         举报 {subjectKind, subjectId, category, detail?, worldId?}
-//! GET    /admin/social/reports?status=&cursor=      举报队列（reviewer/support 档）
+//! GET    /admin/social/reports?status=&category=&subjectKind=&cursor=&cursorId=
+//!                                                   举报队列（reviewer/support 档）
+//! GET    /admin/social/reports/summary              队列形状：积压 / 类别分布 / 升级阈值（只读聚合）
 //! POST   /admin/social/reports/{id}/resolve         处置 {action: actioned|dismissed, reason}
 //! ```
 //!
@@ -379,6 +381,12 @@ const REPORT_PENDING: &str = "pending";
 const REPORT_ACTIONED: &str = "actioned";
 const REPORT_DISMISSED: &str = "dismissed";
 
+/// 举报状态白名单（落库值全集，顺序即运营队列里的处理顺序）。
+const REPORT_STATUSES: &[&str] = &[REPORT_PENDING, REPORT_ACTIONED, REPORT_DISMISSED];
+
+/// 列表筛选的「不筛」取值。与任何落库值都不重名，故不会与真实状态/类别相撞。
+const FILTER_ALL: &str = "all";
+
 /// 举报主体种类白名单。
 const SUBJECT_KINDS: &[&str] = &["character", "unlock_request"];
 
@@ -408,6 +416,7 @@ pub fn router() -> Router<AppState> {
         .route("/me/social/reports", post(create_report))
         // 运营面（reviewer/support 档：举报处置属内容风控 + 客服交叉领域）
         .route("/admin/social/reports", get(list_reports_admin))
+        .route("/admin/social/reports/summary", get(report_summary_admin))
         .route("/admin/social/reports/{id}/resolve", post(resolve_report_admin))
 }
 
@@ -1767,11 +1776,42 @@ fn require_report_handler(admin: &AdminUser) -> Result<(), ApiError> {
 struct ReportListQuery {
     #[serde(default)]
     status: Option<String>,
+    /// 举报类别筛选（`REPORT_CATEGORIES` 之一，或 `all`）。缺省 = `all`。
+    #[serde(default)]
+    category: Option<String>,
+    /// 主体种类筛选（`SUBJECT_KINDS` 之一，或 `all`）。缺省 = `all`。
+    #[serde(default, rename = "subjectKind")]
+    subject_kind: Option<String>,
     #[serde(default)]
     cursor: Option<i64>,
     /// 复合游标的第二段（上一页末行的 `id`），见 `crate::pagination`。
     #[serde(default, rename = "cursorId")]
     cursor_id: Option<String>,
+}
+
+/// 列表筛选值校验：缺省取 `default`，`all` 与白名单值放行，其余 **400**。
+///
+/// 🔴 未知筛选值必须报错，不能走「匹配不到 → 返回空列表」那条路：举报队列是安全通道，
+/// 一个拼错的筛选参数静默返回空队列，运营读到的是「没有积压」——安全面上最危险的那种误读。
+/// （口径同 `create_report` 对未知 `category` 的处理：绝不静默归并。）
+fn filter_value(
+    raw: Option<String>,
+    whitelist: &[&str],
+    field: &str,
+    default: &str,
+) -> Result<String, ApiError> {
+    let value = raw
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| default.to_string());
+    if value == FILTER_ALL || whitelist.contains(&value.as_str()) {
+        Ok(value)
+    } else {
+        Err(ApiError::BadRequest(format!(
+            "{field} 必须是 {} / {FILTER_ALL} 之一",
+            whitelist.join(" / ")
+        )))
+    }
 }
 
 /// 举报队列（运营）。这里**可以**看到 `subjectUserId`——处置需要它，且 admin 面本就是特权面；
@@ -1780,6 +1820,11 @@ struct ReportListQuery {
 /// 🔴 复合游标 `(created_at, id)`（见 `crate::pagination`）：单列游标下，同毫秒到达的一批举报
 /// 若横跨页边界，被跳过的那几条**不会出现在队列的任何一页**——运营看不见 = 永远不会被处置。
 /// 这是本仓所有游标分页里后果最重的一处（举报是安全通道，漏一条就是漏一次处置）。
+///
+/// 🔴 **末页必须回 `nextCursor: null`**（多取一行判定，口径同 `admin_api::ops::list_risk_events`）：
+/// 只按「末行有没有」发游标的话，最后一页也带着一个游标返回，界面上的「加载更多」于是永远在，
+/// 点下去只能得到空页。这在别处只是难看，在举报队列上是**让运营分不清「翻完了」和「还没翻完」**——
+/// 而「还有没有没看的举报」正是这个页面唯一要回答的问题。
 async fn list_reports_admin(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -1788,27 +1833,60 @@ async fn list_reports_admin(
     ensure_ops_enabled(&state.db).await?;
     require_report_handler(&admin)?;
 
-    let filter = q.status.unwrap_or_else(|| REPORT_PENDING.to_string());
-    let rows: Vec<(String, String, String, String, String, String, String, String, String, i64, i64)> =
-        sqlx::query_as(
+    let filter = filter_value(q.status, REPORT_STATUSES, "status", REPORT_PENDING)?;
+    let category = filter_value(q.category, REPORT_CATEGORIES, "category", FILTER_ALL)?;
+    let subject_kind = filter_value(q.subject_kind, SUBJECT_KINDS, "subjectKind", FILTER_ALL)?;
+
+    let page = page_size();
+    // `handled_by` / `resolution` 一并投影：没有它们，`status=actioned` 那一屏只能看到「有结论」，
+    // 看不到**结论是什么、谁下的**——运营复核档最需要回答的恰是这两件事（申诉与复盘都从这里起）。
+    #[allow(clippy::type_complexity)]
+    let mut rows: Vec<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        i64,
+        i64,
+    )> = sqlx::query_as(
             "SELECT id, reporter_user_id, subject_kind, subject_id, subject_user_id, world_id, \
-                    category, detail, status, created_at, resolved_at FROM social_reports \
+                    category, detail, status, handled_by, resolution, created_at, resolved_at \
+             FROM social_reports \
              WHERE ($1 = 'all' OR status = $2) \
-               AND ($3 IS NULL OR created_at < $4 OR (created_at = $5 AND id < $6)) \
-             ORDER BY created_at DESC, id DESC LIMIT $7",
+               AND ($3 = 'all' OR category = $4) \
+               AND ($5 = 'all' OR subject_kind = $6) \
+               AND ($7 IS NULL OR created_at < $8 OR (created_at = $9 AND id < $10)) \
+             ORDER BY created_at DESC, id DESC LIMIT $11",
         )
         .bind(&filter)
         .bind(&filter)
+        .bind(&category)
+        .bind(&category)
+        .bind(&subject_kind)
+        .bind(&subject_kind)
         .bind(q.cursor)
         .bind(q.cursor)
         .bind(q.cursor)
         .bind(crate::pagination::cursor_id_bound(q.cursor_id.as_deref()))
-        .bind(page_size())
+        .bind(page + 1)
         .fetch_all(&state.db)
         .await?;
 
-    let next = rows.last().map(|r| r.9);
-    let next_id = rows.last().map(|r| r.0.clone());
+    // 多取的那一行只用来回答「后面还有没有」，不下发。
+    let has_more = rows.len() as i64 > page;
+    rows.truncate(page.max(0) as usize);
+    let (next, next_id) = if has_more {
+        (rows.last().map(|r| r.11), rows.last().map(|r| r.0.clone()))
+    } else {
+        (None, None)
+    };
     let reports: Vec<Value> = rows
         .into_iter()
         .map(
@@ -1822,6 +1900,8 @@ async fn list_reports_admin(
                 category,
                 detail,
                 status,
+                handled_by,
+                resolution,
                 created_at,
                 resolved_at,
             )| {
@@ -1835,13 +1915,147 @@ async fn list_reports_admin(
                     "category": category,
                     "detail": detail,
                     "status": status,
+                    "handledBy": handled_by,
+                    "resolution": resolution,
                     "createdAt": created_at,
                     "resolvedAt": resolved_at,
                 })
             },
         )
         .collect();
-    Ok(Json(json!({ "reports": reports, "nextCursor": next, "nextCursorId": next_id })))
+    Ok(Json(json!({
+        "reports": reports,
+        "nextCursor": next,
+        "nextCursorId": next_id,
+        "status": filter,
+        "category": category,
+        "subjectKind": subject_kind,
+        "pageSize": page,
+    })))
+}
+
+/// 举报队列的**形状**：积压、类别/主体分布、最久未处理、达升级阈值的对象数。只读聚合，零写入。
+///
+/// 为什么单独一个端点、而不让界面拿列表页自己数：列表是**游标分页**的，按已加载的那一页统计
+/// 出来的「待处理 12 条」意思是「这一页里有 12 条」，不是队列真实积压。
+/// 在别的看板上这只是口径不准，在举报队列上它会被读成「没什么要处理的」——
+/// 与 `docs/design/admin-ui-design.md` §9.1「只渲染接口真实返回的字段」是同一条纪律。
+///
+/// 每项**一次聚合查询**（`GROUP BY` / 单行取），无 N+1、无逐行回传；SQL 全落在
+/// `db.rs` 的双库可移植子集内（只用 `COUNT` / `GROUP BY` / `CAST(... AS BIGINT)`，占位符 `$N`）。
+/// `ORDER BY` 全序：分组键本身唯一，故按分组键升序即全序。
+async fn report_summary_admin(
+    State(state): State<AppState>,
+    admin: AdminUser,
+) -> Result<Json<Value>, ApiError> {
+    ensure_ops_enabled(&state.db).await?;
+    require_report_handler(&admin)?;
+
+    // ① 按状态（积压口径）。
+    let status_rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT status, CAST(COUNT(*) AS BIGINT) AS n FROM social_reports \
+         GROUP BY status ORDER BY status ASC",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    let mut by_status = serde_json::Map::new();
+    // 白名单三档恒出现（哪怕是 0）：缺档会让界面把「这一档没有」渲染成「这一档没数据源」。
+    for s in REPORT_STATUSES {
+        by_status.insert((*s).to_string(), json!(0));
+    }
+    let mut total: i64 = 0;
+    for (status, n) in &status_rows {
+        total += *n;
+        by_status.insert(status.clone(), json!(*n));
+    }
+
+    // ② 按类别 × 状态、③ 按主体种类 × 状态（两条分布，各一次 GROUP BY）。
+    let category_rows: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT category, status, CAST(COUNT(*) AS BIGINT) AS n FROM social_reports \
+         GROUP BY category, status ORDER BY category ASC, status ASC",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    let kind_rows: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT subject_kind, status, CAST(COUNT(*) AS BIGINT) AS n FROM social_reports \
+         GROUP BY subject_kind, status ORDER BY subject_kind ASC, status ASC",
+    )
+    .fetch_all(&state.db)
+    .await?;
+
+    // ④ 最久未处理的待办（全序取一行，不用 MIN 聚合：`MIN` 在空表上回 NULL，
+    //    Any 驱动上还要额外处理空聚合的类型，取一行更直白且顺带证明「确实有这么一条」）。
+    let oldest_pending: Option<i64> = sqlx::query_scalar(
+        "SELECT created_at FROM social_reports WHERE status = $1 \
+         ORDER BY created_at ASC, id ASC LIMIT 1",
+    )
+    .bind(REPORT_PENDING)
+    .fetch_optional(&state.db)
+    .await?;
+
+    // ⑤ 已达升级阈值的被举报人数（与 `create_report` 写 `risk_events` 用的是同一个阈值）。
+    //    这里只给**数量**，不给名单：名单的既有去处是风控面
+    //    （`risk_events(kind='social_report_threshold')`），本页不复制一份。
+    let escalate_at = report_escalate_at();
+    let escalated_subjects: i64 = sqlx::query_scalar(
+        "SELECT CAST(COUNT(*) AS BIGINT) FROM ( \
+           SELECT subject_user_id FROM social_reports WHERE status = $1 \
+           GROUP BY subject_user_id HAVING COUNT(*) >= $2 \
+         ) t",
+    )
+    .bind(REPORT_PENDING)
+    .bind(escalate_at)
+    .fetch_one(&state.db)
+    .await?;
+
+    Ok(Json(json!({
+        "total": total,
+        "byStatus": Value::Object(by_status),
+        "byCategory": group_distribution(&category_rows, REPORT_CATEGORIES),
+        "bySubjectKind": group_distribution(&kind_rows, SUBJECT_KINDS),
+        "oldestPendingCreatedAt": oldest_pending,
+        "escalateAt": escalate_at,
+        "escalatedSubjectCount": escalated_subjects,
+        "notes": [
+            "计数为全量聚合，不受列表分页与筛选影响。",
+            "升级阈值 escalateAt 可运营配置（MUSE_SOCIAL_REPORT_ESCALATE_AT），不是写死的常量。",
+            "达阈值对象的名单在风控面：risk_events.kind = 'social_report_threshold'。",
+        ],
+    })))
+}
+
+/// `(key, status, n)` 分组行 → `[{key, pending, actioned, dismissed, total}]`。
+///
+/// **白名单里的键恒出现（哪怕全 0）**：筛选下拉要按白名单给全，而不是「库里有什么给什么」——
+/// 后者会让一个还没人用过的举报类别在界面上根本不存在，运营也就无从按它筛。
+/// 白名单外的键（历史数据 / 直写库）追加在后面原样回显，不静默丢弃。
+fn group_distribution(rows: &[(String, String, i64)], whitelist: &[&str]) -> Value {
+    let mut order: Vec<String> = whitelist.iter().map(|s| (*s).to_string()).collect();
+    for (key, _, _) in rows {
+        if !order.iter().any(|k| k == key) {
+            order.push(key.clone());
+        }
+    }
+    let items: Vec<Value> = order
+        .into_iter()
+        .map(|key| {
+            let mut obj = serde_json::Map::new();
+            obj.insert("key".into(), json!(key));
+            let mut sum = 0i64;
+            for status in REPORT_STATUSES {
+                let n = rows
+                    .iter()
+                    .find(|(k, s, _)| k == &key && s == status)
+                    .map(|(_, _, n)| *n)
+                    .unwrap_or(0);
+                sum += n;
+                obj.insert((*status).to_string(), json!(n));
+            }
+            obj.insert("total".into(), json!(sum));
+            Value::Object(obj)
+        })
+        .collect();
+    Value::Array(items)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

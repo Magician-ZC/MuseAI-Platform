@@ -580,12 +580,15 @@ if 线：   从终局那一拍岔出去的、只属于你的一条平行线   �
 | GET/POST | `/me/social/blocks` | AuthUser | 我的黑名单 / 拉黑 `{characterId, worldId?, reason?}` |
 | DELETE | `/me/social/blocks/{id}` | AuthUser | 解除拉黑 |
 | POST | `/me/social/reports` | AuthUser | 举报 `{subjectKind, subjectId, category, detail?, worldId?}` |
-| GET | `/admin/social/reports?status=&cursor=&cursorId=` | AdminUser(reviewer/support) | 举报队列（复合游标，见 §4 说明；漏页 = 漏处置） |
-| POST | `/admin/social/reports/{id}/resolve` | AdminUser(reviewer/support) | 处置 `{action: actioned\|dismissed, reason}` |
+| GET | `/admin/social/reports?status=&category=&subjectKind=&cursor=&cursorId=` | AdminUser(reviewer/support) | 举报队列（复合游标，见 §4 说明；漏页 = 漏处置）。三个筛选值走白名单，**未知值 400 而非静默空列表**（空队列会被读成「没有积压」）。末页回 `nextCursor: null`（多取一行判定，口径同 `/admin/risk-events`）。行内含 `handledBy` / `resolution`——没有这两个字段，`status=actioned` 那一屏只看得到「有结论」，看不到结论是什么、谁下的 |
+| GET | `/admin/social/reports/summary` | AdminUser(reviewer/support) | 队列形状（只读聚合）：`byStatus` / `byCategory` / `bySubjectKind`（白名单键恒出现，哪怕是 0）/ `oldestPendingCreatedAt` / `escalateAt` / `escalatedSubjectCount`。**不受分页与筛选影响**——界面拿列表页自己数出来的积压是「这一页里有几条」，在安全队列上会被读成「没什么要处理的」 |
+| POST | `/admin/social/reports/{id}/resolve` | AdminUser(reviewer/support) | 处置 `{action: actioned\|dismissed, reason}`。🔴 **只改举报单状态**：封禁/下架/改判走各自既有路径（见下「处置边界」） |
 
 **运行时开关 `MUSE_SOCIAL_IDENTITY_UNLOCK`（默认关闭，经 `flags::is_enabled` 解析）。**
-关闭时上述 11 个端点**全部 404 且零副作用**（不落幂等键、不发通知、不改任何表），
+关闭时上述端点**全部 404 且零副作用**（不落幂等键、不发通知、不改任何表），
 由 `social::tests::red_line_disabled_by_default_all_endpoints_404_and_no_side_effect` 锁死。
+运营面（`/admin/social/reports*`）的可见性判据是 `entry_ever_open`——**入口曾对任何人开放过**即放行，
+否则同样 404；后台前端把这个 404 渲染成「功能未开启」空态而不是报错（见下「admin 前端」）。
 
 | 项 | 取值 |
 |---|---|
@@ -598,6 +601,8 @@ if 线：   从终局那一拍岔出去的、只属于你的一条平行线   �
 | 拉黑实效 | **按 user 判定、按面具录入**（按角色判定会被换卡绕过）。落库同时**撤销**双方 `pending`/`accepted` 解锁 → `revoked`（已授予的身份可见性立即收回）；被拉黑者发不出解锁请求；🔴 **跨通道生效**——`invitations::create_invitation` 前门也调 `social::is_blocked_pair`，且**不看社交开关**（拉黑是保护态，急停不应让它失效，方向同 `MUSE_SAFETY_LEXICON` 的 fail-safe） |
 | 终局态 | `declined`/`expired`/`revoked` 均为**终局**，唯一索引 `(world_id, requester_character_id, target_character_id)` 使同一条线只有一行 → **拒绝后不能再问一次**（真人身份是最敏感的一次授予，不给反复施压的空间）。解除拉黑**不恢复**已撤销的解锁 |
 | 举报 | 进 `social_reports` 队列（`pending → actioned/dismissed`，CAS + 同事务 `audit_logs('social.report_resolved')`）。同一被举报人 pending 数**恰好**达 `MUSE_SOCIAL_REPORT_ESCALATE_AT` → 写一条 `risk_events(kind='social_report_threshold')` 升级到既有风控面。冷却窗口内重复提交幂等复用既有那条（**不建唯一索引**：唯一即"终身只能举报一次"，会让再犯无法被举报） |
+| 🔴 处置边界 | `resolve` **只改举报单自身的状态 + 留痕**，不做任何实处置。封禁走 `POST /admin/users/{id}/ban`（`require_role(support)`）、内容驳回走 `POST /admin/audit-queue/{id}/reject`（`require_role(reviewer)`）、改判走 `POST /admin/appeals/{id}/resolve`，各自带自己的权限与审计。把处置塞进举报接口等于给封禁开一条**绕过既有权限矩阵**的侧门。后台前端因此只做「跳转 + 回填」，不新开写路径 |
+| admin 前端 | `admin/src/pages/SocialReports.tsx`（RBAC 模块 `social`，可见角色 reviewer/support/admin，与 `require_report_handler` 逐字对齐）。列表按状态/类别/主体种类筛 + 复合游标翻页 + 详情抽屉 + 复核处置（理由必填 ≤500 字）；处置动作跳 `/users?query=<被举报人>`、`/audit`、`/risk?kind=social_report_threshold` 三个既有入口，且**跳转按钮受前端 RBAC 收敛**（reviewer 看得到举报队列但进不去用户管理，就不该有一个能点的封禁按钮）。开关未开启（端点 404）→ 整页「功能未开启」空态，不报错 |
 | 参数化（§0.2） | `MUSE_SOCIAL_UNLOCK_MIN_BOND`(0.6) / `_HOSTILE_MAX`(0.3) / `_HOSTILE_FEAR`(0.5) / `_MIN_SHARED_WORLDS`(1) / `_DEATH_BOND_COUNTS`(on) / `_UNLOCK_DAILY_LIMIT`(3) / `_UNLOCK_TTL_MS`(7d) / `_BLOCK_MAX`(500) / `_REPORT_DAILY_LIMIT`(20) / `_REPORT_COOLDOWN_MS`(24h) / `_REPORT_ESCALATE_AT`(3) / `_PAGE_SIZE`(20) |
 | 幂等 | 发起/回应支持 `Idempotency-Key`；DB 侧 `INSERT ... ON CONFLICT(...) DO NOTHING` + 回读权威行（解锁请求与拉黑均如此，杜绝「先查后插」的并发竞态） |
 | ⚠️ 运营须知 | 只按 `world` 作用域灰度时，玩家能在该世界发起解锁却读不到 `/me/social/**` 收件箱（后者无 world 坐标）。**推荐灰度作用域是 `user` 或 `global`**，`world` 只用于「临时关掉某个出问题世界的社交入口」这种收窄动作 |
@@ -768,7 +773,7 @@ if 线：   从终局那一拍岔出去的、只属于你的一条平行线   �
 | 分配层 `assignmentLayer` | `Implemented` | `assembly::assign_identities`（内核匹配 + `DOMAIN_IDENTITY` 种子），结果钉进 `assembled_json` |
 | 叙事感知层 `narrativeLayer` | `Implemented` | `runtime::load_identity_display_names` 读回 → 他人 brief `唐三（户部主事）` + 本人 `self_identities` 进引擎上下文 |
 | 数值层 `numericLayer` | `NeverByDesign` | 平权红线：不改判定 / 不改发奖 / 不开权限 / 不调难度 / 不改准入 |
-| 校准闭环 `calibrationLoop` | `Missing` | **全仓没有任何指标度量「身份池调整 → 戏份分布变化」**（SLO 的叙事注意力基尼按 `character_id` 聚合，与身份 id 无关） |
+| 校准闭环 `calibrationLoop` | `Implemented`（2026-07-27） | 读数在 `narrativeSlo.calibration.dimensions.identityShareBalance`（按身份 id 分组的「相对均分倍率」）。见下方「校准维度读数」小节。🔴 **读数建成 ≠ 闭环已验证** |
 
 因此本页能回答「分配结果长什么样、是否失衡」，**不能**回答「这样分配是不是更好」——
 后者要先把身份维接进 `slo/`，属独立工作。
@@ -806,7 +811,7 @@ Schema（全部字符串或字符串数组，**一个数字都没有**——§6�
 | 钉住层 `pinningLayer` | `Implemented` | 装配时原样钉进 `assembled_json./assembly/realmTier`（**零抽样、不占 RNG 域常量**，下一个可用域仍是 `0x5C`） |
 | 叙事感知层 `narrativeLayer` | **`Integrated`**（2026-07-27 接通） | `runtime::parse_realm_costume` 读回 `briefing` + `flavorNotes` → `RoundInput.realm_costume` → 引擎 `call_director` 的入场导演设局 prompt（§6「入场导演统一设定」） |
 | 数值层 `numericLayer` | `NeverByDesign` | §6 + §0.1 平权：`RealmTier` 全字段是字符串 / 字符串数组，`realm_tier_carries_no_numeric_field` 锁住；接进叙事层后同样只改描写，不进任何判定域 |
-| 校准闭环 `calibrationLoop` | `Missing` | 没有任何指标度量「换境界档 → 叙事变化」 |
+| 校准闭环 `calibrationLoop` | `Implemented`（2026-07-27） | 读数在 `narrativeSlo.calibration.dimensions.realmTierWorldQuality`（按钉住的戏服分桶的世界质量三指标）。🔴 是**跨世界对比**不是组内分布；读数建成 ≠ 闭环已验证 |
 
 🔴 **七个字段里只有两个进模型上下文**：`briefing` 与 `flavorNotes` 织进入场导演 prompt；
 `id`/`label` 只用于本页展示与审计，`cosmology`/`genre` 只是取值域标注，
@@ -817,8 +822,10 @@ Schema（全部字符串或字符串数组，**一个数字都没有**——§6�
 `realm_costume_only_reaches_director` / `realm_costume_never_reaches_state_or_events`）。
 
 所以这一维现在到 **Integrated**（VALIDATION §0.3）：戏服真的会改变这一篇被怎么描写，
-但**到此为止**——它不改判定 / 发奖 / 权限 / 难度 / 准入，也**没有任何指标**能回答
-「这件戏服配得对不对」（`calibrationLoop` 仍是 `Missing`）。**Integrated ≠ 已验证 ≠ 可上线**。
+但**到此为止**——它不改判定 / 发奖 / 权限 / 难度 / 准入。
+「换一件戏服，那批世界演得怎么样」自 2026-07-27 起有了读数（`calibrationLoop` = `Implemented`，
+见下方「校准维度读数」小节），但那只是**能测了**，仍**不回答**「这件戏服配得对不对」——
+读数不给综合评分、不给判语。**Integrated ≠ 已验证 ≠ 可上线；有读数 ≠ 闭环已成立。**
 
 **未声明即零影响（逐字节）**：`Skeleton.realm_tier` 与 `AssembledInstance.realm_tier` 都是
 `Option` + `skip_serializing_if`（同 `payoutTable` 范式），模板不写 `realmTier` 时
@@ -834,6 +841,42 @@ Schema（全部字符串或字符串数组，**一个数字都没有**——§6�
 | `pinning.staleTierIds` | 实例钉着的档 id ≠ 模板当前声明（模板改版后老实例保持原样）。模板未声明时恒空 |
 | `matchesTemplate` | `null` = 模板未声明 / 实例未钉住，「是否一致」这个问题不成立——**不得当 `false` 渲染** |
 | `invalidEnumFields` / `blankTierId` | 填了官方枚举外的自由文本 / 缺 id。建模板端点拦得住，出现在此 = 历史数据或直写库 |
+
+### 校准维度读数（无迁移；§79/§83 流水线补上「配得对不对可度量」这一环）
+
+**问题**：`/admin/sagas`·`/admin/identity-pools`·`/admin/realm-tiers` 三个视图回答「配成了什么样」，
+仿真试跑与世界质量回归回答「这一批世界演得怎么样」，但两者之间少一根线——
+`narrativeSlo.metrics` 的八项一律按平台 / 按 `character_id` 聚合，与**运营调的那个旋钮**
+（身份 id、境界档）无关，所以「这样配是不是更好」在指标结构上问不出来。
+
+**读出口**：`GET /api/admin/metrics/overview` → **`narrativeSlo.calibration`**（operator/finance）。
+它是 `narrativeSlo` 下与 `metrics` 并列的**兄弟键**（`metrics` 是 VALIDATION §4.2 八项表的命名空间，
+混进去会让那张表名不副实）。窗口与 `?sloDays=` 同一把尺；**`?slo=0` 一并跳过**
+（这一段要分页解析 `assembled_json`，是本端点最重的一块）。实现在 `server/src/slo/calibration.rs`。
+
+**窗口 = cohort**：`worlds.created_at ∈ [start, end)`（窗口内**开出**的这一批世界），两维共用同一批，
+只需一次 `worlds` 分页扫描。⚠️ 与 `metrics.attentionGini` 的窗口（「有贡献分更新的世界」）**不是同一批**，
+两处数字**不可互相校验**。
+
+| 维度 | 键 | 形状 | 读数 |
+|---|---|---|---|
+| 身份维（§5） | `dimensions.identityShareBalance` | **组内分布**（身份各不相同，一个世界里同时存在多个） | 每个身份的**相对均分倍率**：`(该成员贡献分 ÷ 本世界成员贡献分总和) × 本世界成员数`，**1.0 = 恰好拿到均分**。给均值 / 中位数 / 极值 / 零分观察数 / 零分率，外加各身份**均值之间**的集中度 `meanShareGini`，以及 `(unassigned)` 对照桶 |
+| 戏服维（§6【拍板 3】） | `dimensions.realmTierWorldQuality` | **跨世界对比**（境界档全员统一，**没有组内分布**——组内基尼恒为 0，是个假指标） | 按钉住的 `realmTier.id` 分桶，各桶各自报 `slo::quality` 的世界质量三指标：完读率 / 阻断率（含独立的内容安全扣留率）/ 结局分布。`(none)` 是未钉戏服的**对照桶**，不丢弃 |
+
+| 项 | 口径 |
+|---|---|
+| 归一化 | 身份维**先按世界归一化再跨世界求均值**：原始分跨世界求和测的是**世界寿命**不是身份失衡（跑得久的世界分自然多）。归一化后每个「世界 × 角色」观察等权，大小世界不互相主导 |
+| 🔴 分母差异 | 身份维分母 = `world_members` **全集**，无贡献分行的成员按 **0 分**计入。`world_contributions` 是**挣到分才落行**的，`attentionGini` 的交集口径因此**看不见「一分没挣到」的人**——而「某个身份是不是系统性拿不到戏」恰恰要靠这些人才答得了。两个数不可互相校验 |
+| 🔴 只读不回灌 | 本段**没有一条写语句**，产物只作 JSON 返回。理由与 `world_contributions` 独立建表同源（迁移 0025）：一旦按身份分组的戏份差进了引擎判定输入，「身份影响判定」就成立，直接违反 §0.1 平权红线。锁：`calibration_readings_never_write_anything` / `calibration_readings_never_touch_narrative_state` / `calibration_module_source_contains_no_write_statements` |
+| 🔴 三态 | `entry_not_open`（**这一维从未被任何模板配置过**，`value:null`，显示 `—`，且**不发任何计数**——发了会被当成 0 读）/ `no_data_in_window`（配置过但窗口内零样本，`value:null`，`—`，计数照发以便区分是「没世界」还是「有世界但没分配 / 都没挣到分」）/ `ok`（真数，**可以是 0**） |
+| 🔴 不给综合分 | 校准是**多目标**的（公平 vs 戏剧性：把戏份摊平到各身份均值全是 1.0 就没有主角了）。两维在 `ok` 态都**没有**代表整维的标量 `value`，全树也不出现 `score`/`grade`/`verdict`/`recommendation` 一类判语字段。锁：`calibration_readings_expose_no_composite_score` |
+| 口径复用 | 集中度走 `slo::gini_coefficient`（与叙事注意力基尼同一实现）、三指标走 `slo::quality`（与仿真试跑、世界质量回归**算同一个数**）。批量取事实与单世界取事实由 `bulk_world_facts_match_single_world_facts` 锁住不漂移 |
+| cohort 偏差 | `completionRate` 分母含未收尾世界（`quality.rs` 口径），近期窗口天然偏低。本读数的用途是**横向对比**——同一窗口内各桶承受同样的截断偏差；各桶另给 `firstCreatedAt`/`lastCreatedAt`/`unfinished`，年龄分布差得远时的失真要读的人自己看得见 |
+| 上限 | 一次最多展开 `MUSE_SLO_CALIBRATION_WORLD_CAP` 个世界（默认 **300**，比 `scanRowCap` 小两个量级是刻意的——那一路解析 `assembled_json`，管的是内存峰值不是行数）。超限 → `skipped_too_large`，**明说跳过而不给残缺数** |
+
+> 🔴 **读数建成 ≠ 校准闭环已验证**（§0.3 七档）。两处 `effect.calibrationLoop` 因此从 `Missing`
+> 改为 **`Implemented`** 而不是更高：闭环成立要等运营真的据此调过参、并在下一批世界上看到因果。
+> 后台页面照旧只翻译后端下发的状态，不做推断、不做美化。
 
 ### 运行时开关（flags，migration 0036；VALIDATION.md §0.1 的 R1 补齐项）
 

@@ -1675,11 +1675,17 @@ async fn cost_is_recorded_per_beat_and_rolled_up() {
     assert_eq!(st, StatusCode::OK, "{body}");
     assert_eq!(body["costTokens"], sum);
     assert_eq!(body["beats"], 2);
+    // 主看板已并入（`cost.ifline` + `cost.combined`）。这个自述字段的价值不在它此刻是 true 还是
+    // false，而在于**响应自己说得出实情**——接线状态若哪天回退，这里必须跟着变，
+    // 不能让「主看板包含 if 线开销」变成一句只活在某个人记忆里的话。
     assert_eq!(
-        body["dashboardIntegration"]["mainDashboardIncludesIfline"], false,
-        "🔴 主看板尚未并入 if 线开销，这件事必须**写在响应里**，不能只活在某个人的记忆里"
+        body["dashboardIntegration"]["mainDashboardIncludesIfline"], true,
+        "🔴 主看板已并入 if 线开销，响应必须如实反映"
     );
-    assert!(body["dashboardIntegration"]["howToIntegrate"].as_str().unwrap().contains("ifline_beats"));
+    assert!(
+        body["dashboardIntegration"]["where"].as_str().unwrap().contains("cost.ifline"),
+        "自述里要指出并到了哪个字段，否则运营仍然不知道去哪看"
+    );
 }
 
 /// if 线的拍**绝不进世界线 SLO**：它不落 `world_ticks`，而 SLO 判定「一拍真的跑了」的口径

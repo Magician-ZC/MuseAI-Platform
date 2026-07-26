@@ -45,9 +45,15 @@ export function formatPercent(r?: number | null, digits = 1): string {
   return r == null ? '—' : `${(r * 100).toFixed(digits)}%`;
 }
 
-interface PagedResult<T> {
+/**
+ * 分页结果。游标类型 `C` 默认是字符串（多数后台端点回 `"createdAt:id"` 这种拼串），
+ * 但**复合游标**（如 `/admin/social/reports` 的 `nextCursor` + `nextCursorId` 两段）没法塞进一个
+ * 字符串还保持类型安全，故开放为泛型：调用方给什么形状，hook 就原样存、原样回传。
+ * 🔴 hook 只判 `null`（还有没有下一页），从不解析游标内容——游标的语义只有端点自己知道。
+ */
+interface PagedResult<T, C = string> {
   items: T[];
-  nextCursor: string | null;
+  nextCursor: C | null;
 }
 
 /**
@@ -56,15 +62,15 @@ interface PagedResult<T> {
  * 页面在筛选变化时调 reload()；追加下一页调 loadMore()。
  * fetcher 用 ref 持有最新闭包，保证 reload/loadMore 始终读到最新筛选值。
  */
-export function usePagedList<T>(fetcher: (cursor: string | null) => Promise<PagedResult<T>>) {
+export function usePagedList<T, C = string>(fetcher: (cursor: C | null) => Promise<PagedResult<T, C>>) {
   const [items, setItems] = useState<T[]>([]);
-  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [nextCursor, setNextCursor] = useState<C | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const fetcherRef = useRef(fetcher);
   fetcherRef.current = fetcher;
 
-  const run = useCallback(async (cursor: string | null, append: boolean) => {
+  const run = useCallback(async (cursor: C | null, append: boolean) => {
     setLoading(true);
     setError(null);
     try {

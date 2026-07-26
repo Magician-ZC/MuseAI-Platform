@@ -33,6 +33,7 @@ fn cfg() -> SloConfig {
         ooc_appeal_rate_max: 0.10,
         silent_streak_max: 3,
         scan_row_cap: 50_000,
+        calibration_world_cap: 300,
     }
 }
 
@@ -794,6 +795,34 @@ fn skipped_by_request_is_a_distinct_state() {
     assert_eq!(v["metrics"].as_object().unwrap().len(), 0);
     // 清单长度随数据源到位而缩短（3 → 2 → 1）：contradiction（0030）与 oocAppealRate（0037）已转正。
     assert_eq!(v["unavailable"].as_array().unwrap().len(), 1);
+    // 🔴 校准维度读数一并受 ?slo=0 管辖，且用**自己的** skipped_by_request 状态说话——
+    // 与 entry_not_open / no_data_in_window / skipped_too_large 四态互不混淆。
+    assert_eq!(v["calibration"]["status"], "skipped_by_request");
+    assert_eq!(v["calibration"]["dimensions"].as_object().unwrap().len(), 0);
+}
+
+/// 校准维度读数挂在 `narrativeSlo.calibration` 这个**兄弟键**上，不混进八项 SLO 的 `metrics`。
+///
+/// 分开是刻意的：`metrics` 是 VALIDATION §4.2 那张八项表的命名空间（与 `unavailable` 配套），
+/// 而校准读数是「按运营调的旋钮分组」的另一种切法。混进去会让那张表名不副实。
+#[tokio::test]
+async fn narrative_slo_carries_calibration_readings_as_a_sibling_key() {
+    let db = test_db().await;
+    let slo = narrative_slo(&db, &cfg()).await.unwrap();
+
+    let cal = &slo["calibration"];
+    assert_eq!(cal["status"], "ok");
+    assert!(
+        slo["metrics"].as_object().unwrap().keys().all(|k| !k.starts_with("identity")
+            && !k.starts_with("realm")),
+        "校准读数不许挤进八项 SLO 的 metrics 命名空间"
+    );
+    for name in ["identityShareBalance", "realmTierWorldQuality"] {
+        // 空库 = 这两维在平台上从未开工，必须是 entry_not_open（显示 —）而不是 0。
+        assert_eq!(cal["dimensions"][name]["status"], "entry_not_open", "{name}: {cal}");
+        assert!(cal["dimensions"][name]["value"].is_null());
+    }
+    assert_eq!(cal["windowDays"], 7, "窗口口径与八项 SLO 同一把尺（同一个 SloConfig）");
 }
 
 /// 参数化：门槛与上限来自 env（VALIDATION §0.2 禁写死），且回显在响应里可自证。

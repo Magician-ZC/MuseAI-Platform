@@ -1,6 +1,6 @@
 //! 真人社交解锁测试（sqlite::memory + oneshot 真实路由）。总规格 §14【拍板 22】恨隔面具原则。覆盖：
 //!
-//! - **默认关闭**：11 个端点全 404，且**一行都不落库**（前门 + 状态侧双保险）；
+//! - **默认关闭**：`all_endpoints()` 列的全部端点一律 404，且**一行都不落库**（前门 + 状态侧双保险）；
 //! - 🔴 **青少年模式限真人社交是服务端拒绝**（红线）：未声明/未成年/无用户行三种账号调用
 //!   五个身份端点全 403，且**全库逐字节快照相等**（零副作用：不落幂等键、不发通知、不改任何表）；
 //! - 🔴 **对端未成年同样拒绝**，且拒绝文案与"被拉黑""不够格"**逐字相同**（不得成为年龄探测器）；
@@ -228,6 +228,7 @@ fn all_endpoints() -> Vec<(&'static str, String, Option<Value>, bool)> {
             false,
         ),
         ("GET", "/api/admin/social/reports".into(), None, true),
+        ("GET", "/api/admin/social/reports/summary".into(), None, true),
         (
             "POST",
             "/api/admin/social/reports/srp_x/resolve".into(),
@@ -1071,6 +1072,263 @@ async fn admin_report_queue_keyset_cursor_never_drops_a_report() {
     let mut expect = all;
     expect.sort();
     assert_eq!(seen, expect, "举报队列两页并起来必须是全集：安全通道不许丢行");
+}
+
+/// 队列筛选：未知筛选值必须 **400**，绝不静默返回空列表。
+///
+/// 🔴 这条守的是安全队列上最危险的一种误读：`?status=Pending`（大小写写错）若走
+/// 「匹配不到 → 空列表」，运营看到的是一个**空队列**，会读成「没有积压」，
+/// 于是一整批待处理举报没人处理，而界面上没有任何异常。
+#[tokio::test]
+async fn admin_report_queue_rejects_unknown_filter_values_instead_of_returning_an_empty_queue() {
+    let state = test_state().await;
+    base_world(&state).await;
+    open_flag(&state, "global", "").await;
+    let tk = admin_token(&state, "reviewer");
+
+    for uri in [
+        "/api/admin/social/reports?status=Pending",       // 大小写
+        "/api/admin/social/reports?status=待处理",         // 中文
+        "/api/admin/social/reports?category=我不喜欢他",   // 未知类别
+        "/api/admin/social/reports?subjectKind=world",    // 未知主体种类
+    ] {
+        let (s, _) = send(&state, "GET", uri, &tk, None).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{uri} 必须 400，不能静默空队列");
+    }
+
+    // 白名单值与 all 正常放行；缺省 = 待处理。
+    for uri in [
+        "/api/admin/social/reports",
+        "/api/admin/social/reports?status=all&category=all&subjectKind=all",
+        "/api/admin/social/reports?status=dismissed&category=minor_risk&subjectKind=unlock_request",
+    ] {
+        let (s, v) = send(&state, "GET", uri, &tk, None).await;
+        assert_eq!(s, StatusCode::OK, "{uri} 应放行");
+        assert!(v["reports"].is_array());
+    }
+}
+
+/// 筛选真的下推到 SQL：类别/主体种类各筛出自己那一份，且与状态筛可叠加。
+#[tokio::test]
+async fn admin_report_queue_filters_by_category_and_subject_kind() {
+    let state = test_state().await;
+    base_world(&state).await;
+    open_flag(&state, "global", "").await;
+
+    let seed = |kind: &'static str, category: &'static str, status: &'static str| {
+        let db = state.db.clone();
+        async move {
+            sqlx::query(
+                "INSERT INTO social_reports (id, reporter_user_id, subject_kind, subject_id, \
+                 subject_user_id, world_id, category, detail, status, created_at) \
+                 VALUES ($1, 'u1', $2, 'c2', 'u2', 'w1', $3, '', $4, $5)",
+            )
+            .bind(new_id("srp"))
+            .bind(kind)
+            .bind(category)
+            .bind(status)
+            .bind(now_ms())
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+    };
+    seed("character", "harassment", "pending").await;
+    seed("character", "minor_risk", "pending").await;
+    seed("unlock_request", "harassment", "pending").await;
+    seed("character", "harassment", "actioned").await;
+
+    let tk = admin_token(&state, "reviewer");
+    let count = |uri: &'static str| {
+        let state = state.clone();
+        let tk = tk.clone();
+        async move {
+            let (s, v) = send(&state, "GET", uri, &tk, None).await;
+            assert_eq!(s, StatusCode::OK);
+            v["reports"].as_array().unwrap().len()
+        }
+    };
+
+    assert_eq!(count("/api/admin/social/reports").await, 3, "默认只出待处理");
+    assert_eq!(count("/api/admin/social/reports?status=all").await, 4);
+    assert_eq!(count("/api/admin/social/reports?category=harassment").await, 2, "待处理 + 骚扰");
+    assert_eq!(
+        count("/api/admin/social/reports?status=all&category=harassment").await,
+        3,
+        "全部状态 + 骚扰"
+    );
+    assert_eq!(count("/api/admin/social/reports?subjectKind=unlock_request").await, 1);
+    assert_eq!(
+        count("/api/admin/social/reports?category=minor_risk&subjectKind=unlock_request").await,
+        0,
+        "两个筛选是且的关系"
+    );
+}
+
+/// 🔴 末页必须回 `nextCursor: null`。
+///
+/// 只按「末行有没有」发游标的话，最后一页也带游标返回，界面上的「加载更多」永远在。
+/// 在举报队列上这不是难看的问题——它让运营**分不清「翻完了」和「还没翻完」**，
+/// 而"还有没有没看过的举报"正是这个队列唯一要回答的问题。
+#[tokio::test]
+async fn admin_report_queue_last_page_returns_null_cursor() {
+    let state = test_state().await;
+    base_world(&state).await;
+    open_flag(&state, "global", "").await;
+    let tk = admin_token(&state, "reviewer");
+
+    // 空队列：一上来就没有下一页。
+    let (s, empty) = send(&state, "GET", "/api/admin/social/reports", &tk, None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(empty["nextCursor"].is_null() && empty["nextCursorId"].is_null(), "空队列不得回游标");
+
+    // 播种「满一页 + 1」条同毫秒举报：第一页满 → 有游标；第二页只有 1 条 → 无游标。
+    let page = page_size();
+    let at = now_ms();
+    for i in 0..(page + 1) {
+        sqlx::query(
+            "INSERT INTO social_reports (id, reporter_user_id, subject_kind, subject_id, \
+             subject_user_id, world_id, category, detail, status, created_at) \
+             VALUES ($1, 'u1', 'character', $2, 'u2', 'w1', 'harassment', '', 'pending', $3)",
+        )
+        .bind(new_id("srp"))
+        .bind(format!("c{i}"))
+        .bind(at)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+
+    let (_, p1) = send(&state, "GET", "/api/admin/social/reports", &tk, None).await;
+    assert_eq!(p1["reports"].as_array().unwrap().len() as i64, page, "首页满页");
+    assert_eq!(p1["pageSize"].as_i64().unwrap(), page);
+    let cursor = p1["nextCursor"].as_i64().expect("满页必须回游标");
+    let cursor_id = p1["nextCursorId"].as_str().expect("满页必须回复合游标第二段").to_string();
+
+    let (_, p2) = send(
+        &state,
+        "GET",
+        &format!("/api/admin/social/reports?cursor={cursor}&cursorId={cursor_id}"),
+        &tk,
+        None,
+    )
+    .await;
+    assert_eq!(p2["reports"].as_array().unwrap().len(), 1, "第二页是最后一条");
+    assert!(p2["nextCursor"].is_null(), "末页不得回游标，否则「加载更多」永远在");
+    assert!(p2["nextCursorId"].is_null());
+}
+
+/// 队列形状端点：全量聚合，不受分页与筛选影响；白名单键恒出现（哪怕是 0）。
+#[tokio::test]
+async fn admin_report_summary_counts_the_whole_queue_not_one_page() {
+    let state = test_state().await;
+    base_world(&state).await;
+    open_flag(&state, "global", "").await;
+    let tk = admin_token(&state, "reviewer");
+
+    // 空库：三档状态与全部类别都要在，值为 0——缺档会被界面读成「这一档没有数据源」。
+    let (s, empty) = send(&state, "GET", "/api/admin/social/reports/summary", &tk, None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(empty["total"], json!(0));
+    for st in REPORT_STATUSES {
+        assert_eq!(empty["byStatus"][*st], json!(0), "{st} 档必须在场");
+    }
+    let cats = empty["byCategory"].as_array().unwrap();
+    assert_eq!(cats.len(), REPORT_CATEGORIES.len(), "类别按白名单给全，不是「库里有什么给什么」");
+    assert!(empty["oldestPendingCreatedAt"].is_null());
+    assert_eq!(empty["escalateAt"], json!(report_escalate_at()));
+    assert_eq!(empty["escalatedSubjectCount"], json!(0));
+
+    // 播种「超过一页」条：summary 必须数全量，而不是一页。
+    let page = page_size();
+    let base = now_ms();
+    for i in 0..(page + 5) {
+        sqlx::query(
+            "INSERT INTO social_reports (id, reporter_user_id, subject_kind, subject_id, \
+             subject_user_id, world_id, category, detail, status, created_at) \
+             VALUES ($1, 'u1', 'character', $2, 'u2', 'w1', 'harassment', '', 'pending', $3)",
+        )
+        .bind(new_id("srp"))
+        .bind(format!("c{i}"))
+        .bind(base + i) // 递增时间戳：最久未处理的那条可判定
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+    // 另一个被举报人 + 另一类别 + 另一主体种类 + 已处置态。
+    sqlx::query(
+        "INSERT INTO social_reports (id, reporter_user_id, subject_kind, subject_id, \
+         subject_user_id, world_id, category, detail, status, created_at) \
+         VALUES ($1, 'u1', 'unlock_request', 'sul_x', 'u3', 'w1', 'minor_risk', '', 'dismissed', $2)",
+    )
+    .bind(new_id("srp"))
+    .bind(base + 999)
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    let (_, sum) = send(&state, "GET", "/api/admin/social/reports/summary", &tk, None).await;
+    assert_eq!(sum["total"].as_i64().unwrap(), page + 6);
+    assert_eq!(sum["byStatus"]["pending"].as_i64().unwrap(), page + 5, "积压是全量，不是一页");
+    assert_eq!(sum["byStatus"]["dismissed"], json!(1));
+    assert_eq!(sum["byStatus"]["actioned"], json!(0));
+    assert_eq!(sum["oldestPendingCreatedAt"].as_i64().unwrap(), base, "最久未处理 = 最早那条");
+    // u2 的 pending 数远超阈值，u3 那条是 dismissed 不计。
+    assert_eq!(sum["escalatedSubjectCount"], json!(1));
+
+    let by_cat = sum["byCategory"].as_array().unwrap();
+    let harassment = by_cat.iter().find(|c| c["key"] == "harassment").unwrap();
+    assert_eq!(harassment["pending"].as_i64().unwrap(), page + 5);
+    assert_eq!(harassment["total"].as_i64().unwrap(), page + 5);
+    let minor = by_cat.iter().find(|c| c["key"] == "minor_risk").unwrap();
+    assert_eq!(minor["dismissed"], json!(1));
+    assert_eq!(minor["pending"], json!(0));
+    let by_kind = sum["bySubjectKind"].as_array().unwrap();
+    assert_eq!(by_kind.len(), SUBJECT_KINDS.len());
+    assert_eq!(by_kind.iter().find(|k| k["key"] == "unlock_request").unwrap()["total"], json!(1));
+}
+
+/// 队列形状端点与列表端点走**同一条**角色矩阵（operator/finance 进不来）。
+#[tokio::test]
+async fn admin_report_summary_enforces_the_same_role_matrix_as_the_queue() {
+    let state = test_state().await;
+    base_world(&state).await;
+    open_flag(&state, "global", "").await;
+    for (role, expect) in [
+        ("admin", StatusCode::OK),
+        ("reviewer", StatusCode::OK),
+        ("support", StatusCode::OK),
+        ("operator", StatusCode::FORBIDDEN),
+        ("finance", StatusCode::FORBIDDEN),
+    ] {
+        let (s, _) = send(
+            &state,
+            "GET",
+            "/api/admin/social/reports/summary",
+            &admin_token(&state, role),
+            None,
+        )
+        .await;
+        assert_eq!(s, expect, "{role} 的队列形状权限必须与队列本身一致");
+    }
+}
+
+/// 筛选值校验是纯函数，单独钉一遍回落规则（不摆布进程 env、不碰库）。
+#[test]
+fn filter_value_defaults_and_whitelist() {
+    // 缺省 / 空串 / 纯空白 → 默认值。
+    for raw in [None, Some(String::new()), Some("   ".into())] {
+        assert_eq!(filter_value(raw, REPORT_STATUSES, "status", REPORT_PENDING).unwrap(), "pending");
+    }
+    // all 与白名单值放行（两端空白容忍）。
+    assert_eq!(filter_value(Some(" all ".into()), REPORT_STATUSES, "s", "pending").unwrap(), "all");
+    assert_eq!(
+        filter_value(Some("actioned".into()), REPORT_STATUSES, "s", "pending").unwrap(),
+        "actioned"
+    );
+    // 白名单外一律 400（大小写不宽容：状态是落库字面量，不是自然语言）。
+    assert!(filter_value(Some("Pending".into()), REPORT_STATUSES, "s", "pending").is_err());
+    assert!(filter_value(Some("other2".into()), REPORT_CATEGORIES, "c", FILTER_ALL).is_err());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

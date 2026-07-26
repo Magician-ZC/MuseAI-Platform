@@ -28,6 +28,11 @@
 //! （`admin_api::dashboards` 的 `utc_day_start_ms` + `DAY_MS`）在 Rust 侧算成 BIGINT 毫秒区间传入；
 //! 所有聚合列 `CAST(... AS BIGINT)`（PG 下 `SUM/COUNT` 可能返回 numeric，不 CAST 会解码失败）。
 //!
+//! **分组面（`calibration` 子模块，2026-07-27）**：上表八项一律按平台 / 按 `character_id` 聚合，
+//! 与「运营调的那个旋钮」（身份 id、境界档）无关，因此答不了「这样配是不是更好」。
+//! `slo::calibration` 把已有口径**按校准维度重新分组**补上这一根线：身份维看组内分布、
+//! 戏服维看跨世界对比。它同样是**只读**，且**同样不回灌引擎**。
+//!
 //! **性能（本模块的产物挂在被轮询的后台端点上）**：每个指标**一次 GROUP BY / 一次范围扫描**，
 //! 绝无按世界逐个发 SQL 的 N+1；两个逐行扫描的指标（基尼、无戏份）走 `LIMIT cap+1` 的溢出探测，
 //! 超过 `scan_row_cap` 就**明说跳过**（`SloStatus::SkippedTooLarge`）而不是硬算——
@@ -47,6 +52,14 @@ use crate::error::ApiError;
 /// 但**分类口径同源**——`quality` 复用本文件的 `classify_conclusion` / `parse_ended_reason` /
 /// `gini_coefficient` / `rate`，不另立第二套。
 pub(crate) mod quality;
+
+/// **按校准维度分组的读数**（身份维 / 戏服维，总规格 §79/§83 内容生产流水线）。
+///
+/// 与本文件 §4 的八项 SLO **分组方式不同、用途不同**，故物理分开：
+/// 本文件按平台 / 按角色聚合，回答「平台演得好不好」；`calibration` 按**运营调的那个旋钮**
+/// （身份 id、境界档）分组，回答「这一维的配置与叙事结果之间有什么关系」。
+/// 口径同源——集中度走本文件的 `gini_coefficient`，三指标走 `quality`，不另立第二套。
+pub(crate) mod calibration;
 
 /// **拍域谓词**（本模块所有「以拍为分母」的指标共用的一把尺，写死成一处避免各写各的漂移）。
 ///
@@ -314,6 +327,9 @@ const DEFAULT_OOC_APPEAL_RATE_MAX: f64 = 0.10;
 pub(crate) const DEFAULT_SLO_WINDOW_DAYS: i64 = 30;
 /// 单个逐行扫描指标的行数上限。超过即**跳过该指标并明说原因**，不硬算——保护被轮询的后台端点。
 const DEFAULT_SCAN_ROW_CAP: i64 = 50_000;
+/// 校准维度读数一次最多展开的世界数。**比 `scan_row_cap` 小两个量级是刻意的**：
+/// 那一路要把 `worlds.assembled_json`（可达数十 KB/份）解析一遍，上限管的是内存峰值不是行数。
+const DEFAULT_CALIBRATION_WORLD_CAP: i64 = 300;
 /// 榜单长度（最不公平的世界 / 最久没戏的角色只展示头部；分布统计仍覆盖窗口全量）。
 const TOP_N: usize = 10;
 
@@ -347,11 +363,14 @@ pub(crate) struct SloConfig {
     pub silent_streak_max: i64,
     /// 单指标扫描行数上限。
     pub scan_row_cap: i64,
+    /// 校准维度读数一次最多展开的世界数（那一路要解析 `assembled_json`，管的是内存峰值）。
+    pub calibration_world_cap: i64,
 }
 
 impl SloConfig {
     /// env 覆盖 + 默认值。`MUSE_SLO_GINI_MAX` / `MUSE_SLO_SILENT_STREAK_TICKS` /
-    /// `MUSE_SLO_SCAN_ROW_CAP` / `MUSE_SLO_OOC_APPEAL_RATE_MAX`。
+    /// `MUSE_SLO_SCAN_ROW_CAP` / `MUSE_SLO_OOC_APPEAL_RATE_MAX` /
+    /// `MUSE_SLO_CALIBRATION_WORLD_CAP`。
     pub(crate) fn from_env(days: i64, window_start: i64, window_end: i64) -> Self {
         Self {
             days,
@@ -364,6 +383,10 @@ impl SloConfig {
             ),
             silent_streak_max: env_i64("MUSE_SLO_SILENT_STREAK_TICKS", DEFAULT_SILENT_STREAK_MAX),
             scan_row_cap: env_i64("MUSE_SLO_SCAN_ROW_CAP", DEFAULT_SCAN_ROW_CAP),
+            calibration_world_cap: env_i64(
+                "MUSE_SLO_CALIBRATION_WORLD_CAP",
+                DEFAULT_CALIBRATION_WORLD_CAP,
+            ),
         }
     }
 }
@@ -1110,6 +1133,12 @@ pub(crate) async fn narrative_slo(db: &AnyPool, cfg: &SloConfig) -> Result<Value
 
     let unavailable: Vec<&str> = UNAVAILABLE_METRICS.iter().map(|(m, ..)| *m).collect();
 
+    // 校准维度读数：**新的兄弟键，不塞进 `metrics`**。`metrics` 是 VALIDATION §4.2 那张八项表的
+    // 命名空间（每项一个平台级指标，与 `unavailable` 配套），把「按身份 / 按戏服分组的读数」
+    // 混进去会让那张表变得名不副实，也会让 `unavailable` 的语义失准。
+    // 它随本函数一起受 `?slo=0` 管辖（那个开关在 `dashboards` 的更外层，跳过的是整个 narrative_slo）。
+    let calibration = calibration::calibration_readings(db, cfg).await?;
+
     Ok(json!({
         "status": "ok",
         "windowDays": cfg.days,
@@ -1122,6 +1151,9 @@ pub(crate) async fn narrative_slo(db: &AnyPool, cfg: &SloConfig) -> Result<Value
             "oocAppealRateMax": cfg.ooc_appeal_rate_max,
         },
         "metrics": Value::Object(metrics.into_iter().collect()),
+        // 按校准维度分组的读数（身份维 / 戏服维）。与 `metrics` 分母不同、分组方式不同，
+        // 故并列而非嵌入；三态与红线见 `slo::calibration` 模块头注释。
+        "calibration": calibration,
         "unavailable": unavailable,
         "notes": [
             "本段全部为只读聚合，不写库、不回灌引擎（回灌会违反「数值不进引擎决策」红线）。",
@@ -1134,6 +1166,7 @@ pub(crate) async fn narrative_slo(db: &AnyPool, cfg: &SloConfig) -> Result<Value
             "门槛与扫描上限可配（MUSE_SLO_GINI_MAX / MUSE_SLO_SILENT_STREAK_TICKS / MUSE_SLO_SCAN_ROW_CAP / MUSE_SLO_OOC_APPEAL_RATE_MAX），VALIDATION §0.2 参数化。",
             "🔴 oocAppealRate 有三态：entry_not_open（入口没开过，—）/ no_data_in_window（零样本，—）/ ok（真数，可以是 0%）。三者不可混同。",
             "扫描行数超过 scanRowCap 的指标返回 skipped_too_large 而不是残缺数——保护被轮询的后台端点。",
+            "calibration 段按校准维度（身份 id / 境界档）分组，回答「这一维的配置与叙事结果的关系」；🔴 读数建成 ≠ 校准闭环已验证。",
         ],
     }))
 }
@@ -1144,6 +1177,7 @@ pub(crate) fn skipped_by_request(days: i64) -> Value {
         "status": "skipped_by_request",
         "windowDays": days,
         "metrics": {},
+        "calibration": calibration::skipped_by_request(),
         "unavailable": UNAVAILABLE_METRICS.iter().map(|(m, ..)| *m).collect::<Vec<_>>(),
         "notes": ["调用方传了 ?slo=0，本次未计算叙事质量 SLO（高频轮询减负开关）。去掉该参数即恢复。"],
     })

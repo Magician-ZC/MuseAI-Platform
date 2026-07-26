@@ -12,6 +12,7 @@ import {
   DownOutlined,
   ExperimentOutlined,
   FileTextOutlined,
+  FlagOutlined,
   GlobalOutlined,
   LogoutOutlined,
   MenuFoldOutlined,
@@ -34,6 +35,7 @@ import Economy from './pages/Economy';
 import Metrics from './pages/Metrics';
 import Governance from './pages/Governance';
 import Risk from './pages/Risk';
+import SocialReports from './pages/SocialReports';
 import Tickets from './pages/Tickets';
 
 const PAGES: Record<string, ComponentType> = {
@@ -44,6 +46,7 @@ const PAGES: Record<string, ComponentType> = {
   metrics: Metrics,
   prompts: Governance,
   risk: Risk,
+  social: SocialReports,
   tickets: Tickets,
 };
 
@@ -55,6 +58,7 @@ const MODULE_ICON: Record<string, ReactNode> = {
   metrics: <BarChartOutlined />,
   prompts: <DeploymentUnitOutlined />,
   risk: <SafetyCertificateOutlined />,
+  social: <FlagOutlined />,
   tickets: <CustomerServiceOutlined />,
 };
 
@@ -66,6 +70,7 @@ const PAGE_TITLE: Record<string, string> = {
   metrics: '数据看板',
   prompts: '模型与 Prompt',
   risk: '风控',
+  social: '社交举报',
   tickets: '客服与工单',
 };
 

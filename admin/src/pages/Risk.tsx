@@ -1,7 +1,11 @@
 // 风控：risk_events 检索（按 kind 筛选）+ cursor 分页 + 详情抽屉。
+//
+// 深链 `?kind=<事件类型>`：别的运营页把「去看这类升级事件」跳转过来
+//（如社交举报队列 → `?kind=social_report_threshold`），累计升级的名单只在风控面这一处，不复制。
 import { useEffect, useState } from 'react';
 import { Button, Drawer, Descriptions, Input, Select, Space, Table, Tag, Typography } from 'antd';
 import type { TableColumnsType } from 'antd';
+import { useLocation } from 'react-router-dom';
 import { adminFetch } from '../api';
 import { ErrorAlert, formatTime, usePagedList } from '../components/shared';
 
@@ -21,6 +25,9 @@ const KIND_OPTIONS = [
   { value: 'unauthorized', label: '越权访问' },
   { value: 'batch_register', label: '批量注册' },
   { value: 'abuse', label: '滥用' },
+  // 社交举报累计达阈值的升级事件（server/src/social：pending 数恰好等于
+  // MUSE_SOCIAL_REPORT_ESCALATE_AT 时写一条）。举报队列的「查看升级事件」跳到这里。
+  { value: 'social_report_threshold', label: '社交举报累计升级' },
 ];
 
 const KIND_COLOR: Record<string, string> = {
@@ -29,10 +36,14 @@ const KIND_COLOR: Record<string, string> = {
   unauthorized: 'orange',
   batch_register: 'gold',
   abuse: 'magenta',
+  social_report_threshold: 'volcano',
 };
 
 export default function Risk() {
-  const [kind, setKind] = useState<string | undefined>(undefined);
+  const search = useLocation().search;
+  // 深链回填：`?kind=` 直接落到该类型的筛选结果上。
+  const linkedKind = new URLSearchParams(search).get('kind')?.trim() || undefined;
+  const [kind, setKind] = useState<string | undefined>(linkedKind);
   const [detail, setDetail] = useState<RiskRow | null>(null);
 
   const list = usePagedList<RiskRow>(async (cursor) => {
@@ -47,6 +58,11 @@ export default function Risk() {
   });
 
   const { reload } = list;
+  // 深链变化（在本页时被再次跳转过来）→ 同步筛选值；kind 变化本身会触发下面的取数。
+  useEffect(() => {
+    setKind(linkedKind);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [search]);
   useEffect(() => {
     reload();
     // eslint-disable-next-line react-hooks/exhaustive-deps

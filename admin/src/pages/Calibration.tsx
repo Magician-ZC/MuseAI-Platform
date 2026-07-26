@@ -397,8 +397,9 @@ const IDENTITY_LAYERS: { key: string; label: string }[] = [
 
 /**
  * 境界档五层（§6）。比身份池多一层（多出「钉住层」：戏服随实例钉死在 assembled_json）。
- * 叙事感知层已接通，但**校准闭环仍是缺的**——「换一件戏服，叙事真的变了吗」没有任何指标能答，
- * 这正是要让运营看见的事。
+ * 叙事感知层已接通；校准闭环自 2026-07-27 起有读数了（`/admin/metrics/overview` 的
+ * `narrativeSlo.calibration`，按钉住的戏服分桶报世界质量三指标），故后端下发 `Implemented`。
+ * 🔴 **读数建成 ≠ 闭环已验证**——本页照旧只翻译后端下发的状态，不做推断、不做美化。
  */
 const REALM_LAYERS: { key: string; label: string }[] = [
   { key: 'declarationLayer', label: '声明层' },

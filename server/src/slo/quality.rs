@@ -17,9 +17,11 @@
 //!   完读率是 10%（真相）。**T1/T2 门槛要看的是后者**——"跑不完"正是最需要被抓住的失败形态，
 //!   而它在 `status='ended'` 的分母里根本不出现。两个数都输出，便于交叉核对，但不得混用。
 //!
-//! **本文件不接任何路由、不进任何生产读路径**（无 feature flag 亦无开关的原因：它还没有对外面）。
-//! 当前唯一消费方是 `runtime::simulation`（离线仿真试跑工装）。将来接
-//! `/admin/worlds/quality` 或灰度批次看板时，直接复用这三个函数即可——
+//! **本文件不接任何写入面、不含任何运营开关**（它只有读）。消费方有两个：
+//! ① `runtime::simulation`（离线仿真试跑工装，单世界取数走 [`collect_world_facts`]）；
+//! ② `slo::calibration` 的戏服维读数（挂在被轮询的 `/admin/metrics/overview` 上，
+//!    批量取数走 [`collect_world_facts_bulk`]）。
+//! 两条取数路径**共用同一套分类规则**（[`add_tick_bucket`] / `classify_conclusion`），
 //! 这正是把口径写成生产代码而非埋在 `#[cfg(test)]` 里的目的（黄金世界回归把指标提升进
 //! `crate::slo` 时立的规矩：回归与看板必须永远算同一个数）。
 
@@ -28,9 +30,14 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 use sqlx::{AnyPool, Row};
 
+use crate::db::Placeholders;
 use crate::error::ApiError;
 
-use super::{classify_conclusion, gini_coefficient, rate, ConclusionKind};
+use super::{classify_conclusion, gini_coefficient, parse_ended_reason, rate, ConclusionKind};
+
+/// 单条 `IN (…)` 最多绑几个参数（SQLite 老版本 `SQLITE_MAX_VARIABLE_NUMBER` 默认 999，
+/// 不分批会在大批次上直接报错）。
+const BIND_CHUNK: usize = 200;
 
 // ============================================================================
 // §1 单世界原始计数（三个指标唯一的输入形态）
@@ -115,6 +122,24 @@ fn is_terminal_note(err: &str) -> bool {
     err == "terminal" || classify_conclusion(err) != ConclusionKind::Unknown
 }
 
+/// `world_ticks` 的一组 `(status, error, 行数)` → 落进事实的哪个桶。
+///
+/// 🔴 **单世界版与批量版共用这一处**，是刻意的：分类规则是**代码事实**
+/// （`finish_tick_noop` 写了哪些 note、`finish_tick_blocked` 写了什么），
+/// 各写一份必然漂移，而漂移的表现是「同一批世界在看板与回归里阻断率不一样」——
+/// 那种 bug 没人会在数字上看出来。
+fn add_tick_bucket(f: &mut WorldQualityFacts, status: &str, err: &str, n: i64) {
+    match status {
+        "failed" => f.failed_ticks += n,
+        "done" if err.is_empty() => f.committed_ticks += n,
+        "done" if err == "blocked" => f.blocked_ticks += n,
+        "done" if is_terminal_note(err) => f.terminal_ticks += n,
+        "done" => f.gated_ticks += n,
+        // pending / running：观测截止时还没终结。
+        _ => f.open_ticks += n,
+    }
+}
+
 /// 读一个世界的质量事实。
 ///
 /// SQL 全部落在双库可移植子集内：只用 `COUNT` / `GROUP BY` / `COALESCE` / `CAST(... AS BIGINT)`，
@@ -149,15 +174,7 @@ pub(crate) async fn collect_world_facts(
         let status: String = r.try_get("status")?;
         let err: String = r.try_get("err")?;
         let n: i64 = r.try_get("n")?;
-        match status.as_str() {
-            "failed" => f.failed_ticks += n,
-            "done" if err.is_empty() => f.committed_ticks += n,
-            "done" if err == "blocked" => f.blocked_ticks += n,
-            "done" if is_terminal_note(&err) => f.terminal_ticks += n,
-            "done" => f.gated_ticks += n,
-            // pending / running：观测截止时还没终结。
-            _ => f.open_ticks += n,
-        }
+        add_tick_bucket(&mut f, &status, &err, n);
     }
 
     f.events_total = sqlx::query("SELECT CAST(COUNT(*) AS BIGINT) AS n FROM world_events WHERE world_id = $1")
@@ -174,6 +191,113 @@ pub(crate) async fn collect_world_facts(
     .try_get("n")?;
 
     Ok(f)
+}
+
+/// 一次取回**一组**世界的质量事实：与 [`collect_world_facts`] **逐字同口径**，
+/// 只是把「每个世界 4 条 SQL」折成「按 `IN (…)` 分批的 3 条聚合」。
+///
+/// 🔴 存在的唯一理由是 **N+1**：单世界版给 100 个世界取数就是 400 条 SQL，
+/// 而 `slo` 的读数挂在被轮询的 `/admin/metrics/overview` 上，模块头注释明令禁止按世界逐个发 SQL。
+/// 分类规则不另写一份（tick 走 [`add_tick_bucket`]、收尾串走 `parse_ended_reason`），
+/// 故两条取数路径永远算同一个数。
+///
+/// `worlds`：`world_id → worlds.status`（status 由调用方在扫世界时顺手带出来，本函数不再回查）。
+/// 返回值按 world_id 升序（`BTreeMap` 保证跨运行定序）。
+///
+/// 可移植 SQL：只用 `COUNT` / `SUM(CASE …)` / `COALESCE` / `IN` / `CAST(… AS BIGINT)`，
+/// 占位符 `$N` 由 [`Placeholders`] 顺序发号，无方言函数、无 JSON 运算。
+pub(crate) async fn collect_world_facts_bulk(
+    db: &AnyPool,
+    worlds: &BTreeMap<String, String>,
+) -> Result<Vec<WorldQualityFacts>, ApiError> {
+    if worlds.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out: BTreeMap<String, WorldQualityFacts> = worlds
+        .iter()
+        .map(|(id, status)| {
+            (
+                id.clone(),
+                WorldQualityFacts {
+                    world_id: id.clone(),
+                    status: status.clone(),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+    let ids: Vec<&String> = worlds.keys().collect();
+
+    // ① 收尾 (reason, ending)。事实源同单世界版：`audit_logs('world.ended')`
+    //    （走 commit_tick 的收尾会把 world_ticks.error 置 NULL，那一列天然缺一半样本）。
+    //    单世界版取 `LIMIT 1`；这里同一 subject 若有多行，按 **全序** `(subject, id)` 取第一行——
+    //    PG 无稳定序保证，"任取一行"必须落在全序上才跨库可复现。
+    for chunk in ids.chunks(BIND_CHUNK) {
+        let ph = Placeholders::new().list(chunk.len());
+        let sql = format!(
+            "SELECT subject, reason FROM audit_logs \
+             WHERE action = 'world.ended' AND subject IN ({ph}) \
+             ORDER BY subject ASC, id ASC"
+        );
+        let mut q = sqlx::query(&sql);
+        for id in chunk {
+            q = q.bind(id.as_str());
+        }
+        for r in q.fetch_all(db).await? {
+            let subject: String = r.try_get("subject")?;
+            let Some(f) = out.get_mut(&subject) else { continue };
+            if !f.conclusion_reason.is_empty() || !f.ending_id.is_empty() {
+                continue; // 首行胜出（全序下确定）。
+            }
+            let (reason, ending) = parse_ended_reason(&r.try_get::<String, _>("reason")?);
+            f.conclusion_reason = reason;
+            f.ending_id = ending;
+        }
+    }
+
+    // ② tick 分桶。分类在 Rust 侧做（同单世界版）：写进 SQL 的 CASE 里会立刻和代码事实漂移。
+    for chunk in ids.chunks(BIND_CHUNK) {
+        let ph = Placeholders::new().list(chunk.len());
+        let sql = format!(
+            "SELECT world_id, status, COALESCE(error, '') AS err, CAST(COUNT(*) AS BIGINT) AS n \
+             FROM world_ticks WHERE world_id IN ({ph}) \
+             GROUP BY world_id, status, COALESCE(error, '')"
+        );
+        let mut q = sqlx::query(&sql);
+        for id in chunk {
+            q = q.bind(id.as_str());
+        }
+        // 不加 ORDER BY：每行都是 `+=` 累加，消费与行序无关。
+        for r in q.fetch_all(db).await? {
+            let world_id: String = r.try_get("world_id")?;
+            let Some(f) = out.get_mut(&world_id) else { continue };
+            let status: String = r.try_get("status")?;
+            let err: String = r.try_get("err")?;
+            add_tick_bucket(f, &status, &err, r.try_get::<i64, _>("n")?);
+        }
+    }
+
+    // ③ 事件总数 / 安全扣留数（单世界版的两条标量查询在这里合成一条 GROUP BY）。
+    for chunk in ids.chunks(BIND_CHUNK) {
+        let ph = Placeholders::new().list(chunk.len());
+        let sql = format!(
+            "SELECT world_id, CAST(COUNT(*) AS BIGINT) AS total_n, \
+             CAST(COALESCE(SUM(CASE WHEN moderation <> 'approved' THEN 1 ELSE 0 END), 0) AS BIGINT) AS withheld_n \
+             FROM world_events WHERE world_id IN ({ph}) GROUP BY world_id"
+        );
+        let mut q = sqlx::query(&sql);
+        for id in chunk {
+            q = q.bind(id.as_str());
+        }
+        for r in q.fetch_all(db).await? {
+            let world_id: String = r.try_get("world_id")?;
+            let Some(f) = out.get_mut(&world_id) else { continue };
+            f.events_total = r.try_get("total_n")?;
+            f.events_withheld = r.try_get("withheld_n")?;
+        }
+    }
+
+    Ok(out.into_values().collect())
 }
 
 // ============================================================================

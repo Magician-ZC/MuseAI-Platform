@@ -393,6 +393,48 @@ pub(super) async fn metrics_overview(
     let today_tokens = *day_tokens.last().unwrap_or(&0);
     let today_cents = tokens_to_cents(today_tokens);
 
+    // ============ if 线开销（迁移 0041 `ifline_beats` 的成本读出口） ============
+    // 🔴 **为什么单列一项、而不是并进上面的 world_ticks 聚合**：
+    // if 线（§7 人设保险第 3 级）是**付费副本**，它的拍落 `ifline_beats` 而**不是 `world_ticks`**
+    // ——那是 0039 的结构性隔离（一行 `worlds` 会被 `commit_tick → finalize_ending_tx` 自动带进
+    // 发历练/铸卡/发奖励，「花钱开 if 线」就等于「花钱买数值」）。既然两者在数据层是分开的，
+    // 成本口径也必须分得开：`total` 保持**世界线**语义逐字不变（既有字段含义不许被悄悄改写），
+    // if 线单列，另给 `combined` 回答「平台总开销」。
+    //
+    // 在此之前主看板只 SUM `world_ticks.cost_tokens`，**系统性漏掉这部分付费功能的开销**——
+    // 漏记成本比记错更危险：它让单位经济学看起来比实际好，而 T3「ARPPU ≥ 3× 模型成本」
+    // 与 T5「毛利为正」两个门槛都直接建在这个数上。
+    //
+    // ⚠️ **两个口径必须分开取，不能混用**：本响应里 `total` 是**全时段**累计
+    // （`cost_rows` 无时间过滤），而 `trend`/`offPeak` 是 `?costDays=` **窗口内**。
+    // 若拿窗口内的 if 线数去加全时段的 `total`，得到的是一个两头不靠的数。
+    // 故一次查询用 `CASE WHEN` 同时给出两者：`allTime` 与 `total` 同口径可相加，
+    // `window` 与 `trend` 同口径可对照。`CASE WHEN` 是标准 SQL，双库通用。
+    //
+    // `CAST(... AS BIGINT)`：PG 下 `SUM(bigint)` 返回 `numeric`，不 CAST 无法解码到 i64。
+    let ifline_row = sqlx::query(
+        "SELECT \
+         CAST(COALESCE(SUM(cost_tokens), 0) AS BIGINT) AS all_tokens, \
+         CAST(COUNT(*) AS BIGINT) AS all_beats, \
+         CAST(COALESCE(SUM(CASE WHEN created_at >= $1 AND created_at < $2 \
+                                THEN cost_tokens ELSE 0 END), 0) AS BIGINT) AS win_tokens, \
+         CAST(COALESCE(SUM(CASE WHEN created_at >= $3 AND created_at < $4 \
+                                THEN 1 ELSE 0 END), 0) AS BIGINT) AS win_beats \
+         FROM ifline_beats",
+    )
+    .bind(cost_start)
+    .bind(cost_end)
+    .bind(cost_start)
+    .bind(cost_end)
+    .fetch_one(db)
+    .await?;
+    let ifline_all_tokens: i64 = ifline_row.try_get("all_tokens")?;
+    let ifline_all_beats: i64 = ifline_row.try_get("all_beats")?;
+    let ifline_win_tokens: i64 = ifline_row.try_get("win_tokens")?;
+    let ifline_win_beats: i64 = ifline_row.try_get("win_beats")?;
+    let combined_tokens = total_tokens.saturating_add(ifline_all_tokens);
+    let combined_cents = tokens_to_cents(combined_tokens);
+
     // ============ 叙事质量 SLO（VALIDATION §4.2 验证基建三件套第二件） ============
     // **为什么挂在 overview 的新顶层键、而不是新开 /admin/metrics/slo**：
     // ① 运营看板本来就一次拉 overview——"这个平台现在健康吗"里，叙事质量与成本仪表是同一屏的
@@ -477,6 +519,28 @@ pub(super) async fn metrics_overview(
             "byWorld": cost_by_world,
             // 错峰调度可观测面（迁移 0038 三列的唯一读出口）。窗口同 trend；口径与局限见其 notes[]。
             "offPeak": off_peak.to_json(cost_days),
+            // if 线（§7 人设保险第 3 级）开销。数据源 `ifline_beats`，与世界线的 `world_ticks` 物理分开。
+            "ifline": {
+                "allTime": {
+                    "tokens": ifline_all_tokens,
+                    "cents": tokens_to_cents(ifline_all_tokens),
+                    "cny": cents_to_cny(tokens_to_cents(ifline_all_tokens)),
+                    "beats": ifline_all_beats,
+                },
+                "window": {
+                    "days": cost_days,
+                    "tokens": ifline_win_tokens,
+                    "cents": tokens_to_cents(ifline_win_tokens),
+                    "cny": cents_to_cny(tokens_to_cents(ifline_win_tokens)),
+                    "beats": ifline_win_beats,
+                },
+                "notes": [
+                    "数据源 ifline_beats（迁移 0041），与世界线的 world_ticks 物理分开——if 线不是一行 worlds，这是 0039 的结构性隔离（§0.1「付费只买体验容量，永不买结果」）。",
+                    "allTime 与 cost.total 同口径（均为全时段）可相加，合计见 cost.combined；window 与 cost.trend/offPeak 同口径（均为 ?costDays= 窗口内）可对照。两者不可混加。",
+                    "逐拍计量共用 runtime::TokenMeter，与 world_ticks.cost_tokens 口径逐字一致，故两条路径的数字可比。",
+                    "if 线默认关闭（MUSE_IFLINE_PARALLEL）；未开启时本节恒为 0——是「没开」不是「不花钱」。",
+                ],
+            },
             "total": {
                 "worlds": cost_rows.len() as i64,
                 "tokens": total_tokens,
@@ -485,6 +549,16 @@ pub(super) async fn metrics_overview(
                 "activeMembers": total_members,
                 "tokensPerPlayer": per_player(total_tokens, total_members),
                 "centsPerPlayer": per_player(total_cents, total_members),
+            },
+            // 平台总开销 = 世界线 + if 线（均为全时段）。
+            // 🔴 `total` 的语义**刻意保持不变**（它一直是世界线口径，改写既有字段含义会让所有
+            //    历史对账口径失效）；要「平台一共花了多少」看这里。
+            "combined": {
+                "tokens": combined_tokens,
+                "cents": combined_cents,
+                "cny": cents_to_cny(combined_cents),
+                "worldlineTokens": total_tokens,
+                "iflineTokens": ifline_all_tokens,
             },
             "allocation": "per_member_equal_split",
             "notes": [

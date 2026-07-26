@@ -172,7 +172,7 @@
 | 生死契约三档（join 签署 + 引擎分派） | **engine Implemented / server 未接线** | 引擎 `narrative/types.rs` `Lethality` + `mod.rs` `apply_lethality`（写作前降级，保证正文与事件同口径）+ `gate_consents` 生死状放行。**server 侧 `worlds.lethality` 列、join 签署、未成年门、runtime 回灌全部未做**，runtime 恒传默认档 | **关闭**（恒为同意制，生死状档不对任何世界生效） |
 | 身份池进采样域 | **Implemented（分配层）/ 叙事未接线** | `assembly/mod.rs` `IdentitySpec` + `DOMAIN_IDENTITY=0x57` + `assign_identities`，结果钉进 `assembled_json` 的 `/assembly/identityAssignments`。**runtime 尚未读回**，身份目前只存不用、叙事层无效果 | 未启用（模板不声明 identityPool 即零影响） |
 | 确定性产出表 + ③世界线层贡献归因 | 见本表下方补记 | 迁移 `0025`；贡献归因表独立于 `narrative_state_json`（回灌引擎会违反平权红线） | — |
-| 成本仪表 | **Implemented** | `admin_api/dashboards.rs` `cost.*`（今日/趋势/每局/每玩家）；`/admin/worlds` 补 `participantCount`·`successRate`·`todayCostCny`；diagnostics 补金额与用量比。**分摊口径为人均等分**（world_ticks 是整拍口径，无 per-member 分解），局限已写进接口 `notes`。**2026-07-26 补记（R3 成本工程杠杆①）**：迁移 `0038` 给 `world_ticks` 加 `off_peak`·`price_ratio_pct`·`defer_ms` 三列，由 `runtime/mod.rs` 的错峰调度器逐拍写入——成本从此可按「折扣时段 / 原价时段」拆桶，「省了多少」= `Σ cost_tokens × (100-price_ratio_pct)/100 × 单价`，「错峰生效了多少」= `off_peak=1` 占比与 `Σ defer_ms`。**2026-07-26 再补记**：`dashboards.rs` **已接这三列**——`cost.offPeak`（拍/token 占比、估算折让、延后时长、按名义档位分桶）挂在成本趋势那条已有的窗口查询上，未新开路由、未新增迁移、未多发一次 SQL；`cost.trend[]` 逐日拆出 `offPeakTokens`。🔴 单位陷阱已锁进用例：`priceRatioPct` 是**百分数整数**（100=原价）、`priceRatio` 是 0..1 小数，两者同时下发且不得互串。⚠️ **if 线开销尚未并入**（`ifline_beats.cost_tokens` 走独立端点 `GET /api/admin/iflines/cost`，接入 SQL 与索引均已就绪）。**2026-07-27 口径修正（#42）**：被内容安全闸/硬约束**阻断的那一拍此前记 `cost_tokens=0`**，而引擎当时已跑完整个回合（导演/决策/仲裁全部烧过 token）——成本因此系统性低估，且越是阻断多的世界低估越重，T3/T5 会在最危险的地方最乐观。现由 `runtime::finish_tick_blocked` 记实测 token 并累计进 `world_budgets`（口径与提交拍、if 线逐字一致）；一次模型都没调过的空转拍仍记 0。叙事 SLO 的拍域另加 `error IS NULL`（`slo::TICK_DOMAIN`）与成本口径分家，阻断拍进成本、不进「无戏份」分母 | 恒开（只读聚合）；错峰写入侧**默认关闭** |
+| 成本仪表 | **Implemented** | `admin_api/dashboards.rs` `cost.*`（今日/趋势/每局/每玩家）；`/admin/worlds` 补 `participantCount`·`successRate`·`todayCostCny`；diagnostics 补金额与用量比。**分摊口径为人均等分**（world_ticks 是整拍口径，无 per-member 分解），局限已写进接口 `notes`。**2026-07-26 补记（R3 成本工程杠杆①）**：迁移 `0038` 给 `world_ticks` 加 `off_peak`·`price_ratio_pct`·`defer_ms` 三列，由 `runtime/mod.rs` 的错峰调度器逐拍写入——成本从此可按「折扣时段 / 原价时段」拆桶，「省了多少」= `Σ cost_tokens × (100-price_ratio_pct)/100 × 单价`，「错峰生效了多少」= `off_peak=1` 占比与 `Σ defer_ms`。**2026-07-26 再补记**：`dashboards.rs` **已接这三列**——`cost.offPeak`（拍/token 占比、估算折让、延后时长、按名义档位分桶）挂在成本趋势那条已有的窗口查询上，未新开路由、未新增迁移、未多发一次 SQL；`cost.trend[]` 逐日拆出 `offPeakTokens`。🔴 单位陷阱已锁进用例：`priceRatioPct` 是**百分数整数**（100=原价）、`priceRatio` 是 0..1 小数，两者同时下发且不得互串。**2026-07-27 补记（#54）**：**if 线开销已并入**——`cost.ifline`（`allTime` 与 `window` 两个口径 + 拍数）与 `cost.combined`（世界线 + if 线合计）。🔴 **`cost.total` 的语义刻意保持不变**（它一直是世界线口径，改写既有字段含义会让所有历史对账失效），要「平台一共花了多少」看 `combined`。⚠️ 两个口径**不可混加**：`total` 是全时段、`trend`/`offPeak` 是 `?costDays=` 窗口内，故 `ifline` 同时给出两者、`combined` 只用 `allTime`——有一条专门的用例（`cost_includes_ifline_without_rewriting_worldline_total`）钉住这一点，实测把 `combined` 改用 window 会立刻转红。漏记成本比记错更危险：它让单位经济学看起来比实际好，而 T3「ARPPU ≥ 3× 模型成本」与 T5「毛利为正」都直接建在这个数上。**2026-07-27 口径修正（#42）**：被内容安全闸/硬约束**阻断的那一拍此前记 `cost_tokens=0`**，而引擎当时已跑完整个回合（导演/决策/仲裁全部烧过 token）——成本因此系统性低估，且越是阻断多的世界低估越重，T3/T5 会在最危险的地方最乐观。现由 `runtime::finish_tick_blocked` 记实测 token 并累计进 `world_budgets`（口径与提交拍、if 线逐字一致）；一次模型都没调过的空转拍仍记 0。叙事 SLO 的拍域另加 `error IS NULL`（`slo::TICK_DOMAIN`）与成本口径分家，阻断拍进成本、不进「无戏份」分母 | 恒开（只读聚合）；错峰写入侧**默认关闭** |
 | 错峰调度（成本工程杠杆①） | **Implemented** | 总规格 §17【拍板 16】。`runtime/mod.rs` 的 `offpeak` 模块 + `schedule_due_ticks` 接入：连载/慢炖场的 tick 优先排进折扣时段，窗口内按窗口占全天比例**压缩间隔以保住每日拍数**（不是节奏降档）；🔴 直播场（`room_type='arena'` ∨ `tick_per_day ≥ MUSE_OFFPEAK_LIVE_TICK_PER_DAY`）永不延后；🔴 防饿死兜底 `interval + min(interval×200%, 6h)` 恒有限、首拍绝不延后；折扣时段内按「被压最久」优先入队。时区口径与 `dashboards::utc_day_start_ms` 同源（UTC，窗口字面量解析期一次性折算）。参数与列口径见 `docs/API.md` §3「错峰调度」 | **关闭**（`MUSE_OFFPEAK_SCHEDULING` 默认 0）。**2026-07-26 补记**：已登记进 `KNOWN_FLAGS`，成为**首个由纯 env 迁入开关体系的存量开关**——解析链升为 user > world > global > env > 默认，错峰从「全局一刀切」变为可按世界灰度。`runtime` 侧一行未改（`offpeak::enabled_for_world` 早已写好「已登记走体系、未登记退 env」的分支） |
 | Batch API（成本工程杠杆③） | **Specified（未实现）** | 约 5 折，但与现有同步 tick 管线结构性冲突：`run_round` 是**串行**五环节 + 同事务 `commit_tick`，而 Batch 是分钟~小时级异步；一拍需 5 次批往返、`CLAIM_STALE_MS=300000` 会把等批 worker 判成崩溃重排、中间态无持久化（批途中重启 = 半通管线，违反 §5「宁可停拍」）。改造路径：`crates/muse-engine` 把 `run_round` 改成可挂起/可恢复的分步状态机 + `ModelClient` 增 `submit_batch`/`poll_batch`（默认实现回落同步 `complete`，桌面轨零改动），server 侧加中间态表 + 批次协调器 + 降级回落。完整分析见 `server/src/runtime/mod.rs` 的 `offpeak` 模块头 | — （未实现，无开关） |
 | 运行时敏感词库 + 语义分类钩 | **第 2 层 Implemented / 第 3 层仅接口位** | `safety/lexicon.rs`（复用 `inject.rs` 归一化管线，零宽/同形/全角绕过均被拦）+ `runtime` commit 事务内闸 + `events`/`reports`/`clips`/`arena` 全部读取面过滤。**第 3 层语义分类未实装**（不能进事务，见 `safety/mod.rs` TODO） | 恒开（审核链） |
@@ -579,6 +579,42 @@ golden `14`，`runtime/simulation/baseline.json` 与 golden 基线**一个字节
 它 < 1 就是 T5 预案「上调延迟拍数」该被触发的信号，`danmakuBlocked/danmakuTotal` 则是
 「内容审核成本 ≤ 生成成本的 5%」那条门槛的一手输入。
 
+### 3.5 社交举报队列的运营前端（真人社交解锁的治理闭环，**落地于 2026-07-27**）
+
+> 迁移 `0040` 交付了完整的举报 API（`server/src/social/`），但**没有后台界面**——举报单只能靠
+> 直接调接口处置。举报是安全通道：**进得来、处置不进去** 等于队列积压且无人知道。本项补的是这一环。
+
+| 项 | 开发状态 | 代码锚点 | 默认开关 |
+|---|---|---|---|
+| 举报队列前端（列表 / 筛选 / 详情 / 复核处置 / 跳转处置入口） | **Implemented** | `admin/src/pages/SocialReports.tsx` + `.css`；RBAC 模块 `social`（`admin/src/rbac.ts`，可见角色 reviewer/support/admin，与 `social::require_report_handler` 逐字对齐） | 随 `MUSE_SOCIAL_IDENTITY_UNLOCK`（**关闭**）；关闭时端点 404 → 整页「功能未开启」空态 |
+| 队列筛选下推 SQL（status / category / subjectKind） | **Implemented** | `social::list_reports_admin`，三个筛选值走白名单；🔴 **未知值 400 而非静默空列表**——`?status=Pending` 拼错若返回空队列，运营读到的是「没有积压」 | 同上 |
+| 队列形状聚合（积压 / 类别分布 / 最久未处理 / 达阈值对象数） | **Implemented** | `GET /admin/social/reports/summary`（只读聚合，每项一次 `GROUP BY`）。指标**不受分页与筛选影响**——拿已加载那一页数出来的「待处理 12 条」会被读成队列只剩 12 条 | 同上 |
+
+**🔴 处置边界（本项最重要的一条，改动需显式评审）**：后端 `resolve` 刻意**只改举报单状态**，
+真实处置（封禁 / 内容驳回 / 申诉改判）走各自既有路径，各带自己的权限矩阵与审计。
+前端**尊重这条边界**：详情抽屉里的处置动作是**跳转 + 回填**（`/users?query=<被举报人>`、
+`/risk?kind=social_report_threshold`、`/audit`），**一条新的写路径都没有开**；
+且跳转按钮受**前端 RBAC 收敛**——reviewer 看得见举报队列但进不去用户管理，那他就不该有一个
+能点的封禁按钮（后端仍二次校验，前端做的是纵深与诚实）。把处置塞进举报接口 = 给封禁开一条
+绕过既有权限矩阵的侧门。
+
+**分页**：复合游标 `(created_at, id)`（`server/src/pagination.rs`）。举报是**批量同毫秒写入**的
+典型场景，单列游标下横跨页边界的并列组会被永久跳过 = 那几条举报永远不会被处置。
+另补「末页回 `nextCursor: null`」（多取一行判定，口径同 `/admin/risk-events`）：
+只按「末行有没有」发游标的话「加载更多」永远在，运营**分不清翻完了没有**——而这正是队列唯一要回答的问题。
+
+**§14 恨隔面具原则**：玩家侧任何接口都不下发被举报人的真人 id（连举报回执都不给）。
+真人 id 与举报正文只在这一处运营复核档出现，走 reviewer/support 鉴权，处置写
+`audit_logs('social.report_resolved')`；界面把这件事**显式写出来**，不默默展示。
+
+**未成年保护**：举报与拉黑**不设年龄门**（关掉等于让未成年无法自保）。前端**没有**反向给它加限制——
+不对举报人做任何年龄相关的过滤、降权或排序，这条写在页面口径脚注里以防后人"顺手补齐"。
+
+⚠️ 状态止于 **Implemented**：页面结构、口径与权限收敛已落地并有后端用例守护，但
+①「后端未挂 CORS」这条全后台共性问题仍在（见设计文档 §13.4），正式模式的带数据验收只能在
+关闭同源策略的浏览器实例里做；② 队列本身尚无真实举报数据（功能默认关闭），
+**没有任何运营吞吐 / 处置时效的经验值**，因此不构成 `Production-ready`，更不是 `Validated`。
+
 ## 4. 验证基建三件套（优先于新增功能）
 
 1. **黄金世界回归**：一个公版/原创标准样板（固定角色卡 + 世界模板 + 20-30 个关键剧情测试点，
@@ -793,6 +829,62 @@ MUSE_RECORD_DIR=$PWD/muse-objects/recordings \
 录制产物自带 `labels.responseSource`（`scriptedStub` / `real`）——一份桩录制和一份真实录制
 长得一模一样，不把来源钉进产物本身，半年后就会有人拿桩当基线
 （同 `QualitySource::SimulatedStub` 的做法：**数会被复制进评审材料，文档不会**）。
+
+### 4.6 校准维度读数（新增于 2026-07-27 · 任务 #53 · 状态 `Implemented`）
+
+内容中台的生产流水线是**人工校准 → 仿真试跑 → 世界质量回归**（总规格 §79/§83）。
+前两环已建成（§4.4 + `admin_api::calibration` 三维视图），但**闭环缺最后一环**：
+§4.2 那八项一律按平台 / 按 `character_id` 聚合，与**运营调的那个旋钮**（身份 id、境界档）无关，
+于是「这样配是不是更好」在指标结构上根本问不出来——两处 `effect.calibrationLoop` 因此长期写着 `Missing`。
+
+**落点**：`server/src/slo/calibration.rs`（只读聚合）→ `/admin/metrics/overview` 的
+`narrativeSlo.calibration`（与 `metrics` 并列的兄弟键，`?slo=0` 一并跳过）。
+无迁移、无新列、无新路由：读的全是既有数据（`worlds.assembled_json` 的
+`/assembly/identityAssignments` 与 `/assembly/realmTier`、`world_members`、`world_contributions`、
+`world_ticks`、`world_events`、`audit_logs`）。
+
+**两维形状刻意不同构**（把后者套成前者会得到一个恒为 0 的假指标）：
+
+| 维 | 形状 | 为什么是这个形状 | 读数 |
+|---|---|---|---|
+| 身份维（§5） | **组内分布** | 身份是**各不相同**的开局站位，一个世界里同时存在多个 → 有组内可比性 | 每身份的**相对均分倍率** `(score ÷ 世界总分) × 世界成员数`，1.0 = 恰好均分。均值 / 中位数 / 极值 / 零分观察数，外加各身份**均值之间**的集中度基尼，以及 `(unassigned)` 对照桶。直接回答「某个身份是不是系统性拿到更少戏份」 |
+| 戏服维（§6【拍板 3】） | **跨世界对比** | 境界档**全员统一**：一个世界只有一件戏服、无池、无配额、装配层零抽样 ⇒ **没有组内分布**（组内基尼恒为 0） | 按钉住的 `realmTier.id` 分桶，各桶各自报 §4.4 的世界质量三指标（完读 / 阻断 / 结局分布）。`(none)` = 未钉戏服的**对照桶**，是「配了戏服的世界」唯一的参照系 |
+
+**三条纪律（各自有用例锁着）**：
+
+1. 🔴 **只读，绝不回灌引擎**。本模块没有一条 `INSERT/UPDATE/DELETE`，产物只作 JSON 返回。
+   理由与 `world_contributions` 独立于 `narrative_state_json` 单独建表**完全同源**（迁移 0025）：
+   一旦按身份分组的戏份差进了引擎判定输入，「身份影响判定」就成立，直接违反 §0.1 平权红线。
+   锁：`calibration_readings_never_write_anything`（跑完库内容逐字节不变）·
+   `calibration_readings_never_touch_narrative_state`（`narrative_state_json` / `state_revision` 专项）·
+   `calibration_module_source_contains_no_write_statements`（源码级，注释行不计）。
+2. 🔴 **三态分得开**：`entry_not_open`（**这一维从未被任何模板配置过** → `—`，且不发任何计数，
+   发了会被当成 0 读）/ `no_data_in_window`（配置过但窗口内零样本 → `—`，计数照发以便区分
+   「没世界」还是「有世界但都没分配 / 都没挣到分」）/ `ok`（真数，**可以是 0**）。
+   口径抄 §4.2 `oocAppealRate` 的处理——直接报 0 会得到「看起来棒极了、实际上什么都没测」的数，
+   而门槛判定恰恰要拿它决定继续/调整/停止。
+3. 🔴 **不给「越高越好」的单一分数**。校准是**多目标**的（公平 vs 戏剧性：把戏份摊平到各身份
+   均值全是 1.0 就没有主角了），综合评分会诱导运营去优化那个数字本身。两维在 `ok` 态都没有
+   代表整维的标量 `value`，全树也不出现 `score` / `grade` / `verdict` / `recommendation` 一类判语字段。
+   锁：`calibration_readings_expose_no_composite_score`。
+
+**口径复用，不另立第二套**：集中度走 `slo::gini_coefficient`（与叙事注意力基尼同一实现），
+三指标走 `slo::quality`（与 §4.4 仿真回归**算同一个数**）。为避免 N+1，新增了
+`quality::collect_world_facts_bulk`，与单世界版共用同一套分类规则（`add_tick_bucket` / `parse_ended_reason`），
+两条路径不漂移由 `bulk_world_facts_match_single_world_facts` 锁住。
+
+**一处刻意的口径差异（不是 bug，是这个指标存在的理由）**：身份维的分母是 `world_members` **全集**，
+无贡献分行的成员按 **0 分**计入；而 §4.2 `attentionGini` 走的是 `world_contributions ∩ world_members`。
+`world_contributions` 是**挣到分才落行**的，交集口径因此**看不见「一分没挣到」的人**——
+而「某个身份是不是系统性拿不到戏」正要靠这些人才答得了。两个数**不可互相校验**。
+窗口口径也不同：本节是 cohort（`worlds.created_at` 落窗，两维共用一批），`attentionGini` 是
+「窗口内有贡献分更新的世界」。
+
+🔴 **本节交付的是读数，不是校准闭环的结论。** 两处 `effect.calibrationLoop` 从 `Missing` 改为
+**`Implemented`** 而不是更高，是因为七档里 `Implemented` 的含义正是「代码落地并有测试覆盖」：
+**能测了 ≠ 已验证配得对**。闭环真正成立要等运营据此调过参、并在下一批世界上看到因果——
+那才是 `Validated`。在此之前，本节的任何数字**不得**被表述为「校准闭环已建立」或
+「身份池/境界档已调好」。读数本身也拒绝下这个判语：它只给分维度的事实。
 
 ## 5. AI 失败安全降级（写入门槛，因公共事实不可回滚）
 

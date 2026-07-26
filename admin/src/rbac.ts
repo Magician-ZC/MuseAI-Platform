@@ -10,14 +10,20 @@
 //   metrics  GET /admin/metrics/overview → require_role(operator, finance)           ⇒ operator, finance
 //   prompts  GET /admin/prompts          → require_role(operator)                    ⇒ operator
 //   risk     GET /admin/risk-events      → require_role(operator, reviewer, support) ⇒ operator, reviewer, support
+//   social   GET /admin/social/reports   → social::require_report_handler(reviewer, support)
+//                                                                                    ⇒ reviewer, support
 //   tickets  GET /admin/data-requests    → require_role(support)                     ⇒ support
 // admin 为超级角色，可见全部（对齐 require_role 中 role=="admin" 放行一切）。
 //
+// social 的守卫是 social 模块自己的 require_report_handler（语义与 require_role 逐字一致，
+// 那个函数是 admin_api 私有故在兄弟模块重写了一份）：举报同时是内容风控问题（骚扰/冒充 → reviewer）
+// 与客服问题（用户申告链路 → support），两条线必须看同一个队列，否则会各建一套口径。
+//
 // 等价的按角色视图：
-//   admin    全部八模块
+//   admin    全部九模块
 //   operator 世界运营 / 数据看板 / 模型与 Prompt / 风控（只读）
-//   reviewer 内容审核 / 风控（只读）
-//   support  用户管理 / 客服与工单 / 风控（只读）
+//   reviewer 内容审核 / 风控（只读）/ 社交举报
+//   support  用户管理 / 风控（只读）/ 社交举报 / 客服与工单
 //   finance  经济运营 / 数据看板（只读）
 
 export type AdminRole = 'admin' | 'operator' | 'reviewer' | 'support' | 'finance';
@@ -29,7 +35,13 @@ export interface AdminModule {
   roles: AdminRole[];
 }
 
-/** 八大模块（顺序即菜单顺序，也决定各角色的默认落地模块）。 */
+/**
+ * 九大模块（顺序即菜单顺序，也决定各角色的默认落地模块）。
+ *
+ * `social` 刻意插在 `risk` 之后：它是治理队列，与风控同一类工作；
+ * 且插在此处不改变任何角色的**第一个可见模块**（= 登录后的落地页），
+ * 新增模块不该顺手把谁的落地页换掉。
+ */
 export const MODULES: AdminModule[] = [
   { key: 'users', label: '用户管理', roles: ['support'] },
   { key: 'audit', label: '内容审核', roles: ['reviewer'] },
@@ -38,6 +50,7 @@ export const MODULES: AdminModule[] = [
   { key: 'metrics', label: '数据看板', roles: ['operator', 'finance'] },
   { key: 'prompts', label: '模型与 Prompt', roles: ['operator'] },
   { key: 'risk', label: '风控', roles: ['operator', 'reviewer', 'support'] },
+  { key: 'social', label: '社交举报', roles: ['reviewer', 'support'] },
   { key: 'tickets', label: '客服与工单', roles: ['support'] },
 ];
 

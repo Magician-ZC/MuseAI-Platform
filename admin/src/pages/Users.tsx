@@ -1,7 +1,11 @@
 // 用户管理：检索（脱敏由后端处理）+ cursor 分页 + 封禁/解封（理由走 query，写审计）。
+//
+// 深链 `?query=<用户 id>`：别的运营页（如社交举报队列）把「处置这个人」的动作**跳转过来**，
+// 而不是在自己那边复制一套封禁流程——封禁的权限矩阵与审计只有这一处，多一个入口就多一条侧门。
 import { useEffect, useState } from 'react';
 import { Button, Input, message, Space, Table, Tag, Typography } from 'antd';
 import type { TableColumnsType } from 'antd';
+import { useLocation } from 'react-router-dom';
 import { adminFetch } from '../api';
 import { ErrorAlert, formatTime, friendlyError, ReasonModal, usePagedList } from '../components/shared';
 
@@ -30,7 +34,10 @@ const VERIFY_TAG: Record<string, string> = {
 };
 
 export default function Users() {
-  const [query, setQuery] = useState('');
+  const search = useLocation().search;
+  // 深链回填：跳转过来时搜索框预填该用户 id，运营落地即是目标行，不必再手抄一遍 id。
+  const linked = new URLSearchParams(search).get('query')?.trim() ?? '';
+  const [query, setQuery] = useState(linked);
   const [action, setAction] = useState<{ id: string; kind: 'ban' | 'unban'; name: string } | null>(null);
   const [acting, setActing] = useState(false);
 
@@ -47,10 +54,14 @@ export default function Users() {
 
   const { reload } = list;
   useEffect(() => {
-    reload();
-    // 首屏加载；搜索通过按钮触发 reload。
+    // 首屏加载 + 深链变化时重取；其余情况由搜索按钮触发 reload。
+    setQuery(linked);
+    // 延一拍：usePagedList 的 fetcher 是本轮渲染的闭包，setQuery 要下一轮才被它读到
+    //（口径同下面「重置」按钮）。
+    const t = setTimeout(reload, 0);
+    return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [search]);
 
   const doAction = async (reason: string) => {
     if (!action) return;

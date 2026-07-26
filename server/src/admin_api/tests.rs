@@ -2081,6 +2081,77 @@ fn close_to(a: f64, b: f64) -> bool {
     (a - b).abs() < 1e-9
 }
 
+/// ⚠️ `beat_no` 必须逐条不同：`(ifline_id, beat_no)` 是唯一键——那是 if 线推进的**并发闸**
+/// （两个并发请求抢同一拍，后到者撞键即 409），不是可有可无的索引。
+async fn ins_ifline_beat(state: &AppState, id: &str, beat_no: i64, tokens: i64, created_at: i64) {
+    sqlx::query(
+        "INSERT INTO ifline_beats (id, ifline_id, beat_no, status, cost_tokens, created_at) \
+         VALUES ($1, 'ifw_x', $2, 'done', $3, $4)",
+    )
+    .bind(id)
+    .bind(beat_no)
+    .bind(tokens)
+    .bind(created_at)
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+/// 🔴 **if 线开销并入主看板，但 `cost.total` 的语义一个字不改**。
+///
+/// 在此之前主看板只 SUM `world_ticks.cost_tokens`，**系统性漏掉 if 线这部分付费功能的开销**。
+/// 漏记成本比记错更危险：它让单位经济学看起来比实际好，而 T3「ARPPU ≥ 3× 模型成本」与
+/// T5「毛利为正」两个门槛都直接建在这个数上。
+///
+/// 但修法**不是**把 `ifline_beats` 混进 `world_ticks` 的聚合——那会悄悄改写 `cost.total`
+/// 这个既有字段的含义，让所有历史对账口径失效。故 if 线单列 + 另给 `combined`。
+///
+/// 本用例同时钉住两件事：新字段算得对、**旧字段没被动过**。
+#[tokio::test]
+async fn cost_includes_ifline_without_rewriting_worldline_total() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+
+    let now = now_ms();
+    let day = 86_400_000i64;
+    // 世界线：窗口内一拍 500k。
+    ins_tick_offpeak(&state, "wt1", "w_a", 0, 500_000, now, 0, 100, 0).await;
+    // if 线：窗口内两拍（30k + 20k），窗口外一拍（7k）——`?costDays=` 默认 7 天。
+    ins_ifline_beat(&state, "ifb_1", 0, 30_000, now).await;
+    ins_ifline_beat(&state, "ifb_2", 1, 20_000, now - day).await;
+    ins_ifline_beat(&state, "ifb_3", 2, 7_000, now - 30 * day).await;
+
+    let (st, m) = get(&app, "/api/admin/metrics/overview", Some(&admin)).await;
+    assert_eq!(st, StatusCode::OK, "{m}");
+    let c = &m["cost"];
+
+    // 🔴 既有字段：`total` 仍是**世界线**口径，一个 if 线 token 都没混进去。
+    assert_eq!(
+        c["total"]["tokens"], 500_000,
+        "🔴 cost.total 必须保持世界线口径——把 if 线混进去会让所有历史对账失效"
+    );
+
+    // 两个口径分得开：allTime 含窗口外那 7k，window 不含。
+    assert_eq!(c["ifline"]["allTime"]["tokens"], 57_000, "全时段 = 30k + 20k + 7k");
+    assert_eq!(c["ifline"]["allTime"]["beats"], 3);
+    assert_eq!(c["ifline"]["window"]["tokens"], 50_000, "窗口内 = 30k + 20k，不含 30 天前那拍");
+    assert_eq!(c["ifline"]["window"]["beats"], 2);
+
+    // 合计与 total 同口径（均为全时段）相加。
+    assert_eq!(c["combined"]["tokens"], 557_000);
+    assert_eq!(c["combined"]["worldlineTokens"], 500_000);
+    assert_eq!(c["combined"]["iflineTokens"], 57_000);
+
+    // 🔴 口径不可混加：窗口内的 if 线数 + 全时段的 total 是个两头不靠的数，
+    //    本断言防止将来有人"顺手"把 combined 改成用 window。
+    assert_ne!(
+        c["combined"]["tokens"].as_i64().unwrap(),
+        550_000,
+        "🔴 combined 必须用 allTime（与 total 同口径），不是 window"
+    );
+}
+
 /// 🔴 **单位口径锁**：`price_ratio_pct` 是百分数整数（100=原价、40=4 折），
 /// 而对外一切**比率**字段是 0..1 小数（同 successRate/usageRatio）——两者最容易混。
 /// 本用例同时钉住：档位的两种形态、三个比率的取值域、以及折让金额的精确公式。
@@ -2626,6 +2697,9 @@ async fn narrative_slo_window_clamps_and_can_be_skipped_for_polling() {
     assert_eq!(st, StatusCode::OK);
     assert_eq!(m["narrativeSlo"]["status"], "skipped_by_request");
     assert_eq!(m["narrativeSlo"]["metrics"].as_object().unwrap().len(), 0);
+    // 🔴 校准维度读数（那一路要分页解析 assembled_json）必须一并被 ?slo=0 关掉——
+    // 它是本端点最重的一段，漏关等于减负开关白开。
+    assert_eq!(m["narrativeSlo"]["calibration"]["status"], "skipped_by_request");
     assert_eq!(m["narrativeSlo"]["unavailable"].as_array().unwrap().len(), 1);
     // 其余看板段不受影响。
     assert!(m["cost"]["centsPer1kTokens"].as_i64().unwrap() > 0);
@@ -3311,12 +3385,15 @@ async fn identity_pool_distribution_reports_fill_and_effect_scope() {
     assert_eq!(unknown[0]["identityId"], "retired_id");
     assert!(d["gini"].as_f64().unwrap() > 0.0, "3/2/0 的分配不是均分");
 
-    // 🔴 效力自述：四层状态原样下发，且明说没有校准闭环。
+    // 🔴 效力自述：四层状态原样下发，且明说本页不构成效果验证。
     let e = &body["effect"];
     assert_eq!(e["assignmentLayer"], "Implemented");
     assert_eq!(e["narrativeLayer"], "Implemented");
     assert_eq!(e["numericLayer"], "NeverByDesign", "平权红线：身份永不进数值层");
-    assert_eq!(e["calibrationLoop"], "Missing", "没有指标度量「调身份池 → 戏份变化」");
+    assert_eq!(
+        e["calibrationLoop"], "Implemented",
+        "slo::calibration 的身份维读数已建成（narrativeSlo.calibration）；🔴 读数建成 ≠ 闭环已验证，不许标到 Validated"
+    );
     assert!(e["warning"].as_str().unwrap().contains("不构成效果验证"));
     assert_eq!(body["editable"], false, "🔴 校准面只可视化，不可编辑");
 }
@@ -3420,7 +3497,10 @@ async fn realm_tier_directory_separates_saga_gap_from_standalone() {
     assert_eq!(body["editable"], false, "🔴 校准面只可视化，不可编辑");
     // 🔴 效力自述必须随目录一起下发（运营在列表页就该知道这一维现在到底有什么用）。
     assert_eq!(body["effect"]["narrativeLayer"], "Integrated", "戏服已接进入场导演 prompt");
-    assert_eq!(body["effect"]["calibrationLoop"], "Missing", "仍无指标度量「换戏服 → 叙事变化」");
+    assert_eq!(
+        body["effect"]["calibrationLoop"], "Implemented",
+        "戏服维读数已建成（按戏服分桶的世界质量三指标）；读数建成 ≠ 闭环已验证"
+    );
 }
 
 /// 境界档详情：同系列各阶对照（缺档 / 复用同一档 / 跨体系）+ 实例钉住情况（含钉着旧档）。
@@ -3478,7 +3558,7 @@ async fn realm_tier_detail_reports_stage_progression_and_pinning() {
     assert!(w3["pinnedTierId"].is_null(), "没钉住 → null，不得编一个空串");
     assert!(w3["matchesTemplate"].is_null(), "没钉住时「是否一致」不成立 → null，不得当 false 读");
 
-    // 🔴 效力自述五层：叙事感知层已接通、数值层永不生效、校准闭环仍缺。
+    // 🔴 效力自述五层：叙事感知层已接通、数值层永不生效、校准闭环有读数但未验证。
     let e = &body["effect"];
     assert_eq!(e["declarationLayer"], "Implemented");
     assert_eq!(e["pinningLayer"], "Implemented");
@@ -3487,7 +3567,10 @@ async fn realm_tier_detail_reports_stage_progression_and_pinning() {
         "runtime::parse_realm_costume → RoundInput.realm_costume → 入场导演 prompt"
     );
     assert_eq!(e["numericLayer"], "NeverByDesign", "§6 跨体系靠风味翻译，不靠数值换算");
-    assert_eq!(e["calibrationLoop"], "Missing", "没有指标度量「换戏服 → 叙事变化」");
+    assert_eq!(
+        e["calibrationLoop"], "Implemented",
+        "slo::calibration 的戏服维读数已建成；🔴 它是跨世界对比不是组内分布，且只到 Implemented"
+    );
     assert_eq!(body["editable"], false);
 
     // 模板不存在 → 404（同身份池维）。

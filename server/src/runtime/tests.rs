@@ -9,7 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::json;
 use sqlx::any::AnyPoolOptions;
-use sqlx::AnyPool;
+use sqlx::{AnyPool, Row};
 
 use crate::app::AppState;
 use crate::config::ServerConfig;
@@ -848,6 +848,8 @@ async fn game_time_written_back() {
 /// interval 模式在同一 schedule_due_ticks 轮里未到间隔 → 不排新 tick（退化路径不受影响）。
 #[tokio::test]
 async fn timeline_mode_event_back_to_back() {
+    // 与错峰用例互斥（错峰开关是进程级 env，会改变本用例走的调度分支）。
+    let _g = offpeak_fixture::OffPeakSwitch::off();
     let state = test_state().await;
     let ev = running_soft_world(&state, "ev", "event").await;
     let iv = running_soft_world(&state, "iv", "interval").await;
@@ -1130,6 +1132,7 @@ async fn empty_skeleton_does_not_conclude_early() {
 /// ended 后：schedule_due_ticks 不再排新 tick（status='running' 门），遗留 tick 命中 world_not_running noop。
 #[tokio::test]
 async fn ended_world_is_not_rescheduled() {
+    let _g = offpeak_fixture::OffPeakSwitch::off();
     let state = test_state().await;
     seed_template_with_endgame(
         &state.db,
@@ -1779,6 +1782,7 @@ async fn resolve_model_routes_reads_max_output_tokens_from_config() {
 /// chapter start），保 arena「节目节奏优先于定时器」与 chapter「会话驱动」语义。
 #[tokio::test]
 async fn event_non_idle_manual_only_idle_back_to_back() {
+    let _g = offpeak_fixture::OffPeakSwitch::off();
     let state = test_state().await;
     seed_template_soft(&state.db, "tpl-mr").await;
     // 三个 event 房，房型各异（room_type 由 helper 显式落 p.room_type）。
@@ -2988,4 +2992,748 @@ fn critic_persist_switch_defaults_on_and_misconfig_keeps_recording() {
     for on in ["1", "true", "on", "", "yes", "随便写的值"] {
         assert!(critic_persist_from_env_value(Some(on)), "{on} 应保持开启（配错不静默丢数据）");
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// R3 成本工程杠杆①：错峰 / Batch 调度器（总规格 §17【拍板 16】）
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// 本节覆盖任务书列出的全部必测项：
+//   · 开关关闭时调度行为逐字不变（回归保护）
+//   · 折扣时段内优先领取
+//   · 🔴 直播场不受错峰影响（红线）
+//   · 🔴 兜底防饿死（超时无视时段照跑，红线）
+//   · 时区口径正确（与 dashboards 的 UTC 日界同源）
+//   · 并发领取不重复
+// Batch API（杠杆③）本批次未实现（理由见 `runtime::offpeak` 模块头的可行性分析），
+// 故无对应用例——**不给没有实现的东西写"通过"的测试**。
+
+/// 错峰相关 env 的 RAII 夹具。
+///
+/// 🔴 **为什么需要一把全局锁**：`MUSE_OFFPEAK_*` 是**进程级** env，而 `schedule_due_ticks`
+/// 是所有调度用例的公共入口——某个用例把错峰打开的瞬间，并发跑着的 `timeline_mode_event_back_to_back`
+/// 等用例就会走进错峰分支。故**所有调用 `schedule_due_ticks` 的用例都必须持有这把锁**
+/// （不需要错峰的用例用 `OffPeakSwitch::off()`）。范式同 `onboarding::OnboardingSwitch`。
+pub(super) mod offpeak_fixture {
+    use crate::runtime::offpeak;
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 本夹具会动到的全部 env（Drop 时逐个恢复原值）。
+    const KEYS: &[&str] = &[
+        offpeak::ENV_ENABLED,
+        offpeak::ENV_WINDOWS,
+        offpeak::ENV_TZ_OFFSET_MIN,
+        offpeak::ENV_DISCOUNT_PCT,
+        offpeak::ENV_MAX_DEFER_PCT,
+        offpeak::ENV_MAX_DEFER_MS,
+        offpeak::ENV_MIN_INTERVAL_MS,
+        offpeak::ENV_LIVE_TICK_PER_DAY,
+        "MUSE_TICK_INTERVAL_MS",
+    ];
+
+    pub(crate) struct OffPeakSwitch {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        prev: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl OffPeakSwitch {
+        /// 关闭态（清空全部错峰 env）：给不测错峰、但会调 `schedule_due_ticks` 的用例用。
+        pub(crate) fn off() -> Self {
+            Self::with(&[])
+        }
+
+        /// 按给定 env 键值开一把夹具；未列出的错峰 env 一律清空（避免用例间串味）。
+        pub(crate) fn with(extra: &[(&'static str, String)]) -> Self {
+            let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = KEYS.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+            for k in KEYS {
+                std::env::remove_var(k);
+            }
+            for (k, v) in extra {
+                std::env::set_var(k, v);
+            }
+            Self { _guard: guard, prev }
+        }
+    }
+
+    impl Drop for OffPeakSwitch {
+        fn drop(&mut self) {
+            for (k, v) in &self.prev {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    /// 构造一个**包含此刻**的 UTC 折扣时段字面量（前后各留 2 小时）。
+    /// 用例不能注入时钟（`schedule_due_ticks` 内部取 `now_ms()`），故反过来按真实时刻造窗口——
+    /// 无论测试在一天中的哪一刻跑都成立。跨零点时自然写成 `22:30-02:30`，正好也压到跨零点分支。
+    pub(crate) fn window_containing_now() -> String {
+        window_around(super::now_ms(), -2 * 3_600_000, 2 * 3_600_000)
+    }
+
+    /// 构造一个**不含此刻**的 UTC 折扣时段字面量（此刻之后 6 小时起、共 4 小时）。
+    pub(crate) fn window_excluding_now() -> String {
+        window_around(super::now_ms(), 6 * 3_600_000, 10 * 3_600_000)
+    }
+
+    fn window_around(now: i64, from: i64, to: i64) -> String {
+        let day = offpeak::DAY_MS;
+        let o = offpeak::utc_ms_of_day(now);
+        let fmt = |ms: i64| {
+            let ms = ms.rem_euclid(day);
+            format!("{:02}:{:02}", ms / 3_600_000, (ms % 3_600_000) / 60_000)
+        };
+        format!("{}-{}", fmt(o + from), fmt(o + to))
+    }
+}
+
+use offpeak_fixture::{window_containing_now, window_excluding_now, OffPeakSwitch};
+
+// ---------- 纯函数层：配置解析 / 时区口径 / 裁决 ----------
+
+/// **时区口径**：`offpeak::utc_ms_of_day` 必须与 `admin_api::dashboards::utc_day_start_ms`
+/// 是同一套日界（全仓唯一一套 UTC 口径）。这里用 chrono 独立复算那个函数的定义再比对——
+/// 任何一侧改口径本用例立刻红，杜绝"第二套时区口径"。
+#[test]
+fn offpeak_utc_day_offset_matches_dashboard_day_boundary() {
+    // dashboards::utc_day_start_ms 的定义（逐字复算，该函数是 pub(super) 无法跨模块引用）。
+    fn dashboard_day_start(ms: i64) -> i64 {
+        use chrono::NaiveTime;
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
+            .map(|d| d.date_naive().and_time(NaiveTime::MIN).and_utc().timestamp_millis())
+            .unwrap_or(0)
+    }
+    for t in [
+        0i64,
+        1,
+        86_399_999,
+        86_400_000,
+        1_700_000_000_000,
+        1_767_225_599_999,
+        now_ms(),
+    ] {
+        assert_eq!(
+            super::offpeak::utc_ms_of_day(t),
+            t - dashboard_day_start(t),
+            "{t} 的当日偏移必须等于 ms - dashboards 的 UTC 日界"
+        );
+    }
+    // 纪元前（负时间戳）也不能出现负偏移，否则窗口判定会静默失灵。
+    assert_eq!(super::offpeak::utc_ms_of_day(-1), 86_399_999, "负时间戳应回绕到当日末尾");
+}
+
+/// 窗口解析：跨零点拆段 · 时区折算只发生在解析期 · 重叠合并 · 非法条目只丢自己。
+#[test]
+fn offpeak_window_parsing_handles_wraparound_timezone_and_merge() {
+    let h = 3_600_000i64;
+    // 普通窗口。
+    assert_eq!(super::offpeak::parse_windows("01:00-03:00", 0), vec![(h, 3 * h)]);
+    // 跨零点 → 拆两段。
+    assert_eq!(
+        super::offpeak::parse_windows("22:00-02:00", 0),
+        vec![(0, 2 * h), (22 * h, super::offpeak::DAY_MS)]
+    );
+    // 时区折算：北京时间 00:30-08:30（offset=480 分钟）→ UTC 16:30-00:30，即跨零点两段。
+    assert_eq!(
+        super::offpeak::parse_windows("00:30-08:30", 480),
+        vec![(0, 30 * 60_000), (16 * h + 30 * 60_000, super::offpeak::DAY_MS)]
+    );
+    // 与直接按 UTC 书写等价 —— 证明「同一时段的两种写法落到同一套 UTC 口径」。
+    assert_eq!(
+        super::offpeak::parse_windows("00:30-08:30", 480),
+        super::offpeak::parse_windows("16:30-00:30", 0)
+    );
+    // 重叠合并 + 相接合并。
+    assert_eq!(super::offpeak::parse_windows("01:00-03:00,02:00-05:00", 0), vec![(h, 5 * h)]);
+    assert_eq!(super::offpeak::parse_windows("01:00-02:00,02:00-03:00", 0), vec![(h, 3 * h)]);
+    // 非法条目只丢自己：起止相同（歧义）、缺分隔符、时分越界、非数字。
+    assert_eq!(
+        super::offpeak::parse_windows("01:00-01:00,坏的,25:00-26:00,04:61-05:00,06:00-07:00", 0),
+        vec![(6 * h, 7 * h)]
+    );
+    // `24:00` 作为终点合法。
+    assert_eq!(super::offpeak::parse_windows("23:00-24:00", 0), vec![(23 * h, super::offpeak::DAY_MS)]);
+}
+
+/// 🔴 **配错窗口的后果必须是「功能不生效」，不是「所有世界永远被延后」**。
+#[test]
+fn offpeak_config_degrades_to_disabled_when_no_window_parses() {
+    let _g = OffPeakSwitch::with(&[(super::offpeak::ENV_WINDOWS, "全是垃圾,01:00-01:00".into())]);
+    assert!(super::offpeak::Config::from_env().is_none(), "一条窗口都解析不出来 → 整个错峰退化为关闭");
+}
+
+/// 默认配置自洽：默认窗口能解析、默认折扣是 5 折、默认阈值把连载场留在错峰范围内。
+#[test]
+fn offpeak_defaults_are_self_consistent() {
+    let _g = OffPeakSwitch::off();
+    let cfg = super::offpeak::Config::from_env().expect("默认窗口必须可解析");
+    assert_eq!(cfg.window_total_ms, 8 * 3_600_000, "默认窗口（UTC 16:30-00:30）总长 8 小时");
+    assert_eq!(cfg.discount_pct, super::offpeak::DEFAULT_DISCOUNT_PCT);
+    // §2 三档：连载场上限 24 拍/天必须仍在错峰范围内；密集拍（≥48）才算直播场。
+    assert!(!cfg.is_live_room("idle", 24), "每小时一拍的连载场不得被当成直播场");
+    assert!(!cfg.is_live_room("chapter", 3), "慢炖节奏的章节房不得被当成直播场");
+    assert!(cfg.is_live_room("idle", 48), "≥48 拍/天（密集拍）视为直播场");
+    assert!(cfg.is_live_room("arena", 1), "赛事房恒为直播场，与节奏无关");
+    // 🔴 开关本身默认关闭（§0.1）。
+    assert!(!super::offpeak::env_bool(super::offpeak::ENV_ENABLED, super::offpeak::DEFAULT_ENABLED));
+    assert!(!super::offpeak::DEFAULT_ENABLED, "错峰默认必须关闭");
+}
+
+/// 窗口内间隔压缩：**保住每天的拍数不变**（否则错峰就悄悄变成了节奏降档）。
+#[test]
+fn offpeak_compression_preserves_daily_tick_count() {
+    let day = super::offpeak::DAY_MS;
+    // ⚠️ `OffPeakSwitch` 内部是不可重入的 std Mutex：两段配置必须各自成块，不能同时持有两把。
+    {
+        let _g = OffPeakSwitch::with(&[(super::offpeak::ENV_WINDOWS, "16:00-24:00".into())]); // 8h 窗口
+        let cfg = super::offpeak::Config::from_env().unwrap();
+        // 24 拍/天（连载场，interval=1h）→ 窗口内间隔 20 分钟 → 8h 窗口正好还是 24 拍。
+        let interval = day / 24;
+        let compressed = cfg.compressed_interval(interval);
+        assert_eq!(compressed, 20 * 60_000);
+        assert_eq!(cfg.window_total_ms / compressed, day / interval, "窗口内拍数 = 原每日拍数");
+        // 4 拍/天（慢炖场，interval=6h）→ 窗口内 2h → 8h 窗口仍是 4 拍。
+        assert_eq!(cfg.compressed_interval(day / 4), 2 * 3_600_000);
+    }
+    // 地板保护：窗口极窄时不得压出突发风暴。
+    {
+        let _g = OffPeakSwitch::with(&[
+            (super::offpeak::ENV_WINDOWS, "00:00-00:10".into()),
+            (super::offpeak::ENV_MIN_INTERVAL_MS, "300000".into()),
+        ]);
+        let narrow = super::offpeak::Config::from_env().unwrap();
+        assert_eq!(narrow.compressed_interval(day / 24), 300_000, "压缩结果不得低于地板");
+        // 地板比原间隔还大时以原间隔为准（钳制区间不得反转）。
+        assert_eq!(narrow.compressed_interval(60_000), 60_000);
+    }
+}
+
+/// 🔴 **防饿死兜底的数学保证**：延后预算恒有限，且取「比例」与「绝对上限」中的较小者
+/// （阈值越小触发越早 = 世界越不容易被饿着）。
+#[test]
+fn offpeak_defer_budget_is_finite_and_takes_the_smaller_bound() {
+    let _g = OffPeakSwitch::off();
+    let cfg = super::offpeak::Config::from_env().unwrap();
+    let h = 3_600_000i64;
+    // interval=1h：比例 2h < 绝对上限 6h → 取 2h，最长静默 3h。
+    assert_eq!(cfg.defer_budget(h), 2 * h);
+    assert_eq!(cfg.max_gap(h), 3 * h);
+    // interval=6h：比例 12h > 绝对上限 6h → 取 6h，最长静默 12h。
+    assert_eq!(cfg.defer_budget(6 * h), 6 * h);
+    assert_eq!(cfg.max_gap(6 * h), 12 * h);
+    // 任何 interval 下预算都不超过绝对上限 → max_gap 恒有限。
+    for i in [1i64, 1000, h, 6 * h, super::offpeak::DAY_MS, i64::MAX / 4] {
+        assert!(cfg.defer_budget(i) <= cfg.max_defer_ms, "预算必须被绝对上限封顶");
+        assert!(cfg.max_gap(i) >= i, "兜底线不得早于一个正常间隔（那等于错峰从不生效）");
+    }
+}
+
+/// 裁决核心：未到点 → Idle；窗口内 → 带折扣标记排；窗口外未超兜底 → Defer。
+#[test]
+fn offpeak_plan_defers_outside_window_and_discounts_inside() {
+    let _g = OffPeakSwitch::with(&[(super::offpeak::ENV_WINDOWS, "00:00-08:00".into())]);
+    let cfg = super::offpeak::Config::from_env().unwrap();
+    let h = 3_600_000i64;
+    let day0 = 1_767_225_600_000i64; // 某个 UTC 零点。
+    let inside = day0 + 3 * h; // 03:00 UTC，窗口内
+    let outside = day0 + 12 * h; // 12:00 UTC，窗口外
+    let interval = h;
+
+    // 窗口内：压缩后间隔 = 1h × 8/24 = 20min。刚过 10 分钟 → 还没到点。
+    assert_eq!(
+        super::offpeak::plan_interval(&cfg, false, inside, Some(inside - 10 * 60_000), interval, 0),
+        super::offpeak::Verdict::Idle
+    );
+    // 窗口内且到点 → 排，并打上折扣档位。
+    assert_eq!(
+        super::offpeak::plan_interval(&cfg, false, inside, Some(inside - 25 * 60_000), interval, 7_000),
+        super::offpeak::Verdict::Schedule(super::offpeak::TickMark {
+            off_peak: true,
+            price_ratio_pct: cfg.discount_pct,
+            defer_ms: 7_000,
+        })
+    );
+    // 窗口外：按原 interval 判到点（不压缩），到点但未超兜底 → 延后。
+    assert_eq!(
+        super::offpeak::plan_interval(&cfg, false, outside, Some(outside - 30 * 60_000), interval, 0),
+        super::offpeak::Verdict::Idle,
+        "窗口外必须按原 interval 判到点，不得用压缩间隔提前触发"
+    );
+    assert_eq!(
+        super::offpeak::plan_interval(&cfg, false, outside, Some(outside - 90 * 60_000), interval, 0),
+        super::offpeak::Verdict::Defer
+    );
+}
+
+/// 🔴 **红线：直播场不得延后**（§2「一晚跑完一阶段 + 弹幕实时」是它的产品定义）。
+/// 直播场在窗口外照排、且不打折扣标记（没享折扣就不能记账成享了）；也不受窗口内压缩影响。
+#[test]
+fn offpeak_never_defers_live_room() {
+    let _g = OffPeakSwitch::with(&[(super::offpeak::ENV_WINDOWS, "00:00-08:00".into())]);
+    let cfg = super::offpeak::Config::from_env().unwrap();
+    let h = 3_600_000i64;
+    let day0 = 1_767_225_600_000i64;
+    let outside = day0 + 12 * h;
+    let interval = 5 * 60_000; // 密集拍
+
+    // 窗口外 + 到点 → 直播场照排，标记中性。
+    assert_eq!(
+        super::offpeak::plan_interval(&cfg, true, outside, Some(outside - interval), interval, 0),
+        super::offpeak::Verdict::Schedule(super::offpeak::TickMark::default())
+    );
+    // 窗口外 + 未到点 → 仍是 Idle（豁免不等于加速）。
+    assert_eq!(
+        super::offpeak::plan_interval(&cfg, true, outside, Some(outside - 1), interval, 0),
+        super::offpeak::Verdict::Idle
+    );
+    // event 模式（背靠背）同样豁免。
+    assert_eq!(
+        super::offpeak::plan_event(&cfg, true, outside, Some(outside - 1), 0),
+        super::offpeak::Verdict::Schedule(super::offpeak::TickMark::default())
+    );
+    // 🔴 穷举：直播场在一天里的**任何**时刻都不可能得到 Defer。
+    for step in 0..(24 * 4) {
+        let t = day0 + step * 15 * 60_000;
+        for last in [None, Some(t - 1), Some(t - interval), Some(t - 10 * h)] {
+            assert_ne!(
+                super::offpeak::plan_interval(&cfg, true, t, last, interval, 0),
+                super::offpeak::Verdict::Defer,
+                "直播场在 {t} 被延后了，红线破了"
+            );
+            assert_ne!(
+                super::offpeak::plan_event(&cfg, true, t, last, 0),
+                super::offpeak::Verdict::Defer,
+                "直播场（event）在 {t} 被延后了，红线破了"
+            );
+        }
+    }
+}
+
+/// 🔴 **红线：不得饿死世界**。窗口外静默超过 `interval + 延后预算` → 无视时段照跑，
+/// 且标记按原价（就是原价跑的，不许虚报省钱）。首拍同样绝不延后。
+#[test]
+fn offpeak_starvation_guard_fires_outside_window() {
+    let _g = OffPeakSwitch::with(&[(super::offpeak::ENV_WINDOWS, "00:00-08:00".into())]);
+    let cfg = super::offpeak::Config::from_env().unwrap();
+    let h = 3_600_000i64;
+    let day0 = 1_767_225_600_000i64;
+    let outside = day0 + 12 * h;
+    let interval = h;
+    let gap = cfg.max_gap(interval); // 1h + 2h = 3h
+
+    // 差一毫秒 → 仍延后。
+    assert_eq!(
+        super::offpeak::plan_interval(&cfg, false, outside, Some(outside - gap + 1), interval, 0),
+        super::offpeak::Verdict::Defer
+    );
+    // 刚好触线 → 照跑，原价标记 + 如实记录被压了多久。
+    assert_eq!(
+        super::offpeak::plan_interval(&cfg, false, outside, Some(outside - gap), interval, gap - interval),
+        super::offpeak::Verdict::Schedule(super::offpeak::TickMark {
+            off_peak: false,
+            price_ratio_pct: 100,
+            defer_ms: gap - interval,
+        })
+    );
+    // 🔴 首拍（世界一拍都没有）绝不延后——那是玩家建完房的第一印象。
+    assert!(matches!(
+        super::offpeak::plan_interval(&cfg, false, outside, None, interval, 0),
+        super::offpeak::Verdict::Schedule(_)
+    ));
+    assert!(matches!(
+        super::offpeak::plan_event(&cfg, false, outside, None, 0),
+        super::offpeak::Verdict::Schedule(_)
+    ));
+    // event 模式的兜底走绝对预算（默认 6h）。
+    assert_eq!(
+        super::offpeak::plan_event(&cfg, false, outside, Some(outside - cfg.max_defer_ms + 1), 0),
+        super::offpeak::Verdict::Defer
+    );
+    assert!(matches!(
+        super::offpeak::plan_event(&cfg, false, outside, Some(outside - cfg.max_defer_ms), 0),
+        super::offpeak::Verdict::Schedule(_)
+    ));
+    // 🔴 穷举：非直播场在窗口外静默满兜底线后，一天里**任何**时刻都必须照跑。
+    for step in 0..(24 * 4) {
+        let t = day0 + step * 15 * 60_000;
+        assert!(
+            matches!(
+                super::offpeak::plan_interval(&cfg, false, t, Some(t - gap), interval, 0),
+                super::offpeak::Verdict::Schedule(_)
+            ),
+            "{t}：静默已达兜底线仍不排，世界会被饿死"
+        );
+    }
+}
+
+/// 延后账：首次延后开始计时，取走即清零（度量「错峰生效了多少」的唯一数据源）。
+#[test]
+fn offpeak_defer_tracker_measures_held_duration() {
+    let t = super::offpeak::defer_tracker();
+    let wid = format!("w-defer-{}", new_id("t"));
+    assert_eq!(t.held_ms(&wid, 1_000), 0, "从未延后 → 0");
+    t.mark(&wid, 1_000);
+    t.mark(&wid, 5_000); // 二次延后不刷新起点。
+    assert_eq!(t.held_ms(&wid, 9_000), 8_000);
+    assert_eq!(t.take(&wid, 9_000), 8_000);
+    assert_eq!(t.held_ms(&wid, 9_000), 0, "取走后清零");
+    assert_eq!(t.take(&wid, 9_000), 0, "重复取走恒为 0");
+    t.clear(&wid);
+}
+
+// ---------- 集成层：走真 DB 的 schedule_due_ticks ----------
+
+/// 建一个 interval 模式、running、指定房型与节奏的世界（错峰集成用例专用）。
+async fn offpeak_world(state: &AppState, tag: &str, room_type: &str, tick_per_day: i64) -> String {
+    let tpl = format!("tpl-{tag}");
+    let routes_v = format!("routes-{tag}");
+    let (ua, ub) = (format!("u{tag}A"), format!("u{tag}B"));
+    let (ca, cb) = (format!("c{tag}A"), format!("c{tag}B"));
+    seed_template(&state.db, &tpl).await;
+    seed_model_routes(&state.db, &routes_v).await;
+    seed_user(&state.db, &ua).await;
+    seed_user(&state.db, &ub).await;
+    seed_char(&state.db, &ca, &ua, "李").await;
+    seed_char(&state.db, &cb, &ub, "王").await;
+
+    let mut p = CreateWorldParams::official(tpl.clone(), 1, "错峰测试世界");
+    p.status = Some("running".into());
+    p.room_type = room_type.into();
+    p.tick_per_day = tick_per_day;
+    p.model_route_version = Some(routes_v.clone());
+    p.prompt_set_version = Some("test-prompts".into());
+    p.member_limit = 10;
+    p.daily_token_budget = 1_000_000;
+    p.daily_cny_budget_cents = 0;
+    let wid = create_world(&state.db, p).await.unwrap();
+    seed_member(&state.db, &wid, &ua, &ca).await;
+    seed_member(&state.db, &wid, &ub, &cb).await;
+    wid
+}
+
+/// 直接落一条 done 状态的历史 tick，用于把「上一拍在多久以前」钉死。
+async fn seed_done_tick_at(db: &AnyPool, world_id: &str, tick_no: i64, created_at: i64) {
+    sqlx::query(
+        "INSERT INTO world_ticks (id, world_id, tick_no, base_revision, status, cost_tokens, created_at) \
+         VALUES (?, ?, ?, 0, 'done', 0, ?)",
+    )
+    .bind(new_id("tick"))
+    .bind(world_id)
+    .bind(tick_no)
+    .bind(created_at)
+    .execute(db)
+    .await
+    .unwrap();
+}
+
+async fn max_tick_no(db: &AnyPool, world_id: &str) -> i64 {
+    i64_one(db, "SELECT COALESCE(MAX(tick_no), -1) FROM world_ticks WHERE world_id=?", world_id).await
+}
+
+/// 🔴 **回归保护：开关关闭时调度行为逐字不变**。
+/// 关闭态下同时验证 interval 房与 event×idle 房两条分支，并确认新增三列全为中性值。
+#[tokio::test]
+async fn offpeak_disabled_keeps_scheduling_byte_identical() {
+    // 窗口设成「不含此刻」——若错峰真被误开，这些世界就会被延后，用例立刻红。
+    let _g = OffPeakSwitch::with(&[(super::offpeak::ENV_WINDOWS, window_excluding_now())]);
+    let state = test_state().await;
+    let iv = offpeak_world(&state, "offd", "idle", 24).await;
+    let now = now_ms();
+    seed_done_tick_at(&state.db, &iv, 0, now - 2 * 3_600_000).await;
+
+    super::schedule_due_ticks(&state).await.unwrap();
+    assert_eq!(max_tick_no(&state.db, &iv).await, 1, "开关关闭 → 到点即排，与接线前一致");
+
+    // 新增三列必须是中性值（既有 cost.* 聚合看到的世界完全没变）。
+    let row = sqlx::query("SELECT off_peak, price_ratio_pct, defer_ms FROM world_ticks WHERE world_id=? AND tick_no=1")
+        .bind(&iv)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(row.try_get::<i64, _>("off_peak").unwrap(), 0);
+    assert_eq!(row.try_get::<i64, _>("price_ratio_pct").unwrap(), 100);
+    assert_eq!(row.try_get::<i64, _>("defer_ms").unwrap(), 0);
+
+    // 未到点的世界仍然不排（退化路径也不变）。
+    let iv2 = offpeak_world(&state, "offd2", "idle", 24).await;
+    seed_done_tick_at(&state.db, &iv2, 0, now).await;
+    super::schedule_due_ticks(&state).await.unwrap();
+    assert_eq!(max_tick_no(&state.db, &iv2).await, 0, "未到点不应排新 tick");
+}
+
+/// 集成主链路：窗口外延后 → 窗口开启后排出，并把折扣档位与被压时长写进逐拍台账。
+#[tokio::test]
+async fn offpeak_defers_outside_window_then_schedules_inside() {
+    let state = test_state().await;
+    let wid;
+    {
+        // 阶段一：窗口不含此刻 → 到点也不排。
+        let _g = OffPeakSwitch::with(&[
+            (super::offpeak::ENV_ENABLED, "1".into()),
+            (super::offpeak::ENV_WINDOWS, window_excluding_now()),
+        ]);
+        wid = offpeak_world(&state, "offa", "idle", 24).await;
+        seed_done_tick_at(&state.db, &wid, 0, now_ms() - 2 * 3_600_000).await;
+        super::schedule_due_ticks(&state).await.unwrap();
+        assert_eq!(max_tick_no(&state.db, &wid).await, 0, "原价时段应延后，不排新 tick");
+        assert!(
+            super::offpeak::defer_tracker().held_ms(&wid, now_ms()) >= 0,
+            "延后账应已开始计时"
+        );
+    }
+    {
+        // 阶段二：窗口含此刻 → 立刻排出，并带折扣标记。
+        let _g = OffPeakSwitch::with(&[
+            (super::offpeak::ENV_ENABLED, "1".into()),
+            (super::offpeak::ENV_WINDOWS, window_containing_now()),
+            (super::offpeak::ENV_DISCOUNT_PCT, "40".into()),
+        ]);
+        super::schedule_due_ticks(&state).await.unwrap();
+        assert_eq!(max_tick_no(&state.db, &wid).await, 1, "折扣时段应把被压的拍排出来");
+        let row = sqlx::query(
+            "SELECT off_peak, price_ratio_pct FROM world_ticks WHERE world_id=? AND tick_no=1",
+        )
+        .bind(&wid)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(row.try_get::<i64, _>("off_peak").unwrap(), 1, "应标记为折扣时段拍");
+        assert_eq!(row.try_get::<i64, _>("price_ratio_pct").unwrap(), 40, "应记下命中的名义档位");
+    }
+    super::offpeak::defer_tracker().clear(&wid);
+}
+
+/// 🔴 集成红线：**直播场不受错峰影响**。同一轮调度里，连载场被延后而两类直播场照排。
+#[tokio::test]
+async fn offpeak_live_rooms_are_scheduled_even_outside_window() {
+    let _g = OffPeakSwitch::with(&[
+        (super::offpeak::ENV_ENABLED, "1".into()),
+        (super::offpeak::ENV_WINDOWS, window_excluding_now()),
+    ]);
+    let state = test_state().await;
+    let now = now_ms();
+    // 连载场（24 拍/天）：应被延后。
+    let serial = offpeak_world(&state, "offs", "idle", 24).await;
+    // 直播场之一：赛事房（房型判据）。
+    let arena = offpeak_world(&state, "offv", "arena", 24).await;
+    // 直播场之二：密集拍（节奏判据，96 拍/天 = 每 15 分钟一拍）。
+    let dense = offpeak_world(&state, "offn", "chapter", 96).await;
+    for w in [&serial, &arena, &dense] {
+        seed_done_tick_at(&state.db, w, 0, now - 2 * 3_600_000).await;
+    }
+
+    super::schedule_due_ticks(&state).await.unwrap();
+
+    assert_eq!(max_tick_no(&state.db, &serial).await, 0, "连载场在原价时段应被延后");
+    assert_eq!(max_tick_no(&state.db, &arena).await, 1, "🔴 赛事直播场不得被延后");
+    assert_eq!(max_tick_no(&state.db, &dense).await, 1, "🔴 密集拍直播场不得被延后");
+    // 直播场的拍不得被记成「享了折扣」。
+    for w in [&arena, &dense] {
+        let op = i64_one(&state.db, "SELECT off_peak FROM world_ticks WHERE world_id=? AND tick_no=1", w).await;
+        assert_eq!(op, 0, "直播场没享折扣，不许记成享了");
+    }
+    super::offpeak::defer_tracker().clear(&serial);
+}
+
+/// 🔴 集成红线：**兜底防饿死**。窗口外静默超过兜底线的世界照排，同轮里刚到点的世界仍被延后。
+#[tokio::test]
+async fn offpeak_starvation_guard_schedules_outside_window() {
+    let _g = OffPeakSwitch::with(&[
+        (super::offpeak::ENV_ENABLED, "1".into()),
+        (super::offpeak::ENV_WINDOWS, window_excluding_now()),
+    ]);
+    let state = test_state().await;
+    let now = now_ms();
+    // interval=1h（24 拍/天），兜底线 = 1h + min(2h, 6h) = 3h。
+    let starved = offpeak_world(&state, "offh", "idle", 24).await;
+    let fresh = offpeak_world(&state, "offf", "idle", 24).await;
+    seed_done_tick_at(&state.db, &starved, 0, now - 4 * 3_600_000).await; // 超兜底线
+    seed_done_tick_at(&state.db, &fresh, 0, now - 90 * 60_000).await; // 到点但未超
+
+    super::schedule_due_ticks(&state).await.unwrap();
+
+    assert_eq!(max_tick_no(&state.db, &starved).await, 1, "🔴 静默超兜底线必须无视时段照跑");
+    assert_eq!(max_tick_no(&state.db, &fresh).await, 0, "未超兜底线仍应延后");
+    // 兜底跑出来的拍是原价跑的，不许记成折扣。
+    let op = i64_one(
+        &state.db,
+        "SELECT off_peak FROM world_ticks WHERE world_id=? AND tick_no=1",
+        &starved,
+    )
+    .await;
+    assert_eq!(op, 0, "兜底拍按原价记账");
+    // 🔴 从没跑过拍的新世界（首拍）也必须立即排。
+    let brand_new = offpeak_world(&state, "offb", "idle", 24).await;
+    super::schedule_due_ticks(&state).await.unwrap();
+    assert_eq!(max_tick_no(&state.db, &brand_new).await, 0, "首拍应被排出（tick_no 从 0 起）");
+    super::offpeak::defer_tracker().clear(&fresh);
+}
+
+/// **折扣时段优先领取**：被压得最久的世界先入队（先入队 = 先被 worker 领走）。
+/// 无人被延后时排序是稳定的空操作，这一点由 `offpeak_disabled_keeps_scheduling_byte_identical` 覆盖。
+#[tokio::test]
+async fn offpeak_priority_orders_longest_deferred_first() {
+    let state = test_state().await;
+    let (a, b, c);
+    {
+        // 阶段一：三个世界都在原价时段被延后，人为拉开它们的被压时长。
+        let _g = OffPeakSwitch::with(&[
+            (super::offpeak::ENV_ENABLED, "1".into()),
+            (super::offpeak::ENV_WINDOWS, window_excluding_now()),
+        ]);
+        let now = now_ms();
+        a = offpeak_world(&state, "offp1", "idle", 24).await;
+        b = offpeak_world(&state, "offp2", "idle", 24).await;
+        c = offpeak_world(&state, "offp3", "idle", 24).await;
+        for w in [&a, &b, &c] {
+            seed_done_tick_at(&state.db, w, 0, now - 2 * 3_600_000).await;
+        }
+        super::schedule_due_ticks(&state).await.unwrap();
+        for w in [&a, &b, &c] {
+            assert_eq!(max_tick_no(&state.db, w).await, 0, "三个世界都应先被延后");
+        }
+        // 人为把 b 的延后起点推早（= 被压得最久），c 次之，a 最短。
+        super::offpeak::defer_tracker().clear(&b);
+        super::offpeak::defer_tracker().mark(&b, now - 60 * 60_000);
+        super::offpeak::defer_tracker().clear(&c);
+        super::offpeak::defer_tracker().mark(&c, now - 30 * 60_000);
+    }
+    {
+        // 阶段二：窗口开启 → 三个都排出，但入队顺序按被压时长降序（b → c → a）。
+        let _g = OffPeakSwitch::with(&[
+            (super::offpeak::ENV_ENABLED, "1".into()),
+            (super::offpeak::ENV_WINDOWS, window_containing_now()),
+        ]);
+        super::schedule_due_ticks(&state).await.unwrap();
+        // 队列空时 `pop` 会永久挂起（见 queue::MemQueue），故套超时兜底：少于 3 条即断言失败而非卡死。
+        let mut order: Vec<String> = Vec::new();
+        for _ in 0..3 {
+            let popped = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                crate::queue::pop_json::<super::TickJob>(&*state.queue, "world_tick"),
+            )
+            .await
+            .expect("折扣时段应把三个被压的世界全部入队");
+            order.push(popped.expect("队列载荷应可反序列化").world_id);
+        }
+        assert_eq!(order, vec![b.clone(), c.clone(), a.clone()], "应按被压时长降序入队");
+        // 被压时长如实落进逐拍台账（>0 才说明错峰真的生效过）。
+        let dm = i64_one(&state.db, "SELECT defer_ms FROM world_ticks WHERE world_id=? AND tick_no=1", &b).await;
+        assert!(dm >= 60 * 60_000, "b 的 defer_ms 应≥1 小时，实际 {dm}");
+    }
+    for w in [&a, &b, &c] {
+        super::offpeak::defer_tracker().clear(w);
+    }
+}
+
+/// **并发领取不重复**：同一世界被多轮/多并发调度只可能排出一拍
+/// （`world_ticks(world_id, tick_no)` 唯一索引 + 带标记插入走同一条幂等路径）。
+#[tokio::test]
+async fn offpeak_concurrent_scheduling_never_duplicates_ticks() {
+    let _g = OffPeakSwitch::with(&[
+        (super::offpeak::ENV_ENABLED, "1".into()),
+        (super::offpeak::ENV_WINDOWS, window_containing_now()),
+    ]);
+    let state = test_state().await;
+    let wid = offpeak_world(&state, "offc", "idle", 24).await;
+    seed_done_tick_at(&state.db, &wid, 0, now_ms() - 6 * 3_600_000).await;
+
+    // 同一轮里连排三次：第一次插入成功，后两次因「上一拍就是刚插的」不再到点。
+    for _ in 0..3 {
+        super::schedule_due_ticks(&state).await.unwrap();
+    }
+    assert_eq!(
+        i64_one(&state.db, "SELECT COUNT(*) FROM world_ticks WHERE world_id=?", &wid).await,
+        2,
+        "重复轮询不得排出重复拍"
+    );
+    // 带标记插入本身幂等（并发下唯一索引兜底）。
+    assert!(!super::insert_tick_marked(&state.db, &wid, 1, 0, super::TickMark::default()).await.unwrap());
+    assert!(
+        !super::insert_tick_marked(
+            &state.db,
+            &wid,
+            1,
+            0,
+            super::TickMark { off_peak: true, price_ratio_pct: 50, defer_ms: 9 }
+        )
+        .await
+        .unwrap(),
+        "已存在的 tick_no 不得被带标记插入覆盖"
+    );
+    super::offpeak::defer_tracker().clear(&wid);
+}
+
+/// event×idle（背靠背慢炖场）同样受错峰约束：原价时段停排，折扣时段恢复背靠背。
+#[tokio::test]
+async fn offpeak_applies_to_back_to_back_idle_rooms() {
+    let state = test_state().await;
+    let wid;
+    {
+        let _g = OffPeakSwitch::with(&[
+            (super::offpeak::ENV_ENABLED, "1".into()),
+            (super::offpeak::ENV_WINDOWS, window_excluding_now()),
+        ]);
+        wid = offpeak_world(&state, "offe", "idle", 3).await;
+        sqlx::query("UPDATE worlds SET timeline_mode='event' WHERE id=?")
+            .bind(&wid)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        // 上一拍就在刚才 → 背靠背本应立刻续拍，错峰把它压住。
+        seed_done_tick_at(&state.db, &wid, 0, now_ms()).await;
+        super::schedule_due_ticks(&state).await.unwrap();
+        assert_eq!(max_tick_no(&state.db, &wid).await, 0, "原价时段的背靠背世界应停排");
+    }
+    {
+        let _g = OffPeakSwitch::with(&[
+            (super::offpeak::ENV_ENABLED, "1".into()),
+            (super::offpeak::ENV_WINDOWS, window_containing_now()),
+        ]);
+        super::schedule_due_ticks(&state).await.unwrap();
+        assert_eq!(max_tick_no(&state.db, &wid).await, 1, "折扣时段应恢复背靠背");
+        let op = i64_one(&state.db, "SELECT off_peak FROM world_ticks WHERE world_id=? AND tick_no=1", &wid).await;
+        assert_eq!(op, 1);
+    }
+    super::offpeak::defer_tracker().clear(&wid);
+}
+
+/// 错峰路径不叠拍：上一拍还在飞（pending/running）时不排新拍——窗口内间隔被压缩后，
+/// 排出一拍 `base_revision` 已过期的 tick 只会白占拍位（C-2 cas_conflict 终态化）。
+#[tokio::test]
+async fn offpeak_does_not_stack_ticks_on_unfinished_round() {
+    let _g = OffPeakSwitch::with(&[
+        (super::offpeak::ENV_ENABLED, "1".into()),
+        (super::offpeak::ENV_WINDOWS, window_containing_now()),
+    ]);
+    let state = test_state().await;
+    let wid = offpeak_world(&state, "offk", "idle", 24).await;
+    // 一拍 pending 且已滞留很久（早该到点了）。
+    sqlx::query(
+        "INSERT INTO world_ticks (id, world_id, tick_no, base_revision, status, created_at) \
+         VALUES (?, ?, 0, 0, 'pending', ?)",
+    )
+    .bind(new_id("tick"))
+    .bind(&wid)
+    .bind(now_ms() - 6 * 3_600_000)
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    super::schedule_due_ticks(&state).await.unwrap();
+    assert_eq!(max_tick_no(&state.db, &wid).await, 0, "在飞的拍未完成前不得叠新拍");
+
+    // 该拍收尾后，下一轮立刻排出（不叠拍 ≠ 卡死）。
+    sqlx::query("UPDATE world_ticks SET status='done' WHERE world_id=? AND tick_no=0")
+        .bind(&wid)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    super::schedule_due_ticks(&state).await.unwrap();
+    assert_eq!(max_tick_no(&state.db, &wid).await, 1, "在飞拍收尾后应立即续排");
+    super::offpeak::defer_tracker().clear(&wid);
 }

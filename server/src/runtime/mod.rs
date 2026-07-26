@@ -629,6 +629,11 @@ pub(crate) use offpeak::TickMark;
 // ---------- 调度 ----------
 
 /// 插入 pending tick（唯一索引幂等）；已存在返回 false。排期标记取中性值（非错峰路径）。
+///
+/// `allow(dead_code)`：生产路径统一走 `insert_tick_marked`（错峰调度器要带标记），本函数留作
+/// **既有公开入口**——`worlds`/`onboarding`/`golden` 的用例与将来的手动排拍仍按中性标记调它，
+/// 删掉它等于强迫每个调用方都去写一个恒为 `TickMark::default()` 的参数。
+#[allow(dead_code)]
 pub async fn insert_tick(
     db: &AnyPool,
     world_id: &str,
@@ -891,15 +896,64 @@ async fn schedule_due_ticks(state: &AppState) -> Result<(), ApiError> {
                 .fetch_one(&state.db)
                 .await?
                 .try_get("m")?;
-        let due = match last {
-            Some(t) => now - t >= interval,
-            None => true,
-        };
-        if due {
-            let _ = schedule_tick(state, &world_id).await?;
+        if !active {
+            // 原路（错峰关闭）：逐字不变。
+            let due = match last {
+                Some(t) => now - t >= interval,
+                None => true,
+            };
+            if due {
+                let _ = schedule_tick(state, &world_id).await?;
+            }
+            continue;
+        }
+
+        // 错峰路径（连载场 / 慢炖场）：窗口内压缩间隔照排、窗口外延后、超兜底线无视时段照跑。
+        let cfg = offpeak_cfg.as_ref().expect("active 蕴含 cfg 已解析");
+
+        // 窗口内的间隔被压缩（默认 8h 窗口 → 3 倍速），若上一拍跑得比压缩后的间隔还慢，
+        // 就会排出一拍 base_revision 已过期的 tick——它最终只会命中 C-2 的 cas_conflict 终态化，
+        // 白占一个拍位而世界不推进。故错峰路径先确认没有在飞的 tick（与 event×idle 分支同口径）。
+        // 这不会造成饿死：所有失败/冲突路径都会把 tick 终态化，超时 running 由本函数开头回收。
+        let outstanding: i64 = sqlx::query(
+            "SELECT COUNT(*) AS c FROM world_ticks WHERE world_id = ? AND status IN ('pending','running')",
+        )
+        .bind(&world_id)
+        .fetch_one(&state.db)
+        .await?
+        .try_get("c")?;
+        if outstanding > 0 {
+            continue;
+        }
+
+        match offpeak::plan_interval(
+            cfg,
+            live,
+            now,
+            last,
+            interval,
+            offpeak::defer_tracker().held_ms(&world_id, now),
+        ) {
+            offpeak::Verdict::Idle => {}
+            offpeak::Verdict::Defer => {
+                offpeak::defer_tracker().mark(&world_id, now);
+                tracing::debug!(world_id, interval, "错峰：原价时段，本轮延后");
+            }
+            offpeak::Verdict::Schedule(mut mark) => {
+                mark.defer_ms = offpeak::defer_tracker().take(&world_id, now);
+                let _ = schedule_tick_marked(state, &world_id, mark).await?;
+            }
         }
     }
     Ok(())
+}
+
+/// `schedule_due_ticks` 一轮里用到的世界字段（先取完再排序，排序需要 `world_id`）。
+struct SchedWorld {
+    id: String,
+    tick_per_day: i64,
+    timeline_mode: String,
+    room_type: String,
 }
 
 // ---------- 版本钉住解析 ----------

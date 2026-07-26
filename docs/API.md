@@ -182,6 +182,47 @@
 > 与**传世卡**（§12，migration 0034，`memorial/`）是两件事：那是**角色**死后的封卷（遗作馆陈列），
 > 这是**世界**崩塌后的封卷。两者各自独立建表、互不读写。
 
+### 错峰调度（migration 0038；总规格 §17【拍板 16】成本工程杠杆①）
+
+**无 HTTP 端点**——它是 `runtime::schedule_due_ticks` 内部的一条排期策略，
+但它改变世界的推进节奏、并往逐拍成本台账加了三列，故在此登记口径。
+
+| 项 | 取值 |
+|---|---|
+| 做什么 | 把**连载场 / 慢炖场**的 tick 优先排进供应商的夜间折扣时段（§17：5-7.5 折常见）。窗口内按「窗口占全天的比例」压缩有效间隔，**每天的拍数不变**，只是全部挤进便宜时段——不是节奏降档 |
+| 开关 | `MUSE_OFFPEAK_SCHEDULING`，**默认关闭**（VALIDATION §0.1）。开关名同时是运行时开关体系（`flags/`，migration 0036）的开关名：登记进 `KNOWN_FLAGS` 后自动按 **world 作用域**灰度（user > world > global > env > 默认）；**未登记时退回 env 兜底**，语义与解析链第 ④ 层一致 |
+| 🔴 直播场豁免 | `room_type='arena'`（赛事）**或** `tick_per_day >= MUSE_OFFPEAK_LIVE_TICK_PER_DAY`（默认 48，即每 30 分钟一拍以上）→ **永不延后**。§2 直播场的定义就是「一晚跑完一阶段 + 弹幕实时」 |
+| 🔴 防饿死兜底 | 距上一拍超过 `interval + min(interval × MUSE_OFFPEAK_MAX_DEFER_PCT%, MUSE_OFFPEAK_MAX_DEFER_MS)` → **无视时段照跑**。默认 200% / 6h ⇒ 连载场（1 拍/时）最长静默 3h、慢炖场（4 拍/天）最长 12h。event 背靠背房无 interval 可依，直接用绝对预算（默认 6h）。**世界首拍绝不延后** |
+| 优先级 | 折扣时段开启时，**被压得最久的世界先入队**（先入队 = 先被 worker 领走）。稳定排序，无人被延后时逐字保留原顺序 |
+| 时区口径 | 窗口字面量按 `MUSE_OFFPEAK_TZ_OFFSET_MIN`（供应商时区相对 UTC 的分钟偏移，默认 0）**在解析期一次性折算成 UTC**，之后判定/落库/聚合全是 UTC——与 `dashboards::utc_day_start_ms` / `runtime::day_string` / `reports::day_bounds` 同一套日界，**全仓不存在第二套时区口径**（用例 `offpeak_utc_day_offset_matches_dashboard_day_boundary` 钉住） |
+| 可观测 | `world_ticks` 新增 `off_peak`(0/1) · `price_ratio_pct`(名义档位，100=原价) · `defer_ms`(被压时长)。「省了多少」= `Σ cost_tokens × (100-price_ratio_pct)/100 × MUSE_TOKEN_CNY_CENTS_PER_1K`；「生效了多少」= `off_peak=1` 的拍数占比与 `Σ defer_ms` |
+| 失效方向 | 窗口一条都解析不出来 → **整个错峰退化为关闭**（配错的后果必须是「功能不生效」，不是「所有世界永远被延后」） |
+
+**参数**（全部 env，§0.2 参数化，不写死）：
+
+| env | 默认 | 含义 |
+|---|---|---|
+| `MUSE_OFFPEAK_SCHEDULING` | `0` | 🔴 总开关 |
+| `MUSE_OFFPEAK_WINDOWS` | `16:30-00:30` | 折扣时段，`HH:MM-HH:MM` 逗号分隔，跨零点自动识别；重叠自动合并；起止相同视为非法丢弃。默认值 ≡ 北京时间 `00:30-08:30` |
+| `MUSE_OFFPEAK_TZ_OFFSET_MIN` | `0` | 窗口字面量所处时区相对 UTC 的分钟偏移（北京时间填 `480`） |
+| `MUSE_OFFPEAK_DISCOUNT_PCT` | `50` | 折扣时段的**名义**价格档位（只进记账，不参与调度判定） |
+| `MUSE_OFFPEAK_MAX_DEFER_PCT` | `200` | 延后预算 = `interval × 该百分比` |
+| `MUSE_OFFPEAK_MAX_DEFER_MS` | `21600000` | 延后预算绝对上限（与上一条取**较小者**，阈值越小越早触发兜底） |
+| `MUSE_OFFPEAK_MIN_INTERVAL_MS` | `60000` | 窗口内压缩后的间隔地板（防窗口过窄压出突发风暴） |
+| `MUSE_OFFPEAK_LIVE_TICK_PER_DAY` | `48` | 达到该节奏即按直播场豁免 |
+
+> 🔴 **`price_ratio_pct` 是运营配置的名义档位，不是供应商账单的结算价**——用于估算错峰收益，
+> 不得当对账依据。非错峰路径（开关关闭 / 直播场 / 手动端点 `arena host/tick`、`chapters/start`
+> 排的拍）恒为 `100`，**即便那一拍碰巧落在夜间**：只归因给调度器真正做出的决策，宁可低估不可高估。
+>
+> ⚠️ **杠杆③ Batch API 本批次未实现**（约 5 折）。原因：Batch 是异步的（提交→轮询→取结果，
+> 分钟到小时级），而一拍是 `run_round`（引擎内部**串行** director→decide→arbiter→writer→critic）
+> → 同一事务 `commit_tick`。一拍要 5 次批往返、`CLAIM_STALE_MS=300000` 会把等批的 worker 判成崩溃
+> 并重排、且中间态无持久化（批途中重启 = 世界卡在半通管线，比不做更糟）。真正能省的做法是
+> **跨世界同环节合批**，需要 `crates/muse-engine` 把 `run_round` 改成可挂起/可恢复的分步状态机 +
+> `ModelClient` 增加 `submit_batch`/`poll_batch`，server 侧新增中间态表与批次协调器。
+> 完整可行性分析与改造路径见 `server/src/runtime/mod.rs` 的 `offpeak` 模块头。
+
 ## 4. 玩家账户（me / backpack / progression / subplot / memorial / onboarding / annotations / reports / notifications）
 
 | 方法 | 路径 | 鉴权 | 说明 |

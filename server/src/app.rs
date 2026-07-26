@@ -44,6 +44,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::events::router())
         .merge(crate::interventions::router())
         .merge(crate::consents::router())
+        .merge(crate::invitations::router())
         .merge(crate::notifications::router())
         .merge(crate::reports::router())
         .merge(crate::backpack::router())

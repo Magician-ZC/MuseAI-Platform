@@ -2310,3 +2310,365 @@ async fn worldline_payout_never_exceeds_star_rating_power_tier_cap() {
         "超顶道具连定义都不该落库（grant_item_tx 根本没被调用）"
     );
 }
+
+// ---------- 身份池叙事接线（总规格 §5【拍板 4、5】：身份 = 开局站位） ----------
+//
+// 🔴 平权红线（§0.1）：身份**只**进感知层 `other_cards_brief`，不携带数值差异 / 准入门槛 /
+//    产出加成 / 难度优待 / 叙事特权，且**绝不进 active_cards**（角色卡不可变快照）。
+//    下方 `identity_never_pollutes_active_cards_redline` 就是这条红线的断言。
+
+use crate::runtime::{
+    brief_with_identity, load_identity_display_names, parse_identity_assignments, parse_identity_labels,
+};
+
+/// 捕获每次 roleDecide 的 user prompt（内含 `assemble_visible_context` 的可见上下文 JSON），
+/// 供断言"他人如何被本角色感知"。其余环节与 MockModel 同款合法占位 JSON。
+struct CapturingMock {
+    decide_prompts: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl ModelClient for CapturingMock {
+    async fn complete(&self, spec: &ModelCallSpec, cancel: &CancelFlag) -> Result<ModelOutput, EngineError> {
+        cancel.check()?;
+        if spec.agent == "roleDecide" {
+            self.decide_prompts.lock().unwrap().push(spec.user.clone());
+        }
+        let content = match spec.agent.as_str() {
+            "director" => r#"{"situation":"堂前灯火通明，众人各自落座。"}"#,
+            "roleDecide" => r#"{"intent":"观望","action":"上前拱手行礼","speak":{"willSpeak":true,"purpose":"寒暄"},"targets":[],"acceptableCosts":[],"predictions":[]}"#,
+            "arbiter" => r#"{"outcomes":[]}"#,
+            "writer" => r#"{"prose":"堂中礼数周全，暗流未起。"}"#,
+            "critic" => r#"{"characterConsistencyIssues":[],"causalIssues":[],"revisionSuggestions":[]}"#,
+            _ => "{}",
+        };
+        Ok(ModelOutput { content: content.to_string(), input_tokens: Some(10), output_tokens: Some(20) })
+    }
+}
+
+/// 从 roleDecide user prompt 中切出可见上下文 JSON（`build_decide_user_prompt` 的固定包裹）。
+fn decide_ctx(user: &str) -> serde_json::Value {
+    let start = user.find('{').expect("可见上下文 JSON 起点");
+    let end = user.rfind("\n\n请完全代入").expect("可见上下文 JSON 终点");
+    serde_json::from_str(&user[start..end]).expect("可见上下文必须是合法 JSON")
+}
+
+/// 取指定角色本次 tick 的可见上下文（`ctx["you"] == cid`）。
+fn ctx_of(prompts: &[String], cid: &str) -> serde_json::Value {
+    prompts
+        .iter()
+        .map(|p| decide_ctx(p))
+        .find(|c| c["you"] == json!(cid))
+        .unwrap_or_else(|| panic!("未捕获到 {cid} 的决策上下文"))
+}
+
+/// 带 identityPool 的模板（label 齐全）+ 一个软主线节点（不秒终局）。
+async fn seed_template_with_identity_pool(db: &AnyPool, id: &str, pool: serde_json::Value) {
+    let skeleton = json!({
+        "mainlineNodes": [{ "id": "n1", "summary": "堂前议事", "fated": false, "constraint": "soft" }],
+        "forbiddenPredicates": [],
+        "identityPool": pool,
+    });
+    sqlx::query(
+        "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, official, version, moderation, created_at) \
+         VALUES (?, '身份池模板', 'idle', ?, '{\"mode\":\"open\"}', 1, 1, 'approved', ?)",
+    )
+    .bind(id)
+    .bind(skeleton.to_string())
+    .bind(now_ms())
+    .execute(db)
+    .await
+    .unwrap();
+}
+
+fn standard_identity_pool() -> serde_json::Value {
+    json!([
+        { "id": "official", "label": "户部主事", "quota": 1, "themes": ["朝堂"] },
+        { "id": "merchant", "label": "漕帮商贾", "quota": 1, "themes": ["行商"] }
+    ])
+}
+
+/// 起一个「模板声明 identityPool + 实例已钉住分配结果」的 running 世界（chA=official / chB=merchant）。
+/// 预钉 assembled_json ⇒ 5.5 段装配短路，分配结果就是本用例钉的这份（与装配层解耦）。
+async fn running_world_with_identities(
+    state: &AppState,
+    tag: &str,
+    pool: serde_json::Value,
+    assignments: serde_json::Value,
+) -> String {
+    let tpl = format!("tpl-ident-{tag}");
+    seed_template_with_identity_pool(&state.db, &tpl, pool).await;
+    seed_model_routes(&state.db, "test-routes").await;
+    seed_user(&state.db, "uA").await;
+    seed_user(&state.db, "uB").await;
+    seed_char(&state.db, "chA", "uA", "李").await;
+    seed_char(&state.db, "chB", "uB", "王").await;
+
+    let mut p = CreateWorldParams::official(&tpl, 1, "身份池世界");
+    p.status = Some("running".into());
+    p.model_route_version = Some("test-routes".into());
+    p.prompt_set_version = Some("test-prompts".into());
+    p.member_limit = 10;
+    p.daily_token_budget = 1_000_000;
+    p.daily_cny_budget_cents = 0;
+    let wid = create_world(&state.db, p).await.unwrap();
+    seed_member(&state.db, &wid, "uA", "chA").await;
+    seed_member(&state.db, &wid, "uB", "chB").await;
+
+    sqlx::query("UPDATE worlds SET assembled_json=? WHERE id=?")
+        .bind(json!({ "assembly": { "identityAssignments": assignments } }).to_string())
+        .bind(&wid)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    wid
+}
+
+/// 有身份分配 → 感知层带上开局站位；且**跨 tick 恒等**（确定性：同输入同输出）。
+#[tokio::test]
+async fn identity_assignments_decorate_other_cards_brief() {
+    let state = test_state().await;
+    let wid = running_world_with_identities(
+        &state,
+        "basic",
+        standard_identity_pool(),
+        json!([["chA", "official"], ["chB", "merchant"]]),
+    )
+    .await;
+    let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let model: Arc<dyn ModelClient> = Arc::new(CapturingMock { decide_prompts: prompts.clone() });
+
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 0, model.clone()).await.unwrap(), TickStatus::Done);
+
+    let tick0 = prompts.lock().unwrap().clone();
+    // chA 眼里的 chB：名字 + 开局站位（others 剔除自己 ⇒ 只有 chB）。
+    assert_eq!(
+        ctx_of(&tick0, "chA")["others"],
+        json!({ "chB": "王（漕帮商贾）" }),
+        "身份展示名必须织进 other_cards_brief"
+    );
+    assert_eq!(ctx_of(&tick0, "chB")["others"], json!({ "chA": "李（户部主事）" }));
+
+    // 确定性：同一 (world_id, 阵容, template_version) 下一 tick 得到逐字节相同的身份呈现。
+    prompts.lock().unwrap().clear();
+    insert_tick(&state.db, &wid, 1, 1).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 1, model.clone()).await.unwrap(), TickStatus::Done);
+    let tick1 = prompts.lock().unwrap().clone();
+    assert_eq!(
+        ctx_of(&tick1, "chA")["others"],
+        ctx_of(&tick0, "chA")["others"],
+        "身份呈现必须确定性：同输入同输出，不得随 tick / 迭代序漂移"
+    );
+}
+
+/// 🔴 红线：身份**绝不**进 active_cards——角色卡快照一个字节都不许被改。
+/// 断言口径：本人可见上下文里的 `yourDna.identity.name`（直接来自 active_cards 的卡）必须是原始卡名；
+/// DB 里的 card_json 也必须原样。
+#[tokio::test]
+async fn identity_never_pollutes_active_cards_redline() {
+    let state = test_state().await;
+    let wid = running_world_with_identities(
+        &state,
+        "redline",
+        standard_identity_pool(),
+        json!([["chA", "official"], ["chB", "merchant"]]),
+    )
+    .await;
+    let before = text_one(&state.db, "SELECT card_json FROM cloud_characters WHERE id=?", "chA").await;
+    let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let model: Arc<dyn ModelClient> = Arc::new(CapturingMock { decide_prompts: prompts.clone() });
+
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 0, model).await.unwrap(), TickStatus::Done);
+
+    let captured = prompts.lock().unwrap().clone();
+    let a = ctx_of(&captured, "chA");
+    assert_eq!(
+        a["yourDna"]["identity"]["name"],
+        json!("李"),
+        "红线：角色卡快照（active_cards）不得被身份污染"
+    );
+    assert!(
+        !a["yourDna"].to_string().contains("户部主事"),
+        "红线：身份不得出现在角色卡任何字段里"
+    );
+    assert_eq!(
+        text_one(&state.db, "SELECT card_json FROM cloud_characters WHERE id=?", "chA").await,
+        before,
+        "红线：云端角色卡原文必须逐字节不变"
+    );
+}
+
+/// 老世界（模板无 identityPool、实例无 identityAssignments）→ 感知层逐字段与接线前一致。
+#[tokio::test]
+async fn legacy_world_without_identity_pool_is_byte_identical() {
+    let state = test_state().await;
+    let wid = running_world_with_two_members(&state).await; // tpl-x：无 identityPool、assembled_json 由装配层产
+    let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let model: Arc<dyn ModelClient> = Arc::new(CapturingMock { decide_prompts: prompts.clone() });
+
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 0, model).await.unwrap(), TickStatus::Done);
+
+    let captured = prompts.lock().unwrap().clone();
+    assert_eq!(ctx_of(&captured, "chA")["others"], json!({ "chB": "王" }), "老世界：brief 只放名字");
+    assert_eq!(ctx_of(&captured, "chB")["others"], json!({ "chA": "李" }), "老世界：brief 只放名字");
+}
+
+/// `label` 为空 → 展示名回落身份 `id`（模板字段说明的既定口径）。
+#[tokio::test]
+async fn empty_label_falls_back_to_identity_id() {
+    let state = test_state().await;
+    let wid = running_world_with_identities(
+        &state,
+        "fallback",
+        json!([
+            { "id": "official", "label": "", "quota": 1 },
+            { "id": "merchant", "quota": 1 }
+        ]),
+        json!([["chA", "official"], ["chB", "merchant"]]),
+    )
+    .await;
+    let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let model: Arc<dyn ModelClient> = Arc::new(CapturingMock { decide_prompts: prompts.clone() });
+
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 0, model).await.unwrap(), TickStatus::Done);
+
+    let captured = prompts.lock().unwrap().clone();
+    assert_eq!(ctx_of(&captured, "chA")["others"], json!({ "chB": "王（merchant）" }), "label 缺失 → 回落 id");
+    assert_eq!(ctx_of(&captured, "chB")["others"], json!({ "chA": "李（official）" }), "label 为空串 → 回落 id");
+}
+
+/// `assembled_json` 结构损坏（identityAssignments 不是数组 / 条目不是二元组）→ 静默退化，
+/// 不 panic、不阻断 tick，感知层与老世界完全一致。
+#[tokio::test]
+async fn broken_assembled_json_degrades_silently_without_blocking_tick() {
+    let state = test_state().await;
+    let wid = running_world_with_identities(
+        &state,
+        "broken",
+        standard_identity_pool(),
+        json!("这不是数组"),
+    )
+    .await;
+    let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let model: Arc<dyn ModelClient> = Arc::new(CapturingMock { decide_prompts: prompts.clone() });
+
+    // ① identityAssignments 字段类型不符（字符串而非数组）。
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(
+        process_tick_with_model(&state, &wid, 0, model.clone()).await.unwrap(),
+        TickStatus::Done,
+        "结构损坏不得阻断 tick"
+    );
+    assert_eq!(ctx_of(&prompts.lock().unwrap().clone(), "chA")["others"], json!({ "chB": "王" }));
+
+    // ② 再叠一层：整段 assembled_json 直接写成非 JSON 文本。
+    sqlx::query("UPDATE worlds SET assembled_json='{ 这不是 JSON' WHERE id=?")
+        .bind(&wid)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    prompts.lock().unwrap().clear();
+    insert_tick(&state.db, &wid, 1, 1).await.unwrap();
+    assert_eq!(
+        process_tick_with_model(&state, &wid, 1, model).await.unwrap(),
+        TickStatus::Done,
+        "assembled_json 非 JSON 同样静默退化"
+    );
+    assert_eq!(ctx_of(&prompts.lock().unwrap().clone(), "chA")["others"], json!({ "chB": "王" }));
+}
+
+// ---------- 纯函数层：解析 / 退化 / 拼接 ----------
+
+#[test]
+fn parse_identity_assignments_is_defensive() {
+    assert!(parse_identity_assignments(None).is_empty(), "无 assembled_json → 退化");
+    assert!(parse_identity_assignments(Some("{ 坏 JSON")).is_empty(), "非 JSON → 退化");
+    assert!(parse_identity_assignments(Some("{}")).is_empty(), "无 assembly 段 → 退化");
+    assert!(
+        parse_identity_assignments(Some(&json!({ "assembly": {} }).to_string())).is_empty(),
+        "无 identityAssignments 字段（老实例 skip_serializing_if）→ 退化"
+    );
+    assert!(
+        parse_identity_assignments(Some(
+            &json!({ "assembly": { "identityAssignments": "x" } }).to_string()
+        ))
+        .is_empty(),
+        "字段类型不符 → 退化"
+    );
+    // 损坏条目逐条跳过，合法条目照收（顺序 = 装配层钉住的 cid 升序，确定性来源）。
+    let raw = json!({ "assembly": { "identityAssignments": [
+        ["chA", "official"],
+        ["chB"],                 // 缺元素
+        ["", "merchant"],        // 空 cid
+        ["chC", "  "],           // 空身份 id
+        "不是数组",
+        [1, 2],                  // 非字符串
+        ["chD", "wanderer"],
+    ] } })
+    .to_string();
+    assert_eq!(
+        parse_identity_assignments(Some(&raw)),
+        vec![("chA".to_string(), "official".to_string()), ("chD".to_string(), "wanderer".to_string())],
+    );
+}
+
+#[test]
+fn parse_identity_labels_prefers_label_then_id() {
+    assert!(parse_identity_labels("{ 坏 JSON").is_empty());
+    assert!(parse_identity_labels("{}").is_empty(), "模板未声明 identityPool → 空表 → 完全退化");
+    let pool = json!({ "identityPool": [
+        { "id": "official", "label": "户部主事" },
+        { "id": "merchant", "label": "   " },   // 空白 label → 回落 id
+        { "id": "wanderer" },                    // 无 label → 回落 id
+        { "label": "无 id 不可分配" },            // 无 id → 跳过
+    ] })
+    .to_string();
+    let labels = parse_identity_labels(&pool);
+    assert_eq!(labels.get("official").map(String::as_str), Some("户部主事"));
+    assert_eq!(labels.get("merchant").map(String::as_str), Some("merchant"));
+    assert_eq!(labels.get("wanderer").map(String::as_str), Some("wanderer"));
+    assert_eq!(labels.len(), 3, "无 id 条目不得入表");
+}
+
+#[test]
+fn brief_with_identity_degrades_to_plain_name() {
+    let label = "户部主事".to_string();
+    assert_eq!(brief_with_identity("唐三", Some(&label)), "唐三（户部主事）");
+    assert_eq!(brief_with_identity("唐三", None), "唐三", "无身份 → 与接线前逐字节一致");
+    assert_eq!(brief_with_identity("唐三", Some(&"  ".to_string())), "唐三", "空白展示名 → 退化");
+    assert_eq!(brief_with_identity("", Some(&label)), "户部主事", "卡名为空 → 不产孤零零的括号");
+}
+
+/// 分配非空但模板已不再声明 identityPool（模板被改过）→ 完全退化，不回落到裸 id。
+#[tokio::test]
+async fn assignments_without_pool_in_template_degrade_completely() {
+    let state = test_state().await;
+    seed_template(&state.db, "tpl-nopool").await; // 无 identityPool
+    let mut p = CreateWorldParams::official("tpl-nopool", 1, "无池世界");
+    p.status = Some("running".into());
+    let wid = create_world(&state.db, p).await.unwrap();
+    sqlx::query("UPDATE worlds SET assembled_json=? WHERE id=?")
+        .bind(json!({ "assembly": { "identityAssignments": [["chA", "official"]] } }).to_string())
+        .bind(&wid)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let world = load_world(&state.db, &wid).await.unwrap();
+    assert!(
+        load_identity_display_names(&state.db, &world).await.is_empty(),
+        "模板无 identityPool → 完全退化（不回落裸 id）"
+    );
+
+    // 模板行整个查不到（脏数据）同样退化。
+    sqlx::query("UPDATE worlds SET template_id='tpl-missing' WHERE id=?")
+        .bind(&wid)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let world = load_world(&state.db, &wid).await.unwrap();
+    assert!(load_identity_display_names(&state.db, &world).await.is_empty(), "模板缺失 → 退化，不 panic");
+}

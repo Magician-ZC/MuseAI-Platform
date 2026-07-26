@@ -15,6 +15,9 @@ mod error;
 mod events;
 mod idempotency;
 mod interventions;
+// 房间邀请（客户端设计文档 §6 辅助栏）：默认关闭的运营开关 `MUSE_ROOM_INVITATIONS`，
+// 接受邀请只点亮引导入口，入场仍走 worlds::join_world 的全部校验。
+mod invitations;
 mod notifications;
 // 波次 2：历练值 + 卡位制（成长值只作准入与解锁，绝不进引擎决策）。
 mod progression;

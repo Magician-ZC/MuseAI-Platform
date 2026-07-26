@@ -1,20 +1,24 @@
 # 平台后端 API 清单（server）
 
-> 全部端点 nest 在 `/api` 下（`server/src/app.rs:65`），共 **84 条路由声明 / 90 个方法-路径组合**。
+> 全部端点 nest 在 `/api` 下（`server/src/app.rs`），共 **89 条路由声明 / 98 个方法-路径组合**。
 > 鉴权列语义：**JWT** = 需 `Authorization: Bearer <accessToken>`（`AuthUser` 提取器）；
 > **公开** = 无需 token；**admin+角色** = 需管理员 token 且 `require_role` 通过（`admin` 角色恒通过）。
-> 校验于 2026-07-25。**改路由必须同步改本文件**——与 `docs/VALIDATION.md` §3 台账同级纪律。
+> 校验于 2026-07-26。**改路由必须同步改本文件**——与 `docs/VALIDATION.md` §3 台账同级纪律。
 
 ## 0. 挂载与 feature 门控
 
 | 模块 | feature | 说明 |
 |---|---|---|
-| auth / assets / worlds / events / interventions / consents / notifications / reports / backpack / chapters / progression / admin_api | 默认 | 默认构建即含 |
+| auth / assets / worlds / events / interventions / consents / invitations / notifications / reports / backpack / chapters / progression / admin_api | 默认 | 默认构建即含 |
 | arena / livegate | `arena` | 赛事房与直播礼物网关 |
 | billing | `billing` | 计费闭环 |
 | shop | `billing` 或 `arena` | 依赖复式账本，与 ledger 同门控（`app.rs:61`） |
 
 未启用 feature 时对应路由**不注册**，请求返回 404。
+
+**运行时开关**（与 feature 门控正交，同样"未验证功能默认关闭"）：`invitations` 全部端点由
+`MUSE_ROOM_INVITATIONS` 控制，**默认关闭 → 404**；世界的生死状档由 `MUSE_LETHALITY_DEATHMATCH`
+控制，默认关闭 → 读取侧降级为同意制。
 
 ---
 
@@ -43,12 +47,20 @@
 | DELETE | `/api/assets/characters/{id}` | JWT | 删除 |
 | GET | `/api/assets/objects/{*key}` | 公开 | 对象回读（头像等）。**能力 URL**：键含 128 位随机 id，`is_safe_object_key` 防路径穿越 |
 | POST | `/api/assets/worlds` | JWT | 创作者发布世界模板（超集冗余门 `MIN_REDUNDANCY_RATIO=3.0`） |
-| GET | `/api/assets/worlds/mine` | JWT | 我发布的世界 |
-| GET | `/api/assets/worlds/{id}/status` | JWT | 审核状态 |
+| GET | `/api/assets/worlds/mine` | JWT | 我发布的世界。含 `viewCount`/`favoriteCount`（**仅属主可见**，migration 0029） |
+| GET | `/api/assets/worlds/{id}/status` | JWT | 审核状态 + `viewCount`/`favoriteCount`（owner 隔离，非本人 404） |
 | GET | `/api/assets/worlds/{id}/manifest` | JWT | 世界清单 |
 | POST | `/api/assets/worlds/{id}/withdraw` | JWT | 下架 |
+| POST | `/api/assets/worlds/{id}/view` | JWT | 记一次浏览。**防刷**：同用户同窗口只计一次（去重窗口 env `MUSE_VIEW_DEDUP_WINDOW_MS`，默认 24h），属主自刷返回 `counted:false`；匿名不计数（无法按人去重） |
+| POST | `/api/assets/worlds/{id}/favorite` | JWT | 收藏（幂等）。属主收藏自己的发布物 → 409（防自刷） |
+| DELETE | `/api/assets/worlds/{id}/favorite` | JWT | 取消收藏（幂等） |
+| GET | `/api/assets/worlds/{id}/favorite` | JWT | 我是否已收藏（只回自己的状态，不回总数） |
 
-## 3. 世界运行时（worlds / events / interventions / consents / chapters）
+> 计数实现（`migrations/0029_engagement_invitations.sql`）：append-only 去重登记表 + `COUNT(*)` 派生，
+> **没有可变计数列 → 没有热点行**；同人同窗口的重复浏览由主键冲突丢弃（防刷判定在数据库唯一性上，
+> 不在应用层读-判-写）。
+
+## 3. 世界运行时（worlds / events / interventions / consents / invitations / chapters）
 
 | 方法 | 路径 | 鉴权 | 说明 |
 |---|---|---|---|
@@ -66,6 +78,27 @@
 | POST | `/api/worlds/{id}/chapters/finish` | JWT | 章节结算 |
 | GET | `/api/worlds/{id}/offline-gains` | JWT | 离线收益回看 |
 | POST | `/api/worlds/{id}/carry` | JWT | 带入道具 |
+| POST | `/api/worlds/{id}/invitations` | JWT | 发出房间邀请 `{targetCharacterId}`（房主/active 成员）。**开关默认关闭** |
+| GET | `/api/worlds/{id}/invitations` | JWT | 我在该世界**发出**的邀请（只出自己发的） |
+| GET | `/api/me/invitations?status=` | JWT | 我**收到**的邀请（默认 pending） |
+| POST | `/api/me/invitations/{iid}/respond` | JWT | 接受/拒绝 `{accept}`（幂等）。非收件人 404 |
+
+### 房间邀请（invitations，migration 0029）
+
+| 项 | 取值 |
+|---|---|
+| 运营开关 | `MUSE_ROOM_INVITATIONS`，**默认关闭**（VALIDATION.md §0.1）。关闭时四个端点全 404，且**已存在的邀请也读不出、响应不了**（读取侧降级，可逆急停阀，范式同 `MUSE_LETHALITY_DEATHMATCH`） |
+| 有效期 | `MUSE_INVITE_TTL_MS`，默认 7 天（惰性过期） |
+| 防骚扰 | 无自由文本字段（结构化邀请，不是私信）· 拒绝即终局（同邀请人不得重邀同角色进同世界）· 同 (世界,邀请人,被邀角色) 至多一条 pending（重复邀请幂等复用、不重复通知）· 每人每日发出上限 `MUSE_INVITE_DAILY_LIMIT`（默认 20，跨世界合计）· 通知 kind `room_invitation` 非 essential，可被用户通知偏好静默 |
+| 社交防火墙（§14） | 被邀请者由**角色 id** 寻址，邀请人只以**角色面具名**示人；`invitee_user_id` 仅服务端内部使用，**任何响应体/通知 payload 都不下发**真人身份 |
+
+> 🔴 **接受 ≠ 入场**：`respond{accept:true}` 只把邀请置 `accepted` 并回一个 `next` 指引，
+> **不写 `world_members`**；真正入场仍须调用 `POST /api/worlds/{id}/join`，于是 join 的全部服务端权威校验
+> （角色属本人/approved/未撤回 · 人数上限 · 一人一卡防自刷 · 同源唯一 · 星级历练准入 ·
+> 生死契约二次签署 · **未成年禁入生死状**）一条不少地生效。该性质由源码断言测试
+> `invitations::tests::module_never_writes_world_members` 锁死。
+> 未成年保护另有**前门拒绝 + 接受时复查**双保险：生效档为生死状的世界，未声明成年者既收不到邀请、
+> 也接受不了（拒绝文案统一为通用句，不得让端点变成年龄探测器）。
 
 ## 4. 玩家账户（me / backpack / progression / reports / notifications）
 
@@ -150,8 +183,8 @@
 ## 8. 本清单的生成与校验
 
 ```bash
-# 路由与方法（应得 90 个方法-路径）
-grep -rhoE '\.route\("[^"]+"' server/src | wc -l           # 84 条 route 声明
+# 路由与方法（应得 98 个方法-路径）
+grep -rhoE '\.route\("[^"]+"' server/src | wc -l           # 89 条 route 声明
 # admin 角色矩阵
 grep -rn "require_role" server/src/admin_api/*.rs
 ```

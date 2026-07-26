@@ -676,6 +676,122 @@ async fn load_carried_item_facts(
     Ok(map)
 }
 
+// ---------- 身份池叙事接线（总规格 §5【拍板 4、5】：身份 = 开局站位） ----------
+//
+// 🔴 **平权宪法（总规格 §0.1 真红线 1，锁进测试）**：身份只是「这个角色在这个世界的开局站位」
+//（户部主事 / 漕帮商贾 / 被退婚的嫡女），**不携带任何数值差异、准入门槛、产出加成、难度优待
+// 或叙事特权**。本节读回的分配结果**只**用于拼接 `RoundInput.other_cards_brief`——即「他人如何
+// 被本角色感知」的第三人称一句话摘要，**绝不进入 `active_cards`**（角色卡不可变快照，污染它
+// 等于篡改玩家的卡），也绝不得被任何下游用来改判定 / 改发奖 / 开权限 / 调难度。戏份靠玩出来。
+//
+// 退化契约：老世界 / 未装配 / 模板未声明 `identityPool` / JSON 结构损坏 → 一律静默退化为
+// 「brief 只放名字」的现状，逐字段零行为变化；不 panic、不阻断 tick（同本文件 `seed_narrative_layer`
+// 的防御式解析口径）。
+//
+// 确定性：分配结果由装配层按 cid 升序钉死在 `assembled_json`，本节纯读、纯拼接，无随机、
+// 不依赖 map 迭代序产生分支 —— 同一 (world_id, 阵容, template_version) 恒得同一份身份呈现。
+
+/// 从实例 `assembled_json` 读回身份分配 `[[cid, identityId], …]`（`/assembly/identityAssignments`）。
+/// 任一层结构不符（无 assembled / 非 JSON / 无该字段 / 非数组）→ 空 Vec = 完全退化；
+/// 单个条目损坏只跳过该条，不牵连其余（防御式，同 `worldCharacterEntries` 口径）。
+fn parse_identity_assignments(assembled_json: Option<&str>) -> Vec<(String, String)> {
+    let Some(raw) = assembled_json else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<Value>(raw) else {
+        return Vec::new();
+    };
+    let Some(arr) = v.pointer("/assembly/identityAssignments").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, String)> = Vec::new();
+    for pair in arr {
+        let Some(p) = pair.as_array() else {
+            continue; // 条目不是 [cid, identityId] 二元组：跳过。
+        };
+        let (Some(cid), Some(identity_id)) = (
+            p.first().and_then(Value::as_str).map(str::trim),
+            p.get(1).and_then(Value::as_str).map(str::trim),
+        ) else {
+            continue;
+        };
+        if cid.is_empty() || identity_id.is_empty() {
+            continue;
+        }
+        out.push((cid.to_string(), identity_id.to_string()));
+    }
+    out
+}
+
+/// 从模板 skeleton 的 `identityPool[]` 取叙事展示名表：`identityId → 展示名`。
+/// **展示名优先 `label`，`label` 缺失/为空 → 回落 `id`**（与 `docs/build/example-idle-skeleton.md`
+/// 字段说明一致）。模板未声明 `identityPool` / 结构不符 → 空表 → 上层完全退化。
+fn parse_identity_labels(skeleton_json: &str) -> BTreeMap<String, String> {
+    let mut labels: BTreeMap<String, String> = BTreeMap::new();
+    let Ok(sk) = serde_json::from_str::<Value>(skeleton_json) else {
+        return labels;
+    };
+    let Some(arr) = sk.get("identityPool").and_then(Value::as_array) else {
+        return labels;
+    };
+    for spec in arr {
+        let Some(id) =
+            spec.get("id").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
+        else {
+            continue; // 无 id 的身份不可分配（建模板期已被校验拦截），此处防御式跳过。
+        };
+        let label = spec.get("label").and_then(Value::as_str).map(str::trim).unwrap_or("");
+        labels.insert(id.to_string(), if label.is_empty() { id } else { label }.to_string());
+    }
+    labels
+}
+
+/// 组装本世界的 `cid → 身份展示名`（叙事感知层唯一出口）。
+///
+/// 「只在真有分配时才回查模板」：老世界 / 老模板的 `identityAssignments` 为空（装配层
+/// `skip_serializing_if` 保证字段根本不写出）→ 直接返回空表，**零额外查询、零行为变化**。
+/// DB 读失败 / 列类型不符 / 骨架非 JSON → 一律静默退化为空表：身份是叙事装饰，
+/// 绝不因它 fail-closed 或阻断 tick。
+async fn load_identity_display_names(db: &AnyPool, world: &WorldRow) -> BTreeMap<String, String> {
+    let assignments = parse_identity_assignments(world.assembled_json.as_deref());
+    if assignments.is_empty() {
+        return BTreeMap::new();
+    }
+    let Ok(Some(row)) = sqlx::query("SELECT skeleton_json FROM world_templates WHERE id = ?")
+        .bind(&world.template_id)
+        .fetch_optional(db)
+        .await
+    else {
+        return BTreeMap::new();
+    };
+    let Ok(raw) = row.try_get::<String, _>("skeleton_json") else {
+        return BTreeMap::new();
+    };
+    let labels = parse_identity_labels(&raw);
+    if labels.is_empty() {
+        return BTreeMap::new(); // 模板已不再声明 identityPool → 完全退化。
+    }
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    for (cid, identity_id) in assignments {
+        // 池中查不到该身份 id（模板版本被改过）→ 该角色不加身份，退化为只放名字。
+        if let Some(display) = labels.get(&identity_id) {
+            out.insert(cid, display.clone());
+        }
+    }
+    out
+}
+
+/// 感知层展示名拼接：`唐三（户部主事）`。
+/// 无身份 / 展示名为空 → 原样只放名字（退化路径，与接线前逐字节一致）；
+/// 卡名为空（异常卡）→ 只放身份，避免产出孤零零的括号。
+fn brief_with_identity(name: &str, display: Option<&String>) -> String {
+    match display.map(String::as_str).map(str::trim).filter(|d| !d.is_empty()) {
+        None => name.to_string(),
+        Some(d) if name.trim().is_empty() => d.to_string(),
+        Some(d) => format!("{name}（{d}）"),
+    }
+}
+
 // ---------- tick 收尾工具 ----------
 
 async fn finish_tick_noop(
@@ -1288,6 +1404,12 @@ async fn process_tick_inner(
     .fetch_all(db)
     .await?;
 
+    // 身份池叙事接线（总规格 §5【拍板 4、5】）：读回实例装配钉住的开局站位 `cid → 展示名`。
+    // 空表 = 老世界 / 模板未声明 identityPool / 结构损坏 → 下方 brief 拼接完全退化为只放名字。
+    // 🔴 平权红线（§0.1）：身份只进感知层 brief，不携带数值差异 / 准入门槛 / 产出加成 / 难度优待 /
+    //    叙事特权，且**绝不进 active_cards**（角色卡快照不可变）。详见 `load_identity_display_names` 注释。
+    let identity_display = load_identity_display_names(db, &world).await;
+
     let mut members_projection: Vec<ProjectionMember> = Vec::new();
     let mut member_ids: Vec<String> = Vec::new();
     let mut active_cards: BTreeMap<String, CharacterCardV2> = BTreeMap::new();
@@ -1301,7 +1423,10 @@ async fn process_tick_inner(
         if let Ok(card) = serde_json::from_str::<CharacterCardV2>(&card_json) {
             // 平权吃鸡：所有角色每回合同步决策行动（取消「仅前 5」上限）。
             // brief 收录全体名字（每个角色借此感知在场其他人），active 收录全体完整卡（逐一决策）。
-            other_brief.insert(cid.clone(), card.identity.name.clone());
+            // 身份**只**织进 brief（`唐三（户部主事）`）——它是"这个人在这个世界的开局站位"如何被
+            // 他人感知；card 原封不动进 active_cards，一个字节都不改。
+            other_brief
+                .insert(cid.clone(), brief_with_identity(&card.identity.name, identity_display.get(&cid)));
             active_cards.insert(cid, card);
         }
     }

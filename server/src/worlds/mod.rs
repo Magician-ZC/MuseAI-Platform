@@ -14,6 +14,9 @@
 //!   同源唯一（R1）：同一提取源的未编辑原味卡同世界仅可在场一张（编辑过的卡/无指纹卡放行）；
 //!   历练准入（波次 3）：模板 star≥3 时投放卡 mileage 须达门槛（3★=300/4★=1000/5★=3000），1-2★ 免检
 //! POST /worlds/{id}/leave                离场：置成员 left（离场事件交由下个 tick 叙事化）
+//! POST /worlds/{id}/cover                上传世界封面位图（官方房运营 / 创作者房房主）：
+//!   base64 JSON → MIME 白名单 → 1MB 上限 → 对象存储 → 图审 → worlds.cover_* 三列；
+//!   🔴 仅机审 approved 才在任何读取面下发 coverUrl（未过审绝不外泄，口径同角色立绘）
 //!
 //! 官方建房走 admin(S6)，此处提供内部 create_world 供其调用；创建时钉住
 //! engine_version/prompt_set_version/model_route_version/template_version（§9.2 版本钉住）。
@@ -22,6 +25,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{Any, AnyPool, Row, Transaction};
@@ -31,6 +35,7 @@ use crate::auth::AuthUser;
 use crate::db::{new_id, now_ms};
 use crate::error::ApiError;
 use crate::idempotency;
+use crate::providers::ModerationVerdict;
 
 use muse_engine::narrative::types::Lethality;
 
@@ -150,6 +155,90 @@ fn normalize_lethality(raw: &str) -> &str {
     }
 }
 
+// ---------- 世界封面（客户端设计文档 §6「真实位图封面」，迁移 0027） ----------
+
+/// 世界封面原始字节上限（1MB）。比角色立绘的 512KB 大一档：封面是大厅主视觉与卡片图，
+/// 渲染尺寸远大于头像。仍是防滥用硬上限，不是画质目标。
+const MAX_COVER_BYTES: usize = 1024 * 1024;
+
+/// 机审通过的落库标记（worlds.cover_moderation / cloud_characters.avatar_moderation 同一取值）。
+const MODERATION_APPROVED: &str = "approved";
+
+/// 🔴 封面读取面过滤（红线）：**只有机审 approved 的封面才允许下发 URL**。
+///
+/// 口径与角色立绘的「头像读取面双过滤」逐字一致（providers/mod.rs `check_image` 注释）：
+/// 落库时无论裁决都写 cover_url（人审改判后无需重传），下发时按 cover_moderation 卡门。
+/// pending（待人审）与 rejected（直拒）一律视同"没有封面"。
+///
+/// 另一条硬约束：**绝不下发空串**。无封面 / 未过审 → 返回 None → 调用方**不写该字段**，
+/// 让前端走它已实现的"按 world.id 哈希确定性挑一张内置位图"兜底；下发 `""` 会被前端
+/// `coverUrl?.trim() || 兜底` 之外的任何直接消费点渲染成碎图。
+fn visible_cover_url(cover_url: Option<String>, cover_moderation: Option<&str>) -> Option<String> {
+    if cover_moderation != Some(MODERATION_APPROVED) {
+        return None;
+    }
+    cover_url.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+// ---------- 下一拍时刻推算（大厅「下次世界时刻」的真实时间戳来源） ----------
+
+/// 调度器墙钟间隔的 env 覆盖名。**必须与 `runtime::schedule_due_ticks` 读的是同一个变量**。
+const ENV_TICK_INTERVAL_MS: &str = "MUSE_TICK_INTERVAL_MS";
+
+/// interval 世界的排拍间隔（毫秒）。
+///
+/// ⚠️ 这是 `runtime::schedule_due_ticks` 里那行
+/// `interval_override.unwrap_or_else(|| 86_400_000 / tick_per_day.max(1))` 的**镜像**。
+/// 不复用 runtime 的私有实现是因为它内联在调度循环里、没有可调用的公开函数；
+/// 二者一旦分叉，玩家看到的"下一拍"就会和真实排拍时刻错位——`tick_interval_ms_mirrors_scheduler`
+/// 用例把这条公式钉住，改调度器时该用例会红。
+fn tick_interval_ms(tick_per_day: i64) -> i64 {
+    std::env::var(ENV_TICK_INTERVAL_MS)
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or_else(|| 86_400_000 / tick_per_day.max(1))
+}
+
+/// 下一拍的**估算**墙钟时刻（毫秒 epoch）；算不准就返回 `None`（宁可不给，也不给会漂移的假时间）。
+///
+/// 可推算的唯一情形 = `status == 'running'` **且** `timeline_mode == 'interval'`：
+/// 调度器每轮取 `MAX(world_ticks.created_at)`，`now - last >= interval` 即排新拍，
+/// 故下一拍最早在 `last + interval` 入队；世界还没有任何 tick 时 `due` 恒真 → 下一拍"就是现在"。
+///
+/// 三种**不可推算**（一律 None，调用方不下发该字段）：
+/// - `status != 'running'`：open / paused / ended 世界压根不进调度器的 `WHERE status='running'`，
+///   没有"下一拍"这回事。大厅里的 open 房尤其常见，给个时间纯属编造。
+/// - `timeline_mode == 'event'` 且 idle 房：DES 背靠背——上一拍一 done 就立刻排下一拍，
+///   节奏由引擎算出的游戏时钟决定，**不依赖墙钟**，无任何墙钟表达式可给。
+/// - `timeline_mode == 'event'` 且 chapter/arena 房：新拍全部来自手动端点（arena host_tick /
+///   chapter start·advance），由主持人/会话驱动，服务端无从预测。
+///
+/// **为什么叫 Estimated（字段 `nextTickEstimatedAt`）而不是 `nextTickAt`**——三处已知误差：
+/// 1. 调度器是轮询的（`MUSE_TICK_POLL_MS`，默认 5s），实际入队落在 `[t, t + poll)`；
+/// 2. 入队 ≠ 出内容：worker 认领 + 引擎跑完一回合还要数秒到数分钟；
+/// 3. 世界可能在到点前因终局/暂停停机，那一拍不会发生。
+/// 相对 8 小时（tick_per_day=3）量级的间隔，1、2 是分钟级误差；3 是"不发生"而非"晚发生"。
+/// 误差方向恒为"不早于"——玩家按它回访不会错过内容，只会稍早到。
+///
+/// 注：拍与拍的间隔锚在 `created_at`（入队时刻）而非完成时刻，故单拍跑得慢/失败**不会**让后续
+/// 排拍时刻整体漂移，估算不随失败累积。
+fn next_tick_estimated_at(
+    status: &str,
+    timeline_mode: &str,
+    interval_ms: i64,
+    last_tick_created_at: Option<i64>,
+    now: i64,
+) -> Option<i64> {
+    if status != "running" || timeline_mode != "interval" {
+        return None;
+    }
+    // 无历史 tick → 调度器下一轮就排（due 恒真）→ 下一拍即"现在"。
+    Some(match last_tick_created_at {
+        Some(last) => last.saturating_add(interval_ms),
+        None => now,
+    })
+}
+
 /// 世界行（worlds 表投影，runtime 复用）。
 #[derive(Debug, Clone)]
 pub struct WorldRow {
@@ -183,6 +272,12 @@ pub struct WorldRow {
     /// 消费方一律经 `effective_lethality(&row.lethality)` 换算生效档（含运营开关降级），
     /// 不要直接字符串比较——那会绕过急停阀。
     pub lethality: String,
+    /// 封面回读 URL（0027）。**无论机审裁决如何都落库**，下发面另有 approved 门。
+    /// 🔴 消费方一律经 `visible_cover_url(row.cover_url, row.cover_moderation.as_deref())`，
+    /// 不要直接读本字段往响应里塞——那会漏出未过审封面。
+    pub cover_url: Option<String>,
+    /// 封面机审三态（'approved' | 'pending' | 'rejected'；NULL = 从未上传封面）。
+    pub cover_moderation: Option<String>,
 }
 
 fn map_world(row: &sqlx::any::AnyRow) -> Result<WorldRow, ApiError> {
@@ -206,6 +301,8 @@ fn map_world(row: &sqlx::any::AnyRow) -> Result<WorldRow, ApiError> {
         timeline_mode: row.try_get("timeline_mode")?,
         game_time: row.try_get("game_time")?,
         lethality: row.try_get("lethality")?,
+        cover_url: row.try_get("cover_url")?,
+        cover_moderation: row.try_get("cover_moderation")?,
     })
 }
 
@@ -260,22 +357,51 @@ const HOT_GIFTS_WINDOW_MS: i64 = 7 * 24 * 3600 * 1000;
 const STAR_RATING_SUBQUERY: &str =
     "COALESCE((SELECT t.star_rating FROM world_templates t WHERE t.id = worlds.template_id), 1) AS star_rating";
 
+/// 列表/详情共用的 SELECT 片段：封面两列 + 下一拍推算所需的时间线模式与末拍入队时刻。
+/// 末拍时刻用相关子查询取（双库可移植：无 JOIN 去重问题，无方言日期函数）；无 tick → NULL。
+const COVER_AND_TICK_COLUMNS: &str = "cover_url, cover_moderation, timeline_mode, \
+     (SELECT MAX(t.created_at) FROM world_ticks t WHERE t.world_id = worlds.id) AS last_tick_at";
+
 /// 列表项投影（new/hot 共用；hot 分支再追加 hotScore）。
-fn world_list_item(row: &sqlx::any::AnyRow, id: &str) -> Result<Value, ApiError> {
-    Ok(json!({
+/// `now` 由调用方一次算好传入——同一页所有世界的"下一拍"基于同一个 now，页内自洽。
+fn world_list_item(row: &sqlx::any::AnyRow, id: &str, now: i64) -> Result<Value, ApiError> {
+    let status: String = row.try_get("status")?;
+    let tick_per_day: i64 = row.try_get("tick_per_day")?;
+    let mut item = json!({
         "id": id,
         "roomType": row.try_get::<String, _>("room_type")?,
         "title": row.try_get::<String, _>("title")?,
-        "status": row.try_get::<String, _>("status")?,
+        "status": &status,
         "visibility": row.try_get::<String, _>("visibility")?,
         "memberLimit": row.try_get::<i64, _>("member_limit")?,
         "memberCount": row.try_get::<i64, _>("member_count")?,
-        "tickPerDay": row.try_get::<i64, _>("tick_per_day")?,
+        "tickPerDay": tick_per_day,
         "starRating": row.try_get::<i64, _>("star_rating")?,
         // 生死契约档（§11）：与 starRating 并列的独立维度，供大厅筛选「选难度 = 选星级 × 选契约」。
         "lethality": lethality_label(&row.try_get::<String, _>("lethality")?),
         "aiLabel": { "visible": true },
-    }))
+    });
+
+    // 🔴 封面：仅机审 approved 才写字段；无封面/未过审 → **不写该键**（不是空串、不是 null），
+    // 前端据"字段缺席"走它已实现的确定性内置位图兜底。
+    let cover_moderation: Option<String> = row.try_get("cover_moderation")?;
+    if let Some(url) = visible_cover_url(row.try_get("cover_url")?, cover_moderation.as_deref()) {
+        item["coverUrl"] = json!(url);
+    }
+
+    // 下一拍估算时刻：算不准（非 running / event 房）→ 不写该键，绝不下发会漂移的假时间。
+    let timeline_mode: String = row.try_get("timeline_mode")?;
+    let last_tick_at: Option<i64> = row.try_get("last_tick_at")?;
+    if let Some(at) = next_tick_estimated_at(
+        &status,
+        &timeline_mode,
+        tick_interval_ms(tick_per_day),
+        last_tick_at,
+        now,
+    ) {
+        item["nextTickEstimatedAt"] = json!(at);
+    }
+    Ok(item)
 }
 
 async fn list_worlds(
@@ -306,9 +432,11 @@ async fn list_worlds_new(
     like: Option<String>,
 ) -> Result<Json<Value>, ApiError> {
     let page = params.limit.unwrap_or(20).clamp(1, 100);
+    let now = now_ms();
     // 仅可见世界：open/running 且 official/public。
     let mut sql = format!(
         "SELECT id, room_type, title, status, visibility, member_limit, tick_per_day, created_at, lethality, \
+         {COVER_AND_TICK_COLUMNS}, \
          (SELECT COUNT(*) FROM world_members m WHERE m.world_id = worlds.id AND m.status='active') AS member_count, \
          {STAR_RATING_SUBQUERY} \
          FROM worlds \
@@ -349,7 +477,7 @@ async fn list_worlds_new(
         let created_at: i64 = row.try_get("created_at")?;
         let id: String = row.try_get("id")?;
         next_cursor = Some(format!("{created_at}:{id}"));
-        items.push(world_list_item(row, &id)?);
+        items.push(world_list_item(row, &id, now)?);
     }
     if !has_more {
         next_cursor = None;
@@ -374,6 +502,7 @@ async fn list_worlds_hot(
     // 整体分再 CAST 一次，保证双库返回 BIGINT。gift_events 表恒存在（迁移不随 feature 门控）。
     let mut sql = format!(
         "SELECT id, room_type, title, status, visibility, member_limit, tick_per_day, created_at, lethality, \
+         {COVER_AND_TICK_COLUMNS}, \
          (SELECT COUNT(*) FROM world_members m WHERE m.world_id = worlds.id AND m.status='active') AS member_count, \
          {STAR_RATING_SUBQUERY}, \
          CAST( \
@@ -405,7 +534,7 @@ async fn list_worlds_hot(
     let mut items = Vec::new();
     for row in &rows {
         let id: String = row.try_get("id")?;
-        let mut item = world_list_item(row, &id)?;
+        let mut item = world_list_item(row, &id, now)?;
         item["hotScore"] = json!(row.try_get::<i64, _>("hot_score")?);
         items.push(item);
     }
@@ -473,7 +602,14 @@ async fn world_detail(
         .await?
         .unwrap_or(1);
 
-    Ok(Json(json!({
+    // 下一拍估算：末拍入队时刻 + 排拍间隔（仅 running 的 interval 世界可算，详见 next_tick_estimated_at）。
+    let last_tick_at: Option<i64> =
+        sqlx::query_scalar("SELECT MAX(created_at) FROM world_ticks WHERE world_id = ?")
+            .bind(&id)
+            .fetch_one(&state.db)
+            .await?;
+
+    let mut detail = json!({
         "id": world.id,
         "title": world.title,
         "roomType": world.room_type,
@@ -500,7 +636,126 @@ async fn world_detail(
         // 合规信息展示（§2.1）：AI 生成标识 + 仲裁公开承诺。
         "aiLabel": { "visible": true },
         "compliance": { "aiGenerated": true, "arbitrationPublic": true },
-    })))
+    });
+
+    // 🔴 封面：与列表面同一个 approved 门；无封面/未过审 → **不写该键**（不是空串）。
+    if let Some(url) = visible_cover_url(world.cover_url.clone(), world.cover_moderation.as_deref()) {
+        detail["coverUrl"] = json!(url);
+    }
+    // 下一拍：算不准就不写该键（open/paused/ended 世界、event 房一律缺席）。
+    if let Some(at) = next_tick_estimated_at(
+        &world.status,
+        &world.timeline_mode,
+        tick_interval_ms(world.tick_per_day),
+        last_tick_at,
+        now_ms(),
+    ) {
+        detail["nextTickEstimatedAt"] = json!(at);
+    }
+    Ok(Json(detail))
+}
+
+// ---------- 世界封面上传（POST /worlds/{id}/cover） ----------
+
+/// 世界封面上传请求（base64 JSON，形态与角色立绘 `POST /assets/characters/{id}/avatar` 逐字一致，
+/// 复用现有 JSON 栈，不引入 multipart）。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CoverReq {
+    /// 标准 base64 编码的原始图片字节（不含 data: 前缀）。
+    image_base64: String,
+    /// image/png | image/jpeg | image/webp
+    mime: String,
+}
+
+/// 可为**官方世界**设封面的角色。
+///
+/// 官方房由运营建房（admin S6，`visibility='official'` 且 `host_user_id` 为 NULL），封面属于建房动作的
+/// 一部分，故归运营。取 admin/operator 两档而非 `AdminUser` 的全集：reviewer/support/finance 分别是
+/// 审核、客服、财务角色，不承担内容投放职责——口径同 `admin_api::require_role` 对治理写操作的收窄。
+fn can_set_official_cover(role: &str) -> bool {
+    matches!(role, "admin" | "operator")
+}
+
+/// 封面写权限判定（读取面无关，只管谁能改）。
+///
+/// - 官方世界（`visibility='official'`）→ 运营角色，见 `can_set_official_cover`。
+/// - 创作者世界（public/private，房主建房 `POST /worlds` 落 `host_user_id`）→ **仅房主本人**。
+///   运营不在此路径覆盖创作者封面：运营对违规封面的处置手段是审核态（cover_moderation 置非
+///   approved 即刻全站不可见），而不是替人换图——换图会让"这张图是谁放的"失去单一责任人。
+/// - `host_user_id` 为 NULL 的非官方世界（理论上不存在，防御）→ 无人可设。
+fn can_set_cover(world: &WorldRow, user: &AuthUser) -> bool {
+    if world.visibility == "official" {
+        return can_set_official_cover(&user.role);
+    }
+    match world.host_user_id.as_deref() {
+        Some(host) => host == user.user_id,
+        None => false,
+    }
+}
+
+/// POST /worlds/{id}/cover：上传世界封面位图（权限校验 + 图审 + 行级字段落库）。
+///
+/// 范式完全照抄 `assets::upload_avatar`（角色立绘）：MIME 白名单 → base64 解码 → 大小上限 →
+/// 写对象存储（键 `covers/{world_id}.{ext}`，世界 id 为 128 位随机 uuid，充当能力 URL）→
+/// `ModerationProvider::check_image` 图审 → UPDATE cover_object_key / cover_url / cover_moderation。
+///
+/// 🔴 红线：cover_url 无论裁决都落库（人审改判后无需重传），但**响应与所有读取面仅 approved 才给 URL**
+/// （`visible_cover_url`）。私密房不豁免——封面上传与房间可见性无关，恒过机审。
+/// 世界不存在 → 404；无权限 → 403（口径同 `world_detail` 对私有房的 Forbidden）。
+async fn upload_cover(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<String>,
+    Json(req): Json<CoverReq>,
+) -> Result<Json<Value>, ApiError> {
+    let world = load_world(&state.db, &id).await?;
+    if !can_set_cover(&world, &user) {
+        return Err(ApiError::Forbidden);
+    }
+
+    // MIME 白名单（png/jpeg/webp），与角色立绘共用同一张表。
+    let ext = crate::assets::image_ext(req.mime.trim()).ok_or_else(|| {
+        ApiError::BadRequest("封面格式不支持（仅 image/png、image/jpeg、image/webp）".into())
+    })?;
+
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(req.image_base64.trim())
+        .map_err(|_| ApiError::BadRequest("封面 base64 解码失败".into()))?;
+    if bytes.is_empty() {
+        return Err(ApiError::BadRequest("封面数据为空".into()));
+    }
+    if bytes.len() > MAX_COVER_BYTES {
+        return Err(ApiError::BadRequest("封面超过 1MB 上限".into()));
+    }
+
+    // 写对象存储：键以世界 id 命名（同世界重传覆盖式更新）。
+    let object_key = format!("covers/{id}.{ext}");
+    state.objects.put(&object_key, &bytes).map_err(ApiError::internal)?;
+
+    // 图审（dev 直过，prod 待接第三方图审）。裁决三态与角色立绘同源。
+    let verdict = state
+        .moderation
+        .check_image(&bytes)
+        .await
+        .map_err(|e| ApiError::internal(std::io::Error::other(e)))?;
+    let moderation = crate::assets::verdict_str(verdict);
+    let cover_url = format!("/api/assets/objects/{object_key}");
+
+    sqlx::query(
+        "UPDATE worlds SET cover_object_key = ?, cover_url = ?, cover_moderation = ?, updated_at = ? WHERE id = ?",
+    )
+    .bind(&object_key)
+    .bind(&cover_url)
+    .bind(moderation)
+    .bind(now_ms())
+    .bind(&id)
+    .execute(&state.db)
+    .await?;
+
+    // 🔴 未过审绝不下发 URL（与列表/详情读取面同一个门）。
+    let out_url = if verdict == ModerationVerdict::Approved { Some(cover_url) } else { None };
+    Ok(Json(json!({ "worldId": id, "coverUrl": out_url, "moderation": moderation })))
 }
 
 // ---------- 投放（join） ----------
@@ -1015,6 +1270,8 @@ pub fn router() -> Router<AppState> {
         .route("/worlds/{id}", get(world_detail))
         .route("/worlds/{id}/join", post(join_world))
         .route("/worlds/{id}/leave", post(leave_world))
+        // 封面上传恒在（不随经济 feature 门控）：封面是展示层资产，与账本无关。
+        .route("/worlds/{id}/cover", post(upload_cover))
 }
 
 // ---------- 房主建房（POST /worlds）+ 开房费 charge（P4b/P2，feature=billing/arena） ----------

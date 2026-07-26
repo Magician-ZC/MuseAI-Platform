@@ -47,8 +47,9 @@ pub fn router() -> Router<AppState> {
         .route("/assets/characters/{id}/avatar", post(upload_avatar))
         .route("/assets/characters/{id}/withdraw", post(withdraw))
         .route("/assets/characters/{id}", delete(delete_character))
-        // 对象回读（头像等公开可读资产）：无鉴权，靠不可猜的对象键（角色 id 为 128 位随机 uuid）
-        // 充当能力 URL；路径穿越硬防护见 `is_safe_object_key`。
+        // 对象回读（头像 / 世界封面等公开可读资产）：无鉴权，靠不可猜的对象键
+        //（角色 id / 世界 id 均为 128 位随机 uuid）充当能力 URL；
+        // 可读前缀白名单 + 路径穿越硬防护见 `READABLE_OBJECT_PREFIXES` / `is_safe_object_key`。
         .route("/assets/objects/{*key}", get(get_object))
         .merge(worlds::router())
 }
@@ -92,7 +93,9 @@ struct AvatarReq {
 }
 
 /// MIME → 对象键扩展名（同时充当受支持 MIME 白名单）。
-fn avatar_ext(mime: &str) -> Option<&'static str> {
+/// 位图资产共用：角色立绘（本模块 upload_avatar）与世界封面（worlds::upload_cover）同一张白名单，
+/// 免得两处各写一份、日后一处加 MIME 另一处忘了加。
+pub(crate) fn image_ext(mime: &str) -> Option<&'static str> {
     match mime {
         "image/png" => Some("png"),
         "image/jpeg" => Some("jpg"),
@@ -111,9 +114,16 @@ fn content_type_for_ext(ext: &str) -> Option<&'static str> {
     }
 }
 
-/// 对象键安全校验（严防路径穿越）：必须 `avatars/` 前缀、无 `..`、非绝对/前导斜杠、无反斜杠/空字节。
+/// 可回读对象前缀白名单：`avatars/`（角色立绘）与 `covers/`（世界封面）。
+///
+/// 🔴 新增前缀的硬前提：键里必须含 128 位随机 id（角色 id / 世界 id 都是 `uuid::Uuid::new_v4`）。
+/// `GET /assets/objects/{*key}` **无鉴权**，靠不可猜的键充当能力 URL；可枚举的键（自增号、
+/// 用户可控字符串）一旦进白名单就等于把该目录公开可遍历。
+const READABLE_OBJECT_PREFIXES: [&str; 2] = ["avatars/", "covers/"];
+
+/// 对象键安全校验（严防路径穿越）：必须命中前缀白名单、无 `..`、非绝对/前导斜杠、无反斜杠/空字节。
 fn is_safe_object_key(key: &str) -> bool {
-    key.starts_with("avatars/")
+    READABLE_OBJECT_PREFIXES.iter().any(|p| key.starts_with(p))
         && !key.contains("..")
         && !key.starts_with('/')
         && !key.contains('\\')
@@ -217,10 +227,11 @@ fn source_identity(card: &serde_json::Value) -> (Option<String>, bool) {
     (fingerprint, pristine)
 }
 
-/// 机审裁决 → cloud_characters.moderation（服务端权威，不信客户端声明）。
-/// 裁决由 safety::moderate_and_queue 统一给出：注入命中即便 provider 直过也已折叠为 Pending
+/// 机审裁决 → 落库字符串（服务端权威，不信客户端声明）。
+/// 文本裁决由 safety::moderate_and_queue 统一给出：注入命中即便 provider 直过也已折叠为 Pending
 /// （保守阈值，§14 最高优先级威胁），此处只做字符串映射，不重复判定/落库。
-fn verdict_str(verdict: ModerationVerdict) -> &'static str {
+/// 位图裁决（check_image）同样经此映射落 avatar_moderation / worlds.cover_moderation。
+pub(crate) fn verdict_str(verdict: ModerationVerdict) -> &'static str {
     match verdict {
         ModerationVerdict::Approved => "approved",
         ModerationVerdict::Pending => "pending",
@@ -563,7 +574,7 @@ async fn upload_avatar(
     }
 
     // MIME 白名单（png/jpeg/webp）。
-    let ext = avatar_ext(req.mime.trim())
+    let ext = image_ext(req.mime.trim())
         .ok_or_else(|| ApiError::BadRequest("头像格式不支持（仅 image/png、image/jpeg、image/webp）".into()))?;
 
     // base64 解码 + 大小校验。
@@ -607,8 +618,12 @@ async fn upload_avatar(
     Ok(json_response(serde_json::to_string(&resp).unwrap()))
 }
 
-/// GET /assets/objects/{*key}：对象回读（头像等）。无鉴权（能力 URL：对象键含 128 位随机角色 id）。
-/// 严防路径穿越：`is_safe_object_key` 拒绝非 `avatars/` 前缀、`..`、绝对/前导斜杠、反斜杠；缺失 → 404。
+/// GET /assets/objects/{*key}：对象回读（头像 / 世界封面等）。无鉴权（能力 URL：对象键含 128 位随机 id）。
+/// 严防路径穿越：`is_safe_object_key` 拒绝白名单外前缀、`..`、绝对/前导斜杠、反斜杠；缺失 → 404。
+///
+/// 注意：本端点只保证「键猜不到」，**不做审核态判定**——未过审资产的防线在**下发面**
+/// （CharacterView / roster / worlds 列表与详情只在 approved 时才把 URL 写进响应），
+/// 键从未外泄即等价于不可达。新增可回读前缀时必须同步保证其下发面有同样的 approved 门。
 async fn get_object(State(state): State<AppState>, Path(key): Path<String>) -> Result<Response, ApiError> {
     if !is_safe_object_key(&key) {
         return Err(ApiError::NotFound);

@@ -6,9 +6,17 @@
 //! POST   /assets/worlds              发布世界超集：skeletonJson + rightsDeclaration → 引用完整性校验
 //!                                     + 超集校验 → 机审 safety::moderate_and_queue（唯一入队/记险方）
 //!                                     → world_templates(official=0, moderation=裁决)；Idempotency-Key 可选（同键幂等）
-//! GET    /assets/worlds/mine         我发布的世界模板列表（owner 隔离，含审核态）
-//! GET    /assets/worlds/{id}/status  审核态 + manifest（owner 隔离，非本人 404）
+//! GET    /assets/worlds/mine         我发布的世界模板列表（owner 隔离，含审核态 + 浏览/收藏计数）
+//! GET    /assets/worlds/{id}/status  审核态 + manifest + 浏览/收藏计数（owner 隔离，非本人 404）
 //! POST   /assets/worlds/{id}/withdraw 停止后续投放（withdrawn=1；天然幂等）
+//! POST   /assets/worlds/{id}/view    记一次浏览（窗口内按人去重，属主自刷不计；0029）
+//! POST   /assets/worlds/{id}/favorite   收藏（幂等）
+//! DELETE /assets/worlds/{id}/favorite   取消收藏（幂等）
+//! GET    /assets/worlds/{id}/favorite   我是否已收藏
+//!
+//! 计数的口径与防刷设计见 `migrations/0029_engagement_invitations.sql` 顶部长注释：
+//! append-only 去重登记表（无 UPDATE → 无热点行），COUNT(*) 派生计数，
+//! 同人同窗口重复浏览由主键冲突丢弃（防刷靠数据库唯一性，不靠应用层读-判-写）。
 //!
 //! 铁律（§9.6）：skeleton_json 服务端只做「结构 + 引用 + 超集」校验与存储，绝不信任客户端声明的
 //! 审核态/版本号；机审入队/记险统一由 safety::moderate_and_queue 完成，本模块不二次写 audit_queue/risk_events。
@@ -17,6 +25,8 @@
 //! 本模块是创作者上云自制世界（AuthUser, official=0）。两者最终都落 world_templates.skeleton_json，
 //! 并经同一 `moderate_and_queue` 门 + `assembly::validate_skeleton_refs` 引用完整性校验。
 
+use std::collections::HashMap;
+
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::response::Response;
@@ -24,6 +34,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sqlx::AnyPool;
 
 use crate::app::AppState;
 use crate::auth::AuthUser;
@@ -52,6 +63,25 @@ const STAR2_MIN_WORLD_CHARACTERS: usize = 2;
 /// 2★ 结构厚度门槛：地点 ≥ 3（地点图/秘境维度成型）。
 const STAR2_MIN_LOCATIONS: usize = 3;
 
+// ---------------- 浏览计数去重窗口（0029，客户端 §6「发布状态」浏览数/收藏数） ----------------
+
+/// 浏览去重窗口默认值：24 小时。同一用户对同一发布物在一个窗口内只计一次。
+const DEFAULT_VIEW_DEDUP_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// 浏览去重窗口（毫秒）。**运营可调**（VALIDATION.md §0.2「产品规则参数化」，禁止写死）：
+/// 环境变量 `MUSE_VIEW_DEDUP_WINDOW_MS`（正整数毫秒）覆盖，非法/缺省回落默认 24h。
+/// 范式同 `interventions::dream_quota_per_stage`——本仓库尚无配置表，env 是当前唯一的运营开关形态。
+fn view_dedup_window_ms() -> i64 {
+    parse_window_override(std::env::var("MUSE_VIEW_DEDUP_WINDOW_MS").ok().as_deref())
+}
+
+/// 窗口覆盖值解析（与 env 读取分离，便于无副作用地测试回落规则）。
+fn parse_window_override(raw: Option<&str>) -> i64 {
+    raw.and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_VIEW_DEDUP_WINDOW_MS)
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/assets/worlds", post(publish))
@@ -59,6 +89,13 @@ pub fn router() -> Router<AppState> {
         .route("/assets/worlds/{id}/status", get(status))
         .route("/assets/worlds/{id}/manifest", get(manifest))
         .route("/assets/worlds/{id}/withdraw", post(withdraw))
+        // 浏览：高频写，无 Idempotency-Key —— 去重是端点自带语义（窗口内按人唯一），
+        // 不靠客户端传键；重复调用天然无副作用。
+        .route("/assets/worlds/{id}/view", post(record_view))
+        .route(
+            "/assets/worlds/{id}/favorite",
+            post(add_favorite).delete(remove_favorite).get(my_favorite),
+        )
 }
 
 // ---------------- 请求 / 响应类型 ----------------
@@ -87,6 +124,11 @@ struct WorldTemplateView {
     /// 星级（1-5）：发布自动定档（封顶 2★），更高星级由运营 curation 授予。
     star_rating: i64,
     created_at: i64,
+    /// 浏览数（窗口内按人去重的人次，0029）。**仅属主可见**：本字段只出现在 owner 隔离的
+    /// `mine` / `status` 上，不进任何对外端点；是否公开展示由前端决定，服务端只对属主下发。
+    view_count: i64,
+    /// 收藏数（0029）。同上，仅属主可见。
+    favorite_count: i64,
 }
 
 // ---------------- 辅助 ----------------
@@ -342,6 +384,168 @@ fn build_manifest(skeleton: &Value, rights: &str, version: i64) -> Value {
     })
 }
 
+// ---------------- 浏览 / 收藏计数（0029） ----------------
+
+/// 可被浏览/收藏的发布物：存在 + 机审 approved + 未撤回。否则一律 404
+/// （未过审/已下架的发布物对外**不存在**，端点不得成为审核态探测器）。
+/// 返回属主 id（官方模板 owner_id 为 NULL → None）。
+async fn loadable_template_owner(db: &AnyPool, id: &str) -> Result<Option<String>, ApiError> {
+    let row: Option<(Option<String>, String, i64)> =
+        sqlx::query_as("SELECT owner_id, moderation, withdrawn FROM world_templates WHERE id = ?")
+            .bind(id)
+            .fetch_optional(db)
+            .await?;
+    let (owner_id, moderation, withdrawn) = row.ok_or(ApiError::NotFound)?;
+    if moderation != "approved" || withdrawn != 0 {
+        return Err(ApiError::NotFound);
+    }
+    Ok(owner_id)
+}
+
+/// 单个发布物的 (浏览数, 收藏数)。计数由登记行 COUNT(*) 派生——不维护可变计数列，故无热点行。
+async fn engagement_counts(db: &AnyPool, template_id: &str) -> Result<(i64, i64), ApiError> {
+    let views: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM world_template_views WHERE template_id = ?")
+            .bind(template_id)
+            .fetch_one(db)
+            .await?;
+    let favorites: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM world_template_favorites WHERE template_id = ?")
+            .bind(template_id)
+            .fetch_one(db)
+            .await?;
+    Ok((views, favorites))
+}
+
+/// 某属主全部发布物的计数（两条 GROUP BY 聚合，**与列表长度无关的常数次查询**，不做 N+1）。
+async fn engagement_counts_by_owner(
+    db: &AnyPool,
+    owner_id: &str,
+) -> Result<(HashMap<String, i64>, HashMap<String, i64>), ApiError> {
+    let views: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT v.template_id, COUNT(*) FROM world_template_views v \
+         JOIN world_templates t ON t.id = v.template_id \
+         WHERE t.owner_id = ? GROUP BY v.template_id",
+    )
+    .bind(owner_id)
+    .fetch_all(db)
+    .await?;
+    let favorites: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT f.template_id, COUNT(*) FROM world_template_favorites f \
+         JOIN world_templates t ON t.id = f.template_id \
+         WHERE t.owner_id = ? GROUP BY f.template_id",
+    )
+    .bind(owner_id)
+    .fetch_all(db)
+    .await?;
+    Ok((views.into_iter().collect(), favorites.into_iter().collect()))
+}
+
+/// POST /assets/worlds/{id}/view：记一次浏览。
+///
+/// 🔴 防刷（`docs/build/rules-anti-farming.md` 的同一精神）：
+/// - **同人同窗口只计一次**：主键 (template_id, viewer_id, window_bucket) 冲突即丢弃。
+///   判定在数据库唯一性上，不是「先查再插」——后者并发下可被击穿。
+/// - **属主自刷不计数**：创作者浏览自己的发布物返回 counted=false（不是错误，看自己的东西很正常）。
+/// - **必须登录**（AuthUser）：匿名浏览无法按人去重 → 无法防刷 → 干脆不计。
+///   前端只在登录态上报，未登录的浏览不进任何计数。
+async fn record_view(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let owner = loadable_template_owner(&state.db, &id).await?;
+    if owner.as_deref() == Some(user.user_id.as_str()) {
+        let body = serde_json::json!({ "templateId": id, "counted": false, "reason": "self_view" });
+        return Ok(json_response(body.to_string()));
+    }
+
+    let now = now_ms();
+    // 对齐分桶：应用层整除算好后落 BIGINT —— 不用 strftime/date_trunc 之类的方言时间函数。
+    let bucket = now / view_dedup_window_ms();
+    let res = sqlx::query(
+        "INSERT INTO world_template_views (template_id, viewer_id, window_bucket, first_viewed_at) \
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(&user.user_id)
+    .bind(bucket)
+    .bind(now)
+    .execute(&state.db)
+    .await;
+    // 唯一冲突 = 本窗口已计过 → 不重复计数（防刷红线由此条保证）。
+    // 刻意吞冲突而不用 `ON CONFLICT DO NOTHING`：后者双库写法有差异，冲突分支是可移植写法。
+    let counted = match res {
+        Ok(_) => true,
+        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => false,
+        Err(e) => return Err(e.into()),
+    };
+    let body = serde_json::json!({ "templateId": id, "counted": counted });
+    Ok(json_response(body.to_string()))
+}
+
+/// POST /assets/worlds/{id}/favorite：收藏（幂等——重复收藏仍 200，计数不涨）。
+/// 属主不得收藏自己的发布物（防自刷收藏数）→ 409。
+async fn add_favorite(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let owner = loadable_template_owner(&state.db, &id).await?;
+    if owner.as_deref() == Some(user.user_id.as_str()) {
+        return Err(ApiError::Conflict("不能收藏自己发布的世界".into()));
+    }
+    let res = sqlx::query(
+        "INSERT INTO world_template_favorites (template_id, user_id, created_at) VALUES (?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(&user.user_id)
+    .bind(now_ms())
+    .execute(&state.db)
+    .await;
+    match res {
+        Ok(_) => {}
+        // 已收藏 → 幂等成功（不报错、不重复计数）。
+        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {}
+        Err(e) => return Err(e.into()),
+    }
+    let body = serde_json::json!({ "templateId": id, "favorited": true });
+    Ok(json_response(body.to_string()))
+}
+
+/// DELETE /assets/worlds/{id}/favorite：取消收藏（天然幂等，删 0 行也成功）。
+/// 不校验发布物可见性——已下架的发布物也必须能取消收藏，否则用户会被永久钉住一条收藏。
+async fn remove_favorite(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    sqlx::query("DELETE FROM world_template_favorites WHERE template_id = ? AND user_id = ?")
+        .bind(&id)
+        .bind(&user.user_id)
+        .execute(&state.db)
+        .await?;
+    let body = serde_json::json!({ "templateId": id, "favorited": false });
+    Ok(json_response(body.to_string()))
+}
+
+/// GET /assets/worlds/{id}/favorite：我是否已收藏（只回自己的状态，不回总数——总数仅属主可见）。
+async fn my_favorite(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM world_template_favorites WHERE template_id = ? AND user_id = ?",
+    )
+    .bind(&id)
+    .bind(&user.user_id)
+    .fetch_one(&state.db)
+    .await?;
+    let body = serde_json::json!({ "templateId": id, "favorited": n > 0 });
+    Ok(json_response(body.to_string()))
+}
+
 // ---------------- handler ----------------
 
 /// POST /assets/worlds：发布世界超集（服务端权威版本号 + 引用/超集校验 + 机审 + 幂等）。
@@ -449,6 +653,9 @@ async fn publish(
         withdrawn: false,
         star_rating,
         created_at: now,
+        // 刚发布 → 计数恒为 0（字段仍下发，前端不必对新旧发布物做两套解析）。
+        view_count: 0,
+        favorite_count: 0,
     };
     let body = serde_json::to_string(&resp).map_err(ApiError::internal)?;
     guard.store_response(&state.db, &body).await?;
@@ -464,17 +671,25 @@ async fn list_mine(State(state): State<AppState>, user: AuthUser) -> Result<Resp
     .bind(&user.user_id)
     .fetch_all(&state.db)
     .await?;
+    // 浏览/收藏计数（0029）：两条 GROUP BY 聚合一次取全，避免逐行 N+1。
+    let (views, favorites) = engagement_counts_by_owner(&state.db, &user.user_id).await?;
     let items: Vec<WorldTemplateView> = rows
         .into_iter()
-        .map(|(id, title, version, rights, moderation, withdrawn, star_rating, created_at)| WorldTemplateView {
-            id,
-            title,
-            version,
-            rights_declaration: rights.unwrap_or_default(),
-            moderation,
-            withdrawn: withdrawn != 0,
-            star_rating,
-            created_at,
+        .map(|(id, title, version, rights, moderation, withdrawn, star_rating, created_at)| {
+            let view_count = views.get(&id).copied().unwrap_or(0);
+            let favorite_count = favorites.get(&id).copied().unwrap_or(0);
+            WorldTemplateView {
+                id,
+                title,
+                version,
+                rights_declaration: rights.unwrap_or_default(),
+                moderation,
+                withdrawn: withdrawn != 0,
+                star_rating,
+                created_at,
+                view_count,
+                favorite_count,
+            }
         })
         .collect();
     let body = serde_json::to_string(&items).map_err(ApiError::internal)?;
@@ -494,12 +709,16 @@ async fn status(State(state): State<AppState>, user: AuthUser, Path(id): Path<St
     let manifest = manifest_json
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
         .unwrap_or(Value::Null);
+    // 计数只在 owner 隔离的端点下发（本端点非本人已 404）。
+    let (view_count, favorite_count) = engagement_counts(&state.db, &id).await?;
     let resp = serde_json::json!({
         "id": id,
         "moderation": moderation,
         "version": version,
         "withdrawn": withdrawn != 0,
         "manifest": manifest,
+        "viewCount": view_count,
+        "favoriteCount": favorite_count,
     });
     Ok(json_response(serde_json::to_string(&resp).unwrap()))
 }
@@ -980,6 +1199,157 @@ mod tests {
         let (access2, _r, _u) = login_new_user(&app, "13910000098").await;
         let (st, _) = send(&app, "POST", &format!("/api/assets/worlds/{id}/withdraw"), Some(&access2), None, None).await;
         assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    // ---------------- 0029 浏览 / 收藏计数（客户端 §6「发布状态」区块） ----------------
+
+    /// 发一个世界，返回 (模板 id, 属主 access token)。
+    async fn publish_one(app: &axum::Router, phone: &str, key: &str) -> (String, String) {
+        let (access, _r, _u) = crate::auth::tests::login_new_user(app, phone).await;
+        let (st, v) =
+            send(app, "POST", "/api/assets/worlds", Some(&access), Some(key), Some(publish_body(valid_superset()))).await;
+        assert_eq!(st, StatusCode::OK, "{v:?}");
+        (v["id"].as_str().unwrap().to_string(), access)
+    }
+
+    /// 属主视角读自己的计数（mine 与 status 两个 owner 隔离端点应一致）。
+    async fn counts_of(app: &axum::Router, access: &str, id: &str) -> (i64, i64) {
+        let (_st, mine) = send(app, "GET", "/api/assets/worlds/mine", Some(access), None, None).await;
+        let row = mine
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == id)
+            .expect("mine 列表应含该发布物")
+            .clone();
+        let (_st, status) =
+            send(app, "GET", &format!("/api/assets/worlds/{id}/status"), Some(access), None, None).await;
+        assert_eq!(row["viewCount"], status["viewCount"], "mine 与 status 计数须一致");
+        assert_eq!(row["favoriteCount"], status["favoriteCount"]);
+        (row["viewCount"].as_i64().unwrap(), row["favoriteCount"].as_i64().unwrap())
+    }
+
+    #[tokio::test]
+    async fn view_counts_once_per_user_per_window() {
+        let (app, _s) = build_app().await;
+        let (id, owner) = publish_one(&app, "13910000030", "v-a").await;
+        let uri = format!("/api/assets/worlds/{id}/view");
+        assert_eq!(counts_of(&app, &owner, &id).await, (0, 0), "新发布计数为 0");
+
+        let (v1, _r, _u) = crate::auth::tests::login_new_user(&app, "13910000031").await;
+        let (st, a) = send(&app, "POST", &uri, Some(&v1), None, None).await;
+        assert_eq!(st, StatusCode::OK, "{a:?}");
+        assert_eq!(a["counted"], true);
+        assert_eq!(counts_of(&app, &owner, &id).await.0, 1);
+
+        // 🔴 防刷红线：同一用户在同一去重窗口内反复浏览 → 不重复计数。
+        for _ in 0..5 {
+            let (st, again) = send(&app, "POST", &uri, Some(&v1), None, None).await;
+            assert_eq!(st, StatusCode::OK);
+            assert_eq!(again["counted"], false, "窗口内重复浏览不得再次计数");
+        }
+        assert_eq!(counts_of(&app, &owner, &id).await.0, 1, "刷 5 次浏览数仍为 1");
+
+        // 不同用户各计一次。
+        let (v2, _r, _u) = crate::auth::tests::login_new_user(&app, "13910000032").await;
+        let (_st, b) = send(&app, "POST", &uri, Some(&v2), None, None).await;
+        assert_eq!(b["counted"], true);
+        assert_eq!(counts_of(&app, &owner, &id).await.0, 2);
+    }
+
+    #[tokio::test]
+    async fn owner_self_view_never_counts() {
+        // 防刷：创作者刷自己的发布物不计数（否则浏览数可被属主任意做高）。
+        let (app, _s) = build_app().await;
+        let (id, owner) = publish_one(&app, "13910000033", "v-b").await;
+        let (st, v) = send(&app, "POST", &format!("/api/assets/worlds/{id}/view"), Some(&owner), None, None).await;
+        assert_eq!(st, StatusCode::OK, "{v:?}");
+        assert_eq!(v["counted"], false);
+        assert_eq!(v["reason"], "self_view");
+        assert_eq!(counts_of(&app, &owner, &id).await.0, 0);
+    }
+
+    #[tokio::test]
+    async fn view_requires_auth_and_existing_approved_template() {
+        let (app, _s) = build_app().await;
+        let (id, _owner) = publish_one(&app, "13910000034", "v-c").await;
+        // 匿名浏览无法按人去重 → 不接受（未登录的浏览不进任何计数）。
+        let (st, _) = send(&app, "POST", &format!("/api/assets/worlds/{id}/view"), None, None, None).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        // 不存在的发布物 → 404。
+        let (v1, _r, _u) = crate::auth::tests::login_new_user(&app, "13910000035").await;
+        let (st, _) = send(&app, "POST", "/api/assets/worlds/wtpl_ghost/view", Some(&v1), None, None).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn favorite_and_unfavorite_are_idempotent() {
+        let (app, _s) = build_app().await;
+        let (id, owner) = publish_one(&app, "13910000036", "f-a").await;
+        let uri = format!("/api/assets/worlds/{id}/favorite");
+        let (fan, _r, _u) = crate::auth::tests::login_new_user(&app, "13910000037").await;
+
+        let (st, q) = send(&app, "GET", &uri, Some(&fan), None, None).await;
+        assert_eq!(st, StatusCode::OK, "{q:?}");
+        assert_eq!(q["favorited"], false, "初始未收藏");
+
+        // 收藏两次 → 幂等，计数只加一。
+        for _ in 0..2 {
+            let (st, v) = send(&app, "POST", &uri, Some(&fan), None, None).await;
+            assert_eq!(st, StatusCode::OK, "{v:?}");
+            assert_eq!(v["favorited"], true);
+        }
+        assert_eq!(counts_of(&app, &owner, &id).await.1, 1, "重复收藏不得重复计数");
+        let (_st, q) = send(&app, "GET", &uri, Some(&fan), None, None).await;
+        assert_eq!(q["favorited"], true);
+
+        // 取消两次 → 幂等，计数归零。
+        for _ in 0..2 {
+            let (st, v) = send(&app, "DELETE", &uri, Some(&fan), None, None).await;
+            assert_eq!(st, StatusCode::OK, "{v:?}");
+            assert_eq!(v["favorited"], false);
+        }
+        assert_eq!(counts_of(&app, &owner, &id).await.1, 0);
+        let (_st, q) = send(&app, "GET", &uri, Some(&fan), None, None).await;
+        assert_eq!(q["favorited"], false);
+    }
+
+    #[tokio::test]
+    async fn owner_cannot_favorite_own_publication() {
+        let (app, _s) = build_app().await;
+        let (id, owner) = publish_one(&app, "13910000038", "f-b").await;
+        let (st, _) =
+            send(&app, "POST", &format!("/api/assets/worlds/{id}/favorite"), Some(&owner), None, None).await;
+        assert_eq!(st, StatusCode::CONFLICT, "不得自刷收藏数");
+        assert_eq!(counts_of(&app, &owner, &id).await.1, 0);
+    }
+
+    #[tokio::test]
+    async fn counts_are_owner_scoped_only() {
+        // 计数只在 owner 隔离端点下发：他人既进不了 mine，也读不到 status（404）。
+        let (app, _s) = build_app().await;
+        let (id, owner) = publish_one(&app, "13910000039", "c-a").await;
+        let (other, _r, _u) = crate::auth::tests::login_new_user(&app, "13910000040").await;
+        send(&app, "POST", &format!("/api/assets/worlds/{id}/view"), Some(&other), None, None).await;
+        send(&app, "POST", &format!("/api/assets/worlds/{id}/favorite"), Some(&other), None, None).await;
+
+        assert_eq!(counts_of(&app, &owner, &id).await, (1, 1), "属主看得见计数");
+
+        let (st, _) =
+            send(&app, "GET", &format!("/api/assets/worlds/{id}/status"), Some(&other), None, None).await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "非属主读不到计数");
+        let (_st, mine) = send(&app, "GET", "/api/assets/worlds/mine", Some(&other), None, None).await;
+        assert_eq!(mine.as_array().unwrap().len(), 0, "他人的发布物不进我的 mine");
+    }
+
+    #[test]
+    fn view_window_override_falls_back_on_bad_values() {
+        use super::{parse_window_override, DEFAULT_VIEW_DEDUP_WINDOW_MS};
+        assert_eq!(parse_window_override(None), DEFAULT_VIEW_DEDUP_WINDOW_MS);
+        assert_eq!(parse_window_override(Some("abc")), DEFAULT_VIEW_DEDUP_WINDOW_MS);
+        assert_eq!(parse_window_override(Some("0")), DEFAULT_VIEW_DEDUP_WINDOW_MS, "非正数须回落");
+        assert_eq!(parse_window_override(Some("-1")), DEFAULT_VIEW_DEDUP_WINDOW_MS);
+        assert_eq!(parse_window_override(Some(" 60000 ")), 60_000, "合法值生效（运营可调）");
     }
 
     /// 跨 crate round-trip：本端点入库的超集应能被装配层 `assembly::Skeleton`（P3）无损解析且字段非空，

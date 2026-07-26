@@ -435,7 +435,14 @@ const PlatformHall: React.FC = () => {
                 </div>
                 <div>
                   <dt><ThunderboltOutlined /> 世界节奏</dt>
-                  <dd>每日 {featuredWorld.tickPerDay} 拍</dd>
+                  <dd>
+                    每日 {featuredWorld.tickPerDay} 拍
+                    {/* 下一拍是服务端估算值，且只在可推算时下发（running + interval 模式）。
+                        用「约」字如实表达精度，不装作是精确时刻。 */}
+                    {featuredWorld.nextTickEstimatedAt && (
+                      <small>下一拍约在 {formatEventTime(featuredWorld.nextTickEstimatedAt)}</small>
+                    )}
+                  </dd>
                 </div>
               </dl>
               {featuredRecap && <p>{featuredRecap}</p>}
@@ -576,11 +583,21 @@ const PlatformHall: React.FC = () => {
                 </div>
               </div>
             ) : activeMembership ? (
-              <div className="bonded-character bonded-character--compact">
+              // 头像仅在 server 下发时渲染（未过审头像 server 侧不下发，前端无需再判）；
+              // 无头像走 --compact 布局，不留空占位框。
+              <div className={`bonded-character${activeMembership.avatarUrl ? '' : ' bonded-character--compact'}`}>
+                {activeMembership.avatarUrl && (
+                  <img src={activeMembership.avatarUrl} alt={`${activeMembership.characterName}的立绘`} />
+                )}
                 <div>
                   <strong>{activeMembership.characterName}</strong>
                   <span>{activeMembership.worldTitle || activeMembership.worldId}</span>
-                  <small>加入于 {formatDay(activeMembership.joinedAt)}</small>
+                  {/* 有真实互动时刻就显示它，否则回落到加入时间——两者语义不同，不混用同一句文案。 */}
+                  <small>
+                    {activeMembership.lastActiveAt
+                      ? `最近互动 ${relativeTime(activeMembership.lastActiveAt)}`
+                      : `加入于 ${formatDay(activeMembership.joinedAt)}`}
+                  </small>
                   <Button onClick={() => navigate('/platform/bonds')}>查看羁绊</Button>
                 </div>
               </div>

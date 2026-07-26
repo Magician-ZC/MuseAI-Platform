@@ -29,8 +29,16 @@ export interface WorldSummary {
   hotScore?: number;
   /** 星级（1-5）：世界准入门槛展示；星级≥3 的世界要求投放角色历练达标（老服务端缺席则不展示徽标）。 */
   starRating?: number;
-  /** 世界封面位图 URL：当前服务端未下发（前向兼容字段）。缺席时大厅按 world.id 哈希确定性挑选一张内置真实位图。 */
+  /** 世界封面位图 URL。**仅过审封面才下发**，未过审/无封面时字段缺席；此时大厅按 world.id 哈希确定性挑选一张内置真实位图。 */
   coverUrl?: string;
+  /**
+   * 下一拍的**估算**时刻（毫秒）。名字里的 Estimated 是认真的：
+   * 调度器按 `MUSE_TICK_POLL_MS` 轮询、入队后还要跑完一回合才出内容，且世界可能在到点前终局。
+   * 误差方向恒为「不早于」——按它回访只会稍早到，不会错过内容。
+   * 仅 status='running' 且 interval 模式下发；open/paused/ended 与 event 模式（DES 背靠背，
+   * 无墙钟表达式）一律缺席，此时不要自行推算。
+   */
+  nextTickEstimatedAt?: number;
 }
 
 /** 大厅排序：new=最新（cursor 分页）| hot=热度快照榜（不分页）。 */
@@ -251,6 +259,14 @@ export interface Membership {
   characterName: string;
   membershipStatus: string; // active | left
   joinedAt: number;
+  /** 角色立绘。**仅过审头像才下发**，未过审/无头像时字段整体缺席（不是空串）。 */
+  avatarUrl?: string;
+  /**
+   * 最近互动时刻。口径：**本人**对「该世界 × 该角色」发起、且已落地
+   * （status ∈ accepted|applied）的最近一次干预——是"你与这张卡的互动"，
+   * 不是"世界在动"。从未落地互动过则字段缺席（不是 0、也不回退 joinedAt）。
+   */
+  lastActiveAt?: number;
 }
 
 /** 跨世界背包物品（GET /me/backpack；镜像 backpack/mod.rs::my_backpack）。 */

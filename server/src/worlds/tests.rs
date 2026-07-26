@@ -1682,6 +1682,420 @@ mod discovery {
     }
 }
 
+// ---------- 世界封面 coverUrl（迁移 0027）+ 下一拍 nextTickEstimatedAt ----------
+
+mod cover_and_next_tick {
+    //! 封面：上传 → 图审 → 下发全链路；🔴 未过审绝不下发；无封面不含该键（不是空串）；
+    //! 对象回读路径穿越被拒；权限矩阵（官方房运营 / 创作者房房主）。
+    //! 下一拍：仅 running 的 interval 世界可确定性推算，其余一律不下发。
+
+    use super::*;
+    use crate::worlds::{next_tick_estimated_at, tick_interval_ms, visible_cover_url};
+
+    /// 带角色的 access token（默认 `token()` 恒为 "user"，官方房封面需运营角色）。
+    fn token_with_role(state: &AppState, user_id: &str, role: &str) -> String {
+        crate::auth::issue_access(&state.config.jwt_secret, user_id, role, 3600).unwrap()
+    }
+
+    /// 原始字节 GET（对象回读返回二进制，非 JSON，故不能用 `get_json`）。
+    async fn get_raw(app: &axum::Router, uri: &str) -> (StatusCode, Vec<u8>) {
+        let req = Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let stat = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes().to_vec();
+        (stat, bytes)
+    }
+
+    /// 封面上传 body（base64 JSON，形态同角色立绘）。
+    fn cover_body(bytes: &[u8], mime: &str) -> Value {
+        use base64::Engine as _;
+        json!({
+            "imageBase64": base64::engine::general_purpose::STANDARD.encode(bytes),
+            "mime": mime,
+        })
+    }
+
+    /// 创作者世界（public + host_user_id），封面归房主。
+    async fn seed_host_world(state: &AppState, title: &str, host: &str) -> String {
+        let mut p = CreateWorldParams::official("tpl_cover", 1, title);
+        p.visibility = "public".into();
+        p.host_user_id = Some(host.into());
+        create_world(&state.db, p).await.unwrap()
+    }
+
+    /// 直接改库模拟机审给出非 approved 裁决（DevModeration::check_image 恒直过，
+    /// 无法从上传路径造出 pending/rejected；范式同 assets::tests 对 avatar_moderation 的做法）。
+    async fn force_cover_moderation(state: &AppState, world_id: &str, verdict: &str) {
+        sqlx::query("UPDATE worlds SET cover_moderation = ? WHERE id = ?")
+            .bind(verdict)
+            .bind(world_id)
+            .execute(&state.db)
+            .await
+            .unwrap();
+    }
+
+    /// 从列表里挑出指定标题的世界项。
+    fn find_world<'a>(body: &'a Value, title: &str) -> &'a Value {
+        body["worlds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["title"].as_str() == Some(title))
+            .unwrap_or_else(|| panic!("列表里没有「{title}」: {body}"))
+    }
+
+    // ===== 封面：全链路 =====
+
+    /// 上传 → 过审 → 上传回执/详情/列表(new+hot) 都带 coverUrl → 对象回读拿到原始字节。
+    #[tokio::test]
+    async fn cover_upload_then_projected_everywhere_and_readable() {
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_user(&state, "coverHost").await;
+        let th = token(&state, "coverHost");
+        let wid = seed_host_world(&state, "有封面的世界", "coverHost").await;
+
+        let raw: &[u8] = b"\x89PNG\r\n\x1a\n-fake-cover-bytes-\x00\x01\x02\xff";
+        let (st, up) =
+            post_json(&app, &format!("/api/worlds/{wid}/cover"), &th, None, cover_body(raw, "image/png")).await;
+        assert_eq!(st, StatusCode::OK, "{up}");
+        assert_eq!(up["moderation"], "approved", "dev 图审直过");
+        let url = up["coverUrl"].as_str().expect("过审应回传 coverUrl");
+        assert_eq!(url, format!("/api/assets/objects/covers/{wid}.png"), "对象键以世界 id 命名");
+
+        // 详情投影。
+        let (st, detail) = get_json(&app, &format!("/api/worlds/{wid}"), &th).await;
+        assert_eq!(st, StatusCode::OK, "{detail}");
+        assert_eq!(detail["coverUrl"].as_str(), Some(url), "详情应下发 coverUrl");
+
+        // 列表（new + hot）投影。
+        let (_st, list) = get_json(&app, "/api/worlds", &th).await;
+        assert_eq!(find_world(&list, "有封面的世界")["coverUrl"].as_str(), Some(url), "sort=new 应下发 coverUrl");
+        let (_st, hot) = get_json(&app, "/api/worlds?sort=hot", &th).await;
+        assert_eq!(find_world(&hot, "有封面的世界")["coverUrl"].as_str(), Some(url), "sort=hot 应下发 coverUrl");
+
+        // 对象回读：原样字节 + 正确 Content-Type 路径。
+        let (st, bytes) = get_raw(&app, url).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(bytes, raw, "回读应得到上传的原始字节");
+    }
+
+    /// 🔴 红线：未过审（pending / rejected）封面在**任何读取面**都不下发。
+    #[tokio::test]
+    async fn unapproved_cover_is_never_projected() {
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_user(&state, "modHost").await;
+        let th = token(&state, "modHost");
+        let wid = seed_host_world(&state, "待审封面世界", "modHost").await;
+
+        let (st, _up) = post_json(
+            &app,
+            &format!("/api/worlds/{wid}/cover"),
+            &th,
+            None,
+            cover_body(b"\x89PNG-pending", "image/png"),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+
+        for verdict in ["pending", "rejected"] {
+            force_cover_moderation(&state, &wid, verdict).await;
+
+            let (_st, detail) = get_json(&app, &format!("/api/worlds/{wid}"), &th).await;
+            assert!(
+                detail.get("coverUrl").is_none(),
+                "🔴 {verdict} 封面不得出现在详情: {detail}"
+            );
+
+            let (_st, list) = get_json(&app, "/api/worlds", &th).await;
+            assert!(
+                find_world(&list, "待审封面世界").get("coverUrl").is_none(),
+                "🔴 {verdict} 封面不得出现在 sort=new 列表: {list}"
+            );
+
+            let (_st, hot) = get_json(&app, "/api/worlds?sort=hot", &th).await;
+            assert!(
+                find_world(&hot, "待审封面世界").get("coverUrl").is_none(),
+                "🔴 {verdict} 封面不得出现在 sort=hot 列表: {hot}"
+            );
+        }
+
+        // 改判回 approved 后无需重传即恢复下发（cover_url 无论裁决都已落库）。
+        force_cover_moderation(&state, &wid, "approved").await;
+        let (_st, detail) = get_json(&app, &format!("/api/worlds/{wid}"), &th).await;
+        assert!(detail["coverUrl"].as_str().is_some(), "改判 approved 后应恢复下发: {detail}");
+    }
+
+    /// 无封面世界：coverUrl **键缺席**（不是空串、不是 null），前端据此走确定性内置位图兜底。
+    #[tokio::test]
+    async fn world_without_cover_omits_cover_url_key() {
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_user(&state, "plainUser").await;
+        let tk = token(&state, "plainUser");
+        let wid = create_world(&state.db, CreateWorldParams::official("tpl_x", 1, "无封面世界")).await.unwrap();
+
+        let (_st, detail) = get_json(&app, &format!("/api/worlds/{wid}"), &tk).await;
+        assert!(detail.get("coverUrl").is_none(), "无封面详情不得含 coverUrl 键: {detail}");
+
+        let (_st, list) = get_json(&app, "/api/worlds", &tk).await;
+        let item = find_world(&list, "无封面世界");
+        assert!(item.get("coverUrl").is_none(), "无封面列表项不得含 coverUrl 键: {item}");
+        // 显式排除"下发空串"这条错误实现。
+        assert_ne!(item.get("coverUrl").and_then(|v| v.as_str()), Some(""), "绝不下发空串");
+    }
+
+    /// 封面读取面过滤（纯函数）：只有 approved 且非空才给 URL。
+    #[test]
+    fn visible_cover_url_gates_on_approved() {
+        let url = || Some("/api/assets/objects/covers/wld_x.png".to_string());
+        assert_eq!(visible_cover_url(url(), Some("approved")), url(), "approved 才下发");
+        assert_eq!(visible_cover_url(url(), Some("pending")), None, "🔴 pending 不下发");
+        assert_eq!(visible_cover_url(url(), Some("rejected")), None, "🔴 rejected 不下发");
+        assert_eq!(visible_cover_url(url(), None), None, "无裁决（从未上传）不下发");
+        assert_eq!(visible_cover_url(None, Some("approved")), None, "无 URL 不下发");
+        assert_eq!(visible_cover_url(Some("   ".into()), Some("approved")), None, "空白 URL 归零，不下发空串");
+    }
+
+    // ===== 封面：对象回读安全 =====
+
+    /// 路径穿越硬防护：含 `..`、白名单外前缀、绝对路径一律 404。
+    #[tokio::test]
+    async fn cover_object_readback_rejects_path_traversal() {
+        let state = test_state().await;
+        let app = build_router(state.clone());
+
+        for bad in [
+            "/api/assets/objects/covers/../avatars/x.png",
+            "/api/assets/objects/covers/../../etc/passwd",
+            "/api/assets/objects/notcovers/x.png",
+            "/api/assets/objects/x.png",
+        ] {
+            let (st, _) = get_raw(&app, bad).await;
+            assert_eq!(st, StatusCode::NOT_FOUND, "路径穿越/白名单外键必须 404: {bad}");
+        }
+        // 合法前缀但对象不存在 → 同样 404（不泄露存在性差异）。
+        let (st, _) = get_raw(&app, "/api/assets/objects/covers/wld_nope.png").await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    // ===== 封面：权限矩阵 =====
+
+    /// 创作者世界：仅房主可设封面，他人 403；官方世界：仅运营角色可设，普通用户 403。
+    #[tokio::test]
+    async fn cover_upload_permission_matrix() {
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_user(&state, "owner").await;
+        seed_user(&state, "stranger").await;
+        seed_user(&state, "ops").await;
+        let t_owner = token(&state, "owner");
+        let t_stranger = token(&state, "stranger");
+        let t_ops = token_with_role(&state, "ops", "operator");
+        let t_reviewer = token_with_role(&state, "reviewer1", "reviewer");
+
+        let creator_world = seed_host_world(&state, "创作者世界", "owner").await;
+        let official_world =
+            create_world(&state.db, CreateWorldParams::official("tpl_o", 1, "官方世界")).await.unwrap();
+        let body = || cover_body(b"\x89PNG-perm", "image/png");
+
+        // 创作者世界：房主 OK。
+        let (st, _) = post_json(&app, &format!("/api/worlds/{creator_world}/cover"), &t_owner, None, body()).await;
+        assert_eq!(st, StatusCode::OK, "房主可为自己的世界设封面");
+        // 创作者世界：他人 403。
+        let (st, _) = post_json(&app, &format!("/api/worlds/{creator_world}/cover"), &t_stranger, None, body()).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "非房主不得设创作者世界封面");
+        // 创作者世界：运营也不得替创作者换图（处置手段是审核态，不是换图）。
+        let (st, _) = post_json(&app, &format!("/api/worlds/{creator_world}/cover"), &t_ops, None, body()).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "运营不得覆盖创作者封面");
+
+        // 官方世界：运营 OK。
+        let (st, v) = post_json(&app, &format!("/api/worlds/{official_world}/cover"), &t_ops, None, body()).await;
+        assert_eq!(st, StatusCode::OK, "运营可为官方世界设封面: {v}");
+        // 官方世界：普通用户 403。
+        let (st, _) = post_json(&app, &format!("/api/worlds/{official_world}/cover"), &t_owner, None, body()).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "普通用户不得设官方世界封面");
+        // 官方世界：reviewer（审核角色，非投放角色）403。
+        let (st, _) = post_json(&app, &format!("/api/worlds/{official_world}/cover"), &t_reviewer, None, body()).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "reviewer 不承担内容投放职责");
+
+        // 不存在的世界 → 404。
+        let (st, _) = post_json(&app, "/api/worlds/wld_nope/cover", &t_ops, None, body()).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+
+        // 未鉴权 → 401。
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/worlds/{creator_world}/cover"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&body()).unwrap()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// 入参校验：MIME 白名单外、空数据、超 1MB 上限一律 400。
+    #[tokio::test]
+    async fn cover_upload_rejects_bad_mime_empty_and_oversize() {
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_user(&state, "valHost").await;
+        let th = token(&state, "valHost");
+        let wid = seed_host_world(&state, "校验世界", "valHost").await;
+        let uri = format!("/api/worlds/{wid}/cover");
+
+        let (st, _) = post_json(&app, &uri, &th, None, cover_body(b"GIF89a", "image/gif")).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "gif 不在白名单");
+
+        let (st, _) = post_json(&app, &uri, &th, None, cover_body(b"", "image/png")).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "空数据应拒");
+
+        let (st, _) =
+            post_json(&app, &uri, &th, None, json!({ "imageBase64": "!!not-base64!!", "mime": "image/png" })).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "非法 base64 应拒");
+
+        let too_big = vec![0u8; 1024 * 1024 + 1];
+        let (st, _) = post_json(&app, &uri, &th, None, cover_body(&too_big, "image/png")).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "超 1MB 上限应拒");
+
+        // 全程失败 → 世界仍无封面（不留半截状态）。
+        let (_st, detail) = get_json(&app, &format!("/api/worlds/{wid}"), &th).await;
+        assert!(detail.get("coverUrl").is_none(), "校验失败不得落封面: {detail}");
+    }
+
+    // ===== 下一拍 nextTickEstimatedAt =====
+
+    /// 排拍间隔公式必须与 `runtime::schedule_due_ticks` 的
+    /// `86_400_000 / tick_per_day.max(1)` 逐字一致——改调度器时这条会红。
+    #[test]
+    fn tick_interval_ms_mirrors_scheduler() {
+        assert_eq!(tick_interval_ms(3), 86_400_000 / 3, "默认 3 拍/天 = 8 小时");
+        assert_eq!(tick_interval_ms(1), 86_400_000);
+        assert_eq!(tick_interval_ms(24), 3_600_000);
+        // max(1) 防除零（脏数据 tick_per_day <= 0）。
+        assert_eq!(tick_interval_ms(0), 86_400_000, "0 拍/天按 1 兜底，绝不 panic");
+        assert_eq!(tick_interval_ms(-5), 86_400_000, "负值同样按 1 兜底");
+    }
+
+    /// running 的 interval 世界：下一拍 = 末拍入队时刻 + 间隔；从未有拍 → "现在"。
+    #[test]
+    fn next_tick_estimated_at_is_last_tick_plus_interval() {
+        let interval = 8 * 3600 * 1000;
+        let now = 1_700_000_000_000_i64;
+        assert_eq!(
+            next_tick_estimated_at("running", "interval", interval, Some(now - 1000), now),
+            Some(now - 1000 + interval),
+            "锚在末拍 created_at，不是 now——单拍跑慢/失败不会让排期整体漂移"
+        );
+        assert_eq!(
+            next_tick_estimated_at("running", "interval", interval, None, now),
+            Some(now),
+            "无历史拍 → 调度器下一轮即排 → 下一拍就是现在"
+        );
+        // 已经过点（末拍很久以前）→ 给出过去时刻，表示"已到期待排"，不谎报未来。
+        let overdue = next_tick_estimated_at("running", "interval", interval, Some(now - 10 * interval), now);
+        assert_eq!(overdue, Some(now - 9 * interval));
+        assert!(overdue.unwrap() < now, "过期世界诚实给过去时刻，不伪造未来时间");
+    }
+
+    /// 🔴 算不准就不给：非 running 状态、event 时间线一律 None。
+    #[test]
+    fn next_tick_estimated_at_none_when_not_computable() {
+        let interval = 8 * 3600 * 1000;
+        let now = 1_700_000_000_000_i64;
+        for status in ["open", "paused", "ended"] {
+            assert_eq!(
+                next_tick_estimated_at(status, "interval", interval, Some(now), now),
+                None,
+                "{status} 世界不进调度器 WHERE status='running'，没有下一拍"
+            );
+        }
+        assert_eq!(
+            next_tick_estimated_at("running", "event", interval, Some(now), now),
+            None,
+            "event 房（背靠背 DES / 手动端点驱动）无墙钟表达式，宁可不给"
+        );
+    }
+
+    /// 集成：running 的 interval 世界，详情与列表都带 nextTickEstimatedAt = 末拍 created_at + 间隔。
+    #[tokio::test]
+    async fn next_tick_projected_for_running_interval_world() {
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_user(&state, "tickUser").await;
+        let tk = token(&state, "tickUser");
+        let wid = create_world(&state.db, CreateWorldParams::official("tpl_t", 1, "跑动世界")).await.unwrap();
+        sqlx::query("UPDATE worlds SET status='running' WHERE id=?")
+            .bind(&wid)
+            .execute(&state.db)
+            .await
+            .unwrap();
+
+        // 末拍入队时刻钉死，便于精确断言。
+        let last_tick_at = now_ms() - 60_000;
+        sqlx::query(
+            "INSERT INTO world_ticks (id, world_id, tick_no, base_revision, status, created_at) \
+             VALUES (?, ?, 0, 0, 'done', ?)",
+        )
+        .bind(new_id("tick"))
+        .bind(&wid)
+        .bind(last_tick_at)
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+        let expected = last_tick_at + tick_interval_ms(3); // official() 默认 tick_per_day=3
+
+        let (st, detail) = get_json(&app, &format!("/api/worlds/{wid}"), &tk).await;
+        assert_eq!(st, StatusCode::OK, "{detail}");
+        assert_eq!(detail["nextTickEstimatedAt"].as_i64(), Some(expected), "详情下一拍 = 末拍 + 间隔");
+
+        let (_st, list) = get_json(&app, "/api/worlds", &tk).await;
+        assert_eq!(
+            find_world(&list, "跑动世界")["nextTickEstimatedAt"].as_i64(),
+            Some(expected),
+            "列表下一拍与详情同源"
+        );
+        let (_st, hot) = get_json(&app, "/api/worlds?sort=hot", &tk).await;
+        assert_eq!(find_world(&hot, "跑动世界")["nextTickEstimatedAt"].as_i64(), Some(expected));
+    }
+
+    /// 集成 🔴：open 世界（大厅里最常见）与 event 世界一律**不含** nextTickEstimatedAt 键——
+    /// 宁可不给，也不给一个会漂移的假时间（用户会按它安排回访）。
+    #[tokio::test]
+    async fn next_tick_absent_for_open_and_event_worlds() {
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_user(&state, "absentUser").await;
+        let tk = token(&state, "absentUser");
+
+        // open（建房默认状态，未开跑）。
+        create_world(&state.db, CreateWorldParams::official("tpl_a", 1, "未开跑世界")).await.unwrap();
+
+        // running 但 event 时间线（放置房背靠背，无墙钟）。
+        let mut p = CreateWorldParams::official("tpl_b", 1, "放置房世界");
+        p.timeline_mode = "event".into();
+        let ev = create_world(&state.db, p).await.unwrap();
+        sqlx::query("UPDATE worlds SET status='running' WHERE id=?")
+            .bind(&ev)
+            .execute(&state.db)
+            .await
+            .unwrap();
+
+        let (_st, list) = get_json(&app, "/api/worlds", &tk).await;
+        for title in ["未开跑世界", "放置房世界"] {
+            let item = find_world(&list, title);
+            assert!(item.get("nextTickEstimatedAt").is_none(), "🔴 {title} 不得含 nextTickEstimatedAt: {item}");
+        }
+        let (_st, detail) = get_json(&app, &format!("/api/worlds/{ev}"), &tk).await;
+        assert!(
+            detail.get("nextTickEstimatedAt").is_none(),
+            "🔴 event 房详情不得含 nextTickEstimatedAt: {detail}"
+        );
+    }
+}
+
 // ---------- P2 房主建房 POST /worlds + 开房费 charge（feature=billing/arena 才装配该端点） ----------
 
 #[cfg(any(feature = "billing", feature = "arena"))]

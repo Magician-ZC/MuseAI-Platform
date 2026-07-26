@@ -184,14 +184,74 @@ async fn my_backpack(State(state): State<AppState>, user: AuthUser) -> Result<Js
 
 // ---------- GET /me/memberships ----------
 
+/// 「最近互动时间」口径（`lastActiveAt`）——**本人对该角色在该世界发起、且被受理的最近一次干预时刻**：
+///
+/// - 数据源：`interventions`（kind = whisper 托梦 / item 投物），取 `MAX(created_at)`；
+/// - 主体限定：`user_id = 本人`——这是「**你**与这张卡的互动」，不是「角色在世界里有动静」。
+///   世界自身推进（tick 产出的 world_events）不算互动：那是世界在动，不是你在陪它；
+/// - 状态限定：`status IN ('accepted','applied')`，与托梦配额计数口径逐字一致
+///   （见 `interventions::create` 上方注释）——`applied` 是「已被引擎消费」而非「额度归还」，
+///   仍是一次落地的互动；`rejected`（超配额 / 机审拒）没有落地，不算互动；
+/// - 无记录 → **不下发该字段**（不下发 0，也不回退 joinedAt——joinedAt 已是独立字段，前端自行兜底）。
+///
+/// 为什么不用 `world_events.actors_json`：那是「角色戏份」而非「你的互动」，且 actors_json 是 JSON
+/// 文本数组，按角色筛选只能 `LIKE '%cid%'`——不可索引、且 id 互为前缀时会误命中，列表接口承受不起。
+///
+/// 性能（列表接口铁律）：一次 `GROUP BY` + `IN(本人在场世界 id)` 取回全部成员行的时间戳，
+/// **绝不逐成员发 SQL**——大厅每次进入都拉这个接口，N+1 会随持卡数放大 QPS。
+/// `world_id` 前导命中 `idx_interventions_char(world_id, character_id, status)`（迁移 0022），无需新索引。
+async fn last_interaction_by_pair(
+    db: &AnyPool,
+    user_id: &str,
+    world_ids: &[String],
+) -> Result<std::collections::HashMap<(String, String), i64>, ApiError> {
+    let mut out = std::collections::HashMap::new();
+    if world_ids.is_empty() {
+        return Ok(out);
+    }
+    let placeholders = vec!["?"; world_ids.len()].join(",");
+    // CAST(MAX(...) AS BIGINT)：双库可移植子集，PG/SQLite 通用，解码类型确定（同 worlds_ops 聚合先例）。
+    let sql = format!(
+        "SELECT world_id, character_id, CAST(MAX(created_at) AS BIGINT) AS last_at \
+         FROM interventions \
+         WHERE user_id = ? AND status IN ('accepted', 'applied') AND world_id IN ({placeholders}) \
+         GROUP BY world_id, character_id"
+    );
+    let mut query = sqlx::query(&sql).bind(user_id);
+    for wid in world_ids {
+        query = query.bind(wid.as_str());
+    }
+    for r in query.fetch_all(db).await? {
+        let wid: String = r.try_get("world_id")?;
+        let cid: String = r.try_get("character_id")?;
+        out.insert((wid, cid), r.try_get::<i64, _>("last_at")?);
+    }
+    Ok(out)
+}
+
 /// 权威「我的角色 × 世界」清单：直接读 world_members（WHERE user_id=本人 AND status='active'），
 /// 补齐日报反推的盲区（刚投放尚无日报的角色/世界也在场）。无 owner 泄漏——只出本人成员行。
 /// 角色名解析复用 worlds::world_detail 的 `card_json → identity.name`（缺失兜底为 cloud_character_id）。
+///
+/// 展示字段（客户端大厅辅助栏「你的羁绊角色」）：
+/// - `avatarUrl`：仅 `avatar_moderation == 'approved'` 才下发（红线，见下方注释）；
+/// - `lastActiveAt`：口径见 `last_interaction_by_pair`；无记录不下发该字段。
+///
+/// TODO（羁绊强度 `bondStrength`，需产品先拍板口径）：本端点**有意不下发**羁绊强度。
+/// 总规格 §14 只定了「仅正向羁绊线达阈值后双向自愿解锁真人身份」，**没有定义强度公式**；
+/// 引擎侧的原始关系维度（trust/affinity/fear/debt，`relation_dynamics`）已有权威下发面
+/// `GET /worlds/{id}/state-summary`（events::world_state_summary），且在那里按 §9.4 信息边界过滤
+/// （只放行 `from == viewer 本世界角色` 或 `knownTo 含之` 的有向边）。此处不重复第二套过滤，
+/// 也不自造加权合成指标——合成值一旦下发就会被前端拿去排序/展示，成为无人认可的既成事实。
+/// 另有硬约束：关系存在 `worlds.narrative_state_json` 整块 blob 内，列表接口逐世界拉回完整叙事状态
+/// 反序列化，载荷与 CPU 是 O(世界数 × 状态大小) 且随 tick 增长——不满足列表接口的有界取数要求。
+/// 待产品定义强度口径后，宜在**单世界**面（state-summary）上做，而非跨世界列表。
 async fn my_memberships(State(state): State<AppState>, user: AuthUser) -> Result<Json<Value>, ApiError> {
     let rows = sqlx::query(
         "SELECT wm.cloud_character_id AS cid, wm.status AS mstatus, wm.joined_at AS joined_at, \
          w.id AS world_id, w.title AS title, w.room_type AS room_type, w.status AS wstatus, \
-         w.state_revision AS state_revision, cc.card_json AS card \
+         w.state_revision AS state_revision, cc.card_json AS card, \
+         cc.avatar_url AS avatar_url, cc.avatar_moderation AS avatar_moderation \
          FROM world_members wm \
          JOIN worlds w ON w.id = wm.world_id \
          JOIN cloud_characters cc ON cc.id = wm.cloud_character_id \
@@ -201,6 +261,16 @@ async fn my_memberships(State(state): State<AppState>, user: AuthUser) -> Result
     .bind(&user.user_id)
     .fetch_all(&state.db)
     .await?;
+
+    // 第 2 条（也是最后一条）查询：整页世界 id 去重后一次性取回最近互动时间。总查询数恒为 2（空清单为 1）。
+    let mut world_ids: Vec<String> = Vec::new();
+    for r in &rows {
+        let wid: String = r.try_get("world_id")?;
+        if !world_ids.contains(&wid) {
+            world_ids.push(wid);
+        }
+    }
+    let last_map = last_interaction_by_pair(&state.db, &user.user_id, &world_ids).await?;
 
     let mut memberships = Vec::new();
     for r in &rows {
@@ -212,17 +282,33 @@ async fn my_memberships(State(state): State<AppState>, user: AuthUser) -> Result
             .and_then(|v| v["identity"]["name"].as_str().map(str::to_string))
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| cid.clone());
-        memberships.push(json!({
-            "worldId": r.try_get::<String, _>("world_id")?,
+        let world_id: String = r.try_get("world_id")?;
+        let mut item = json!({
+            "worldId": world_id.clone(),
             "worldTitle": r.try_get::<String, _>("title")?,
             "roomType": r.try_get::<String, _>("room_type")?,
             "worldStatus": r.try_get::<String, _>("wstatus")?,
             "stateRevision": r.try_get::<i64, _>("state_revision")?,
-            "cloudCharacterId": cid,
+            "cloudCharacterId": cid.clone(),
             "characterName": name,
             "membershipStatus": r.try_get::<String, _>("mstatus")?,
             "joinedAt": r.try_get::<i64, _>("joined_at")?,
-        }));
+        });
+        // 🔴 红线（头像读取面双过滤，providers::ModerationProvider::check_image）：
+        // 仅头像机审 approved 才带 avatarUrl；未过审 / 无头像一律**不带该字段**（不下发空串，
+        // 前端据此走无头像布局）。口径与 worlds::world_detail 的公开阵容逐字一致。
+        let avatar_url: Option<String> = r.try_get("avatar_url")?;
+        let avatar_moderation: Option<String> = r.try_get("avatar_moderation")?;
+        if avatar_moderation.as_deref() == Some("approved") {
+            if let Some(url) = avatar_url.filter(|u| !u.is_empty()) {
+                item["avatarUrl"] = json!(url);
+            }
+        }
+        // 最近互动时间：无落地干预记录时不下发该字段（行为与新增前完全一致）。
+        if let Some(at) = last_map.get(&(world_id, cid)) {
+            item["lastActiveAt"] = json!(at);
+        }
+        memberships.push(item);
     }
     Ok(Json(json!({ "memberships": memberships })))
 }
@@ -402,6 +488,49 @@ mod tests {
         .expect("seed cloud_character");
     }
 
+    /// 给已播种的角色补头像（object_key/url/裁决）。裁决取 approved / pending / rejected。
+    async fn set_avatar(db: &AnyPool, char_id: &str, url: &str, moderation: &str) {
+        sqlx::query(
+            "UPDATE cloud_characters SET avatar_object_key = ?, avatar_url = ?, avatar_moderation = ? \
+             WHERE id = ?",
+        )
+        .bind(format!("obj/{char_id}"))
+        .bind(url)
+        .bind(moderation)
+        .bind(char_id)
+        .execute(db)
+        .await
+        .expect("set avatar");
+    }
+
+    /// 直接插一条干预（绕过 API）：供 lastActiveAt 口径用例指定 user/角色/状态/时刻。
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_intervention(
+        db: &AnyPool,
+        id: &str,
+        world: &str,
+        user: &str,
+        character: &str,
+        kind: &str,
+        status: &str,
+        created_at: i64,
+    ) {
+        sqlx::query(
+            "INSERT INTO interventions (id, world_id, user_id, character_id, kind, payload_json, \
+             expected_revision, status, created_at) VALUES (?, ?, ?, ?, ?, '{}', 0, ?, ?)",
+        )
+        .bind(id)
+        .bind(world)
+        .bind(user)
+        .bind(character)
+        .bind(kind)
+        .bind(status)
+        .bind(created_at)
+        .execute(db)
+        .await
+        .expect("seed intervention");
+    }
+
     async fn get_memberships(state: &AppState, bearer: Option<&str>) -> (StatusCode, Value) {
         let app = crate::app::build_router(state.clone());
         let mut builder = Request::builder().method("GET").uri("/api/me/memberships");
@@ -473,5 +602,243 @@ mod tests {
         let state = test_state().await;
         let (s, _) = get_memberships(&state, None).await;
         assert_eq!(s, StatusCode::UNAUTHORIZED, "AuthUser 守卫：缺凭证应 401");
+    }
+
+    // ---------- 头像下发（红线：未过审绝不外泄） ----------
+
+    #[tokio::test]
+    async fn memberships_ships_approved_avatar() {
+        let state = test_state().await;
+        seed_user(&state.db, "u1").await;
+        seed_world(&state.db, "w1", 0, "running").await;
+        seed_cloud_char(&state.db, "c1", "u1", &json!({ "identity": { "name": "沈霜" } }).to_string()).await;
+        set_avatar(&state.db, "c1", "/api/assets/objects/av1.png", "approved").await;
+        seed_member(&state.db, "m1", "w1", "u1", "c1", "active").await;
+
+        let (s, v) = get_memberships(&state, Some(&token(&state, "u1"))).await;
+        assert_eq!(s, StatusCode::OK, "body={v}");
+        let ms = v["memberships"].as_array().unwrap();
+        assert_eq!(ms[0]["avatarUrl"], "/api/assets/objects/av1.png", "机审 approved 的头像应下发");
+    }
+
+    /// 🔴 红线：avatar_moderation 非 approved（pending 待人审 / rejected 已拒）一律不下发头像，
+    /// 且**不下发空串**——字段整体缺席，前端据此走无头像布局。
+    #[tokio::test]
+    async fn memberships_never_ships_unapproved_avatar() {
+        for verdict in ["pending", "rejected"] {
+            let state = test_state().await;
+            seed_user(&state.db, "u1").await;
+            seed_world(&state.db, "w1", 0, "running").await;
+            seed_cloud_char(&state.db, "c1", "u1", &json!({ "identity": { "name": "沈霜" } }).to_string())
+                .await;
+            set_avatar(&state.db, "c1", "/api/assets/objects/secret.png", verdict).await;
+            seed_member(&state.db, "m1", "w1", "u1", "c1", "active").await;
+
+            let (s, v) = get_memberships(&state, Some(&token(&state, "u1"))).await;
+            assert_eq!(s, StatusCode::OK);
+            let m = &v["memberships"][0];
+            assert!(
+                m.get("avatarUrl").is_none(),
+                "avatar_moderation={verdict} 时绝不下发 avatarUrl（含空串），实际 body={v}"
+            );
+            // 反证：URL 字符串不得以任何形式出现在响应里。
+            assert!(!v.to_string().contains("secret.png"), "未过审头像路径不得外泄：{v}");
+        }
+    }
+
+    #[tokio::test]
+    async fn memberships_omits_avatar_field_when_none() {
+        let state = test_state().await;
+        seed_user(&state.db, "u1").await;
+        seed_world(&state.db, "w1", 0, "running").await;
+        // 从未上传头像：三列均为 NULL（迁移 0016 历史行形态）。
+        seed_cloud_char(&state.db, "c1", "u1", &json!({ "identity": { "name": "无像" } }).to_string()).await;
+        seed_member(&state.db, "m1", "w1", "u1", "c1", "active").await;
+
+        let (s, v) = get_memberships(&state, Some(&token(&state, "u1"))).await;
+        assert_eq!(s, StatusCode::OK);
+        let m = &v["memberships"][0];
+        assert!(m.get("avatarUrl").is_none(), "无头像 → 不含该字段（不是空串、不是 null）：{v}");
+        assert_eq!(m["characterName"], "无像", "其余字段行为与新增前完全一致");
+    }
+
+    // ---------- lastActiveAt 口径 ----------
+
+    /// 口径：本人对「该世界 × 该角色」发起、且 status IN ('accepted','applied') 的干预的 MAX(created_at)。
+    /// 本例同时把四类噪声钉死：他人的干预、rejected 的干预、同世界他角色、同角色他世界。
+    #[tokio::test]
+    async fn memberships_last_active_at_uses_accepted_interventions_max() {
+        let state = test_state().await;
+        seed_user(&state.db, "u1").await;
+        seed_user(&state.db, "u2").await;
+        seed_world(&state.db, "w1", 0, "running").await;
+        seed_world(&state.db, "w2", 0, "running").await;
+        seed_cloud_char(&state.db, "c1", "u1", &json!({ "identity": { "name": "沈霜" } }).to_string()).await;
+        seed_cloud_char(&state.db, "c2", "u1", &json!({ "identity": { "name": "别的卡" } }).to_string()).await;
+        seed_cloud_char(&state.db, "c3", "u2", &json!({ "identity": { "name": "他人" } }).to_string()).await;
+        seed_member(&state.db, "m1", "w1", "u1", "c1", "active").await;
+        seed_member(&state.db, "m2", "w1", "u1", "c2", "active").await;
+        seed_member(&state.db, "m3", "w1", "u2", "c3", "active").await;
+
+        // 目标对 (w1, c1)：accepted@1000、applied@3000（applied 计入——已被引擎消费仍是一次落地互动）。
+        seed_intervention(&state.db, "iv1", "w1", "u1", "c1", "whisper", "accepted", 1_000).await;
+        seed_intervention(&state.db, "iv2", "w1", "u1", "c1", "item", "applied", 3_000).await;
+        // 噪声 ①：rejected（超配额/机审拒）时刻最新，但没落地 → 不得成为 lastActiveAt。
+        seed_intervention(&state.db, "iv3", "w1", "u1", "c1", "whisper", "rejected", 9_000).await;
+        // 噪声 ②：他人（u2）对同世界的干预，绝不能算进本人的互动。
+        seed_intervention(&state.db, "iv4", "w1", "u2", "c3", "whisper", "accepted", 8_000).await;
+        // 噪声 ③：同世界的另一张卡 → 只影响 c2 自己的时刻。
+        seed_intervention(&state.db, "iv5", "w1", "u1", "c2", "whisper", "accepted", 2_000).await;
+        // 噪声 ④：本人本角色但在他世界（w2，本人不在场）→ 不得渗进 w1 的行。
+        seed_intervention(&state.db, "iv6", "w2", "u1", "c1", "whisper", "accepted", 7_000).await;
+
+        let (s, v) = get_memberships(&state, Some(&token(&state, "u1"))).await;
+        assert_eq!(s, StatusCode::OK, "body={v}");
+        let ms = v["memberships"].as_array().unwrap();
+        assert_eq!(ms.len(), 2, "u1 在 w1 有两张卡");
+        let by_cid: std::collections::HashMap<&str, &Value> =
+            ms.iter().map(|m| (m["cloudCharacterId"].as_str().unwrap(), m)).collect();
+        assert_eq!(
+            by_cid["c1"]["lastActiveAt"].as_i64(),
+            Some(3_000),
+            "取 accepted/applied 的 MAX；rejected@9000、他人@8000、他世界@7000 均不计：{v}"
+        );
+        assert_eq!(by_cid["c2"]["lastActiveAt"].as_i64(), Some(2_000), "逐 (世界,角色) 独立取值");
+    }
+
+    #[tokio::test]
+    async fn memberships_omits_last_active_at_without_landed_intervention() {
+        let state = test_state().await;
+        seed_user(&state.db, "u1").await;
+        seed_world(&state.db, "w1", 0, "running").await;
+        seed_cloud_char(&state.db, "c1", "u1", &json!({ "identity": { "name": "沈霜" } }).to_string()).await;
+        seed_member(&state.db, "m1", "w1", "u1", "c1", "active").await;
+        // 仅有 rejected 记录 → 视同从未互动。
+        seed_intervention(&state.db, "iv1", "w1", "u1", "c1", "whisper", "rejected", 5_000).await;
+
+        let (s, v) = get_memberships(&state, Some(&token(&state, "u1"))).await;
+        assert_eq!(s, StatusCode::OK);
+        let m = &v["memberships"][0];
+        assert!(
+            m.get("lastActiveAt").is_none(),
+            "无落地互动 → 不含该字段（不下发 0、不回退 joinedAt）：{v}"
+        );
+        assert!(m["joinedAt"].as_i64().is_some(), "joinedAt 仍在，前端自行兜底");
+    }
+
+    // ---------- 羁绊强度：有意不下发（口径未拍板） ----------
+
+    /// 本端点**不得**出现 bondStrength 一类合成指标：总规格 §14 只定「达阈值双向解锁」，
+    /// 未定义强度公式；原始关系维度另有带 §9.4 信息边界过滤的下发面 `/worlds/{id}/state-summary`。
+    /// 本用例是防回归闸——防止后来者顺手加一个自造加权值，让未经评审的口径变成既成事实。
+    #[tokio::test]
+    async fn memberships_does_not_ship_synthetic_bond_strength() {
+        let state = test_state().await;
+        seed_user(&state.db, "u1").await;
+        seed_world(&state.db, "w1", 0, "running").await;
+        seed_cloud_char(&state.db, "c1", "u1", &json!({ "identity": { "name": "沈霜" } }).to_string()).await;
+        seed_member(&state.db, "m1", "w1", "u1", "c1", "active").await;
+        // 世界带上关系图：即便有数据，本端点也不得据此合成任何强度值。
+        sqlx::query("UPDATE worlds SET narrative_state_json = ? WHERE id = 'w1'")
+            .bind(
+                json!({ "relations": [
+                    { "from": "c1", "to": "npcX", "trust": 0.8, "affinity": 0.9, "fear": 0.0, "debt": 0.0 }
+                ] })
+                .to_string(),
+            )
+            .execute(&state.db)
+            .await
+            .expect("set narrative state");
+
+        let (s, v) = get_memberships(&state, Some(&token(&state, "u1"))).await;
+        assert_eq!(s, StatusCode::OK);
+        let m = &v["memberships"][0];
+        assert!(m.get("bondStrength").is_none(), "羁绊强度口径未拍板，不下发合成指标：{v}");
+        assert!(
+            !v.to_string().contains("affinity") && !v.to_string().contains("npcX"),
+            "关系维度不从本列表接口外泄（信息边界由 state-summary 单世界面把守）：{v}"
+        );
+    }
+
+    // ---------- 性能：固定条数查询，无 N+1 ----------
+
+    /// 批量取数单元测试：**一次调用**解析全部 (world, character) 对。
+    /// 这是「无 N+1」的结构性证据——端点侧总查询数恒为 2（成员行 1 条 + 本聚合 1 条），与成员数无关。
+    #[tokio::test]
+    async fn last_interaction_batch_resolves_all_pairs_in_one_call() {
+        let state = test_state().await;
+        seed_user(&state.db, "u1").await;
+        let mut world_ids = Vec::new();
+        for i in 0..40 {
+            let w = format!("w{i}");
+            seed_world(&state.db, &w, 0, "running").await;
+            seed_intervention(
+                &state.db,
+                &format!("iv{i}"),
+                &w,
+                "u1",
+                &format!("c{i}"),
+                "whisper",
+                "accepted",
+                1_000 + i as i64,
+            )
+            .await;
+            world_ids.push(w);
+        }
+        let map = last_interaction_by_pair(&state.db, "u1", &world_ids).await.unwrap();
+        assert_eq!(map.len(), 40, "一次调用取回全部 40 对");
+        for i in 0..40 {
+            assert_eq!(map.get(&(format!("w{i}"), format!("c{i}"))), Some(&(1_000 + i as i64)));
+        }
+        // 空世界集合 → 直接短路，连这条聚合都不发。
+        assert!(last_interaction_by_pair(&state.db, "u1", &[]).await.unwrap().is_empty());
+    }
+
+    /// 端到端：40 个成员行，头像与 lastActiveAt 逐行正确（列表规模不改变取数条数，也不退化正确性）。
+    #[tokio::test]
+    async fn memberships_batch_fields_correct_at_scale() {
+        let state = test_state().await;
+        seed_user(&state.db, "u1").await;
+        for i in 0..40 {
+            let (w, c) = (format!("w{i}"), format!("c{i}"));
+            seed_world(&state.db, &w, 0, "running").await;
+            seed_cloud_char(&state.db, &c, "u1", &json!({ "identity": { "name": c } }).to_string()).await;
+            seed_member(&state.db, &format!("m{i}"), &w, "u1", &c, "active").await;
+            // 偶数号：过审头像 + 一次落地互动；奇数号：未过审头像 + 无互动（两条分支都在规模下验一遍）。
+            if i % 2 == 0 {
+                set_avatar(&state.db, &c, &format!("/api/assets/objects/{c}.png"), "approved").await;
+                seed_intervention(
+                    &state.db,
+                    &format!("iv{i}"),
+                    &w,
+                    "u1",
+                    &c,
+                    "whisper",
+                    "accepted",
+                    1_000 + i as i64,
+                )
+                .await;
+            } else {
+                set_avatar(&state.db, &c, &format!("/api/assets/objects/{c}.png"), "pending").await;
+            }
+        }
+
+        let (s, v) = get_memberships(&state, Some(&token(&state, "u1"))).await;
+        assert_eq!(s, StatusCode::OK, "body={v}");
+        let ms = v["memberships"].as_array().unwrap();
+        assert_eq!(ms.len(), 40);
+        let by_cid: std::collections::HashMap<&str, &Value> =
+            ms.iter().map(|m| (m["cloudCharacterId"].as_str().unwrap(), m)).collect();
+        for i in 0..40 {
+            let c = format!("c{i}");
+            let m = by_cid[c.as_str()];
+            if i % 2 == 0 {
+                assert_eq!(m["avatarUrl"], format!("/api/assets/objects/{c}.png"), "第 {i} 行头像");
+                assert_eq!(m["lastActiveAt"].as_i64(), Some(1_000 + i as i64), "第 {i} 行互动时刻");
+            } else {
+                assert!(m.get("avatarUrl").is_none(), "第 {i} 行 pending 头像不得下发");
+                assert!(m.get("lastActiveAt").is_none(), "第 {i} 行无互动不得有该字段");
+            }
+        }
     }
 }

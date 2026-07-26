@@ -118,6 +118,18 @@
 | 运行时敏感词库 + 语义分类钩 | **第 2 层 Implemented / 第 3 层仅接口位** | `safety/lexicon.rs`（复用 `inject.rs` 归一化管线，零宽/同形/全角绕过均被拦）+ `runtime` commit 事务内闸 + `events`/`reports`/`clips`/`arena` 全部读取面过滤。**第 3 层语义分类未实装**（不能进事务，见 `safety/mod.rs` TODO） | 恒开（审核链） |
 | Saga 归组字段（saga_id + stage_no） | **Implemented** | 迁移 `0024`；`admin_api/worlds_ops.rs` 建模板成对校验 + `?sagaId=` 阶段列表（按 stage_no 升序、不分页） | 未启用（不填即独立模板） |
 
+**⚠️ 本表初版漏掉的一项（2026-07-26 补记）**：§0.1 原文写着「运行时开关体系**列入 R1 开发**」，
+但它既不在总规格 §19 的 R1 清单里，也不在本表初版中——**两边都漏了**。
+
+| R1 项 | 开发状态 | 现状 | 默认开关 |
+|---|---|---|---|
+| 运行时开关体系 | **Specified**（未动工） | 现有全部是 **env 进程级开关**：`MUSE_ONBOARDING` / `MUSE_SUBPLOT_CARDS` / `MUSE_LETHALITY_DEATHMATCH` / `MUSE_ROOM_INVITATIONS` / `MUSE_SAFETY_LEXICON`。它们**不能按世界灰度、不能按用户灰度、改一次要重启、运营在后台点不了**——与 §0.1 要的「运营开关」差一层 | — |
+
+> 这不只是形式问题：T0-T5 每个阶段都要求「开放范围」可控（如 T0「邀请制 ≤100 人」、
+> T3「订阅制灰度」），而 env 开关只有全开/全关两态，**做不到分阶段开闸**。
+> 换句话说，验证计划本身依赖这套体系。另注 `prompt_versions.canary_world_ids`
+> （迁移 0001 就有）是现成的按世界灰度先例，但目前**只写不读**、无任何消费方。
+
 **仍缺的接线（不在上表，单独跟踪）**：生死契约 server 侧全部 · 身份池叙事回灌 ·
 第 3 层语义分类 · 机审耗时打点（`moderationLatency` 全仓无数据源，后台该列恒为 `—`）。
 

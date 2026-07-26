@@ -682,3 +682,69 @@ fn module_never_writes_world_members() {
         }
     }
 }
+
+// ==================== 新人礼包的副本卡（§13「1 张低星副本卡」） ====================
+
+/// 两个开关是**正交**的：新手动线开着、副本卡关着 → 礼包少一张卡，其余照常。
+///
+/// 这条守的是"不该因为另一块未开放的能力而整体失败"——新人仍须拿到预制卡与微本，
+/// 否则一个尚未开放的经济模块就能把整条新手动线打死。
+#[tokio::test]
+async fn starter_subplot_card_is_skipped_when_that_switch_is_off() {
+    let state = test_state().await;
+    seed_user(&state.db, "u_nocard").await;
+    let app = build_router(state.clone());
+    let tok = token(&state, "u_nocard");
+
+    let _on = OnboardingSwitch::set(true);
+    let _off = crate::subplot::SubplotSwitch::set(false);
+
+    let (st, body) = post_json(&app, "/api/me/onboarding/gift", &tok, None, json!({})).await;
+    assert_eq!(st, StatusCode::OK, "副本卡开关关闭不得让整个礼包失败: {body}");
+    // 预制卡与微本世界照常拿到。
+    assert!(body["cloudCharacterId"].as_str().is_some(), "预制卡仍须发放");
+    assert!(body["worldId"].as_str().is_some(), "微本世界仍须创建");
+
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subplot_cards WHERE owner_id = 'u_nocard'")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "副本卡开关关闭时一张都不该铸出");
+}
+
+/// 两个开关都开 → 礼包附赠 1★ 副本卡；且**重复领取不多出卡**（双层幂等）。
+#[tokio::test]
+async fn starter_subplot_card_is_granted_once_and_is_idempotent() {
+    let state = test_state().await;
+    seed_user(&state.db, "u_card").await;
+    let app = build_router(state.clone());
+    let tok = token(&state, "u_card");
+
+    let _on = OnboardingSwitch::set(true);
+    let _cards = crate::subplot::SubplotSwitch::set(true);
+
+    let (st, body) = post_json(&app, "/api/me/onboarding/gift", &tok, None, json!({})).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+
+    let star: i64 = sqlx::query_scalar("SELECT star_rating FROM subplot_cards WHERE owner_id = 'u_card'")
+        .fetch_one(&state.db).await.expect("礼包应铸出一张副本卡");
+    assert_eq!(star, 1, "礼包卡固定 1★——礼包是教学物不是产出物");
+    let origin: String = sqlx::query_scalar("SELECT origin_kind FROM subplot_cards WHERE owner_id = 'u_card'")
+        .fetch_one(&state.db).await.unwrap();
+    assert_eq!(origin, "grant");
+    let key: String = sqlx::query_scalar("SELECT grant_key FROM subplot_cards WHERE owner_id = 'u_card'")
+        .fetch_one(&state.db).await.unwrap();
+    assert_eq!(key, "starter:u_card", "幂等键须可预测，运营补发才能对齐");
+    let status: String = sqlx::query_scalar("SELECT status FROM subplot_cards WHERE owner_id = 'u_card'")
+        .fetch_one(&state.db).await.unwrap();
+    assert_eq!(status, "owned");
+
+    // 重复领取：外层 onboarding_grants 主键先挡下，内层 (owner_id, grant_key) 是第二道。
+    let (st2, _) = post_json(&app, "/api/me/onboarding/gift", &tok, None, json!({})).await;
+    assert_eq!(st2, StatusCode::OK, "重复领取应幂等返回既有礼包");
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subplot_cards WHERE owner_id = 'u_card'")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(n, 1, "重复领取绝不能多出第二张卡");
+}

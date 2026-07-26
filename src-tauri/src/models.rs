@@ -279,6 +279,76 @@ pub struct GeneratedBackgroundItem {
     pub fields: Value,
 }
 
+// ---------- 渐进式捏人（总规格 §7【拍板 21】）----------
+// 三句话开卡（名字 + 执念 + 底线）→ AI 展开 18 字段草稿。
+// 纯本地功能：模型凭据由前端传入（用户自己的 Key），不依赖任何平台账号。
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuickCharacterDraftRequest {
+    pub model_interface: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    /// 灵魂三句之一：名字
+    pub name: String,
+    /// 灵魂三句之一：执念（他放不下的东西）
+    pub obsession: String,
+    /// 灵魂三句之一：底线（他绝不肯做的事）
+    pub bottom_line: String,
+    /// 人格变奏种子：同样三句话 + 不同种子 → 不同的展开。缺省由后端按时间生成。
+    pub variation_seed: Option<String>,
+    pub temperature: Option<f32>,
+    pub max_output_tokens: Option<u32>,
+    pub thinking_depth: Option<String>,
+    pub system_prompt: Option<String>,
+    pub task_id: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct QuickDecisionRule {
+    pub when: String,
+    pub then: String,
+    pub because: String,
+}
+
+/// AI 展开出的 15 个字段（另有 3 个字段是用户原话，前端直接落卡，不经模型）。
+/// 字段名与 CharacterCardV2 的层内字段同名，前端按固定映射表拼进 createEmptyCardV2 的产物。
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct QuickCharacterDraftFields {
+    pub narrative_role: String,
+    pub core_contradiction: String,
+    pub surface_goal: String,
+    pub hidden_need: String,
+    pub core_fear: String,
+    pub stakes: String,
+    pub value_priorities: Vec<String>,
+    pub risk_appetite: String,
+    pub decision_rules: Vec<QuickDecisionRule>,
+    pub attribution_style: String,
+    pub triggers: Vec<String>,
+    pub trust_building: String,
+    pub sentence_rhythm: String,
+    pub plot_seeds: Vec<String>,
+    pub immutable_core: Vec<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct QuickCharacterDraftResponse {
+    pub fields: QuickCharacterDraftFields,
+    /// 本次实际生效的变奏种子（回传以便「换一种变奏」与复现）
+    pub variation_seed: String,
+    /// 本次选中的变奏轴人类可读描述（UI 展示「这一版偏向什么」）
+    pub variation_axes: Vec<String>,
+    /// 同源指纹：三句话归一化后的哈希。同样三句话 → 同样指纹（防同质的比对锚点）。
+    pub source_fingerprint: String,
+    /// 模型没能填上的字段（camelCase 字段名），前端提示「这几项得你自己写」
+    pub missing_fields: Vec<String>,
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct BackgroundStageOneResponse {

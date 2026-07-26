@@ -18,6 +18,10 @@ mod interventions;
 // 房间邀请（客户端设计文档 §6 辅助栏）：默认关闭的运营开关 `MUSE_ROOM_INVITATIONS`，
 // 接受邀请只点亮引导入口，入场仍走 worlds::join_world 的全部校验。
 mod invitations;
+// R2 传世卡（总规格 §12【拍板 23】）：死亡 = 传记封卷，不是资产清零。
+// 封卷 = 卡转「传世卡」（只读、入遗作馆陈列、不可再入世界）+ 道具归账户背包 + 羁绊方得「故人」印记。
+// 默认关闭的运营开关 `MUSE_MEMORIAL`；不改写世界线（公共事实不可回滚），无任何隐藏数值。
+mod memorial;
 mod notifications;
 // 新手动线（总规格 §13【拍板 21】）：预制卡库 + 单人微本模板 + 新人礼包发放。
 // 默认关闭的运营开关 `MUSE_ONBOARDING`；礼包只发卡 + 建房，入场仍走 worlds::join_world 的全部校验。

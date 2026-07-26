@@ -98,6 +98,15 @@ pub struct InstanceSampling {
     /// `#[serde(default)]` 兼容改造前已钉住实例的回读（同 `culled_over_tier` 范式）。
     #[serde(default)]
     pub identity_assignments: Vec<(String, String)>,
+    /// 卡集合指纹哈希（R2 自定义房装配，四段式种子第四段）：排序去重的 `{cardId}@{cardVersion}`
+    /// 以 `\n` 连接后取 fnv 哈希——与 `roster_fingerprint` 同款，只存哈希不存明文。
+    /// **非容器形态恒为空**，`skip_serializing_if` 保证既有实例 `assembled_json` 逐字节不变。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub card_set_fingerprint: String,
+    /// 本实例装入的副本卡 id（模板 `subplotCardRefs` 序）。仅服务端 / 审计可见，绝不进
+    /// members_projection 或日报投影（同 `seed` / `roster_fingerprint` 的契约）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selected_cards: Vec<String>,
 }
 
 // ---------- 公示产出表（总规格 §10【拍板 17】：确定性产出，无 RNG 抽卡） ----------
@@ -273,6 +282,79 @@ struct Skeleton {
     /// 超集标记：`true` 且 storylines 非空 且 sampling 非全空 → 走种子采样；否则退化为全量装配。
     #[serde(default)]
     is_superset: bool,
+    /// 副本卡引用列表（R2 容器形态，技术附录 §3.1）：容器模板声明「本房装哪几张卡」，
+    /// 版本钉住。空 = 普通模板（**走原三段式种子 + 原装配路径，字节级不变**）。
+    #[serde(default)]
+    subplot_card_refs: Vec<SubplotCardRef>,
+    /// 跨卡缝合边（技术附录 §3.3）：两端须分别是各自卡 `anchors` 白名单成员。
+    /// 卡内 `connections` 只许闭包在卡内，跨卡连接**只能**经本字段显式声明。
+    #[serde(default)]
+    seams: Vec<Seam>,
+    /// 容器枢纽地点声明（技术附录 §3.3）：合并后地点图不连通时自动生成 `loc-nexus` 把各分量接起来。
+    #[serde(default)]
+    nexus: Option<NexusSpec>,
+    /// 对外缝合口白名单：本骨架（容器本体或卡片段）允许被缝合边落上的地点 id。
+    /// 空 = 回落「首个非秘境地点」。**秘境永不可作缝合口**（gate 语义必须完整保留在卡内）。
+    #[serde(default)]
+    anchors: Vec<String>,
+    /// 容器装配计划：**非反序列化字段**，只由 `compose_container_skeleton` 产出。
+    /// `None` = 非容器形态（种子走三段式、storyline 权重不乘卡权重、审计段无卡字段）——
+    /// 这是「容器形态之外字节级不变」的唯一开关点，所有容器行为都挂在它是不是 `Some` 上。
+    #[serde(skip)]
+    container: Option<ContainerPlan>,
+}
+
+/// 副本卡引用（技术附录 §3.1）：容器模板 → 卡的**精确版本钉住**引用。
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct SubplotCardRef {
+    /// `subplot_cards.id`。命名空间前缀取自它，故**不得含 `:`**（建房期校验）。
+    #[serde(default)]
+    card_id: String,
+    /// 期望的卡蓝图版本（`subplot_cards.source_template_version`）。
+    /// 声明了就必须与服务端读到的版本一致（钉住校验）；未声明则由服务端权威读取——
+    /// 无论哪种，进指纹的**恒是服务端值**，客户端声明改不动种子。
+    #[serde(default)]
+    card_version: Option<i64>,
+    /// 采样权重（乘进该卡各 storyline 的选取权重）。
+    /// **只影响"哪条戏更容易上演"，不影响任何数值 / 产出 / 准入**（§0.1 平权红线）。
+    #[serde(default = "one")]
+    weight: f32,
+}
+
+/// 跨卡缝合边（技术附录 §3.3）：`from`/`to` 为命名空间全限定地点 id
+/// （卡内地点写 `{cardId}:{locId}`，容器本体地点写裸 id）。双向连通。
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct Seam {
+    #[serde(default)]
+    from: String,
+    #[serde(default)]
+    to: String,
+}
+
+/// 容器枢纽地点（技术附录 §3.3）：多卡地点图裂成孤岛时的交汇之地。
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct NexusSpec {
+    #[serde(default)]
+    name: String,
+}
+
+/// 容器装配计划（`compose_container_skeleton` 产物，随 `Skeleton` 传给 `plan_sampling`）。
+/// 它是「容器形态」的**唯一标志**：`Skeleton.container.is_none()` ⇒ 全部行为与改造前逐字节一致。
+#[derive(Debug, Clone, Default)]
+struct ContainerPlan {
+    /// 卡集合指纹**明文**（技术附录 §4.1）：排序去重的 `{cardId}@{cardVersion}` 以 `\n` 连接。
+    /// 进种子的是明文（对齐 `roster_fingerprint` 进种子的方式），进审计段的是它的哈希。
+    fingerprint: String,
+    /// `(cardId, weight)`，模板序。前缀即归属映射（`{cardId}:xxx`），故按前缀查权重即可。
+    weights: Vec<(String, f32)>,
+    /// 缝合钉住地点（nexus + 全部 seam 端点）：进地点采样的**必选种子**，
+    /// 保证被选各卡的地点分量在实例内互达（技术附录 §3.3 连通性保障）。
+    pinned_locations: Vec<String>,
+    /// 装入的卡 id（模板序），仅进审计段。
+    card_ids: Vec<String>,
 }
 
 /// 剧情线采样单元（对齐 `assets/worlds.rs` StorylineView + affinity）：一条剧情线引用一组
@@ -692,9 +774,52 @@ fn aggregate_obsession_terms(cards: &[(String, CharacterCardV2)]) -> Vec<String>
     all
 }
 
-/// 实例种子：`fnv1a_64(world_id ‖ 0x01 ‖ 阵容指纹 ‖ 0x01 ‖ template_version)`。
+/// 实例种子（**三段式，普通模板恒走这条**）：
+/// `fnv1a_64(world_id ‖ 0x01 ‖ 阵容指纹 ‖ 0x01 ‖ template_version)`。
+///
+/// ⚠️ 本函数的字节口径被 `prng_test_vectors` / `same_seed_same_sampling` /
+/// `roster_fingerprint_changes_seed` 与黄金世界回归逐字节锁死，**不得改动**。
+/// 容器形态的第四段走下面的 `container_instance_seed`，与本函数物理分离。
 fn instance_seed(world_id: &str, fingerprint: &str, template_version: i64) -> u64 {
     fnv1a_64(format!("{world_id}\u{1}{fingerprint}\u{1}{template_version}").as_bytes())
+}
+
+/// 实例种子（**四段式，仅容器形态**，技术附录 §4.1）：三段式尾部追加**卡集合指纹**。
+///
+/// 目的是防「换一张卡组合刷同一世界」：
+/// ① 即便有人绕过版本递增（后台直改 `skeleton_json` 换卡而 `template_version` 未动），
+///    换卡即换种子，无法拿同一实例试探不同卡组合下的高收益路径；
+/// ② 审计可复算——`world_container_cards` 的行 + 审计段 `cardSetFingerprint` 两侧交叉对账，
+///    能证明这份装配由哪个卡集合产生。
+fn container_instance_seed(
+    world_id: &str,
+    fingerprint: &str,
+    template_version: i64,
+    card_set_fingerprint: &str,
+) -> u64 {
+    fnv1a_64(
+        format!("{world_id}\u{1}{fingerprint}\u{1}{template_version}\u{1}{card_set_fingerprint}")
+            .as_bytes(),
+    )
+}
+
+/// 种子分派：**容器形态才四段，其余一律三段**。
+///
+/// 这是「四段式只在容器形态生效」的唯一落点——`Skeleton.container` 只可能由
+/// `compose_container_skeleton` 置上，而它只在「开关已开 + 模板声明了 subplotCardRefs +
+/// 卡全部解引用成功」时才被调用。任何一条不满足 → `None` → 与改造前逐字节相同的三段式。
+fn resolve_instance_seed(
+    skeleton: &Skeleton,
+    world_id: &str,
+    fingerprint: &str,
+    template_version: i64,
+) -> u64 {
+    match &skeleton.container {
+        Some(plan) => {
+            container_instance_seed(world_id, fingerprint, template_version, &plan.fingerprint)
+        }
+        None => instance_seed(world_id, fingerprint, template_version),
+    }
 }
 
 /// storyline 阵容加权 boost（复用 weight_endings 的阵容画像口径）。
@@ -926,7 +1051,7 @@ fn plan_sampling(
                 &skeleton.identity_pool,
                 cards,
                 &in_play,
-                instance_seed(world_id, fingerprint, template_version),
+                resolve_instance_seed(skeleton, world_id, fingerprint, template_version),
             )
         };
         return Selection {
@@ -939,11 +1064,20 @@ fn plan_sampling(
         };
     }
 
-    let seed = instance_seed(world_id, fingerprint, template_version);
+    let seed = resolve_instance_seed(skeleton, world_id, fingerprint, template_version);
 
     // 1) Storyline 脊柱（阵容依赖 + 种子扰动）。
-    let weighted_sl: Vec<(&StorylineSpec, f32)> =
-        skeleton.storylines.iter().map(|s| (s, 1.0 + affinity_boost(&s.affinity, profile))).collect();
+    //    容器形态额外乘上**卡权重**（`subplotCardRefs[].weight`，按 id 前缀归属查表）——
+    //    于是「卡 × storyline」的联合选取在**同一级采样**里完成，不必新开 RNG 子流域，
+    //    也就不会扰动既有六个域的消费协议。非容器形态走原表达式，逐字节不变。
+    let weighted_sl: Vec<(&StorylineSpec, f32)> = match &skeleton.container {
+        None => skeleton.storylines.iter().map(|s| (s, 1.0 + affinity_boost(&s.affinity, profile))).collect(),
+        Some(plan) => skeleton
+            .storylines
+            .iter()
+            .map(|s| (s, (1.0 + affinity_boost(&s.affinity, profile)) * container_card_weight(plan, &s.id)))
+            .collect(),
+    };
     let sl_k = skeleton
         .sampling
         .instance_storyline_count
@@ -1099,6 +1233,11 @@ fn plan_sampling(
             }
         }
     }
+    // 容器形态：枢纽 + 全部 seam 端点并入必选种子（技术附录 §3.3 连通性保障）——
+    // 否则 BFS 可能只采到某一张卡的地点分量，实例内其余卡的地点变成到不了的孤岛。
+    if let Some(plan) = &skeleton.container {
+        loc_seeds.extend(plan.pinned_locations.iter().cloned());
+    }
     let mut rng_loc = Rng(seed ^ DOMAIN_LOC);
     let loc_ids =
         sample_location_ids(&mut rng_loc, &skeleton.locations, &loc_seeds, skeleton.sampling.instance_location_count);
@@ -1132,8 +1271,771 @@ fn plan_sampling(
         culled_over_tier,
         culled_rare_budget,
         identity_assignments: identity_assignments.clone(),
+        // 容器形态才写（`skip_serializing_if` 保证非容器实例 assembled_json 逐字节不变）。
+        // 指纹只存哈希不存明文，口径同 `roster_fingerprint`。
+        card_set_fingerprint: skeleton
+            .container
+            .as_ref()
+            .map(|p| format!("{:016x}", fnv1a_64(p.fingerprint.as_bytes())))
+            .unwrap_or_default(),
+        selected_cards: skeleton
+            .container
+            .as_ref()
+            .map(|p| p.card_ids.clone())
+            .unwrap_or_default(),
     };
     Selection { audit: Some(audit), hidden_ids, enabled_endings, npc_ids, loc_ids, identity_assignments }
+}
+
+// ============================================================================
+// R2 自定义房装配：容器世界 + 命名空间 + 缝合 + 卡集合指纹
+// 总规格 §10「自定义房闭环」；技术附录 `docs/build/spec-subplot-cards.md` §3/§4/§5
+// （⚠️ 该文件 §1/§2/§6/§7/§8 业务假设已作废，只有 §3/§4/§5 技术方案有效）
+// ============================================================================
+//
+// 🔴 四条硬约束，改本节前先读完
+//
+// ① **确定性可 replay**：同一 (world_id, 阵容, template_version, 卡集合) 必得同一份装配。
+//    合并（compose）是纯函数、按模板序遍历；种子四段式；**禁三样**（系统随机 / 浮点 RNG /
+//    map 迭代序驱动 RNG）在本节同样适用——本节压根不掷骰子，只做确定性重写与图运算。
+//
+// ② **平权（§0.1）**：副本卡是**内容燃料，永不加战力**。落点有三：
+//    - 卡只贡献「内容四类」（剧情线 / 主线 / 内容池 / 结局 / NPC / 道具 / 地点），
+//      **绝不贡献规则维度**——`payoutTable`（产出表）、`identityPool`（身份池）、
+//      `assemblyRules`、`sampling`、`isSuperset`、`admission` 一律只认容器本体（`merge_fragment` 只搬内容）；
+//    - 卡带入的道具 `powerTier` 在合并时被夹到 `min(容器星级, 卡星级)`（`translate_item` 只降不升语义，
+//      `effectTags` 恒不变），杜绝「借高星卡在低星容器刷高价值道具」；
+//    - 卡内道具逐件过容器 `admission` 闸（`check_admission`），不兼容即**建房期拒绝**，
+//      没有"运行时静默降级"的中间态。
+//
+// ③ **未验证功能默认关闭（VALIDATION §0.1）**：`MUSE_CONTAINER_ASSEMBLY` 默认关闭。
+//    前门拒绝（建模板期不许声明 `subplotCardRefs`）+ 读取侧降级（装配期忽略 refs，走原路径、
+//    产物逐字节不变）双保险，范式抄 `worlds::deathmatch_enabled`。
+//
+// ④ **装配不消耗卡（§10【拍板 11】）**：副本卡是**永久蓝图**——「装入自定义房，房散卡在」。
+//    装配只在 `world_container_cards` 记一行引用，**绝不 UPDATE/DELETE `subplot_cards`**
+//    （唯一销毁语义是合成，归 `subplot/` 独占）。源码级断言守死，见
+//    `container_tests::red_line_assembly_never_writes_subplot_cards`。
+
+/// 容器装配（自定义房）运营开关环境变量。
+const ENV_CONTAINER_ASSEMBLY: &str = "MUSE_CONTAINER_ASSEMBLY";
+
+/// 容器装配默认值 = **关闭**（VALIDATION.md §0.1）。
+///
+/// 🔴 自定义房是副本卡经济闭环的消费端，属 T4「平台生态」才验证的范围；代码合并不等于对用户开放。
+const DEFAULT_CONTAINER_ASSEMBLY_ENABLED: bool = false;
+
+/// 命名空间分隔符：卡内 id 一律重写为 `{cardId}:{原id}`。
+/// 容器本体 id **不加前缀**（见 `compose_container_skeleton` 头部说明）。
+const NS_SEP: char = ':';
+
+/// 容器枢纽地点 id（保留字）：合并后地点图裂成孤岛时自动生成，把各连通分量接起来。
+const NEXUS_LOCATION_ID: &str = "loc-nexus";
+
+/// 枢纽地点缺省名（容器可用 `nexus.name` 覆盖）。
+const NEXUS_DEFAULT_NAME: &str = "交汇之地";
+
+/// 容器装配是否已由运营开启（env 覆盖 + 默认常量，范式同 `worlds::deathmatch_enabled`
+/// 与 `subplot::subplot_cards_enabled`——本仓库尚无配置表，env 是当前唯一的运营开关形态）。
+///
+/// 开关是**可逆急停阀**：关掉之后所有容器房**立即**降级为「只装容器本体」的普通装配
+/// （种子回三段式、卡内容不进实例），再打开则原样恢复。已装配实例被 C-7 CAS 钉住不重掷，
+/// 故开关不会让在跑的房内容漂移。
+pub fn container_assembly_enabled() -> bool {
+    match std::env::var(ENV_CONTAINER_ASSEMBLY) {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "on" | "yes" => true,
+            "0" | "false" | "off" | "no" => false,
+            // 配错不静默开启未验证的经济闭环：回落默认（关闭）。
+            _ => DEFAULT_CONTAINER_ASSEMBLY_ENABLED,
+        },
+        Err(_) => DEFAULT_CONTAINER_ASSEMBLY_ENABLED,
+    }
+}
+
+// 测试专用的开关 RAII 夹具 `ContainerSwitch` 定义在文件末尾的 `container_tests` 模块里。
+//
+// ⚠️ 本文件的**生产代码段不得出现那个 test-only 编译属性的字面量**，连注释里都不许写出来
+// （真要提，请像 `concat!("#[cfg", "(test)]")` 那样拆开）。原因：
+// `member_order_tests::order_by_clause_pins_secondary_key` 与
+// `container_tests::red_line_assembly_never_writes_subplot_cards` 都用 `include_str!("mod.rs")`
+// 并按**该属性的首次出现**截断，只扫生产代码段；中途插一个（哪怕在注释里）就会把
+// `load_container_cards` / `load_active_cards` 截在扫描范围之外，两条防回归断言随即静默失效（假绿）。
+
+/// 一张已解引用的副本卡（DB 读取产物 → 合并器输入）。纯数据，合并是纯函数。
+#[derive(Debug, Clone)]
+struct ContainerCard {
+    /// `subplot_cards.id`，同时是命名空间前缀。
+    card_id: String,
+    /// 卡蓝图版本（`subplot_cards.source_template_version`），进卡集合指纹。
+    card_version: i64,
+    /// 卡星级（`subplot_cards.star_rating`）：与容器星级取小，作为卡内道具的档位上限。
+    star_rating: i64,
+    /// 采样权重（容器 ref 声明）。
+    weight: f32,
+    /// 卡的内容蓝图 = `source_template_id` 指向的模板骨架（0032 原话：
+    /// "来源世界与模板（内容蓝图指针，**自定义房装配的解引用入口**）"）。
+    fragment: Skeleton,
+}
+
+/// 命名空间重写：`{cardId}:{原id}`。空 id 原样返回空（下游按"无引用"处理，不造出 `card:` 这种残 id）。
+fn ns(card_id: &str, id: &str) -> String {
+    let t = id.trim();
+    if t.is_empty() {
+        String::new()
+    } else {
+        format!("{card_id}{NS_SEP}{t}")
+    }
+}
+
+/// 批量命名空间重写（保留模板序，空项丢弃）。
+fn ns_all(card_id: &str, ids: &[String]) -> Vec<String> {
+    ids.iter().map(|i| ns(card_id, i)).filter(|s| !s.is_empty()).collect()
+}
+
+/// 归属映射：`{cardId}:xxx` → `Some(cardId)`；裸 id（容器本体）→ `None`。
+/// **前缀即归属，无需附表**——这是命名空间设计的全部价值。
+fn ns_owner(id: &str) -> Option<&str> {
+    id.split_once(NS_SEP).map(|(card, _)| card)
+}
+
+/// 容器 storyline 的采样权重乘数：按前缀查卡权重；容器本体（无前缀）恒 1.0。
+fn container_card_weight(plan: &ContainerPlan, storyline_id: &str) -> f32 {
+    match ns_owner(storyline_id) {
+        Some(card) => plan
+            .weights
+            .iter()
+            .find(|(c, _)| c == card)
+            .map(|(_, w)| w.max(0.0))
+            .unwrap_or(1.0),
+        None => 1.0,
+    }
+}
+
+/// 骨架内**全部会被当作 id 使用**的字符串（含定义位与引用位），供「不得含命名空间分隔符」校验。
+/// 只收集 id 与 id 引用，不收集叙事文本（文本里出现冒号完全合法）。
+fn collect_id_like(sk: &Skeleton) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |s: &str| {
+        let t = s.trim();
+        if !t.is_empty() {
+            out.push(t.to_string());
+        }
+    };
+    for n in &sk.mainline_nodes {
+        push(&n.id);
+        if let Some(g) = &n.variant_group {
+            push(g);
+        }
+        n.arc_tags.iter().for_each(|t| push(t));
+    }
+    for s in &sk.storylines {
+        push(&s.id);
+        s.mainline_node_ids.iter().for_each(|t| push(t));
+        s.hidden_pool_ids.iter().for_each(|t| push(t));
+        s.ending_ids.iter().for_each(|t| push(t));
+    }
+    for pool in [&sk.hidden_content_pool, &sk.side_hook_pool] {
+        for p in pool {
+            push(&p.id);
+            if let Some(r) = &p.reward_item_ref {
+                push(r);
+            }
+            if let Some(g) = &p.variant_group {
+                push(g);
+            }
+            p.arc_tags.iter().for_each(|t| push(t));
+        }
+    }
+    for e in &sk.ending_pool {
+        push(&e.id);
+        if let Some(g) = &e.variant_group {
+            push(g);
+        }
+        e.arc_tags.iter().for_each(|t| push(t));
+    }
+    for it in &sk.world_items {
+        push(&it.id);
+    }
+    for l in &sk.locations {
+        push(&l.id);
+        l.connections.iter().for_each(|c| push(c));
+        l.resident_item_ids.iter().for_each(|i| push(i));
+        if let Some(g) = &l.gate {
+            g.required_item_ids.iter().for_each(|i| push(i));
+        }
+    }
+    for wc in &sk.world_characters {
+        push(&wc.card.id);
+        push(&wc.home_location);
+        wc.carried_item_ids.iter().for_each(|i| push(i));
+        wc.agenda_nodes.iter().for_each(|n| push(n));
+    }
+    for a in &sk.anchors {
+        push(a);
+    }
+    out
+}
+
+/// 把一张卡的内容块**全命名空间化**后并入容器骨架（技术附录 §3.2）。
+///
+/// 重写覆盖**定义位与引用位全集**：
+/// `mainlineNodes.id/variantGroup/arcTags` · `storylines.id` 及其三个 id 列表 ·
+/// `hiddenContentPool`/`sideHookPool` 的 `id/rewardItemRef/variantGroup/arcTags` ·
+/// `endingPool.id/variantGroup/arcTags` · `worldItems.id` ·
+/// `locations.id/connections/residentItemIds/gate.requiredItemIds` ·
+/// `worldCharacters.card.id/carriedItemIds/homeLocation/agendaNodes`。
+///
+/// 两个有意的语义：
+/// - **`variantGroup` 带前缀 ⇒ 互斥组天然不跨卡**（不同小说的变体不该互相排斥）；
+/// - **不搬规则维度**：产出表 / 身份池 / 装配规则 / 采样计数 / 超集标记 / 来源作品 / 嵌套卡引用
+///   一律不从卡继承（§0.1 平权：卡是内容燃料，不带来产出加成、准入豁免或规则特权；
+///   顺带杜绝「卡里再引用卡」的递归炸弹）。
+fn merge_fragment(target: &mut Skeleton, card: &ContainerCard, item_tier_cap: u8) {
+    let cid = card.card_id.as_str();
+    let f = &card.fragment;
+
+    for n in &f.mainline_nodes {
+        target.mainline_nodes.push(MainlineNode {
+            id: ns(cid, &n.id),
+            fated: n.fated,
+            variant_group: n.variant_group.as_deref().map(|g| ns(cid, g)).filter(|s| !s.is_empty()),
+            arc_tags: ns_all(cid, &n.arc_tags),
+        });
+    }
+    for s in &f.storylines {
+        target.storylines.push(StorylineSpec {
+            id: ns(cid, &s.id),
+            mainline_node_ids: ns_all(cid, &s.mainline_node_ids),
+            hidden_pool_ids: ns_all(cid, &s.hidden_pool_ids),
+            ending_ids: ns_all(cid, &s.ending_ids),
+            affinity: s.affinity.clone(),
+        });
+    }
+    let rewrite_pool = |p: &PoolItem| PoolItem {
+        id: ns(cid, &p.id),
+        themes: p.themes.clone(),
+        template: p.template.clone(),
+        difficulty_base: p.difficulty_base,
+        reward_item_ref: p.reward_item_ref.as_deref().map(|r| ns(cid, r)).filter(|s| !s.is_empty()),
+        // 内联奖励同样夹档：`reward_item_ref` 与内联 `reward_item` 是同一口径（`reward_tier`），
+        // 不夹内联就等于给了一条绕过封顶的内联后门。
+        reward_item: p.reward_item.as_ref().map(|it| cap_item(it, cid, item_tier_cap)),
+        variant_group: p.variant_group.as_deref().map(|g| ns(cid, g)).filter(|s| !s.is_empty()),
+        arc_tags: ns_all(cid, &p.arc_tags),
+    };
+    target.hidden_content_pool.extend(f.hidden_content_pool.iter().map(&rewrite_pool));
+    target.side_hook_pool.extend(f.side_hook_pool.iter().map(&rewrite_pool));
+    for e in &f.ending_pool {
+        target.ending_pool.push(EndingCandidate {
+            id: ns(cid, &e.id),
+            affinity: e.affinity.clone(),
+            base_weight: e.base_weight,
+            variant_group: e.variant_group.as_deref().map(|g| ns(cid, g)).filter(|s| !s.is_empty()),
+            arc_tags: ns_all(cid, &e.arc_tags),
+        });
+    }
+    target.world_items.extend(f.world_items.iter().map(|it| cap_item(it, cid, item_tier_cap)));
+    for l in &f.locations {
+        target.locations.push(LocationSpec {
+            id: ns(cid, &l.id),
+            name: l.name.clone(),
+            connections: ns_all(cid, &l.connections),
+            is_secret_realm: l.is_secret_realm,
+            gate: l.gate.as_ref().map(|g| {
+                let mut g = g.clone();
+                g.required_item_ids = ns_all(cid, &g.required_item_ids);
+                g
+            }),
+            resident_item_ids: ns_all(cid, &l.resident_item_ids),
+        });
+    }
+    for wc in &f.world_characters {
+        let mut card_v2 = wc.card.clone();
+        card_v2.id = ns(cid, &wc.card.id);
+        target.world_characters.push(WorldCharacter {
+            card: card_v2,
+            home_location: ns(cid, &wc.home_location),
+            carried_item_ids: ns_all(cid, &wc.carried_item_ids),
+            agenda_nodes: ns_all(cid, &wc.agenda_nodes),
+        });
+    }
+}
+
+/// 卡内道具的命名空间化 + **档位夹持**（§0.1 平权红线：卡永不加战力）。
+/// 语义逐字对齐 `admission::translate_item`：`power_tier` 只降不升，`effect_tags` 恒不变。
+fn cap_item(item: &ItemDefinition, card_id: &str, tier_cap: u8) -> ItemDefinition {
+    let mut it = item.clone();
+    it.id = ns(card_id, &item.id);
+    if it.origin.power_tier > tier_cap {
+        it.origin.power_tier = tier_cap;
+    }
+    it
+}
+
+/// 地点图的**无向连通分量**（下标分组，按模板序）。用于判断多卡混装后是否裂成孤岛。
+fn location_components(locations: &[LocationSpec]) -> Vec<Vec<usize>> {
+    let n = locations.len();
+    let idx_of = |id: &str| locations.iter().position(|l| l.id == id);
+    // 邻接表（无向：connections 两端都记）。
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, l) in locations.iter().enumerate() {
+        for c in &l.connections {
+            if let Some(j) = idx_of(c) {
+                if i != j {
+                    if !adj[i].contains(&j) {
+                        adj[i].push(j);
+                    }
+                    if !adj[j].contains(&i) {
+                        adj[j].push(i);
+                    }
+                }
+            }
+        }
+    }
+    let mut seen = vec![false; n];
+    let mut comps: Vec<Vec<usize>> = Vec::new();
+    for start in 0..n {
+        if seen[start] {
+            continue;
+        }
+        let mut comp = vec![start];
+        seen[start] = true;
+        let mut head = 0usize;
+        while head < comp.len() {
+            let cur = comp[head];
+            head += 1;
+            for &nb in &adj[cur] {
+                if !seen[nb] {
+                    seen[nb] = true;
+                    comp.push(nb);
+                }
+            }
+        }
+        comp.sort_unstable(); // 模板序，确定性输出。
+        comps.push(comp);
+    }
+    comps
+}
+
+/// 某个连通分量的缝合代表：白名单内的首个 anchor；无 anchor 则首个非秘境地点。
+/// 全是秘境 → `None`（**秘境不可作缝合口**，gate 语义必须完整保留在卡内）。
+fn component_anchor(
+    locations: &[LocationSpec],
+    comp: &[usize],
+    anchors: &std::collections::BTreeSet<String>,
+) -> Option<String> {
+    comp.iter()
+        .map(|&i| &locations[i])
+        .find(|l| !l.is_secret_realm && anchors.contains(&l.id))
+        .or_else(|| comp.iter().map(|&i| &locations[i]).find(|l| !l.is_secret_realm))
+        .map(|l| l.id.clone())
+}
+
+/// 加一条**双向**连接（幂等；两端须存在，由调用方前置校验）。
+fn link_bidirectional(locations: &mut [LocationSpec], a: &str, b: &str) {
+    for l in locations.iter_mut() {
+        if l.id == a && !l.connections.iter().any(|c| c == b) {
+            l.connections.push(b.to_string());
+        } else if l.id == b && !l.connections.iter().any(|c| c == a) {
+            l.connections.push(a.to_string());
+        }
+    }
+}
+
+/// **容器合并器**（纯函数，可单测；技术附录 §3.2 + §3.3 + §4.1 + §5.1）。
+///
+/// 输入：容器本体骨架 + 已解引用的卡集合 + 容器星级 + 容器准入策略。
+/// 输出：合并后的骨架（`container` 计划已填），或**建房期拒绝**的中文原因。
+///
+/// ⚠️ **容器本体 id 不加前缀**（与技术附录「隐式卡前缀 = 模板 id」的差异，有意为之）：
+/// 章节钩子的发货幂等键是 `hook_key = {world_id}:{cid}:{pool_item_id}`（`chapters/mod.rs`），
+/// 若本体 id 随容器开关一开一关而漂移，同一钩子会被算成两个 key → **重复发货**。
+/// 开关是可逆急停阀，因此本体 id 必须在两种形态下逐字相同。
+/// 归属仍然明确：**裸 id = 容器本体，带前缀 = 卡**（`ns_owner`），且本体 id 不许含 `:`（建房期校验）
+/// 保证两个空间不可能相交。
+///
+/// 步骤（全程无 RNG、按模板序）：
+/// 1. 本体自查：id 不含分隔符、未占用枢纽保留 id；
+/// 2. 逐卡校验 + 命名空间化并入（卡内引用须闭包在卡内；道具过准入闸 + 档位夹持）；
+/// 3. 全局 id 唯一性复核（前缀在构造上保证，此处是"断言而非期望"）；
+/// 4. 显式 seams 落边（两端须在 anchors 白名单、非秘境）；
+/// 5. 连通性保障：仍有多个分量 → 生成枢纽地点接上各分量代表；
+/// 6. 产出 `ContainerPlan`（卡集合指纹 / 权重 / 钉住地点 / 卡 id）。
+fn compose_container_skeleton(
+    container: Skeleton,
+    cards: &[ContainerCard],
+    star_rating: i64,
+    policy: &crate::admission::WorldAdmissionPolicy,
+) -> Result<Skeleton, String> {
+    let mut merged = container;
+
+    // 1) 容器本体自查。
+    for id in collect_id_like(&merged) {
+        if id.contains(NS_SEP) {
+            return Err(format!(
+                "容器本体 id `{id}` 含保留分隔符 `{NS_SEP}`：装卡的容器里，`{NS_SEP}` 是命名空间前缀专用（`卡id:原id`），本体 id 不得占用"
+            ));
+        }
+    }
+    if merged.locations.iter().any(|l| l.id == NEXUS_LOCATION_ID) {
+        return Err(format!(
+            "地点 id `{NEXUS_LOCATION_ID}` 是容器枢纽保留字：请给本体地点换个 id"
+        ));
+    }
+
+    // 2) 逐卡合并（模板序）。
+    let container_cap = star_rating.clamp(0, u8::MAX as i64) as u8;
+    for card in cards {
+        let cid = card.card_id.as_str();
+        // 2a) 卡内 id 不得含分隔符（否则前缀解析会把归属算错）。
+        for id in collect_id_like(&card.fragment) {
+            if id.contains(NS_SEP) {
+                return Err(format!(
+                    "副本卡 `{cid}` 的内容 id `{id}` 含保留分隔符 `{NS_SEP}`：命名空间前缀无法解析"
+                ));
+            }
+        }
+        // 2b) 卡内引用闭包：跨卡连接只能经 seams，卡内 connections 不许指向卡外。
+        validate_fragment_closure(cid, &card.fragment)?;
+        // 2c) cosmology / 强度兼容（技术附录 §5.1，全部复用既有闸门，零新机制）。
+        //     不兼容 → **建房期拒绝**，不留到运行时静默退化。
+        let card_cap = card.star_rating.clamp(0, u8::MAX as i64) as u8;
+        let tier_cap = container_cap.min(card_cap);
+        for item in &card.fragment.world_items {
+            check_card_item_admission(cid, item, policy)?;
+        }
+        // 2d) 命名空间化并入（含道具档位夹持）。
+        merge_fragment(&mut merged, card, tier_cap);
+    }
+
+    // 3) 全局 id 唯一性复核（前缀保证不可能撞车；此处按"断言"处理，撞了说明前缀逻辑坏了）。
+    assert_unique_ids(&merged)?;
+
+    // 4) 显式缝合边。anchors 白名单 = 容器本体 anchors ∪ 各卡命名空间化后的 anchors。
+    let mut anchor_set: std::collections::BTreeSet<String> =
+        merged.anchors.iter().map(|a| a.trim().to_string()).filter(|a| !a.is_empty()).collect();
+    for card in cards {
+        for a in ns_all(&card.card_id, &card.fragment.anchors) {
+            anchor_set.insert(a);
+        }
+    }
+    let loc_ids: std::collections::BTreeSet<String> =
+        merged.locations.iter().map(|l| l.id.clone()).collect();
+    let mut pinned: Vec<String> = Vec::new();
+    let seams = merged.seams.clone();
+    for seam in &seams {
+        let (from, to) = (seam.from.trim().to_string(), seam.to.trim().to_string());
+        for end in [&from, &to] {
+            if !loc_ids.contains(end.as_str()) {
+                return Err(format!("seams 悬空：缝合口 `{end}` 不是本容器（含所装卡）的地点"));
+            }
+            if !anchor_set.contains(end.as_str()) {
+                return Err(format!(
+                    "seams 越界：缝合口 `{end}` 不在其声明的 anchors 白名单内（缝合边只能落在锚点上）"
+                ));
+            }
+            if merged.locations.iter().any(|l| &l.id == end && l.is_secret_realm) {
+                return Err(format!("seams 非法：秘境 `{end}` 不可作缝合口（gate 语义须完整保留在卡内）"));
+            }
+        }
+        link_bidirectional(&mut merged.locations, &from, &to);
+        pinned.push(from);
+        pinned.push(to);
+    }
+
+    // 5) 连通性保障：仍裂成多个分量 → 生成枢纽地点，把各分量代表锚点接上去。
+    //    只在真的不连通时才造枢纽——本来就连通的容器不该凭空多出一个地点。
+    let comps = location_components(&merged.locations);
+    if comps.len() > 1 {
+        let mut reps: Vec<String> = Vec::new();
+        for comp in &comps {
+            match component_anchor(&merged.locations, comp, &anchor_set) {
+                Some(rep) => reps.push(rep),
+                None => {
+                    let sample = comp.first().map(|&i| merged.locations[i].id.clone()).unwrap_or_default();
+                    return Err(format!(
+                        "地点图不连通且无合法缝合口：含 `{sample}` 的分量全是秘境，无法接入枢纽（请给它声明非秘境 anchors）"
+                    ));
+                }
+            }
+        }
+        let nexus_name = merged
+            .nexus
+            .as_ref()
+            .map(|n| n.name.trim())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(NEXUS_DEFAULT_NAME)
+            .to_string();
+        merged.locations.push(LocationSpec {
+            id: NEXUS_LOCATION_ID.to_string(),
+            name: nexus_name,
+            connections: Vec::new(),
+            is_secret_realm: false,
+            gate: None,
+            resident_item_ids: Vec::new(),
+        });
+        for rep in &reps {
+            link_bidirectional(&mut merged.locations, NEXUS_LOCATION_ID, rep);
+        }
+        pinned.push(NEXUS_LOCATION_ID.to_string());
+        pinned.extend(reps);
+    }
+
+    // 6) 计划落定：卡集合指纹（排序去重）+ 权重 + 钉住地点 + 卡 id（模板序）。
+    let mut fp_parts: Vec<String> =
+        cards.iter().map(|c| format!("{}@{}", c.card_id, c.card_version)).collect();
+    fp_parts.sort_unstable();
+    fp_parts.dedup();
+    pinned.sort_unstable();
+    pinned.dedup();
+    merged.container = Some(ContainerPlan {
+        fingerprint: fp_parts.join("\n"),
+        weights: cards.iter().map(|c| (c.card_id.clone(), c.weight)).collect(),
+        pinned_locations: pinned,
+        card_ids: cards.iter().map(|c| c.card_id.clone()).collect(),
+    });
+    Ok(merged)
+}
+
+/// 卡内引用闭包校验（技术附录 §3.3：卡内 `connections` 只许指向卡内地点）。
+/// 卡片段来自已过审模板，正常闭包成立；此处是**建房期硬门**，不成立就拒绝装入而不是运行时静默丢弃。
+fn validate_fragment_closure(card_id: &str, f: &Skeleton) -> Result<(), String> {
+    let loc_ids: std::collections::BTreeSet<&str> = f.locations.iter().map(|l| l.id.as_str()).collect();
+    let item_ids: std::collections::BTreeSet<&str> = f.world_items.iter().map(|i| i.id.as_str()).collect();
+    for l in &f.locations {
+        for c in &l.connections {
+            if !loc_ids.contains(c.as_str()) {
+                return Err(format!(
+                    "副本卡 `{card_id}` 引用悬空：地点 `{}` 连向卡外地点 `{c}`（跨卡连接只能经容器 seams 声明）",
+                    l.id
+                ));
+            }
+        }
+        for iid in &l.resident_item_ids {
+            if !item_ids.contains(iid.as_str()) {
+                return Err(format!(
+                    "副本卡 `{card_id}` 引用悬空：地点 `{}` 的驻留道具 `{iid}` 不在本卡道具目录内",
+                    l.id
+                ));
+            }
+        }
+    }
+    for wc in &f.world_characters {
+        let home = wc.home_location.trim();
+        if !home.is_empty() && !loc_ids.contains(home) {
+            return Err(format!(
+                "副本卡 `{card_id}` 引用悬空：世界角色 `{}` 落在卡外地点 `{home}`",
+                wc.card.id
+            ));
+        }
+        for iid in &wc.carried_item_ids {
+            if !item_ids.contains(iid.as_str()) {
+                return Err(format!(
+                    "副本卡 `{card_id}` 引用悬空：世界角色 `{}` 携带卡外道具 `{iid}`",
+                    wc.card.id
+                ));
+            }
+        }
+    }
+    for a in &f.anchors {
+        let a = a.trim();
+        if !a.is_empty() && !loc_ids.contains(a) {
+            return Err(format!("副本卡 `{card_id}` 引用悬空：anchors 指向不存在的地点 `{a}`"));
+        }
+    }
+    Ok(())
+}
+
+/// 卡内道具的准入相容判定（技术附录 §5.1）：直接复用 `admission::check_admission`，零新机制。
+/// - `Admitted` → 放行；
+/// - `Translated` → 放行（容器显式声明 `rejectedHandling=translate` 才可能走到，
+///   合并时会按 `min(容器星级, 卡星级)` 夹档，语义与 `translate_item` 一致：只降不升）；
+/// - `Rejected` / `Sealed` → **建房期拒绝**（不兼容的世界观不该缝在一起，也不该运行时静默退化）；
+/// - 体系标签不在 `KNOWN_COSMOLOGIES` → 拒绝（自由文本一律不收）。
+fn check_card_item_admission(
+    card_id: &str,
+    item: &ItemDefinition,
+    policy: &crate::admission::WorldAdmissionPolicy,
+) -> Result<(), String> {
+    use crate::admission::AdmissionDecision;
+    match crate::admission::check_admission(policy, item) {
+        Ok(AdmissionDecision::Admitted) | Ok(AdmissionDecision::Translated) => Ok(()),
+        Ok(AdmissionDecision::Rejected) | Ok(AdmissionDecision::Sealed) => Err(format!(
+            "cosmology 不相容：副本卡 `{card_id}` 的道具 `{}`（体系 {:?} / 档位 {}）不被本容器的准入策略接受",
+            item.id, item.origin.cosmology, item.origin.power_tier
+        )),
+        Err(e) => Err(format!("副本卡 `{card_id}` 的道具 `{}` 准入校验失败：{e}", item.id)),
+    }
+}
+
+/// 合并后全局 id 唯一性复核（同类目内不得重复）。命名空间前缀在构造上已保证，
+/// 这里当**断言**用：撞了说明前缀逻辑被改坏了，必须在建房期炸出来而不是运行时静默采样出鬼东西。
+fn assert_unique_ids(sk: &Skeleton) -> Result<(), String> {
+    let dup = |kind: &str, ids: Vec<&str>| -> Result<(), String> {
+        let mut seen: std::collections::BTreeSet<&str> = Default::default();
+        for id in ids {
+            if !id.is_empty() && !seen.insert(id) {
+                return Err(format!("{kind} id 冲突：`{id}` 在合并后的容器里出现多次"));
+            }
+        }
+        Ok(())
+    };
+    dup("mainlineNodes", sk.mainline_nodes.iter().map(|n| n.id.as_str()).collect())?;
+    dup("storylines", sk.storylines.iter().map(|s| s.id.as_str()).collect())?;
+    dup(
+        "内容池",
+        sk.hidden_content_pool
+            .iter()
+            .chain(sk.side_hook_pool.iter())
+            .map(|p| p.id.as_str())
+            .collect(),
+    )?;
+    dup("endingPool", sk.ending_pool.iter().map(|e| e.id.as_str()).collect())?;
+    dup("worldItems", sk.world_items.iter().map(|i| i.id.as_str()).collect())?;
+    dup("locations", sk.locations.iter().map(|l| l.id.as_str()).collect())?;
+    dup("worldCharacters", sk.world_characters.iter().map(|w| w.card.id.as_str()).collect())?;
+    Ok(())
+}
+
+/// 解引用容器模板声明的副本卡（DB 侧）。返回空 Vec = **非容器形态**（走原路径）。
+///
+/// 关闭开关或模板未声明 `subplotCardRefs` → 直接空（读取侧降级，产物逐字节不变）。
+/// 其余任何一条不成立都是**建房期拒绝**（400），不静默跳过某张卡：
+/// 少装一张卡 = 内容不同 = 种子不同，静默容忍等于给了"卡不合法就退化重刷"的旁路。
+async fn load_container_cards(
+    db: &AnyPool,
+    world: &crate::worlds::WorldRow,
+    skeleton: &Skeleton,
+) -> Result<Vec<ContainerCard>, ApiError> {
+    if skeleton.subplot_card_refs.is_empty() || !container_assembly_enabled() {
+        return Ok(Vec::new());
+    }
+    // 房主：无交易红线（§10「玩家间交易暂不开」）下，只能装自己的卡。
+    let Some(host) = world.host_user_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return Err(ApiError::BadRequest(
+            "容器房缺少房主：副本卡只能由卡主本人装入自己的房".into(),
+        ));
+    };
+
+    let mut out: Vec<ContainerCard> = Vec::new();
+    for card_ref in &skeleton.subplot_card_refs {
+        let card_id = card_ref.card_id.trim();
+        if card_id.is_empty() {
+            return Err(ApiError::BadRequest("subplotCardRefs 含空 cardId".into()));
+        }
+        let row = sqlx::query(
+            "SELECT owner_id, star_rating, status, source_template_id, source_template_version \
+             FROM subplot_cards WHERE id = ?",
+        )
+        .bind(card_id)
+        .fetch_optional(db)
+        .await?
+        .ok_or_else(|| ApiError::BadRequest(format!("副本卡 `{card_id}` 不存在")))?;
+
+        let owner: String = row.try_get("owner_id")?;
+        if owner != host {
+            // 不泄露"这张卡存在但不是你的"，与卡不存在同一措辞。
+            return Err(ApiError::BadRequest(format!("副本卡 `{card_id}` 不存在")));
+        }
+        let status: String = row.try_get("status")?;
+        if status != "owned" {
+            return Err(ApiError::BadRequest(format!(
+                "副本卡 `{card_id}` 已作为合成材料销毁，不可装入"
+            )));
+        }
+        let star_rating: i64 = row.try_get("star_rating")?;
+        let source_template_id: Option<String> = row.try_get("source_template_id")?;
+        let source_template_version: Option<i64> = row.try_get("source_template_version")?;
+        let (Some(tpl_id), Some(tpl_ver)) = (source_template_id, source_template_version) else {
+            return Err(ApiError::BadRequest(format!(
+                "副本卡 `{card_id}` 没有内容蓝图（来源模板缺失），不可作自定义房的内容燃料"
+            )));
+        };
+        // 版本钉住：客户端声明了就必须与服务端一致；进指纹的恒是服务端值。
+        if let Some(declared) = card_ref.card_version {
+            if declared != tpl_ver {
+                return Err(ApiError::BadRequest(format!(
+                    "副本卡 `{card_id}` 版本不匹配：声明 {declared}，实际 {tpl_ver}（卡发新版不自动生效，请发容器新版本）"
+                )));
+            }
+        }
+        // 蓝图解引用：卡的内容 = 来源模板骨架。下架/未过审的来源 → 停止后续建房（§3.1）。
+        let tpl = sqlx::query(
+            "SELECT skeleton_json, moderation, withdrawn FROM world_templates WHERE id = ?",
+        )
+        .bind(&tpl_id)
+        .fetch_optional(db)
+        .await?
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!("副本卡 `{card_id}` 的内容蓝图已不存在"))
+        })?;
+        let moderation: String = tpl.try_get("moderation")?;
+        let withdrawn: i64 = tpl.try_get("withdrawn")?;
+        if moderation != "approved" || withdrawn != 0 {
+            return Err(ApiError::BadRequest(format!(
+                "副本卡 `{card_id}` 的内容蓝图已下架或未过审，不可装入"
+            )));
+        }
+        let raw: String = tpl.try_get("skeleton_json")?;
+        let fragment: Skeleton = serde_json::from_str(&raw).unwrap_or_default();
+
+        let weight = if card_ref.weight.is_finite() { card_ref.weight.max(0.0) } else { 1.0 };
+        out.push(ContainerCard {
+            card_id: card_id.to_string(),
+            card_version: tpl_ver,
+            star_rating,
+            weight,
+            fragment,
+        });
+    }
+    Ok(out)
+}
+
+/// 记录「本房装了哪几张卡」（migration 0033）。
+///
+/// 🔴 **装配不消耗卡**（§10【拍板 11】"永久蓝图：装入自定义房，房散卡在"）：
+/// 本函数只在 `world_container_cards` 里 INSERT 引用行，**从不 UPDATE/DELETE `subplot_cards`**。
+/// 幂等：先读已有 card_id 集合、只补缺失行；DB 唯一索引 (world_id, card_id) 是最后一道防线。
+async fn record_container_cards(
+    db: &AnyPool,
+    world: &crate::worlds::WorldRow,
+    cards: &[ContainerCard],
+) -> Result<(), ApiError> {
+    if cards.is_empty() {
+        return Ok(());
+    }
+    let existing: Vec<String> =
+        sqlx::query("SELECT card_id FROM world_container_cards WHERE world_id = ?")
+            .bind(&world.id)
+            .fetch_all(db)
+            .await?
+            .iter()
+            .map(|r| r.try_get::<String, _>("card_id"))
+            .collect::<Result<Vec<_>, _>>()?;
+    let owner = world.host_user_id.clone().unwrap_or_default();
+    let now = now_ms();
+    for (slot, card) in cards.iter().enumerate() {
+        if existing.iter().any(|c| c == &card.card_id) {
+            continue;
+        }
+        sqlx::query(
+            "INSERT INTO world_container_cards \
+             (id, world_id, card_id, card_version, owner_id, template_id, slot_no, assembled_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(crate::db::new_id("wcc"))
+        .bind(&world.id)
+        .bind(&card.card_id)
+        .bind(card.card_version)
+        .bind(&owner)
+        .bind(&world.template_id)
+        .bind(slot as i64)
+        .bind(now)
+        .execute(db)
+        .await?;
+    }
+    Ok(())
 }
 
 // ---------- assembled_json 包装（assembly 段钉住 + chapterState 段可变） ----------
@@ -1184,7 +2086,27 @@ pub async fn assemble_instance(state: &AppState, world_id: &str) -> Result<Assem
 
     // 骨架（预审核池）：缺失/解析失败 → 空池（装配退化为无个性化，但不 panic）。
     // star_rating 同查读出：产出封顶输入 + 快照进 assembled_json（服务端留档）。
-    let (skeleton, star_rating) = load_skeleton(&state.db, &world.template_id).await?;
+    // admission 同查读出：容器混装的 cosmology 相容判定输入（技术附录 §5.1）。
+    let (skeleton, star_rating, admission) = load_skeleton(&state.db, &world.template_id).await?;
+
+    // R2 自定义房：容器形态解引用 + 合并（开关关闭 / 模板未声明 subplotCardRefs → 空 → 原路径）。
+    // 合并失败一律 400 **拒绝装配**（房开不起来），不静默退化——静默退化等于给了"内容不合法就
+    // 退回普通装配再重刷"的旁路，且会让玩家在不知情下玩到缺内容的房。
+    //
+    // ⚠️ 「卡被下架 → 停止后续建房，**已钉住实例照旧运行**」靠调用方的前置条件成立：
+    // 两个调用点（`chapters::start` 的 `assembly_of(&wrapper).is_none()`、`runtime` 的
+    // `world.assembled_json.is_none()`）都只在**尚未装配**时进来，故已钉住的房永不重走本段。
+    let container_cards = load_container_cards(&state.db, &world, &skeleton).await?;
+    let skeleton = if container_cards.is_empty() {
+        skeleton
+    } else {
+        let composed =
+            compose_container_skeleton(skeleton, &container_cards, star_rating, &admission)
+                .map_err(ApiError::BadRequest)?;
+        // 🔴 装配**不消耗卡**：只在 world_container_cards 记引用行，subplot_cards 一个字节都不改。
+        record_container_cards(&state.db, &world, &container_cards).await?;
+        composed
+    };
 
     // 全体在场成员卡。
     let cards = load_active_cards(&state.db, world_id).await?;
@@ -1370,19 +2292,27 @@ pub async fn assemble_instance(state: &AppState, world_id: &str) -> Result<Assem
 
 // ---------- 读取辅助 ----------
 
-/// 读骨架 + 星级（波次 3：star_rating 装配时从 world_templates 读出，供产出封顶并快照进
-/// assembled_json）。模板行缺失（测试/历史数据）→ (空骨架, 1★)：退化装配且封顶按最保守档。
-async fn load_skeleton(db: &AnyPool, template_id: &str) -> Result<(Skeleton, i64), ApiError> {
-    let row = sqlx::query("SELECT skeleton_json, star_rating FROM world_templates WHERE id = ?")
-        .bind(template_id)
-        .fetch_optional(db)
-        .await?;
+/// 读骨架 + 星级 + 准入策略（波次 3：star_rating 装配时从 world_templates 读出，供产出封顶并快照进
+/// assembled_json；R2：admission_json 供容器混装的 cosmology 相容判定，技术附录 §5.1）。
+/// 模板行缺失（测试/历史数据）→ (空骨架, 1★, 默认 open 策略)：退化装配且封顶按最保守档。
+async fn load_skeleton(
+    db: &AnyPool,
+    template_id: &str,
+) -> Result<(Skeleton, i64, crate::admission::WorldAdmissionPolicy), ApiError> {
+    let row =
+        sqlx::query("SELECT skeleton_json, star_rating, admission_json FROM world_templates WHERE id = ?")
+            .bind(template_id)
+            .fetch_optional(db)
+            .await?;
     let Some(row) = row else {
-        return Ok((Skeleton::default(), 1));
+        return Ok((Skeleton::default(), 1, Default::default()));
     };
     let raw: String = row.try_get("skeleton_json")?;
     let star_rating: i64 = row.try_get("star_rating")?;
-    Ok((serde_json::from_str(&raw).unwrap_or_default(), star_rating))
+    // 准入策略解析失败 → 默认 open（与 load_skeleton 对骨架的防御式 unwrap_or_default 同款）。
+    let admission_raw: String = row.try_get("admission_json").unwrap_or_default();
+    let admission = serde_json::from_str(&admission_raw).unwrap_or_default();
+    Ok((serde_json::from_str(&raw).unwrap_or_default(), star_rating, admission))
 }
 
 async fn load_active_cards(db: &AnyPool, world_id: &str) -> Result<Vec<(String, CharacterCardV2)>, ApiError> {
@@ -1605,6 +2535,115 @@ pub(crate) fn validate_skeleton_refs(skeleton: &Value) -> Result<(), String> {
                         "payoutTable.worldlineTiers 道具 id 为空：档位 `{}` 无法发货与幂等去重",
                         tier.label
                     ));
+                }
+            }
+        }
+    }
+
+    // 6) 容器形态（R2 自定义房，技术附录 §3）：副本卡引用 / 缝合边 / 锚点的**建房期硬门**。
+    //    未声明 subplotCardRefs（普通模板）直接放行——本段一个字节都不影响它们。
+    validate_container_refs(&sk)?;
+
+    Ok(())
+}
+
+/// 容器声明的建房期校验（`validate_skeleton_refs` 第 6 段，技术附录 §3.1/§3.3/§5）。
+///
+/// 这里只做**不依赖 DB 的静态门**（结构、格式、白名单、保留字）；需要卡内容才能判的
+/// （卡内 id 含分隔符 / 卡内引用悬空 / cosmology 不相容 / 地点图不连通）由装配期的
+/// `compose_container_skeleton` 拒绝，两道门合起来覆盖「建房期就拒绝，不留到运行时静默退化」。
+fn validate_container_refs(sk: &Skeleton) -> Result<(), String> {
+    if sk.subplot_card_refs.is_empty() {
+        // 普通模板：seams / nexus / anchors 单独声明而没有卡，是无意义配置，直接忽略（不拦老模板）。
+        return Ok(());
+    }
+    // 🔴 前门拒绝（VALIDATION §0.1 未验证功能默认关闭）：开关未开时连声明都不许落库。
+    // 读取侧另有降级（装配期忽略 refs 走原路径），两道合起来才是可逆急停阀。
+    if !container_assembly_enabled() {
+        return Err(
+            "自定义房装配（subplotCardRefs）尚未开放：本功能由运营开关 MUSE_CONTAINER_ASSEMBLY 控制，默认关闭"
+                .to_string(),
+        );
+    }
+
+    // 6a) 卡引用：id 非空 / 不含命名空间分隔符 / 不重复；weight 有限非负；cardVersion 非负。
+    let mut seen_cards: std::collections::BTreeSet<&str> = Default::default();
+    for r in &sk.subplot_card_refs {
+        let cid = r.card_id.trim();
+        if cid.is_empty() {
+            return Err("subplotCardRefs 缺少 cardId：无法确定命名空间前缀".to_string());
+        }
+        if cid.contains(NS_SEP) {
+            return Err(format!(
+                "subplotCardRefs cardId 非法：`{cid}` 含保留分隔符 `{NS_SEP}`（它是命名空间前缀专用）"
+            ));
+        }
+        if !seen_cards.insert(cid) {
+            return Err(format!("subplotCardRefs 重复引用同一张卡：`{cid}`"));
+        }
+        if !r.weight.is_finite() || r.weight < 0.0 {
+            return Err(format!("subplotCardRefs weight 非法：卡 `{cid}` 的权重须为非负有限数（当前 {}）", r.weight));
+        }
+        if let Some(v) = r.card_version {
+            if v < 0 {
+                return Err(format!("subplotCardRefs cardVersion 非法：卡 `{cid}` 的版本须 ≥ 0（当前 {v}）"));
+            }
+        }
+    }
+
+    // 6b) 容器本体 id 不得含命名空间分隔符（命名空间的前提：裸 id = 本体、带前缀 = 卡，两空间不相交）。
+    for id in collect_id_like(sk) {
+        if id.contains(NS_SEP) {
+            return Err(format!(
+                "容器本体 id `{id}` 含保留分隔符 `{NS_SEP}`：装卡的容器里 `{NS_SEP}` 是命名空间前缀专用（`卡id:原id`）"
+            ));
+        }
+    }
+
+    // 6c) 枢纽保留 id 不得被本体占用。
+    if sk.locations.iter().any(|l| l.id.trim() == NEXUS_LOCATION_ID) {
+        return Err(format!("地点 id `{NEXUS_LOCATION_ID}` 是容器枢纽保留字：请给本体地点换个 id"));
+    }
+
+    // 6d) 本体 anchors：须指向本体存在的地点，且**非秘境**（秘境不可作缝合口）。
+    let loc_ids: std::collections::BTreeSet<&str> = sk.locations.iter().map(|l| l.id.as_str()).collect();
+    for a in &sk.anchors {
+        let a = a.trim();
+        if a.is_empty() {
+            continue;
+        }
+        if !loc_ids.contains(a) {
+            return Err(format!("anchors 悬空：锚点 `{a}` 不是本容器的地点"));
+        }
+        if sk.locations.iter().any(|l| l.id == a && l.is_secret_realm) {
+            return Err(format!("anchors 非法：秘境 `{a}` 不可作缝合口（gate 语义须完整保留在卡内）"));
+        }
+    }
+
+    // 6e) 缝合边：两端非空且不相等；带前缀的端点其 cardId 必须在 refs 内（悬空引用）；
+    //     裸 id 端点必须是本体地点。卡内那一端是否存在 / 是否在卡的 anchors 白名单内，
+    //     须待卡解引用后判，由 compose_container_skeleton 兜（同样是建房期，不是运行时）。
+    for seam in &sk.seams {
+        let (from, to) = (seam.from.trim(), seam.to.trim());
+        if from.is_empty() || to.is_empty() {
+            return Err("seams 非法：缝合边两端都必须声明地点".to_string());
+        }
+        if from == to {
+            return Err(format!("seams 非法：缝合边两端相同（`{from}`）"));
+        }
+        for end in [from, to] {
+            match ns_owner(end) {
+                Some(card) => {
+                    if !seen_cards.contains(card) {
+                        return Err(format!(
+                            "seams 悬空：缝合口 `{end}` 指向未被 subplotCardRefs 引用的卡 `{card}`"
+                        ));
+                    }
+                }
+                None => {
+                    if !loc_ids.contains(end) {
+                        return Err(format!("seams 悬空：缝合口 `{end}` 不是本容器本体的地点"));
+                    }
                 }
             }
         }
@@ -2511,6 +3550,944 @@ mod sampling_tests {
             s.hidden_ids,
             vec!["h1".to_string(), "h2".to_string()],
             "退化路径不读星级：tier5 奖励钩子照旧全量装配"
+        );
+    }
+}
+
+// ============================================================================
+// R2 自定义房装配单测：命名空间 / 四段式种子 / 缝合 / 建房期校验 / 红线
+// ============================================================================
+
+#[cfg(test)]
+mod container_tests {
+    use super::*;
+    use serde_json::json;
+    use std::collections::BTreeSet;
+
+    const PROFILE: (u32, u32, u32) = (1, 1, 1);
+
+    /// 容器装配开关的 RAII 夹具（进程级 env → 同一把锁串行化，Drop 时恢复原状）。
+    /// 范式同 `worlds::DeathmatchSwitch` / `subplot::SubplotSwitch`。
+    /// 定义在测试模块内：本文件的生产代码段不得出现 test-only 编译属性（见文件中部说明）。
+    pub(crate) struct ContainerSwitch {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        prev: Option<String>,
+    }
+
+    impl ContainerSwitch {
+        pub(crate) fn set(on: bool) -> Self {
+            static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = std::env::var(ENV_CONTAINER_ASSEMBLY).ok();
+            std::env::set_var(ENV_CONTAINER_ASSEMBLY, if on { "1" } else { "0" });
+            Self { _guard: guard, prev }
+        }
+    }
+
+    impl Drop for ContainerSwitch {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(ENV_CONTAINER_ASSEMBLY, v),
+                None => std::env::remove_var(ENV_CONTAINER_ASSEMBLY),
+            }
+        }
+    }
+
+    fn sk(v: serde_json::Value) -> Skeleton {
+        serde_json::from_value(v).expect("骨架 JSON")
+    }
+
+    fn open_policy() -> crate::admission::WorldAdmissionPolicy {
+        Default::default()
+    }
+
+    /// 卡片段：**两张卡内部 id 完全相同**（arc/mn/hc/end/wi/gate/inner/secret）——
+    /// 命名空间若失效，合并即撞车，这是本组测试的主要探针。
+    fn frag_json(theme: &str, item_tier: u8) -> serde_json::Value {
+        json!({
+            "storylines": [
+                { "id": "arc", "mainlineNodeIds": ["mn"], "hiddenPoolIds": ["hc"], "endingIds": ["end"] }
+            ],
+            "mainlineNodes": [ { "id": "mn", "fated": true, "arcTags": ["arc"] } ],
+            "hiddenContentPool": [
+                { "id": "hc", "arcTags": ["arc"], "themes": [theme], "rewardItemRef": "wi", "variantGroup": "vg" }
+            ],
+            "endingPool": [ { "id": "end", "arcTags": ["arc"] } ],
+            "worldItems": [ {
+                "id": "wi", "narrative": "卡内道具", "effectTags": ["advantage:combat"],
+                "origin": { "worldTemplateId": "src", "cosmology": ["myth"], "powerTier": item_tier }
+            } ],
+            "locations": [
+                { "id": "gate",   "connections": ["inner"], "residentItemIds": ["wi"] },
+                { "id": "inner",  "connections": ["gate", "secret"] },
+                { "id": "secret", "isSecretRealm": true, "connections": ["inner"] }
+            ],
+            "anchors": ["gate"]
+        })
+    }
+
+    /// 容器本体：超集 + 一个孤立的本体地点（故意不连通，用来验证缝合）。
+    fn container_json() -> serde_json::Value {
+        json!({
+            "isSuperset": true,
+            "storylines": [
+                { "id": "core-arc", "mainlineNodeIds": ["core-mn"], "hiddenPoolIds": ["core-hc"], "endingIds": ["core-end"] }
+            ],
+            "mainlineNodes": [ { "id": "core-mn", "fated": true, "arcTags": ["core-arc"] } ],
+            "hiddenContentPool": [ { "id": "core-hc", "arcTags": ["core-arc"], "themes": ["core"] } ],
+            "endingPool": [ { "id": "core-end", "arcTags": ["core-arc"] } ],
+            "locations": [ { "id": "core-hub", "connections": [] } ],
+            "anchors": ["core-hub"],
+            "sampling": { "instanceStorylineCount": 2, "instanceHiddenCount": 2, "instanceLocationCount": 5 }
+        })
+    }
+
+    fn card(id: &str, ver: i64, star: i64, weight: f32, frag: serde_json::Value) -> ContainerCard {
+        ContainerCard {
+            card_id: id.to_string(),
+            card_version: ver,
+            star_rating: star,
+            weight,
+            fragment: sk(frag),
+        }
+    }
+
+    /// 标准两卡容器（卡星级 5，容器星级 5 → 不触发夹档；夹档另有专项）。
+    fn two_card_container(refs: serde_json::Value) -> (Skeleton, Vec<ContainerCard>) {
+        let mut c = container_json();
+        c["subplotCardRefs"] = refs;
+        (
+            sk(c),
+            vec![
+                card("c1", 1, 5, 1.0, frag_json("甲", 1)),
+                card("c2", 1, 5, 1.0, frag_json("乙", 1)),
+            ],
+        )
+    }
+
+    fn refs_json(ids: &[&str]) -> serde_json::Value {
+        serde_json::Value::Array(ids.iter().map(|id| json!({ "cardId": id })).collect())
+    }
+
+    fn compose(container: Skeleton, cards: &[ContainerCard], star: i64) -> Result<Skeleton, String> {
+        compose_container_skeleton(container, cards, star, &open_policy())
+    }
+
+    fn plan(sk: &Skeleton, world_id: &str, fp: &str, star: i64) -> Selection {
+        plan_sampling(sk, fp, world_id, 1, &PROFILE, &[], &[], 0.5, star)
+    }
+
+    /// 一组地点 id 在给定图上是否连通（无向）。
+    fn ids_connected(all: &[LocationSpec], ids: &[String]) -> bool {
+        let subset: Vec<LocationSpec> = all
+            .iter()
+            .filter(|l| ids.iter().any(|i| i == &l.id))
+            .map(|l| {
+                let mut l = l.clone();
+                l.connections.retain(|c| ids.iter().any(|i| i == c));
+                l
+            })
+            .collect();
+        location_components(&subset).len() <= 1
+    }
+
+    // ---------------- ① 开关：默认关闭 → 原路径、原公式 ----------------
+
+    #[test]
+    fn switch_defaults_to_off() {
+        // env 未设置时必须是关闭（VALIDATION §0.1 未验证功能默认关闭）。
+        let prev = std::env::var(ENV_CONTAINER_ASSEMBLY).ok();
+        std::env::remove_var(ENV_CONTAINER_ASSEMBLY);
+        let off = container_assembly_enabled();
+        if let Some(v) = prev {
+            std::env::set_var(ENV_CONTAINER_ASSEMBLY, v);
+        }
+        assert!(!off, "MUSE_CONTAINER_ASSEMBLY 默认必须关闭");
+        assert!(!DEFAULT_CONTAINER_ASSEMBLY_ENABLED, "默认常量必须是 false");
+    }
+
+    #[test]
+    fn switch_rejects_garbage_value_by_falling_back_to_off() {
+        let _sw = ContainerSwitch::set(false);
+        std::env::set_var(ENV_CONTAINER_ASSEMBLY, "maybe");
+        assert!(!container_assembly_enabled(), "配错不得静默开启未验证功能");
+    }
+
+    // ---------------- ② 四段式种子只在容器形态生效 ----------------
+
+    #[test]
+    fn four_part_seed_only_in_container_mode() {
+        let plain = sk(container_json());
+        assert!(plain.container.is_none(), "未合并的骨架不是容器形态");
+        assert_eq!(
+            resolve_instance_seed(&plain, "w1", "cidA\ncidB", 3),
+            instance_seed("w1", "cidA\ncidB", 3),
+            "非容器形态必须走原三段式公式（byte 级不变）"
+        );
+
+        let (container, cards) = two_card_container(refs_json(&["c1", "c2"]));
+        let composed = compose(container, &cards, 5).unwrap();
+        let plan_ref = composed.container.as_ref().unwrap();
+        assert_eq!(plan_ref.fingerprint, "c1@1\nc2@1", "卡集合指纹 = 排序去重的 cardId@version");
+        assert_eq!(
+            resolve_instance_seed(&composed, "w1", "cidA\ncidB", 3),
+            container_instance_seed("w1", "cidA\ncidB", 3, "c1@1\nc2@1"),
+            "容器形态必须走四段式公式"
+        );
+        assert_ne!(
+            resolve_instance_seed(&composed, "w1", "cidA\ncidB", 3),
+            instance_seed("w1", "cidA\ncidB", 3),
+            "四段式必须与三段式不同，否则卡集合没进种子"
+        );
+    }
+
+    #[test]
+    fn card_set_fingerprint_is_order_independent() {
+        let (c_a, cards_a) = two_card_container(refs_json(&["c1", "c2"]));
+        let (c_b, _) = two_card_container(refs_json(&["c2", "c1"]));
+        let cards_b = vec![cards_a[1].clone(), cards_a[0].clone()];
+        let fa = compose(c_a, &cards_a, 5).unwrap().container.unwrap().fingerprint;
+        let fb = compose(c_b, &cards_b, 5).unwrap().container.unwrap().fingerprint;
+        assert_eq!(fa, fb, "卡集合指纹排序去重后与声明顺序无关（同一套卡 = 同一个房）");
+    }
+
+    // ---------------- ③ 防刷：换卡 / 换卡版本 → 种子变 → 采样变 ----------------
+
+    #[test]
+    fn swapping_a_card_changes_the_fingerprint_and_seed() {
+        let (c_a, cards_a) = two_card_container(refs_json(&["c1", "c2"]));
+        let mut c_b = container_json();
+        c_b["subplotCardRefs"] = refs_json(&["c1", "c3"]);
+        let cards_b =
+            vec![card("c1", 1, 5, 1.0, frag_json("甲", 1)), card("c3", 1, 5, 1.0, frag_json("丙", 1))];
+        let a = compose(c_a, &cards_a, 5).unwrap();
+        let b = compose(sk(c_b), &cards_b, 5).unwrap();
+        assert_ne!(
+            a.container.as_ref().unwrap().fingerprint,
+            b.container.as_ref().unwrap().fingerprint
+        );
+        assert_ne!(
+            resolve_instance_seed(&a, "w_swap", "cidA", 1),
+            resolve_instance_seed(&b, "w_swap", "cidA", 1),
+            "换一张卡 → 种子必变（防「换卡组合刷同一世界」）"
+        );
+    }
+
+    /// 🔴 防刷核心：**内容完全相同、只有卡版本不同** → 种子必变、采样必变。
+    /// 内容相同保证了差异只可能来自种子（不是"换了内容当然选到不同东西"的假阳性）。
+    #[test]
+    fn same_content_different_card_version_changes_sampling() {
+        let build = |ver: i64| {
+            let (c, mut cards) = two_card_container(refs_json(&["c1", "c2"]));
+            cards[0].card_version = ver;
+            compose(c, &cards, 5).unwrap()
+        };
+        let (v1, v2) = (build(1), build(2));
+        assert_ne!(
+            v1.container.as_ref().unwrap().fingerprint,
+            v2.container.as_ref().unwrap().fingerprint
+        );
+
+        let sig = |s: &Skeleton, w: &str| {
+            let a = plan(s, w, "cidA\ncidB", 5).audit.unwrap();
+            format!(
+                "{}|{}|{}|{}",
+                a.seed,
+                a.selected_storylines.join(","),
+                a.selected_hidden.join(","),
+                a.selected_locations.join(",")
+            )
+        };
+        let mut differ = 0usize;
+        for i in 0..16 {
+            let w = format!("world_cardver_{i}");
+            assert_ne!(
+                plan(&v1, &w, "cidA\ncidB", 5).audit.unwrap().seed,
+                plan(&v2, &w, "cidA\ncidB", 5).audit.unwrap().seed,
+                "同一实例、同一内容，仅卡版本不同 → 种子必须不同"
+            );
+            if sig(&v1, &w) != sig(&v2, &w) {
+                differ += 1;
+            }
+        }
+        assert!(differ > 0, "换卡集合后 16 个实例的采样竟然完全一致 —— 卡集合没有真正进采样");
+    }
+
+    // ---------------- ④ 确定性：同卡集合恒得同装配 ----------------
+
+    #[test]
+    fn same_card_set_yields_identical_assembly() {
+        for i in 0..8 {
+            let (c_a, cards_a) = two_card_container(refs_json(&["c1", "c2"]));
+            let (c_b, cards_b) = two_card_container(refs_json(&["c1", "c2"]));
+            let a = compose(c_a, &cards_a, 5).unwrap();
+            let b = compose(c_b, &cards_b, 5).unwrap();
+            // 合并本身确定：地点图逐项一致。
+            assert_eq!(
+                a.locations.iter().map(|l| (l.id.clone(), l.connections.clone())).collect::<Vec<_>>(),
+                b.locations.iter().map(|l| (l.id.clone(), l.connections.clone())).collect::<Vec<_>>(),
+                "合并器必须是纯函数（同输入同输出）"
+            );
+            let w = format!("world_det_{i}");
+            let (sa, sb) =
+                (plan(&a, &w, "cidA\ncidB", 5).audit.unwrap(), plan(&b, &w, "cidA\ncidB", 5).audit.unwrap());
+            assert_eq!(sa.seed, sb.seed);
+            assert_eq!(sa.selected_storylines, sb.selected_storylines);
+            assert_eq!(sa.selected_mainline, sb.selected_mainline);
+            assert_eq!(sa.selected_hidden, sb.selected_hidden);
+            assert_eq!(sa.selected_endings, sb.selected_endings);
+            assert_eq!(sa.selected_locations, sb.selected_locations);
+            assert_eq!(sa.card_set_fingerprint, sb.card_set_fingerprint);
+            assert_eq!(sa.selected_cards, vec!["c1".to_string(), "c2".to_string()]);
+        }
+    }
+
+    // ---------------- ⑤ 命名空间：多卡混装不撞车 ----------------
+
+    #[test]
+    fn namespace_prevents_cross_card_id_collision() {
+        let (container, cards) = two_card_container(refs_json(&["c1", "c2"]));
+        let m = compose(container, &cards, 5).unwrap();
+
+        // 两张卡内部 id 完全相同，合并后必须全部唯一。
+        assert!(assert_unique_ids(&m).is_ok(), "命名空间失效：合并后出现重复 id");
+
+        let ids: Vec<&str> = m.storylines.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["core-arc", "c1:arc", "c2:arc"], "卡内 id 必须带 `卡id:` 前缀，容器本体保持裸 id");
+        assert!(m.world_items.iter().any(|i| i.id == "c1:wi"));
+        assert!(m.world_items.iter().any(|i| i.id == "c2:wi"));
+
+        // 引用位同步重写：奖励引用、驻留道具、地点连接、变体组、arcTags。
+        let hc1 = m.hidden_content_pool.iter().find(|p| p.id == "c1:hc").expect("c1:hc");
+        assert_eq!(hc1.reward_item_ref.as_deref(), Some("c1:wi"), "rewardItemRef 必须跟着重写");
+        assert_eq!(hc1.variant_group.as_deref(), Some("c1:vg"), "变体组带前缀 → 互斥组天然不跨卡");
+        assert_eq!(hc1.arc_tags, vec!["c1:arc".to_string()]);
+        let gate1 = m.locations.iter().find(|l| l.id == "c1:gate").expect("c1:gate");
+        assert_eq!(gate1.resident_item_ids, vec!["c1:wi".to_string()]);
+        assert!(gate1.connections.contains(&"c1:inner".to_string()));
+
+        // 归属映射：前缀即归属，容器本体裸 id 归属为 None。
+        assert_eq!(ns_owner("c1:hc"), Some("c1"));
+        assert_eq!(ns_owner("core-hc"), None);
+
+        // 变体组不跨卡：两张卡的同名 vg 前缀化后互不干扰，两条 hc 可同时在演。
+        let vgs: BTreeSet<&str> =
+            m.hidden_content_pool.iter().filter_map(|p| p.variant_group.as_deref()).collect();
+        assert_eq!(vgs, ["c1:vg", "c2:vg"].into_iter().collect::<BTreeSet<_>>());
+    }
+
+    #[test]
+    fn card_content_resolves_across_cards_without_crosstalk() {
+        let (container, cards) = two_card_container(refs_json(&["c1", "c2"]));
+        let m = compose(container, &cards, 5).unwrap();
+        // 解引用走合并后的目录：c1 的钩子只可能解出 c1 的道具。
+        let hc1 = m.hidden_content_pool.iter().find(|p| p.id == "c1:hc").unwrap();
+        let item = resolve_reward_item(hc1, &m.world_items).expect("解引用成功");
+        assert_eq!(item.id, "c1:wi", "跨卡解引用必须落在本卡的道具上");
+        // 地点驻留道具同理。
+        let groups = distribute_resident_items(&m.locations, &m.world_items);
+        let g1 = groups.iter().find(|g| g.location_id == "c1:gate").expect("c1:gate 有驻留道具");
+        assert_eq!(g1.items.len(), 1);
+        assert_eq!(g1.items[0].id, "c1:wi");
+    }
+
+    // ---------------- ⑥ 缝合：合并后地点图连通 ----------------
+
+    #[test]
+    fn seams_and_nexus_make_the_location_graph_connected() {
+        let (container, cards) = two_card_container(refs_json(&["c1", "c2"]));
+        // 合并前：本体孤点 + 两张卡各自一坨 = 3 个分量。
+        let mut raw = sk(container_json());
+        for c in &cards {
+            merge_fragment(&mut raw, c, 5);
+        }
+        assert_eq!(location_components(&raw.locations).len(), 3, "未缝合时应当是 3 个孤岛");
+
+        let m = compose(container, &cards, 5).unwrap();
+        assert_eq!(location_components(&m.locations).len(), 1, "缝合后地点图必须连通");
+        let nexus = m.locations.iter().find(|l| l.id == NEXUS_LOCATION_ID).expect("应生成枢纽");
+        assert_eq!(nexus.name, NEXUS_DEFAULT_NAME);
+        assert!(!nexus.is_secret_realm, "枢纽不得是秘境");
+        // 枢纽只接锚点，不接秘境。
+        assert!(nexus.connections.iter().all(|c| c == "core-hub" || c == "c1:gate" || c == "c2:gate"));
+    }
+
+    #[test]
+    fn explicit_seam_links_two_cards_and_pins_endpoints() {
+        let mut c = container_json();
+        c["subplotCardRefs"] = refs_json(&["c1", "c2"]);
+        c["seams"] = json!([{ "from": "c1:gate", "to": "c2:gate" }]);
+        c["nexus"] = json!({ "name": "十字驿站" });
+        let cards =
+            vec![card("c1", 1, 5, 1.0, frag_json("甲", 1)), card("c2", 1, 5, 1.0, frag_json("乙", 1))];
+        let m = compose(sk(c), &cards, 5).unwrap();
+        let g1 = m.locations.iter().find(|l| l.id == "c1:gate").unwrap();
+        assert!(g1.connections.contains(&"c2:gate".to_string()), "缝合边必须双向落地");
+        let g2 = m.locations.iter().find(|l| l.id == "c2:gate").unwrap();
+        assert!(g2.connections.contains(&"c1:gate".to_string()));
+        assert_eq!(location_components(&m.locations).len(), 1);
+        assert_eq!(
+            m.locations.iter().find(|l| l.id == NEXUS_LOCATION_ID).map(|l| l.name.as_str()),
+            Some("十字驿站"),
+            "枢纽名取容器声明"
+        );
+        let pinned = &m.container.as_ref().unwrap().pinned_locations;
+        for want in ["c1:gate", "c2:gate", NEXUS_LOCATION_ID] {
+            assert!(pinned.iter().any(|p| p == want), "缝合端点与枢纽必须钉成地点采样必选种子");
+        }
+    }
+
+    /// 缝合的目的在采样后仍成立：任意实例的被选地点集在合并图上连通。
+    #[test]
+    fn sampled_locations_stay_connected_in_container_mode() {
+        let (container, cards) = two_card_container(refs_json(&["c1", "c2"]));
+        let m = compose(container, &cards, 5).unwrap();
+        for i in 0..16 {
+            let s = plan(&m, &format!("world_conn_{i}"), "cidA", 5).audit.unwrap();
+            assert!(
+                ids_connected(&m.locations, &s.selected_locations),
+                "实例 {i} 的地点子图裂了：{:?}",
+                s.selected_locations
+            );
+            // 秘境保连通语义在跨卡场景同样成立。
+            for secret in ["c1:secret", "c2:secret"] {
+                if s.selected_locations.iter().any(|l| l == secret) {
+                    let inner = secret.replace("secret", "inner");
+                    assert!(
+                        s.selected_locations.contains(&inner),
+                        "秘境 {secret} 入选但通路 {inner} 未入选"
+                    );
+                }
+            }
+        }
+    }
+
+    // ---------------- ⑦ 平权红线：卡是内容燃料，不带规则、不加战力 ----------------
+
+    /// 🔴 卡带入的道具档位被夹到 `min(容器星级, 卡星级)`：只降不升、effectTags 不变。
+    #[test]
+    fn card_items_are_capped_by_container_and_card_star() {
+        // 5★ 卡的 tier5 道具装进 2★ 容器 → 夹到 2。
+        let mut c = container_json();
+        c["subplotCardRefs"] = refs_json(&["c1"]);
+        let cards = vec![card("c1", 1, 5, 1.0, frag_json("甲", 5))];
+        let m = compose(sk(c.clone()), &cards, 2).unwrap();
+        let it = m.world_items.iter().find(|i| i.id == "c1:wi").unwrap();
+        assert_eq!(it.origin.power_tier, 2, "容器星级封顶：借高星卡在低星容器刷高档道具必须被堵死");
+        assert_eq!(it.effect_tags, vec!["advantage:combat".to_string()], "effectTags 恒不变（防转译后门）");
+
+        // 1★ 卡的 tier5 道具装进 5★ 容器 → 夹到 1（低星卡不因装进高星容器而升档）。
+        let low = vec![card("c1", 1, 1, 1.0, frag_json("甲", 5))];
+        let m2 = compose(sk(c), &low, 5).unwrap();
+        assert_eq!(m2.world_items.iter().find(|i| i.id == "c1:wi").unwrap().origin.power_tier, 1);
+    }
+
+    /// 🔴 产出封顶不被绕过：夹档（compose）+ 星级封顶剔除（plan_sampling）双保险，
+    /// 内联奖励与 ref 奖励同口径（内联不是后门）。
+    #[test]
+    fn container_payout_cap_cannot_be_bypassed() {
+        let mut frag = frag_json("甲", 5);
+        // 再挂一条**内联** tier5 奖励的钩子：内联路径必须同样被夹。
+        frag["hiddenContentPool"] = json!([
+            { "id": "hc", "arcTags": ["arc"], "themes": ["甲"], "rewardItemRef": "wi" },
+            { "id": "hc-inline", "arcTags": ["arc"], "themes": ["甲"], "rewardItem": {
+                "id": "inline", "narrative": "内联神器", "effectTags": [],
+                "origin": { "worldTemplateId": "src", "cosmology": ["myth"], "powerTier": 5 } } }
+        ]);
+        frag["storylines"] = json!([
+            { "id": "arc", "mainlineNodeIds": ["mn"], "hiddenPoolIds": ["hc", "hc-inline"], "endingIds": ["end"] }
+        ]);
+        let mut c = container_json();
+        c["subplotCardRefs"] = refs_json(&["c1"]);
+        let cards = vec![card("c1", 1, 5, 1.0, frag)];
+        let m = compose(sk(c), &cards, 2).unwrap();
+
+        for p in &m.hidden_content_pool {
+            if let Some(t) = reward_tier(p, &m.world_items) {
+                assert!(t <= 2, "钩子 {} 的奖励档位 {t} 越过 2★ 容器封顶", p.id);
+            }
+        }
+        // 采样后仍不越界（星级封顶第二道）。
+        for i in 0..8 {
+            let s = plan(&m, &format!("world_cap_{i}"), "cidA", 2).audit.unwrap();
+            for id in &s.selected_hidden {
+                let p = m.hidden_content_pool.iter().find(|p| &p.id == id).unwrap();
+                if let Some(t) = reward_tier(p, &m.world_items) {
+                    assert!(t <= 2, "入选钩子 {id} 的奖励档位 {t} 越过封顶");
+                }
+            }
+        }
+    }
+
+    /// 🔴 卡只贡献「内容」，不贡献规则维度：产出表 / 身份池 / 装配规则 / 采样计数 / 超集标记
+    /// 一律只认容器本体（卡不得带来产出加成、准入豁免或规则特权）。
+    #[test]
+    fn cards_never_contribute_rule_dimensions() {
+        let mut frag = frag_json("甲", 1);
+        frag["payoutTable"] = json!({ "worldlineTiers": [ { "label": "卡自带的产出表", "minScore": 0.0, "mileage": 9999 } ] });
+        frag["identityPool"] = json!([ { "id": "card-lead", "quota": 9, "isLead": true } ]);
+        frag["assemblyRules"] = json!({ "hiddenPerCharacter": 9 });
+        frag["sampling"] = json!({ "instanceHiddenCount": 99 });
+        frag["isSuperset"] = json!(false);
+        frag["subplotCardRefs"] = refs_json(&["c-nested"]); // 递归炸弹：卡里再引用卡。
+
+        let mut c = container_json();
+        c["subplotCardRefs"] = refs_json(&["c1"]);
+        let m = compose(sk(c), &[card("c1", 1, 5, 1.0, frag)], 5).unwrap();
+
+        assert!(m.payout_table.is_none(), "卡不得带来产出表（产出加成 = 加战力的侧门）");
+        assert!(m.identity_pool.is_empty(), "卡不得带来身份池（站位与配额是容器的规则维度）");
+        assert_eq!(m.assembly_rules.hidden_per_character, 1, "装配规则只认容器本体");
+        assert_eq!(m.sampling.instance_hidden_count, Some(2), "采样计数只认容器本体");
+        assert!(m.is_superset, "超集标记只认容器本体");
+        assert_eq!(m.subplot_card_refs.len(), 1, "卡内的 subplotCardRefs 不得被继承（禁止递归装卡）");
+    }
+
+    // ---------------- ⑧ 建房期拒绝（静态门 + 合并门） ----------------
+
+    fn validate(v: serde_json::Value) -> Result<(), String> {
+        validate_skeleton_refs(&v)
+    }
+
+    #[test]
+    fn front_door_rejects_container_declaration_while_switch_is_off() {
+        let _sw = ContainerSwitch::set(false);
+        let mut c = container_json();
+        c["subplotCardRefs"] = refs_json(&["c1"]);
+        let err = validate(c).unwrap_err();
+        assert!(err.contains("MUSE_CONTAINER_ASSEMBLY"), "应报未开放，实得：{err}");
+        // 普通模板不受影响。
+        assert!(validate(container_json()).is_ok(), "无 subplotCardRefs 的模板不得被本段拦住");
+    }
+
+    #[test]
+    fn validate_accepts_wellformed_container() {
+        let _sw = ContainerSwitch::set(true);
+        let mut c = container_json();
+        c["subplotCardRefs"] = json!([
+            { "cardId": "c1", "cardVersion": 3, "weight": 0.5 },
+            { "cardId": "c2" }
+        ]);
+        c["seams"] = json!([{ "from": "core-hub", "to": "c1:gate" }]);
+        c["nexus"] = json!({ "name": "十字驿站" });
+        assert!(validate(c.clone()).is_ok(), "合法容器不得被拦：{:?}", validate(c));
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_card_ref() {
+        let _sw = ContainerSwitch::set(true);
+        let mut c = container_json();
+        c["subplotCardRefs"] = refs_json(&["c1", "c1"]);
+        assert!(validate(c).unwrap_err().contains("重复引用"));
+    }
+
+    #[test]
+    fn validate_rejects_card_id_with_namespace_separator() {
+        let _sw = ContainerSwitch::set(true);
+        let mut c = container_json();
+        c["subplotCardRefs"] = refs_json(&["c1:evil"]);
+        assert!(validate(c).unwrap_err().contains("保留分隔符"));
+    }
+
+    #[test]
+    fn validate_rejects_container_body_id_with_separator() {
+        let _sw = ContainerSwitch::set(true);
+        let mut c = container_json();
+        c["subplotCardRefs"] = refs_json(&["c1"]);
+        c["hiddenContentPool"] = json!([{ "id": "core:hc", "themes": ["x"] }]);
+        assert!(validate(c).unwrap_err().contains("容器本体 id"));
+    }
+
+    #[test]
+    fn validate_rejects_reserved_nexus_id() {
+        let _sw = ContainerSwitch::set(true);
+        let mut c = container_json();
+        c["subplotCardRefs"] = refs_json(&["c1"]);
+        c["locations"] = json!([{ "id": NEXUS_LOCATION_ID }]);
+        assert!(validate(c).unwrap_err().contains("保留字"));
+    }
+
+    #[test]
+    fn validate_rejects_dangling_seam_endpoints() {
+        let _sw = ContainerSwitch::set(true);
+        // ① 指向未被引用的卡。
+        let mut a = container_json();
+        a["subplotCardRefs"] = refs_json(&["c1"]);
+        a["seams"] = json!([{ "from": "core-hub", "to": "c9:gate" }]);
+        assert!(validate(a).unwrap_err().contains("未被 subplotCardRefs 引用"));
+        // ② 裸 id 不是本体地点。
+        let mut b = container_json();
+        b["subplotCardRefs"] = refs_json(&["c1"]);
+        b["seams"] = json!([{ "from": "no-such-loc", "to": "c1:gate" }]);
+        assert!(validate(b).unwrap_err().contains("不是本容器本体的地点"));
+        // ③ 两端相同。
+        let mut d = container_json();
+        d["subplotCardRefs"] = refs_json(&["c1"]);
+        d["seams"] = json!([{ "from": "core-hub", "to": "core-hub" }]);
+        assert!(validate(d).unwrap_err().contains("两端相同"));
+    }
+
+    #[test]
+    fn validate_rejects_bad_anchors() {
+        let _sw = ContainerSwitch::set(true);
+        let mut a = container_json();
+        a["subplotCardRefs"] = refs_json(&["c1"]);
+        a["anchors"] = json!(["nope"]);
+        assert!(validate(a).unwrap_err().contains("anchors 悬空"));
+
+        let mut b = container_json();
+        b["subplotCardRefs"] = refs_json(&["c1"]);
+        b["locations"] = json!([{ "id": "core-hub", "isSecretRealm": true }]);
+        b["anchors"] = json!(["core-hub"]);
+        assert!(validate(b).unwrap_err().contains("秘境"));
+    }
+
+    #[test]
+    fn validate_rejects_negative_weight() {
+        let _sw = ContainerSwitch::set(true);
+        let mut c = container_json();
+        c["subplotCardRefs"] = json!([{ "cardId": "c1", "weight": -1.0 }]);
+        assert!(validate(c).unwrap_err().contains("weight 非法"));
+    }
+
+    #[test]
+    fn compose_rejects_card_internal_id_with_separator() {
+        let mut frag = frag_json("甲", 1);
+        frag["hiddenContentPool"] = json!([{ "id": "evil:hc", "arcTags": ["arc"] }]);
+        let mut c = container_json();
+        c["subplotCardRefs"] = refs_json(&["c1"]);
+        let err = compose(sk(c), &[card("c1", 1, 5, 1.0, frag)], 5).unwrap_err();
+        assert!(err.contains("保留分隔符"), "实得：{err}");
+    }
+
+    #[test]
+    fn compose_rejects_dangling_reference_inside_card() {
+        // 卡内 connections 指向卡外地点（跨卡连接只能经 seams）。
+        let mut frag = frag_json("甲", 1);
+        frag["locations"] = json!([{ "id": "gate", "connections": ["somewhere-else"] }]);
+        let mut c = container_json();
+        c["subplotCardRefs"] = refs_json(&["c1"]);
+        let err = compose(sk(c), &[card("c1", 1, 5, 1.0, frag)], 5).unwrap_err();
+        assert!(err.contains("引用悬空"), "实得：{err}");
+    }
+
+    #[test]
+    fn compose_rejects_seam_outside_anchor_whitelist() {
+        let mut c = container_json();
+        c["subplotCardRefs"] = refs_json(&["c1", "c2"]);
+        // c1:inner 不在 c1 的 anchors 白名单里（白名单只有 gate）。
+        c["seams"] = json!([{ "from": "core-hub", "to": "c1:inner" }]);
+        let cards =
+            vec![card("c1", 1, 5, 1.0, frag_json("甲", 1)), card("c2", 1, 5, 1.0, frag_json("乙", 1))];
+        let err = compose(sk(c), &cards, 5).unwrap_err();
+        assert!(err.contains("anchors 白名单"), "实得：{err}");
+    }
+
+    #[test]
+    fn compose_rejects_seam_into_secret_realm() {
+        let mut frag = frag_json("甲", 1);
+        frag["anchors"] = json!(["secret"]); // 故意把秘境声明成锚点。
+        let mut c = container_json();
+        c["subplotCardRefs"] = refs_json(&["c1"]);
+        c["seams"] = json!([{ "from": "core-hub", "to": "c1:secret" }]);
+        let err = compose(sk(c), &[card("c1", 1, 5, 1.0, frag)], 5).unwrap_err();
+        assert!(err.contains("秘境"), "实得：{err}");
+    }
+
+    #[test]
+    fn compose_rejects_incompatible_cosmology() {
+        // 容器 allowlist 只收 cultivation，卡内道具是 myth → 不相容，建房期拒绝。
+        let policy: crate::admission::WorldAdmissionPolicy = serde_json::from_value(json!({
+            "mode": "allowlist", "cosmologies": ["cultivation"]
+        }))
+        .unwrap();
+        let mut c = container_json();
+        c["subplotCardRefs"] = refs_json(&["c1"]);
+        let err = compose_container_skeleton(
+            sk(c),
+            &[card("c1", 1, 5, 1.0, frag_json("甲", 1))],
+            5,
+            &policy,
+        )
+        .unwrap_err();
+        assert!(err.contains("cosmology 不相容"), "实得：{err}");
+    }
+
+    #[test]
+    fn compose_rejects_component_without_any_seam_anchor() {
+        // 卡只有秘境地点 → 无合法缝合口 → 建房期拒绝（不留成运行时的孤岛）。
+        let mut frag = frag_json("甲", 1);
+        frag["locations"] = json!([{ "id": "gate", "isSecretRealm": true, "connections": [] }]);
+        frag["anchors"] = json!([]);
+        let mut c = container_json();
+        c["subplotCardRefs"] = refs_json(&["c1"]);
+        let err = compose(sk(c), &[card("c1", 1, 5, 1.0, frag)], 5).unwrap_err();
+        assert!(err.contains("无合法缝合口"), "实得：{err}");
+    }
+
+    #[test]
+    fn assert_unique_ids_catches_real_collision() {
+        // 直接构造撞车骨架：命名空间逻辑若被改坏，必须在建房期炸出来。
+        let bad = sk(json!({
+            "hiddenContentPool": [ { "id": "dup" }, { "id": "dup" } ]
+        }));
+        assert!(assert_unique_ids(&bad).unwrap_err().contains("id 冲突"));
+    }
+
+    // ---------------- ⑨ DB 全链路：默认关闭字节不变 / 装配不消耗卡 ----------------
+
+    async fn seed_tpl(db: &AnyPool, id: &str, skeleton: &serde_json::Value, star: i64) {
+        sqlx::query(
+            "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, \
+             official, version, moderation, star_rating, created_at) \
+             VALUES (?, '容器模板', 'chapter', ?, '{\"mode\":\"open\"}', 1, 1, 'approved', ?, ?)",
+        )
+        .bind(id)
+        .bind(skeleton.to_string())
+        .bind(star)
+        .bind(now_ms())
+        .execute(db)
+        .await
+        .expect("seed template");
+    }
+
+    async fn seed_world_for(db: &AnyPool, world_id: &str, tpl: &str, host: &str) {
+        sqlx::query(
+            "INSERT INTO worlds (id, template_id, template_version, engine_version, prompt_set_version, \
+             model_route_version, room_type, title, status, visibility, host_user_id, member_limit, \
+             tick_per_day, state_revision, narrative_state_json, created_at, updated_at) \
+             VALUES (?, ?, 1, 'e1', 'p1', 'm1', 'chapter', '容器房', 'running', 'private', ?, 10, 3, 0, '{}', ?, ?)",
+        )
+        .bind(world_id)
+        .bind(tpl)
+        .bind(host)
+        .bind(now_ms())
+        .bind(now_ms())
+        .execute(db)
+        .await
+        .expect("seed world");
+    }
+
+    async fn seed_subplot_card(db: &AnyPool, id: &str, owner: &str, star: i64, src_tpl: &str, ver: i64) {
+        sqlx::query(
+            "INSERT INTO subplot_cards (id, owner_id, star_rating, label, origin_kind, grant_key, \
+             source_world_id, source_template_id, source_template_version, synthesized_from_json, \
+             status, acquired_at) \
+             VALUES (?, ?, ?, '剧情结晶', 'settlement', ?, 'w_src', ?, ?, '[]', 'owned', ?)",
+        )
+        .bind(id)
+        .bind(owner)
+        .bind(star)
+        .bind(format!("settlement:{id}"))
+        .bind(src_tpl)
+        .bind(ver)
+        .bind(now_ms())
+        .execute(db)
+        .await
+        .expect("seed subplot card");
+    }
+
+    /// 清掉已钉住的装配后重装（C-7 CAS 只允许首次写入）。
+    async fn reassemble(state: &AppState, world_id: &str) -> String {
+        sqlx::query("UPDATE worlds SET assembled_json = NULL WHERE id = ?")
+            .bind(world_id)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let a = assemble_instance(state, world_id).await.expect("装配成功");
+        serde_json::to_string(&a).expect("序列化装配产物")
+    }
+
+    /// 🔴 **最重要的回归保护**：开关默认关闭时，声明了 subplotCardRefs 的模板与
+    /// 完全没有这些字段的模板，装配产物必须**逐字节相同**（同一 world_id / 同一阵容 / 同一版本）。
+    /// 这同时证明了「关闭时走三段式原公式」——种子若变，采样与产物必变。
+    #[tokio::test]
+    async fn switch_off_keeps_assembly_byte_identical() {
+        let state = crate::safety::testkit::test_state().await;
+        let _sw = ContainerSwitch::set(false);
+
+        let mut with_refs = container_json();
+        with_refs["subplotCardRefs"] = refs_json(&["c1", "c2"]);
+        with_refs["seams"] = json!([{ "from": "core-hub", "to": "c1:gate" }]);
+        with_refs["nexus"] = json!({ "name": "十字驿站" });
+
+        seed_tpl(&state.db, "tpl_off", &with_refs, 5).await;
+        seed_world_for(&state.db, "w_off", "tpl_off", "u_host").await;
+        let with_container = reassemble(&state, "w_off").await;
+
+        // 同一个世界、同一模板 id，只把 skeleton 换成"没有容器字段"的版本 → 产物必须逐字节相同。
+        sqlx::query("UPDATE world_templates SET skeleton_json = ? WHERE id = 'tpl_off'")
+            .bind(container_json().to_string())
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let without_container = reassemble(&state, "w_off").await;
+
+        assert_eq!(
+            with_container, without_container,
+            "开关关闭时容器声明必须完全无副作用（装配产物逐字节不变）"
+        );
+        assert!(!with_container.contains("cardSetFingerprint"), "关闭时不得写入卡集合审计段");
+        assert!(!with_container.contains(NEXUS_LOCATION_ID), "关闭时不得生成枢纽地点");
+
+        // 关闭时也绝不写引用表。
+        let n = crate::safety::testkit::count(
+            &state.db,
+            "SELECT COUNT(*) FROM world_container_cards WHERE world_id = 'w_off'",
+        )
+        .await;
+        assert_eq!(n, 0, "开关关闭时不得记录任何装卡引用");
+    }
+
+    /// 🔴 **装配不消耗卡**（§10【拍板 11】永久蓝图："装入自定义房，房散卡在"）：
+    /// 装配后卡仍是 `owned`、`consumed_into` 仍为空；只在 `world_container_cards` 多出引用行。
+    #[tokio::test]
+    async fn assembly_never_consumes_cards() {
+        let state = crate::safety::testkit::test_state().await;
+        let _sw = ContainerSwitch::set(true);
+
+        seed_tpl(&state.db, "tpl_src1", &frag_json("甲", 1), 5).await;
+        seed_tpl(&state.db, "tpl_src2", &frag_json("乙", 1), 5).await;
+        let mut c = container_json();
+        c["subplotCardRefs"] = refs_json(&["card_a", "card_b"]);
+        seed_tpl(&state.db, "tpl_box", &c, 5).await;
+        seed_subplot_card(&state.db, "card_a", "u_host", 5, "tpl_src1", 1).await;
+        seed_subplot_card(&state.db, "card_b", "u_host", 5, "tpl_src2", 1).await;
+        seed_world_for(&state.db, "w_box", "tpl_box", "u_host").await;
+
+        let first = reassemble(&state, "w_box").await;
+        assert!(first.contains("cardSetFingerprint"), "容器形态必须写入卡集合审计段");
+        assert!(first.contains("card_a"), "审计段应含被装入的卡");
+
+        // 卡仍在手，一个字节都没被动过。
+        for id in ["card_a", "card_b"] {
+            let row = sqlx::query("SELECT status, consumed_into FROM subplot_cards WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+            let status: String = row.try_get("status").unwrap();
+            let consumed: Option<String> = row.try_get("consumed_into").unwrap();
+            assert_eq!(status, "owned", "装配消耗了卡 {id} —— 违反「永久蓝图」红线");
+            assert!(consumed.is_none(), "装配给卡 {id} 写了合成血缘");
+        }
+        // 引用表记账：两张卡两行。
+        assert_eq!(
+            crate::safety::testkit::count(
+                &state.db,
+                "SELECT COUNT(*) FROM world_container_cards WHERE world_id = 'w_box'"
+            )
+            .await,
+            2
+        );
+
+        // 重复装配幂等：不重复记账、卡仍不被消耗。
+        let second = reassemble(&state, "w_box").await;
+        assert_eq!(first, second, "同一 (world, 阵容, 版本, 卡集合) 必须得到同一份装配");
+        assert_eq!(
+            crate::safety::testkit::count(
+                &state.db,
+                "SELECT COUNT(*) FROM world_container_cards WHERE world_id = 'w_box'"
+            )
+            .await,
+            2,
+            "重复装配不得重复记账"
+        );
+
+        // 同一张卡可以同时装进另一个房（蓝图可复制，资产不转移）。
+        seed_world_for(&state.db, "w_box2", "tpl_box", "u_host").await;
+        assemble_instance(&state, "w_box2").await.expect("第二个房照样能装同一批卡");
+        assert_eq!(
+            crate::safety::testkit::count(
+                &state.db,
+                "SELECT COUNT(*) FROM world_container_cards WHERE card_id = 'card_a'"
+            )
+            .await,
+            2,
+            "一卡多房是正常形态（房散卡在）"
+        );
+    }
+
+    /// 别人的卡 / 已熔的卡 / 无蓝图的卡 / 版本对不上 → 建房期拒绝（400），不静默跳过。
+    #[tokio::test]
+    async fn container_rejects_unusable_cards_at_assembly() {
+        let state = crate::safety::testkit::test_state().await;
+        let _sw = ContainerSwitch::set(true);
+        seed_tpl(&state.db, "tpl_src", &frag_json("甲", 1), 5).await;
+
+        let mut c = container_json();
+        c["subplotCardRefs"] = refs_json(&["card_x"]);
+        seed_tpl(&state.db, "tpl_reject", &c, 5).await;
+
+        // ① 卡不存在。
+        seed_world_for(&state.db, "w_r1", "tpl_reject", "u_host").await;
+        assert!(assemble_instance(&state, "w_r1").await.is_err(), "引用不存在的卡必须拒绝装配");
+
+        // ② 卡属于别人（无交易红线：只能装自己的卡）。
+        seed_subplot_card(&state.db, "card_x", "u_other", 5, "tpl_src", 1).await;
+        assert!(assemble_instance(&state, "w_r1").await.is_err(), "别人的卡不得被装入");
+
+        // ③ 已作为合成材料销毁的卡。
+        sqlx::query("UPDATE subplot_cards SET owner_id = 'u_host', status = 'consumed' WHERE id = 'card_x'")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        assert!(assemble_instance(&state, "w_r1").await.is_err(), "已熔的卡不得被装入");
+
+        // ④ 版本钉住对不上。
+        sqlx::query("UPDATE subplot_cards SET status = 'owned' WHERE id = 'card_x'")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let mut c2 = container_json();
+        c2["subplotCardRefs"] = json!([{ "cardId": "card_x", "cardVersion": 7 }]);
+        sqlx::query("UPDATE world_templates SET skeleton_json = ? WHERE id = 'tpl_reject'")
+            .bind(c2.to_string())
+            .execute(&state.db)
+            .await
+            .unwrap();
+        assert!(assemble_instance(&state, "w_r1").await.is_err(), "卡版本对不上必须拒绝（版本钉住）");
+
+        // ⑤ 来源蓝图被下架 → 停止后续建房。
+        sqlx::query("UPDATE world_templates SET skeleton_json = ? WHERE id = 'tpl_reject'")
+            .bind(c.to_string())
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE world_templates SET withdrawn = 1 WHERE id = 'tpl_src'")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        assert!(assemble_instance(&state, "w_r1").await.is_err(), "蓝图下架后不得再装入");
+
+        // 全程一张引用行都不该落。
+        assert_eq!(
+            crate::safety::testkit::count(&state.db, "SELECT COUNT(*) FROM world_container_cards").await,
+            0,
+            "被拒的装配不得留下记账"
+        );
+    }
+
+    /// 🔴 源码级断言：装配层**永不改写副本卡资产**。
+    /// 唯一的销毁语义（合成）归 `subplot/` 独占；装配只在 `world_container_cards` 记引用。
+    #[test]
+    fn red_line_assembly_never_writes_subplot_cards() {
+        // ⚠️ include_str! 会把本测试自己读进来，故按 test-only 编译属性的首次出现截断，
+        //    只扫生产代码段（体例同 member_order_tests::order_by_clause_pins_secondary_key）。
+        let cut_marker = concat!("#[cfg", "(test)]");
+        let src = include_str!("mod.rs");
+        let src = src.split(cut_marker).next().unwrap_or(src).to_ascii_uppercase();
+        for stmt in ["UPDATE SUBPLOT_CARDS", "DELETE FROM SUBPLOT_CARDS", "INSERT INTO SUBPLOT_CARDS"] {
+            assert!(
+                !src.contains(stmt),
+                "装配层出现 `{stmt}`：副本卡是**永久蓝图**（装入自定义房，房散卡在），\n\
+                 装配只许在 world_container_cards 记一行引用；资产的写入路径归 subplot/ 独占（§0.2）"
+            );
+        }
+        // 只读一次卡（解引用蓝图）是允许的，且必须是 SELECT。
+        assert!(
+            src.contains("FROM SUBPLOT_CARDS WHERE ID = ?"),
+            "装配层应当只以 SELECT 方式解引用副本卡（若本断言失败，多半是扫描截断点被前移了）"
         );
     }
 }

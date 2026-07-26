@@ -1,6 +1,6 @@
 # 平台后端 API 清单（server）
 
-> 全部端点 nest 在 `/api` 下（`server/src/app.rs`），共 **95 条路由声明 / 104 个方法-路径组合**。
+> 全部端点 nest 在 `/api` 下（`server/src/app.rs`），共 **99 条路由声明 / 108 个方法-路径组合**。
 > 鉴权列语义：**JWT** = 需 `Authorization: Bearer <accessToken>`（`AuthUser` 提取器）；
 > **公开** = 无需 token；**admin+角色** = 需管理员 token 且 `require_role` 通过（`admin` 角色恒通过）。
 > 校验于 2026-07-26。**改路由必须同步改本文件**——与 `docs/VALIDATION.md` §3 台账同级纪律。
@@ -9,7 +9,7 @@
 
 | 模块 | feature | 说明 |
 |---|---|---|
-| auth / assets / worlds / events / interventions / consents / invitations / notifications / reports / backpack / chapters / progression / subplot / onboarding / admin_api | 默认 | 默认构建即含 |
+| auth / assets / worlds / events / interventions / consents / invitations / notifications / reports / backpack / chapters / progression / subplot / memorial / onboarding / admin_api | 默认 | 默认构建即含 |
 | arena / livegate | `arena` | 赛事房与直播礼物网关 |
 | billing | `billing` | 计费闭环 |
 | shop | `billing` 或 `arena` | 依赖复式账本，与 ledger 同门控（`app.rs:61`） |
@@ -19,7 +19,10 @@
 **运行时开关**（与 feature 门控正交，同样"未验证功能默认关闭"）：`invitations` 全部端点由
 `MUSE_ROOM_INVITATIONS` 控制，**默认关闭 → 404**；`onboarding`（新手动线）全部端点由
 `MUSE_ONBOARDING` 控制，**默认关闭 → 404**；`subplot`（副本卡）全部端点**与结算铸卡**由
-`MUSE_SUBPLOT_CARDS` 控制，**默认关闭 → 端点 404 且结算一张不铸**；世界的生死状档由
+`MUSE_SUBPLOT_CARDS` 控制，**默认关闭 → 端点 404 且结算一张不铸**；自定义房容器装配
+（副本卡的消费端，无独立端点）由 `MUSE_CONTAINER_ASSEMBLY` 控制，**默认关闭 → 建模板期拒绝声明
+`subplotCardRefs`，装配期忽略容器字段走原路径**；`memorial`（传世卡 · 遗作馆）全部端点
+**与封卷本身**由 `MUSE_MEMORIAL` 控制，**默认关闭 → 端点 404 且不发生任何封卷**；世界的生死状档由
 `MUSE_LETHALITY_DEATHMATCH` 控制，默认关闭 → 读取侧降级为同意制。
 
 ---
@@ -102,7 +105,7 @@
 > 未成年保护另有**前门拒绝 + 接受时复查**双保险：生效档为生死状的世界，未声明成年者既收不到邀请、
 > 也接受不了（拒绝文案统一为通用句，不得让端点变成年龄探测器）。
 
-## 4. 玩家账户（me / backpack / progression / subplot / onboarding / reports / notifications）
+## 4. 玩家账户（me / backpack / progression / subplot / memorial / onboarding / reports / notifications）
 
 | 方法 | 路径 | 鉴权 | 说明 |
 |---|---|---|---|
@@ -180,6 +183,85 @@
 > 合成的三重幂等：① 事务原子性（先铸后熔，任一步失败整笔回滚，绝不"熔了却没出卡"）·
 > ② 源卡 `status='owned'` 条件 UPDATE 的 CAS（并发/重放抢不到即回滚）· ③ `grant_key` 唯一键。
 > 销毁是**软删**（`status='consumed'` + 反向指针），回收口必须可溯（§0.2 全链审计）。
+
+### 自定义房装配（容器世界，migration 0033；总规格 §10「自定义房闭环」）
+
+副本卡的**消费端**：打官方世界 → 结算得卡 → 合成 → **装进自提取世界容器开房**。
+技术方案见 `docs/build/spec-subplot-cards.md` §3/§4/§5（⚠️ 该文件 §1/§2/§6/§7/§8 业务假设已作废）。
+
+**无新增端点**：容器形态是**模板骨架的一段声明**，随既有建模板路径入库
+（`POST /api/assets/worlds` 创作者发布 / `POST /api/admin/world-templates` 运营建模板），
+两处都经 `assembly::validate_skeleton_refs` 校验；装配在 `assembly::assemble_instance` 内完成。
+
+`skeleton_json` 顶层新增字段（全部可选，未声明 = 普通模板，**行为与产物逐字节不变**）：
+
+```jsonc
+"subplotCardRefs": [ { "cardId": "scard_a", "cardVersion": 3, "weight": 1.0 } ],  // 版本钉住
+"seams":   [ { "from": "core-hub", "to": "scard_a:loc-gate" } ],  // 跨卡缝合边（两端须是 anchors）
+"anchors": [ "core-hub" ],                                        // 本骨架对外缝合口白名单（秘境不可入）
+"nexus":   { "name": "十字驿站" }                                  // 枢纽地点名（缺省「交汇之地」）
+```
+
+| 项 | 取值 |
+|---|---|
+| 运营开关 | `MUSE_CONTAINER_ASSEMBLY`，**默认关闭**（VALIDATION.md §0.1）。**前门拒绝**（关闭时建模板不许声明 `subplotCardRefs`）+ **读取侧降级**（装配期忽略 refs，走原路径、产物逐字节不变）双保险，可逆急停阀，范式同 `MUSE_LETHALITY_DEATHMATCH` |
+| 命名空间 | 卡内 id 一律重写为 `{cardId}:{原id}`（定义位与引用位全集）；**容器本体不加前缀**——本体 id 必须在开关一开一关两种形态下逐字相同，否则章节发货幂等键 `hook_key={world_id}:{cid}:{poolItemId}` 会漂移成两个 key → 重复发货。归属映射 = 前缀（裸 id = 本体） |
+| 卡内容来源 | 卡是**蓝图指针**：`subplot_cards.source_template_id@source_template_version` 指向的模板骨架即卡片段（0032 原话「内容蓝图指针，自定义房装配的解引用入口」）。蓝图未过审/已下架 → 停止后续建房 |
+| 实例种子 | **仅容器形态**升为四段式：`H(world_id‖阵容指纹‖template_version‖卡集合指纹)`，卡集合指纹 = 排序去重的 `{cardId}@{cardVersion}` 以 `\n` 连接。普通模板恒走原三段式（测试向量与黄金世界回归逐字节锁死）。防「换一张卡组合刷同一世界」 |
+| 缝合 | 卡内 `connections` 只许闭包在卡内；跨卡连接**只能**经 `seams` 显式声明且两端须在各自 `anchors` 白名单内、非秘境。合并后仍不连通 → 自动生成枢纽地点 `loc-nexus`（保留 id）接上各连通分量的代表锚点；枢纽与全部缝合端点进地点采样**必选种子** |
+| 建房期拒绝 | 静态门（`validate_skeleton_refs` 第 6 段）：卡引用重复/空/含 `:`、本体 id 含 `:`、占用 `loc-nexus`、锚点悬空或指向秘境、缝合边悬空/自环/指向未引用的卡、权重非法。合并门（`compose_container_skeleton`）：卡内 id 含 `:`、卡内引用悬空、缝合口不在锚点白名单、cosmology 不相容、分量无合法缝合口。**一律 400 拒绝装配，不留到运行时静默退化** |
+| 🔴 装配不消耗卡 | 副本卡是**永久蓝图**（§10【拍板 11】"装入自定义房，房散卡在"）。装配只在 `world_container_cards`（0033）INSERT 一行引用，**绝不 UPDATE/DELETE `subplot_cards`**（唯一销毁语义是合成，归 `subplot/` 独占）。一卡多房是正常形态；源码级断言 + DB 全链路用例双守 |
+| 🔴 永不加战力 | 卡只贡献**内容**（剧情线/主线/内容池/结局/NPC/道具/地点），**绝不贡献规则维度**——`payoutTable`/`identityPool`/`assemblyRules`/`sampling`/`isSuperset`/准入策略一律只认容器本体（顺带杜绝「卡里再引用卡」的递归）。卡内道具 `powerTier` 合并时夹到 `min(容器星级, 卡星级)`（只降不升，`effectTags` 恒不变）；钩子奖励再过既有星级封顶与稀有预算 |
+| 🔴 cosmology 相容 | 卡内道具逐件跑既有 `admission::check_admission`（零新机制）：`Rejected`/`Sealed` → 建房期拒绝；`Translated`（容器显式 `rejectedHandling=translate`）→ 降档放行 |
+| 确定性 | 合并是纯函数（按模板序遍历、无 RNG）；卡权重乘进该卡各 storyline 的选取权重，**不新开 RNG 子流域**，故既有六个采样域的消费协议一字未动。同 (world_id, 阵容, template_version, 卡集合) 恒得同一份装配 |
+| 审计段 | `assembled_json./assembly/sampling` 新增 `cardSetFingerprint`（哈希，不存明文）+ `selectedCards`，均 `skip_serializing_if` → 非容器实例逐字节不变。**仅服务端/审计可见**，绝不进 members_projection 或日报 |
+
+### 传世卡 · 遗作馆（memorial，migration 0034；总规格 §12【拍板 23】）
+
+**死亡 = 传记封卷，不是资产清零。** 卡死后转「传世卡」：**只读、入遗作馆陈列、不可再入世界**；
+道具归账户背包；与其有羁绊的**在世**角色获得「故人」印记。
+**内核可复制，履历不可复制**——同内核开新卡 = 转世（双胞胎），不是复活：它没死过那一次。
+
+| 方法 | 路径 | 鉴权 | 说明 |
+|---|---|---|---|
+| GET | `/api/memorial/characters?limit=&offset=` | JWT | 遗作馆陈列（按封卷时刻倒序）。**开关默认关闭** |
+| GET | `/api/memorial/characters/{id}` | JWT | 传世卡详情：累计人生 = 历练 + 传记 + 足迹 + 谁还记得他。在世的卡 404 |
+| GET | `/api/me/memorial/marks` | JWT | 我的角色获得的「故人」印记 |
+| POST | `/api/me/characters/{id}/memorial` | JWT | **封卷**（本模块唯一写端点）。服务端核验死亡公共事实；幂等。`Idempotency-Key` 可选 |
+
+| 项 | 取值 |
+|---|---|
+| 运营开关 | `MUSE_MEMORIAL`，**默认关闭**（VALIDATION.md §0.1；死亡属 §2 中 T5 才验证的范围，T0-T2 明写「暂不验证：死亡」）。关闭时四个端点全 404，**且不发生任何封卷**。已封卷的卡不因关阀回到在世——封卷是单向状态转换，不是可开可关的功能，关阀只让它暂时不可见 |
+| 🔴 不可再入世界 | 封卷是**原子双写**：`memorial_status='sealed'`（语义状态 + 幂等 CAS）**与** `withdrawn=1`。后者复用 `worlds::join_world` **既有**的 `withdrawn != 0` 门（→ `character_withdrawn`）——`worlds/mod.rs` **一行未改**。join 的资格查询是列名写死的 SELECT，新列它读不到，故只加新列等于没拦住 |
+| 🔴 withdrawn 必须单向 | 上面那道门成立的前提是全仓不存在把 `cloud_characters.withdrawn` 置回 0 的 SQL（已 grep 核实，并由 `red_line_withdrawn_is_one_way_across_the_repo` 跨 8 个模块源码断言守死）。任何「取消下架」端点都会变成复活侧门 |
+| 🔴 公共事实不可回滚（§0.3） | 封卷**不改写世界线**：不写 `world_events` / `narrative_state_json`，不改 `consent_requests`，不删 `world_members`（足迹是履历）。源码级断言 `red_line_never_rewrites_worldline` |
+| 🔴 故人印记落独立表 | `memorial_marks`，**绝不进 `worlds.narrative_state_json`**——那一列每 tick 经 `build_seed_state` 原样回灌进引擎 `RoundInput.state`，写进去即把记账喂给决策（§0.1 平权红线，口径同 0025 贡献账本 / 0030 critic / 0032 副本卡）。引擎侧零 `memorial` 引用，grep 级断言 |
+| 🔴 无隐藏数值（§12） | 传世卡与印记**不带任何加成/系数/强度**。卡的价值 = 历练 `mileage` + 传记 + 足迹 `world_members` + 羁绊 `memorial_marks`，全是**已存在的显性资产**。`memorial_marks` 只有「谁记得谁、在哪、何时」 |
+| 死亡核验（服务端权威） | **两条证据缺一不可**：(a) `consent_requests` 有 `event_kind='death'` / `status='approved'` 且 subject 含本卡；(b) 该世界 `narrative.pendingConsents` **已不含**本卡的 death 条目（= 引擎已落定并清账）。**授权 ≠ 死亡**：引擎在下一拍才凭 `approved_consents` 落定，只看 (a) 会把活角色误封卷（捏造死亡）。查不到证据 → 409，绝不 fail-open |
+| 幂等 | 两层：① `Idempotency-Key`（同一次点击的 HTTP 重试）；② **DB 状态 CAS**（`WHERE memorial_status='living'`）——抢到才归还道具、才打印记，重复封卷命中 0 行整段短路，`sealed:false` + 两个计数恒 0。印记另有 `memorial_marks(character_id, deceased_character_id)` 唯一键作第二道闸 |
+| 道具归还口径 | §12 原文「道具归账户背包（**道具本为账户资产**）」= **解除携带**（`carried\|sealed → owned`，清 `carried_world_id` 与 S-5 降档覆盖），**不是** `grant_item_tx`。后者是 INSERT 类**发货**路径，对本就在账户里的道具再发一次会凭空多出一行——一次死亡把道具变成两件，违反 §0.2 资产守恒。本模块**绝不 INSERT `backpacks`**（`red_line_never_mints_items` 断言）；背包总行数封卷前后恒等 |
+| 角色面具（§14） | 遗作馆与详情**只出角色维度事实**，不出 `owner_id`/昵称/任何真人身份。遗作馆是角色的墓园，不是玩家名录 |
+| 参数化（§0.2） | `MUSE_MEMORIAL_BOND_MIN`（够得上「故人」的羁绊强度阈值，默认 0.0 = 有关系记录即算；强度 = `max(\|trust\|,\|affinity\|,\|fear\|,\|debt\|)`，**取绝对值**——§12 说的是羁绊不是友谊，宿敌同样成立）· `MUSE_MEMORIAL_PAGE_SIZE`（默认 20，clamp [1,100]） |
+| 转世 | 同内核开新卡走既有 `POST /api/assets/characters`，本模块零特权：新卡新 id、零历练、空传记、无足迹、无印记，不进遗作馆。封卷置 `withdrawn=1` 顺带腾出卡位（`count_active_cards` 只数 `withdrawn=0`）。**同源唯一（0021）对转世卡照常生效**——同一提取源的 `pristine` 卡在同世界仍只允许一张，这是预期行为（「这个世界只有一个唐三」），未开任何后门 |
+
+> 🔴 **遗作馆只读**：`/api/memorial/*` 下**只有 GET**，没有任何编辑/删除/复活传世卡的端点。
+> 唯一的写端点 `POST /api/me/characters/{id}/memorial` 刻意放在 `/me/characters` 命名空间下——
+> 它是**卡的状态转换**，不是对陈列品的编辑。由路由白名单（含逐条方法核对）+ 运行时探测双重锁死
+> （`red_line_memorial_hall_is_read_only`）。
+>
+> **接线待办（自动封卷）**：本批次的封卷入口是**玩家主动认领**（服务端核验公共事实）。
+> 自动封卷的正解是在「死亡落定」处直接调 `memorial::seal_character_tx`，但那一处在
+> `runtime::commit_tick` 内；且平权红线要求 `runtime/mod.rs` 对资产模块零引用（同副本卡的处理：
+> 结算铸卡挂在 `progression::settle_worldline_tx`，不挂 runtime）。故正确落点是**结算侧的薄接线层**。
+> 该接线未做前，**生死状档（`Lethality::Deathmatch`）的死亡无法封卷**——该档入场即签、
+> 引擎不产 `ConsentRequested`，证据 (a) 恒不成立。生死状档本身也默认关闭，故当前无实际缺口。
+>
+> **已知副作用（待 progression 侧裁定）**：`withdrawn=1` 会让传世卡退出
+> `progression::total_mileage`（`SUM(mileage) WHERE withdrawn = 0`），于是**死亡会拉低"下一个卡位"
+> 的解锁进度**。已解锁的卡位不受影响（`users.card_slots` 是只增的存量列，非派生量）。
+> 这与 §12「死亡不是资产清零、履历是显性资产」有张力：更贴合规格的口径应是
+> **总历练把传世卡也算进去**（`WHERE withdrawn = 0 OR memorial_status = 'sealed'`）。
+> 该判断与改动均在 `progression/` 内，本批次未越界修改，留给该模块的负责人裁定。
 
 ## 5. 计费与商城（billing / shop）
 

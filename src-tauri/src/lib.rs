@@ -245,6 +245,7 @@ pub fn run() {
             generate_background_items,
             generate_background_stage_one,
             generate_background_character_card,
+            generate_quick_character_draft,
             assemble_book_travel_materials,
             generate_book_travel_entry_setup,
             start_assemble_book_travel_materials_stream,

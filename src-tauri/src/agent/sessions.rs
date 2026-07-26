@@ -1607,6 +1607,436 @@ pub async fn generate_background_character_card(
     parse_background_character_card_response(raw_content, character_name)
 }
 
+// ==================== 渐进式捏人（总规格 §7【拍板 21】）====================
+// 三句话开卡（名字 + 执念 + 底线）→ AI 展开 15 个字段（+ 三句原话共 18 字段）。
+// 与 generate_background_character_card 同构：prompt 组装 / 严格 JSON 解析 / 可取消。
+// 纯本地：凭据由前端传入，不触网校验、不依赖平台账号。
+
+/// 单句输入上限：三句话是「灵魂」，不是简历，长了反而抬高门槛。
+const QUICK_CARD_SENTENCE_MAX_CHARS: usize = 200;
+
+/// FNV-1a 64：只用于变奏取样与同源指纹，不作安全用途。
+fn fnv1a64(text: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// 三句话归一化（去首尾空白 + 折叠内部空白 + 小写），用于同源指纹比对。
+fn normalize_quick_card_sentence(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// 同源指纹：同样的三句话 → 同样的指纹。
+/// 用途是「同源卡同世界唯一」的比对锚点（§7）；本地只负责生成与记录，
+/// 平台侧的 join 校验尚未接入。
+fn quick_card_source_fingerprint(name: &str, obsession: &str, bottom_line: &str) -> String {
+    let joined = format!(
+        "{}\u{1f}{}\u{1f}{}",
+        normalize_quick_card_sentence(name),
+        normalize_quick_card_sentence(obsession),
+        normalize_quick_card_sentence(bottom_line),
+    );
+    format!("qc1-{:016x}", fnv1a64(&joined))
+}
+
+/// 人格变奏轴：同样三句话每次展开要长出不一样的人（§7「AI 展开注入人格变奏」）。
+/// 每条轴按种子独立取样，轴本身是「偏向」而非硬设定，模型仍须服从灵魂三句。
+const QUICK_CARD_VARIATION_AXES: [(&str, [&str; 6]); 5] = [
+    (
+        "气质底色",
+        [
+            "外热内冷",
+            "外冷内热",
+            "钝感克制",
+            "锋利张扬",
+            "疲惫世故",
+            "天真固执",
+        ],
+    ),
+    (
+        "出身位置",
+        [
+            "出身优渥却被剥夺",
+            "从底层一路爬上来",
+            "被寄予厚望的继承者",
+            "被抹去名字的人",
+            "半路卷进来的局外人",
+            "从一次彻底失败里活下来",
+        ],
+    ),
+    (
+        "缺陷形状",
+        [
+            "把愧疚当燃料",
+            "用规矩掩饰恐惧",
+            "以牺牲换取控制感",
+            "先怀疑再谈信任",
+            "用玩笑回避真话",
+            "习惯把人算成筹码",
+        ],
+    ),
+    (
+        "表达节奏",
+        [
+            "短句、极少形容词",
+            "长句、爱铺陈细节",
+            "反问多于陈述",
+            "沉默很久、开口即重",
+            "满口行话与比喻",
+            "刻意平淡、把情绪压平",
+        ],
+    ),
+    (
+        "失控方向",
+        [
+            "越紧张越安静",
+            "先动手再解释",
+            "转而攻击自己",
+            "把事情推到无法回头",
+            "退到只剩底线",
+            "改口、装作无所谓",
+        ],
+    ),
+];
+
+/// 按种子确定性地取一组变奏轴（同种子同结果，便于「复现这一版」）。
+fn quick_card_variation_axes(seed: &str) -> Vec<String> {
+    QUICK_CARD_VARIATION_AXES
+        .iter()
+        .enumerate()
+        .map(|(index, (axis, options))| {
+            let picked = (fnv1a64(&format!("{}#{}", seed, index)) % options.len() as u64) as usize;
+            format!("{}：{}", axis, options[picked])
+        })
+        .collect()
+}
+
+fn default_quick_character_system_prompt() -> &'static str {
+    "你是一位角色设计师。用户只肯给三句话——名字、执念、底线——你要把它展开成一张能立刻开演的角色草稿，而不是一份人物简历。\
+     你写的每一条都会被标注为「AI 猜的」交到用户手上任其改写，所以宁可具体到会被否定，也不要写正确但空洞的话。\
+     请务必返回严格的纯JSON格式数据，不要包含 Markdown 标记或任何额外说明。"
+}
+
+fn quick_character_draft_schema() -> &'static str {
+    r#"{
+  "narrativeRole": "叙事角色（主角/对手/盟友/导师/催化者，可自拟）",
+  "coreContradiction": "核心矛盾：他身上互相拉扯的两股力",
+  "surfaceGoal": "表层目标：他嘴上说要的",
+  "hiddenNeed": "隐藏需求：他真正缺的（通常他自己不承认）",
+  "coreFear": "核心恐惧：具体到一个画面，不要写抽象名词",
+  "stakes": "赌注：输了会失去什么",
+  "valuePriorities": ["价值排序，冲突时从高到低，3-5 条"],
+  "riskAppetite": "风险偏好：什么情况下他敢赌，什么情况下他绝不赌",
+  "decisionRules": [
+    {"when": "当……时", "then": "他通常会……", "because": "因为……"}
+  ],
+  "attributionStyle": "归因风格：他默认怎样解释别人的动机",
+  "triggers": ["情绪触发点，2-4 条，要具体到情境"],
+  "trustBuilding": "他怎样才会开始信一个人",
+  "sentenceRhythm": "说话的句式节奏与口气",
+  "plotSeeds": ["剧情种子：他天然带进任何故事的麻烦/秘密/未了之事，2-4 条"],
+  "immutableCore": ["不可变内核：改了他就不是他了，2-4 条"]
+}"#
+}
+
+fn build_quick_character_prompts(
+    name: &str,
+    obsession: &str,
+    bottom_line: &str,
+    variation_axes: &[String],
+    variation_seed: &str,
+    system_prompt_override: Option<&str>,
+    max_output_tokens: Option<u32>,
+) -> (String, String, u32) {
+    let system_prompt = system_prompt_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default_quick_character_system_prompt())
+        .to_string();
+
+    let axes_block = variation_axes
+        .iter()
+        .map(|axis| format!("- {}", axis))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let user_prompt = format!(
+        "灵魂三句（用户原话，不可改写、不可弱化、不可绕开）：\n\
+         - 名字：{}\n\
+         - 执念：{}\n\
+         - 底线：{}\n\n\
+         本次人格变奏（同样三句话每次要长出不一样的人；以下是本次的偏向，不是硬设定，与灵魂三句冲突时以三句为准）：\n\
+         {}\n\
+         变奏种子：{}\n\n\
+         请在不背叛灵魂三句的前提下，把这个人展开成下列 15 个字段。\n\n\
+         硬约束：\n\
+         1. 每个字段都要能回溯到「灵魂三句」或某条变奏轴；写不出来就写得更具体，不要写得更空泛。\n\
+         2. 禁止模板化人设（如「外冷内热的天才少年」「背负血海深仇」这类通用壳）。\
+         凡是换个名字也照样成立的句子，一律重写。\n\
+         3. decisionRules 至少 2 条，每条都要能推翻一个「常人默认会做的选择」，其中至少 1 条与底线正面相关。\n\
+         4. immutableCore 必须包含底线所保护的东西，用你自己的话重述，不要照抄原句。\n\
+         5. plotSeeds 至少 2 条，要具体到可以立刻开演。\n\
+         6. 不要替用户决定他没说的关键设定（世界、阵营、境界一律不写死）——境界是世界发的戏服，不是卡的一部分。\n\
+         7. 仅返回纯 JSON，不要包含 ```json、前言或后记。\n\n\
+         JSON 必须严格满足以下结构定义：\n{}",
+        name.trim(),
+        obsession.trim(),
+        bottom_line.trim(),
+        axes_block,
+        variation_seed,
+        quick_character_draft_schema(),
+    );
+
+    (
+        system_prompt,
+        user_prompt,
+        max_output_tokens.unwrap_or(4096),
+    )
+}
+
+/// 宽容取字符串：非字符串/缺失 → 空串（由 missing_fields 兜底提示，不让整张草稿失败）。
+fn quick_draft_string(root: &Value, key: &str) -> String {
+    root.get(key)
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+/// 宽容取字符串数组：数组 → 逐项取字符串；单个字符串 → 按换行/顿号/分号切分。
+fn quick_draft_list(root: &Value, key: &str) -> Vec<String> {
+    match root.get(key) {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| item.as_str())
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty())
+            .collect(),
+        Some(Value::String(text)) => text
+            .split(['\n', '、', '；', ';'])
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// 宽容取决策规则：对象 → when/then/because；字符串 → 只当 then（信息不丢）。
+fn quick_draft_rules(root: &Value) -> Vec<QuickDecisionRule> {
+    let Some(Value::Array(items)) = root.get("decisionRules") else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| match item {
+            Value::Object(_) => {
+                let rule = QuickDecisionRule {
+                    when: quick_draft_string(item, "when"),
+                    then: quick_draft_string(item, "then"),
+                    because: quick_draft_string(item, "because"),
+                };
+                if rule.when.is_empty() && rule.then.is_empty() {
+                    None
+                } else {
+                    Some(rule)
+                }
+            }
+            Value::String(text) if !text.trim().is_empty() => Some(QuickDecisionRule {
+                when: String::new(),
+                then: text.trim().to_string(),
+                because: String::new(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// 解析模型输出 → 15 字段 + 缺失字段清单。
+/// 非法 JSON 一律降级为可读中文错误（含原始输出），不 panic、不吞掉。
+fn parse_quick_character_draft_response(
+    text: String,
+) -> Result<(QuickCharacterDraftFields, Vec<String>), String> {
+    let raw_text = text.clone();
+    let canonical = canonical_background_json_response(text)?;
+    let parsed: Value = serde_json::from_str(&canonical)
+        .map_err(|e| background_json_error_with_raw(&raw_text, e))?;
+
+    // 允许模型多包一层（fields / characterDraft / draft），也允许直接给扁平对象。
+    let root = ["fields", "characterDraft", "draft"]
+        .iter()
+        .find_map(|key| parsed.get(*key).filter(|value| value.is_object()))
+        .unwrap_or(&parsed);
+
+    if !root.is_object() {
+        return Err(background_json_error_with_raw(
+            &raw_text,
+            "模型没有返回角色草稿对象",
+        ));
+    }
+
+    let fields = QuickCharacterDraftFields {
+        narrative_role: quick_draft_string(root, "narrativeRole"),
+        core_contradiction: quick_draft_string(root, "coreContradiction"),
+        surface_goal: quick_draft_string(root, "surfaceGoal"),
+        hidden_need: quick_draft_string(root, "hiddenNeed"),
+        core_fear: quick_draft_string(root, "coreFear"),
+        stakes: quick_draft_string(root, "stakes"),
+        value_priorities: quick_draft_list(root, "valuePriorities"),
+        risk_appetite: quick_draft_string(root, "riskAppetite"),
+        decision_rules: quick_draft_rules(root),
+        attribution_style: quick_draft_string(root, "attributionStyle"),
+        triggers: quick_draft_list(root, "triggers"),
+        trust_building: quick_draft_string(root, "trustBuilding"),
+        sentence_rhythm: quick_draft_string(root, "sentenceRhythm"),
+        plot_seeds: quick_draft_list(root, "plotSeeds"),
+        immutable_core: quick_draft_list(root, "immutableCore"),
+    };
+
+    let mut missing = Vec::new();
+    let string_checks: [(&str, &String); 9] = [
+        ("narrativeRole", &fields.narrative_role),
+        ("coreContradiction", &fields.core_contradiction),
+        ("surfaceGoal", &fields.surface_goal),
+        ("hiddenNeed", &fields.hidden_need),
+        ("coreFear", &fields.core_fear),
+        ("stakes", &fields.stakes),
+        ("riskAppetite", &fields.risk_appetite),
+        ("attributionStyle", &fields.attribution_style),
+        ("sentenceRhythm", &fields.sentence_rhythm),
+    ];
+    for (key, value) in string_checks {
+        if value.is_empty() {
+            missing.push(key.to_string());
+        }
+    }
+    if fields.value_priorities.is_empty() {
+        missing.push("valuePriorities".to_string());
+    }
+    if fields.decision_rules.is_empty() {
+        missing.push("decisionRules".to_string());
+    }
+    if fields.triggers.is_empty() {
+        missing.push("triggers".to_string());
+    }
+    if fields.trust_building.is_empty() {
+        missing.push("trustBuilding".to_string());
+    }
+    if fields.plot_seeds.is_empty() {
+        missing.push("plotSeeds".to_string());
+    }
+    if fields.immutable_core.is_empty() {
+        missing.push("immutableCore".to_string());
+    }
+
+    // 15 项全空说明这根本不是一张草稿（例如模型返回了 {} 或答非所问）。
+    if missing.len() == 15 {
+        return Err(background_json_error_with_raw(
+            &raw_text,
+            "模型没有返回任何可用的角色字段",
+        ));
+    }
+
+    Ok((fields, missing))
+}
+
+fn validate_quick_card_sentence(value: &str, label: &str) -> Result<(), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{}不能为空", label));
+    }
+    if trimmed.chars().count() > QUICK_CARD_SENTENCE_MAX_CHARS {
+        return Err(format!(
+            "{}请控制在 {} 字以内——这里只要一句话，细节留给后面改",
+            label, QUICK_CARD_SENTENCE_MAX_CHARS
+        ));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn generate_quick_character_draft(
+    request: QuickCharacterDraftRequest,
+) -> Result<QuickCharacterDraftResponse, String> {
+    validate_quick_card_sentence(&request.name, "名字")?;
+    validate_quick_card_sentence(&request.obsession, "执念")?;
+    validate_quick_card_sentence(&request.bottom_line, "底线")?;
+
+    let variation_seed = request
+        .variation_seed
+        .as_deref()
+        .map(str::trim)
+        .filter(|seed| !seed.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let variation_axes = quick_card_variation_axes(&variation_seed);
+    let source_fingerprint = quick_card_source_fingerprint(
+        &request.name,
+        &request.obsession,
+        &request.bottom_line,
+    );
+
+    let cancel_token = register_cancellation_token(request.task_id.clone());
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(180))
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .http1_only()
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let (system_prompt, user_prompt, max_tokens) = build_quick_character_prompts(
+        &request.name,
+        &request.obsession,
+        &request.bottom_line,
+        &variation_axes,
+        &variation_seed,
+        request.system_prompt.as_deref(),
+        request.max_output_tokens,
+    );
+
+    let raw_content = call_background_llm(
+        &client,
+        &request.model_interface,
+        &request.base_url,
+        &request.api_key,
+        &request.model,
+        &system_prompt,
+        &user_prompt,
+        max_tokens,
+        // 变奏需要采样自由度：默认温度高于「提取型」任务（提取求准，捏人求不同）。
+        request.temperature.unwrap_or(0.9),
+        request.thinking_depth.as_deref(),
+        &cancel_token,
+    )
+    .await;
+
+    // 如果是取消，等待 reqwest 底层连接清理
+    if let Err(ref e) = raw_content {
+        if e == "任务已取消" {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+
+    unregister_cancellation_token(&request.task_id);
+    let raw_content = raw_content?;
+    let (fields, missing_fields) = parse_quick_character_draft_response(raw_content)?;
+
+    Ok(QuickCharacterDraftResponse {
+        fields,
+        variation_seed,
+        variation_axes,
+        source_fingerprint,
+        missing_fields,
+    })
+}
+
 #[tauri::command]
 pub async fn generate_background_items(
     request: GenerateBackgroundItemsRequest,
@@ -3529,7 +3959,9 @@ mod tests {
         build_short_reverse_outline_text, build_silly_tavern_user_prompt,
         canonical_json_response, clean_json_response, default_silly_tavern_exporter_prompt,
         format_reverse_outline_send_error, long_final_prompt, long_summary_prompt,
-        parse_background_character_card_response, parse_background_stage_one_response,
+        build_quick_character_prompts, parse_background_character_card_response,
+        parse_background_stage_one_response, parse_quick_character_draft_response,
+        quick_card_source_fingerprint, quick_card_variation_axes,
         resolve_reverse_outline_sources, reverse_outline_char_count,
         sanitize_reverse_outline_title, save_agent_session_in_dir, save_reverse_outline_for_root,
         session_matches_filters, short_reverse_outline_prompt, validate_silly_tavern_v2,
@@ -4061,6 +4493,154 @@ plain text
             );
         assert_eq!(character_system_prompt, "自定义角色卡系统提示词");
         assert_eq!(character_max_tokens, 2345);
+    }
+
+    // ---------- 渐进式捏人（§7【拍板 21】）----------
+
+    #[test]
+    fn quick_character_prompts_carry_three_sentences_and_variation_axes() {
+        let axes = quick_card_variation_axes("seed-a");
+        let (system_prompt, user_prompt, max_tokens) = build_quick_character_prompts(
+            "沈砚",
+            "找到那年雪夜里失踪的妹妹",
+            "绝不拿孩子做筹码",
+            &axes,
+            "seed-a",
+            None,
+            None,
+        );
+
+        // 灵魂三句必须原样进 prompt
+        assert!(user_prompt.contains("沈砚"));
+        assert!(user_prompt.contains("找到那年雪夜里失踪的妹妹"));
+        assert!(user_prompt.contains("绝不拿孩子做筹码"));
+        // 变奏轴与种子必须进 prompt（否则「同样三句话产出不同的人」无从谈起）
+        assert!(user_prompt.contains("变奏种子：seed-a"));
+        for axis in &axes {
+            assert!(user_prompt.contains(axis.as_str()));
+        }
+        // 反同质硬约束与 18 字段 schema
+        assert!(user_prompt.contains("禁止模板化人设"));
+        assert!(user_prompt.contains("decisionRules"));
+        assert!(user_prompt.contains("immutableCore"));
+        assert!(system_prompt.contains("纯JSON"));
+        assert_eq!(max_tokens, 4096);
+    }
+
+    #[test]
+    fn quick_character_prompts_use_custom_system_prompt_and_token_limit() {
+        let (system_prompt, _, max_tokens) = build_quick_character_prompts(
+            "沈砚",
+            "执念",
+            "底线",
+            &quick_card_variation_axes("s"),
+            "s",
+            Some("自定义捏人系统提示词"),
+            Some(2048),
+        );
+
+        assert_eq!(system_prompt, "自定义捏人系统提示词");
+        assert_eq!(max_tokens, 2048);
+    }
+
+    #[test]
+    fn quick_card_variation_axes_are_deterministic_and_seed_sensitive() {
+        let a1 = quick_card_variation_axes("seed-a");
+        let a2 = quick_card_variation_axes("seed-a");
+        let b = quick_card_variation_axes("seed-b");
+
+        assert_eq!(a1, a2, "同种子必须可复现");
+        assert_eq!(a1.len(), 5);
+        assert_ne!(a1, b, "换种子应当换一组变奏（防同质）");
+    }
+
+    #[test]
+    fn quick_card_fingerprint_is_stable_under_whitespace_and_case() {
+        let base = quick_card_source_fingerprint("沈砚", "找到妹妹", "绝不拿孩子做筹码");
+        let spaced = quick_card_source_fingerprint("  沈砚 ", "找到妹妹", " 绝不拿孩子做筹码 ");
+        let different = quick_card_source_fingerprint("沈砚", "找到弟弟", "绝不拿孩子做筹码");
+
+        assert_eq!(base, spaced, "同源三句归一化后必须同指纹");
+        assert_ne!(base, different);
+        assert!(base.starts_with("qc1-"));
+    }
+
+    #[test]
+    fn parse_quick_character_draft_response_reads_flat_and_wrapped_shapes() {
+        let flat = r#"{
+            "narrativeRole": "主角",
+            "coreContradiction": "既想救人又怕再失去",
+            "surfaceGoal": "查清雪夜真相",
+            "hiddenNeed": "被允许放下",
+            "coreFear": "再看见一双空着的鞋",
+            "stakes": "最后一个亲人",
+            "valuePriorities": ["亲人", "承诺", "自己"],
+            "riskAppetite": "涉及孩子时不赌",
+            "decisionRules": [{"when": "有人拿孩子要挟", "then": "宁可暴露自己", "because": "底线"}],
+            "attributionStyle": "先假设对方有难处",
+            "triggers": ["听见雪落"],
+            "trustBuilding": "看对方怎么对待弱者",
+            "sentenceRhythm": "短句，话尾常吞掉",
+            "plotSeeds": ["身上带着一封没寄出的信"],
+            "immutableCore": ["不拿孩子做筹码"]
+        }"#;
+        let (fields, missing) =
+            parse_quick_character_draft_response(flat.to_string()).expect("flat shape should parse");
+        assert!(missing.is_empty());
+        assert_eq!(fields.narrative_role, "主角");
+        assert_eq!(fields.value_priorities.len(), 3);
+        assert_eq!(fields.decision_rules[0].then, "宁可暴露自己");
+
+        // 多包一层 fields 也要能读到
+        let wrapped = format!("{{\"fields\": {}}}", flat);
+        let (wrapped_fields, _) = parse_quick_character_draft_response(wrapped)
+            .expect("wrapped shape should parse");
+        assert_eq!(wrapped_fields.core_fear, "再看见一双空着的鞋");
+    }
+
+    #[test]
+    fn parse_quick_character_draft_response_tolerates_loose_field_types() {
+        // 列表被写成整段字符串、规则被写成字符串：不该整张失败
+        let loose = r#"{
+            "coreContradiction": "想赢又怕赢",
+            "surfaceGoal": "拿到名额",
+            "coreFear": "被当成替补",
+            "stakes": "唯一的机会",
+            "valuePriorities": "胜负、体面、朋友",
+            "decisionRules": ["被质疑时会先认下再反击"],
+            "plotSeeds": "欠了人一条命\n藏着一份旧名单",
+            "immutableCore": ["不背叛同队"]
+        }"#;
+        let (fields, missing) = parse_quick_character_draft_response(loose.to_string())
+            .expect("loose types should degrade, not fail");
+
+        assert_eq!(fields.value_priorities, vec!["胜负", "体面", "朋友"]);
+        assert_eq!(fields.plot_seeds.len(), 2);
+        assert_eq!(fields.decision_rules[0].then, "被质疑时会先认下再反击");
+        // 没给的字段要如实报缺，交给用户自己写
+        assert!(missing.contains(&"narrativeRole".to_string()));
+        assert!(missing.contains(&"triggers".to_string()));
+    }
+
+    #[test]
+    fn parse_quick_character_draft_response_rejects_non_json_with_readable_error() {
+        let err = parse_quick_character_draft_response("我先来聊聊这个角色吧……".to_string())
+            .expect_err("non-json should fail");
+
+        assert!(err.contains("模型没有返回合法 JSON"));
+        // 原始输出要一并回传，便于用户判断是模型跑偏还是配置问题
+        let parsed: Value = serde_json::from_str(&err).expect("error payload should be json");
+        assert!(parsed["rawOutput"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("聊聊这个角色"));
+    }
+
+    #[test]
+    fn parse_quick_character_draft_response_rejects_empty_draft() {
+        let err = parse_quick_character_draft_response("{}".to_string())
+            .expect_err("empty object should fail");
+        assert!(err.contains("没有返回任何可用的角色字段"));
     }
 
     #[test]

@@ -42,6 +42,7 @@ import { StylePresetEditor } from '../components/StylePresetEditor';
 import { useStylePresetStore } from '../stores/useStylePresetStore';
 import ExtractionWizard from '../components/ExtractionWizard';
 import KnowledgePackManager from '../components/KnowledgePackManager';
+import QuickCardWizard from '../components/QuickCardWizard';
 
 const DIRECTORY_WIDTH = 280;
 const DEFAULT_BACKGROUND_CANCELLATION_SETTLE_MS = 15_000;
@@ -199,6 +200,8 @@ const useBackgroundView = () => {
   // P0.b / P1 入口：全书角色提取向导与知识包管理（最小侵入，仅新增，不改动现有提取逻辑）。
   const [isExtractionWizardOpen, setIsExtractionWizardOpen] = React.useState(false);
   const [isKnowledgeManagerOpen, setIsKnowledgeManagerOpen] = React.useState(false);
+  // R2 入口：渐进式捏人（总规格 §7【拍板 21】）——三句话开卡，本地功能，不依赖平台账号。
+  const [isQuickCardWizardOpen, setIsQuickCardWizardOpen] = React.useState(false);
 
   const [uiState, patchUiState, setUiField] = useStateGroup<BackgroundUiState>({
     isAiModalOpen: false,
@@ -2112,6 +2115,17 @@ const useBackgroundView = () => {
             背景设定
           </span>
           <Space size={2}>
+            <Tooltip title="只写名字、执念、底线三句话，AI 展开成 18 字段草稿（逐条标注可改）">
+              <Button
+                type="text"
+                size="small"
+                icon={<ThunderboltOutlined style={{ color: '#d97757' }} />}
+                onClick={() => setIsQuickCardWizardOpen(true)}
+                className="background-quick-card-button"
+              >
+                三句话捏人
+              </Button>
+            </Tooltip>
             <Tooltip title="从整本书扫描并分层生成角色卡（TXT / Markdown）">
               <Button
                 type="text"
@@ -2145,6 +2159,9 @@ const useBackgroundView = () => {
             </Button>
           </Space>
         </div>
+        {isQuickCardWizardOpen && (
+          <QuickCardWizard open onClose={() => setIsQuickCardWizardOpen(false)} />
+        )}
         {isExtractionWizardOpen && (
           <ExtractionWizard open onClose={() => setIsExtractionWizardOpen(false)} />
         )}

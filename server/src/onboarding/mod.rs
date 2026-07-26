@@ -76,10 +76,12 @@
 //!
 //! ## 规格里本次**未实现**的一项（TODO）
 //!
-//! 礼包的「**1 张低星副本卡**」本次做不了：副本卡资产表（`subplot_cards`）属 R2 的另一项、
-//! 尚未实现（全仓零命中）。刻意**不造临时表**——副本卡有自己的合成/装配/经济闭环（总规格 §10），
-//! 在这里搭个形似的表只会制造一份要迁移的债。等副本卡项落地后，在领取事务里追加一次
-//! 「发一张 1★ 副本卡」即可，本模块的幂等键与开关无需改动。
+//! 礼包的「**1 张低星副本卡**」已于副本卡资产层（迁移 0032）落地后接上：领取事务内调
+//! `subplot::grant_card_tx`，`grant_key = starter:{user_id}`，固定 1★。
+//! ⚠️ 两个开关是**正交**的——副本卡开关（`MUSE_SUBPLOT_CARDS`）关闭时**跳过发卡而非报错**，
+//! 玩家仍拿到预制卡与微本。一块未开放的经济模块不该有能力打死整条新手动线。
+//! 「3 条托梦」不单独发放：配额已是 `MUSE_DREAM_QUOTA_PER_STAGE` 全局参数，
+//! 在此复述数字只会制造第二个事实源。
 //! 「3 条托梦」**不需要单独发放**：托梦配额已是每卡每阶段的全局参数
 //! （`interventions::dream_quota_per_stage`，`MUSE_DREAM_QUOTA_PER_STAGE` 默认 3），
 //! 新卡自动享有，另造一套发放逻辑只会出现两个事实源。
@@ -109,6 +111,13 @@ mod tests;
 
 /// 新手动线运营开关环境变量。
 const ENV_ONBOARDING_ENABLED: &str = "MUSE_ONBOARDING";
+
+/// 新人礼包附赠的副本卡星级（§13「1 张**低星**副本卡」）。
+/// 固定 1★ 而非参数化：礼包是**教学物**不是产出物，调高它就等于绕过「打世界换卡」这条正路
+/// —— 副本卡的稀缺性由 §10 的确定性产出表与合成回收口共同维持，礼包不该成为侧门。
+const STARTER_SUBPLOT_CARD_STAR: i64 = 1;
+/// 礼包卡的卡面名。叙事信物性质（§10 道具用途之一），不带任何效力。
+const STARTER_SUBPLOT_CARD_LABEL: &str = "新手纪念·初入世界";
 
 /// 新手动线默认值 = **关闭**。
 ///
@@ -407,6 +416,38 @@ async fn claim_gift(
         initial_state_json: None,
     };
     let world_id = create_world_tx(&mut tx, params).await?;
+
+    // 2.5) 新人礼包的「1 张低星副本卡」（§13）。副本卡资产层（迁移 0032）落地后补上。
+    //
+    //    🔴 **副本卡有自己的开关**（`MUSE_SUBPLOT_CARDS`，默认关闭）：关闭时**跳过发卡而非报错**——
+    //    新手动线不该因为另一块未开放的能力而整体失败，玩家仍应拿到预制卡与微本。
+    //    这是两个正交开关的组合：本模块开着、副本卡关着 → 礼包少一张卡，其余照常。
+    //
+    //    幂等是双层的：`subplot_cards(owner_id, grant_key)` 唯一约束挡重放，
+    //    外层 `onboarding_grants.user_id` 主键挡整个礼包重领。两层都撞不穿才算安全。
+    // 返回值刻意不用：副本卡是否附赠**不进礼包回执**。
+    // 回执由纯函数 `grant_response` 构造，且被「首次领取」与「重复领取读回」两条路径共用——
+    // 若把发卡结果塞进去，重复领取那条路径就得再查一次库才能拼出同样的回执，
+    // 幂等回执"逐字节相同"这条性质会被打破。玩家在 `GET /me/subplot-cards` 看得到卡，够了。
+    let _starter_card_id = if crate::subplot::subplot_cards_enabled() {
+        crate::subplot::grant_card_tx(
+            &mut tx,
+            &crate::subplot::NewSubplotCard {
+                owner_id: &user.user_id,
+                star_rating: STARTER_SUBPLOT_CARD_STAR,
+                label: STARTER_SUBPLOT_CARD_LABEL,
+                origin_kind: crate::subplot::ORIGIN_GRANT,
+                grant_key: format!("starter:{}", user.user_id),
+                source_world_id: None,
+                source_template_id: None,
+                source_template_version: None,
+                synthesized_from: Vec::new(),
+            },
+        )
+        .await?
+    } else {
+        None
+    };
 
     // 3) 登记行**最后写**：撞主键 → 整个事务回滚（卡与世界一起消失，无残留）→ 读回既有登记行。
     //    这就是「每人只领一次」的唯一权威，不依赖上面那条快路径的读-判-写。

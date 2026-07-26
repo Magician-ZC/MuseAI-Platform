@@ -80,8 +80,11 @@ pub struct AssembledInstance {
     /// `None` = 模板未声明 → 本实例无境界维度（`skip_serializing_if` 保证老实例 / 未声明模板的
     /// `assembled_json` **逐字节不变**，同 `payout_table` 范式）。
     ///
-    /// 🔴 钉在这里只是"存下来了"：**runtime 目前不读它**，故它还没有任何叙事可见性
-    ///（见 `admin_api::calibration` 的效力自述 `narrativeLayer: Missing`）。
+    /// 消费者（唯一一条）：`runtime::parse_realm_costume` 读回 `briefing` + `flavorNotes` →
+    /// `RoundInput.realm_costume` → 引擎 `call_director` 的入场导演设局 prompt
+    ///（§6「入场导演统一设定」）。**只影响模型怎么描写，不进任何判定域**
+    ///（见 `admin_api::calibration` 的效力自述 `narrativeLayer: Implemented` /
+    /// `numericLayer: NeverByDesign`）。其余五个字段仍只服务审计与运营展示，不进模型上下文。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub realm_tier: Option<RealmTier>,
 }
@@ -258,11 +261,13 @@ pub struct RealmTier {
     #[serde(default)]
     pub conflict_intensity: String,
     /// 入场导演的统一戏服说明（§6「入场导演统一设定」）：一句话交代"这一篇全员是什么水位"。
-    /// 🔴 目前**没有任何消费者**——runtime 不读 `realmTier`，这句话进不了引擎上下文。
+    /// **本字段与 `flavor_notes` 是七个字段里仅有的两个会进模型上下文的**——
+    /// `runtime::parse_realm_costume` 读它 → 引擎 `call_director` 的设局 prompt。
+    /// 它只改变导演怎么描写，不改判定（红线见本类型上方第 2 条与 `RoundInput.realm_costume`）。
     #[serde(default)]
     pub briefing: String,
     /// 跨体系风味翻译提示（§6「唐三入斗破世界，魂技译为斗气招式风味，内核不变」）。
-    /// 同 `briefing`，当前只存不用。
+    /// 同 `briefing`，一并进入入场导演 prompt（空数组 = 无风味翻译，该段不出现）。
     #[serde(default)]
     pub flavor_notes: Vec<String>,
 }
@@ -2383,7 +2388,8 @@ pub async fn assemble_instance(state: &AppState, world_id: &str) -> Result<Assem
         // 9) 境界档（§6 拍板 3 戏服原则）：同样是"声明什么就钉什么"——**全员统一的一件戏服**，
         //    无分配、无抽样、无数值（见 `RealmTier` 三条设计约束）。
         //    未声明 → None → `skip_serializing_if` 不写键 → assembled_json 逐字节不变。
-        //    🔴 钉住≠生效：runtime 目前不读这个键，境界档尚无任何叙事可见性。
+        //    钉住后由 `runtime::parse_realm_costume` 读回 briefing/flavorNotes 喂入场导演
+        //    （§6「入场导演统一设定」）——仅影响描写，不进判定域。
         realm_tier: skeleton.realm_tier.clone(),
     };
 

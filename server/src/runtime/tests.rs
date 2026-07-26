@@ -3792,3 +3792,223 @@ async fn offpeak_does_not_stack_ticks_on_unfinished_round() {
     assert_eq!(max_tick_no(&state.db, &wid).await, 1, "在飞拍收尾后应立即续排");
     super::offpeak::defer_tracker().clear(&wid);
 }
+
+// ============================================================================
+// 境界档叙事接线（总规格 §6【拍板 3】「戏服原则——境界即布景」）
+// ============================================================================
+//
+// 链路全长：模板 `skeleton_json.realmTier` → 装配钉住 `assembled_json./assembly/realmTier`
+// → `runtime::parse_realm_costume` → `RoundInput.realm_costume` → 引擎 `call_director`。
+// 下面三条用例分别钉死这条链的**通**、**只通到导演为止**、以及**未声明时逐字节不通**。
+
+/// 记录每次模型调用的 `(agent, user)`，返回与 `MockModel` 同款的合法 JSON。
+/// 用它才能断言「戏服进了哪个环节的 prompt、没进哪个」——`MockModel` 不留痕，问不出这件事。
+#[derive(Default)]
+struct RecordingMockModel {
+    calls: std::sync::Mutex<Vec<(String, String)>>,
+}
+
+impl RecordingMockModel {
+    fn user_of(&self, agent: &str) -> String {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(a, _)| a == agent)
+            .map(|(_, u)| u.clone())
+            .unwrap_or_else(|| panic!("未捕获到 {agent} 环节的调用"))
+    }
+
+    /// 除 `agent` 外的全部调用（用于断言戏服没有外溢到别的环节）。
+    fn users_except(&self, agent: &str) -> Vec<(String, String)> {
+        self.calls.lock().unwrap().iter().filter(|(a, _)| a != agent).cloned().collect()
+    }
+}
+
+#[async_trait]
+impl ModelClient for RecordingMockModel {
+    async fn complete(&self, spec: &ModelCallSpec, cancel: &CancelFlag) -> Result<ModelOutput, EngineError> {
+        cancel.check()?;
+        self.calls.lock().unwrap().push((spec.agent.clone(), spec.user.clone()));
+        let content = match spec.agent.as_str() {
+            "director" => r#"{"situation":"密室之中，烛火摇曳，两人对坐。"}"#,
+            "roleDecide" => r#"{"intent":"观望","action":"上前拱手行礼","speak":{"willSpeak":true,"purpose":"寒暄"},"targets":[],"acceptableCosts":[],"predictions":[]}"#,
+            "arbiter" => r#"{"outcomes":[]}"#,
+            "writer" => r#"{"prose":"两位大臣于烛下各怀心事，礼数周全。"}"#,
+            "critic" => r#"{"characterConsistencyIssues":[],"causalIssues":[],"revisionSuggestions":[]}"#,
+            _ => "{}",
+        };
+        Ok(ModelOutput { content: content.to_string(), input_tokens: Some(10), output_tokens: Some(20) })
+    }
+}
+
+/// 声明了境界档的模板（§6：阶段模板天然携带戏服）。其余形状与 `seed_template` 一致。
+async fn seed_dressed_template(db: &AnyPool, id: &str) {
+    let skeleton = json!({
+        "mainlineNodes": [{ "id": "n1", "summary": "两位大臣在密室摊牌", "fated": true }],
+        "realmTier": {
+            "id": "tier-douwang",
+            "label": "斗王档",
+            "cosmology": "cultivation",
+            "genre": "xuanhuan",
+            // 🔴 刻意填 lethal：它是**题材标注**，绝不是生死开关（世界是否致命由建房参数
+            //    lethality 独立决定）。下面的用例据此断言它不进模型上下文。
+            "conflictIntensity": "lethal",
+            "briefing": "本篇全员领斗王档戏服：能御空短距、能扛一记斗皇余威，仅此而已。",
+            "flavorNotes": ["魂技译为斗气招式风味，内核不变"]
+        }
+    });
+    sqlx::query(
+        "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, official, version, moderation, created_at) \
+         VALUES ($1, '戏服模板', 'idle', $2, '{\"mode\":\"open\"}', 1, 1, 'approved', $3)",
+    )
+    .bind(id)
+    .bind(skeleton.to_string())
+    .bind(now_ms())
+    .execute(db)
+    .await
+    .unwrap();
+}
+
+/// 建一个 running、模板声明了境界档、带 2 名成员的 idle 世界（首 tick 自动装配 → 钉住戏服）。
+async fn dressed_world_with_two_members(state: &AppState) -> String {
+    seed_dressed_template(&state.db, "tpl-realm").await;
+    seed_model_routes(&state.db, "realm-routes").await;
+    seed_user(&state.db, "uR1").await;
+    seed_user(&state.db, "uR2").await;
+    seed_char(&state.db, "chR1", "uR1", "李").await;
+    seed_char(&state.db, "chR2", "uR2", "王").await;
+
+    let mut p = CreateWorldParams::official("tpl-realm", 1, "戏服测试世界");
+    p.status = Some("running".into());
+    p.model_route_version = Some("realm-routes".into());
+    p.prompt_set_version = Some("test-prompts".into());
+    p.member_limit = 10;
+    p.daily_token_budget = 1_000_000;
+    p.daily_cny_budget_cents = 0;
+    let wid = create_world(&state.db, p).await.unwrap();
+    seed_member(&state.db, &wid, "uR1", "chR1").await;
+    seed_member(&state.db, &wid, "uR2", "chR2").await;
+    wid
+}
+
+/// 🔴 端到端：模板声明的戏服真的穿到了这一拍上——**且只穿在入场导演身上**。
+///
+/// 正面：`briefing` 与 `flavorNotes` 逐字进导演 prompt（§6「入场导演统一设定」「风味翻译」）。
+/// 反面（红线）：
+///   ① 决策 / 仲裁 / 写作 / 审校四个环节一个字都看不到它——漏进决策就成了「你现在是斗王」的能力暗示；
+///   ② `conflictIntensity: lethal` **不进任何 prompt**：它是题材标注，不是生死开关（§11 的
+///      `lethality` 才是），让一个叙事标注去撬动生死观感属平权红线违规；
+///   ③ 落库的世界状态与公共事实（world_events）里不得出现戏服的任何一个字——布景不留痕，
+///      更不会变成谁的持有事实 / 判定输入。
+#[tokio::test]
+async fn realm_tier_reaches_only_the_director_prompt() {
+    let state = test_state().await;
+    let wid = dressed_world_with_two_members(&state).await;
+
+    let model = Arc::new(RecordingMockModel::default());
+    let mc: Arc<dyn ModelClient> = model.clone();
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 0, mc).await.unwrap(), TickStatus::Done);
+
+    // 前提自检：首 tick 兜底装配把戏服钉进了 assembled_json（否则本用例是空跑）。
+    let assembled = load_world(&state.db, &wid).await.unwrap().assembled_json.unwrap();
+    assert!(assembled.contains("\"realmTier\""), "首 tick 应把模板声明的境界档钉住：{assembled}");
+
+    // 正面：戏服进入场导演。
+    let director = model.user_of("director");
+    assert!(director.contains("本篇戏服（全员统一，同一水位）"), "导演应看到戏服段：{director}");
+    assert!(director.contains("能扛一记斗皇余威"), "briefing 必须逐字进导演 prompt：{director}");
+    assert!(
+        director.contains("跨体系风味翻译：魂技译为斗气招式风味，内核不变"),
+        "flavorNotes 必须进导演 prompt：{director}"
+    );
+    assert!(director.contains("不得据此判定谁能赢"), "必须带「只改描写、不改胜负」的免责话术");
+
+    // 红线①：戏服不外溢到其它环节。
+    for (agent, user) in model.users_except("director") {
+        assert!(!user.contains("斗王"), "戏服泄漏到了 {agent} 环节：{user}");
+        assert!(!user.contains("斗气招式"), "风味翻译泄漏到了 {agent} 环节：{user}");
+    }
+    // 红线②：题材标注三件套（含 lethal）一个都不进模型上下文——只有 briefing/flavorNotes 进。
+    for (agent, user) in model.calls.lock().unwrap().iter() {
+        assert!(!user.contains("lethal"), "conflictIntensity 不得进 {agent} 的上下文：{user}");
+        assert!(!user.contains("cultivation"), "cosmology 不得进 {agent} 的上下文：{user}");
+        assert!(!user.contains("tier-douwang"), "档位 id 是审计键，不得进 {agent} 的上下文：{user}");
+    }
+
+    // 红线③：布景不留痕——世界状态与公共事实里都没有它。
+    let w = load_world(&state.db, &wid).await.unwrap();
+    assert!(!w.narrative_state_json.contains("斗王"), "红线：戏服渗进了 narrative_state_json");
+    let leaked = i64_one(
+        &state.db,
+        "SELECT COUNT(*) FROM world_events WHERE world_id=$1 AND \
+         (COALESCE(public_projection_json,'') LIKE '%斗王%' OR COALESCE(private_projections_json,'') LIKE '%斗王%')",
+        &wid,
+    )
+    .await;
+    assert_eq!(leaked, 0, "红线：戏服不得出现在公共事实 / 私有投影里");
+}
+
+/// 未声明境界档的世界：导演 prompt 里**一个字节都不多**（黄金骨架正是这一类，
+/// 它保证了 golden 基线不会因本次接线漂移）。
+#[tokio::test]
+async fn world_without_realm_tier_keeps_director_prompt_clean() {
+    let state = test_state().await;
+    let wid = running_world_with_two_members(&state).await;
+
+    let model = Arc::new(RecordingMockModel::default());
+    let mc: Arc<dyn ModelClient> = model.clone();
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 0, mc).await.unwrap(), TickStatus::Done);
+
+    let director = model.user_of("director");
+    assert!(!director.contains("本篇戏服"), "模板没声明戏服 → 导演 prompt 不得出现戏服段：{director}");
+    assert!(!director.contains("风味翻译"), "同上：{director}");
+}
+
+/// `parse_realm_costume` 的退化契约：读不到 / 读不懂 / 读到一件没词儿的戏服 → 一律 `None`
+/// （= 与接线前逐字节一致），且任何输入都不 panic。
+#[test]
+fn parse_realm_costume_degrades_to_none_on_anything_unusable() {
+    use super::parse_realm_costume as parse;
+
+    assert!(parse(None).is_none(), "未装配 → None");
+    assert!(parse(Some("不是 JSON")).is_none(), "坏 JSON → None，不 panic");
+    assert!(parse(Some(r#"{"assembly":{}}"#)).is_none(), "无 realmTier 键（绝大多数存量实例）→ None");
+    assert!(parse(Some(r#"{"assembly":{"realmTier":[]}}"#)).is_none(), "数组 → None（境界不是池）");
+    assert!(parse(Some(r#"{"assembly":{"realmTier":"斗王档"}}"#)).is_none(), "字符串 → None");
+    // 声明了档位却没写任何文案：导演无话可说 → 等价于未声明，绝不生成一个空标题。
+    assert!(
+        parse(Some(r#"{"assembly":{"realmTier":{"id":"t","label":"斗王档","conflictIntensity":"lethal"}}}"#)).is_none(),
+        "只有 id/label/枚举、没有 briefing/flavorNotes → None"
+    );
+    assert!(
+        parse(Some(r#"{"assembly":{"realmTier":{"id":"t","briefing":"   ","flavorNotes":["","  "]}}}"#)).is_none(),
+        "全空白文案 → None"
+    );
+}
+
+/// 解析出来的戏服**只含两段文案**：其余五个字段（id / label / cosmology / genre /
+/// conflictIntensity）一律留在服务端，不进模型上下文。这是「哪些字段该被模型看到」的单一守卫。
+#[test]
+fn parse_realm_costume_keeps_only_briefing_and_flavor_notes() {
+    let c = super::parse_realm_costume(Some(
+        r#"{"assembly":{"realmTier":{"id":"tier-douwang","label":"斗王档","cosmology":"cultivation",
+            "genre":"xuanhuan","conflictIntensity":"lethal","briefing":"  全员同一水位，仅此而已  ",
+            "flavorNotes":["魂技译为斗气招式风味"," ","内核不变"]}}}"#,
+    ))
+    .expect("声明了文案就应解出戏服");
+
+    assert_eq!(c.briefing, "全员同一水位，仅此而已", "两端空白应裁掉（prompt 拼接口径稳定）");
+    assert_eq!(c.flavor_notes, vec!["魂技译为斗气招式风味".to_string(), "内核不变".to_string()], "空条目丢弃");
+
+    // 🔴 平权红线：进模型的这份结构里一个数字都没有，也没有任何档位 / 体系 / 烈度标注。
+    let v = serde_json::to_value(&c).unwrap();
+    let obj = v.as_object().unwrap();
+    assert_eq!(obj.len(), 2, "戏服进模型的字段只有 briefing / flavorNotes：{v}");
+    let dumped = v.to_string();
+    for leaked in ["tier-douwang", "斗王档", "cultivation", "xuanhuan", "lethal"] {
+        assert!(!dumped.contains(leaked), "「{leaked}」不该进模型上下文：{dumped}");
+    }
+}

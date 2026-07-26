@@ -146,10 +146,11 @@
 > **不是** `Production-ready`，更**不是** `Validated`：
 >
 > - 从未在真实部署 / 真实并发 / 真实数据量下跑过；连接池、超时、迁移锁、故障恢复零验证。
-> - ⚠️ **排序稳定性：清单已修，两处硬骨头仍在**（2026-07-27）。PG 对 `ORDER BY` 的并列行不保证
->   顺序，SQLite 则常按 rowid 稳定返回。审出的约 30 处已按三类处置完毕（见 **§3.3**）；
->   剩余两项是**并发正确性**而非排序问题，需迁移 + 评审：`world_events.sequence` 的
->   `MAX+1` 分配、`sms_challenges` 的「最新那条」。**CI 全绿仍不能证明剩余项是对的。**
+> - ⚠️ **排序稳定性：清单已修；并发项修掉一项、剩一项**（2026-07-27）。PG 对 `ORDER BY` 的并列行
+>   不保证顺序，SQLite 则常按 rowid 稳定返回。审出的约 30 处已按三类处置完毕（见 **§3.3**）。
+>   两项**并发正确性**（非排序）问题中，`world_events.sequence` 的 `MAX+1` 分配已由迁移 `0043`
+>   的发号器表修掉（PG 上有实测对照，见 §3.3 ①）；`sms_challenges` 的「最新那条」仍在。
+>   **CI 全绿仍不能证明剩余项是对的。**
 >
 > CI（`.github/workflows/test.yml` 的 `platform-test`）已把 PG 全量两个 feature 组合都设为
 > **阻塞门禁**（`continue-on-error` 已删除）。
@@ -286,6 +287,39 @@
 **本次未做（登记为下一步）**：境界档接进 `runtime` 叙事上下文；把境界维接进 `slo/` 形成校准闭环；
 题材 → 审核档位的真实联动。三项都不在本批次范围内。
 
+> **2026-07-27 更新（境界档叙事层接通，上段第一项已兑现）**
+>
+> 「境界档接进 `runtime` 叙事上下文」这一项**已完成**，故上面「境界档的三条限定」第 2 条
+> （叙事感知层是缺的 / 对玩家零可见 / 状态只到 `Implemented`）**不再成立**，其余两条一字不改。
+>
+> **接在哪一步**：只接 §6 原文点名的那一步——「**入场导演统一设定**」。
+> 链路 `skeleton.realmTier` →（装配钉住）`assembled_json./assembly/realmTier`
+> → `runtime::parse_realm_costume` → `RoundInput.realm_costume`
+> → 引擎 `call_director` 的设局 prompt。**七个字段里只有 `briefing` 与 `flavorNotes` 进模型上下文**；
+> `id`/`label` 留作审计与展示，`cosmology`/`genre` 只是标注，**`conflictIntensity` 刻意不进**
+> （它不是生死开关，生死由建房参数 `lethality` 与 §11 独立决定）。
+> 多地点组时每组导演拿的是**同一件**戏服（§6 全员统一；分地点分化就成了数值差）。
+>
+> **状态：`Integrated`，不是更高**（§0.3 七档）。它改变的只有「这一篇被怎么描写」，
+> 且**校准闭环仍然缺失**——没有任何指标能回答「换一件戏服，叙事真的变了吗」。
+> 没有任何真实用户数据，故不得读作 Production-ready / Validated / Enabled
+> （`realm_tier_effect_states_narrative_layer_is_integrated` 顺带把这个天花板锁进测试）。
+>
+> **红线守卫（新增用例）**：
+> | 用例 | 锁住什么 |
+> |---|---|
+> | `runtime::tests::realm_tier_reaches_only_the_director_prompt` | 端到端：戏服逐字进导演 prompt；决策/仲裁/写作/审校四环节一个字看不到；`lethal`/`cultivation`/档位 id 不进任何上下文；世界状态与 `world_events` 里不留痕 |
+> | `narrative::tests::realm_costume_only_reaches_director` | 引擎侧同一条边界 + 免责话术（「不得据此判定谁能赢」）必须在场 |
+> | `narrative::tests::realm_costume_never_reaches_state_or_events` | 戏服不进 StatePatch / DomainEvent / 世界状态 / DNA 卡 / `CharacterState.resources`（引擎判定域） |
+> | `narrative::tests::realm_costume_carries_no_numeric_field` | 零数值红线的引擎端（server 端是既有的 `realm_tier_carries_no_numeric_field`） |
+> | `runtime::tests::world_without_realm_tier_keeps_director_prompt_clean` + `absent_or_blank_realm_costume_keeps_director_prompt_byte_identical` | **未声明 / 空戏服 → 导演 prompt 逐字节不变**（黄金骨架正属此类） |
+>
+> **黄金世界快照仍未变**：黄金骨架不声明 `realmTier`，`golden` 那 14 项零改动通过，
+> 本次**没有刷任何基线**（若它变了即说明接线泄漏到了默认路径，属 bug 而非需要更新基线）。
+>
+> **仍未做**：把境界维接进 `slo/` 形成校准闭环；题材 → 审核档位的真实联动；
+> if 线是否继承原世界那件戏服（当前恒 `None`，与接线前一致）。
+
 ### 3.2 R3 批次台账 —— 人设保险三级出口（总规格 §7，**校验于 2026-07-26**）
 
 > 三级出口是同一句话的三种兑现方式：**公共事实不可回滚（§0.3）**，
@@ -372,7 +406,7 @@ if 线现在是「可开、可跑、可读、可审、可查成本」，但仍**
 > **纪律提醒**：本节存在的意义是 §4.3 那条"发布评审以台账为准，禁止口头'已完成'"。
 > 台账漏项 = 评审失去依据，与状态写错同等严重。改 R1 相关代码时同步改本表。
 
-### 3.3 Postgres 排序稳定性（登记 2026-07-27 · **排序清单已修，两处并发问题仍在**）
+### 3.3 Postgres 排序稳定性（登记 2026-07-27 · **排序清单已修；并发项 ① 已修、② 仍在**）
 
 PG 对 `ORDER BY` 并列行的顺序**不作任何保证**（可随计划、并行度、物理页序变化）；SQLite 则
 常按 rowid 稳定返回。首轮审计出的约 30 处已全部处置（下表），处置状态 **`Implemented`**。
@@ -427,34 +461,65 @@ PG 对 `ORDER BY` 并列行的顺序**不作任何保证**（可随计划、并�
   （PG 实例建在临时目录、跑完立即 `pg_ctl stop` + `rm -rf`，未在仓库或系统留任何数据目录。）
 - golden 基线与 `runtime/simulation/baseline.json` **一个字节未动**。
 
-#### 剩余两项（**并发正确性，不是排序**；需迁移 + 评审，本批次有意未动）
+#### 两项并发正确性问题（**不是排序**）：① 已修，② 仍在
 
-**① `world_events.sequence` 的分配没有并发安全**（风险更高的一项）
+**① `world_events.sequence` 的分配没有并发安全 —— 已修（迁移 `0043`，状态 `Implemented`）**
 
-`events::insert_events_tx` 与 `events::persist_and_broadcast_public_event` 都用事务内
-`SELECT COALESCE(MAX(sequence),-1)+1` 读-改-写分配，而 `idx_world_events_world(world_id, sequence)`
+原口径：`events::insert_events_tx` 与 `events::persist_and_broadcast_public_event` 各自在事务内
+跑 `SELECT COALESCE(MAX(sequence),-1)+1` 读-改-写分配，而 `idx_world_events_world(world_id, sequence)`
 **非唯一**。SQLite 的单写者锁让它事实上串行；**PG 在 READ COMMITTED 下不会**——
 `SELECT MAX()` 不取任何锁，两个并发事务读到同一个 `MAX` 就会写出同号，且**静默提交**。
 
 - **竞态是真实可达的，不是理论**：`arena/mod.rs:85`（`arena` feature 下的礼物/赛事事件）
   是玩家/运营触发的 HTTP 路径，与 `runtime::commit_tick` 的批量落库并行，二者写同一个世界。
 - **爆炸半径 = 反向把并列引入所有依赖 sequence 唯一性的站点**：`clips/mod.rs:36` 的"后来者胜"
-  高光规则、`arena/mod.rs:240/:367`、`slo/mod.rs:253`，最重的是 `events/mod.rs:107`
+  高光规则、`arena/mod.rs:240/:367`、`slo/mod.rs:253`，最重的是 `events/mod.rs`
   的 `VISIBLE_EVENTS_SQL`——它拿 `sequence > $cursor` 当 WS 断线补偿游标，撞号意味着
   两条事件里有一条**永远不会补给重连的客户端**。
-- 🔴 **只加 `UNIQUE(world_id, sequence)` 是错的修法**：它把静默损坏换成 23505，而输的那一方
-  是**一整个 tick 的 commit 事务回滚**；且迁移在存量已有重复数据时会直接失败（= 服务起不来）。
+- 🔴 **只加 `UNIQUE(world_id, sequence)` 是错的修法**（故未采用）：它把静默损坏换成 23505，
+  而输的那一方是**一整个 tick 的 commit 事务回滚**（模型已跑完、token 已烧掉）；
+  且迁移在存量已有重复数据时会直接失败 = 服务起不来。
 
-  **建议方案（可移植、无需 `FOR UPDATE`/`RETURNING`）**：加一张 `world_event_seq(world_id PK, next_seq)`，
-  在**同一事务内**按 `INSERT ... ON CONFLICT DO NOTHING` → `UPDATE ... SET next_seq = next_seq + n`
-  → `SELECT next_seq` 三步领号。正确性来自第二步的 `UPDATE` 拿**行级排他锁**：并发事务的
-  同一行 `UPDATE` 会阻塞到前者提交，再在**更新后**的值上叠加，无丢失更新；SQLite 那边写锁本就串行。
-  迁移里用 `SELECT world_id, MAX(sequence)+1 FROM world_events GROUP BY world_id` 回填。
-  待分配改造落地**之后**，唯一索引才可以作为兜底加上（仍需先扫存量重复）。
-  代价：该行锁持有到 tick 提交为止 ⇒ 同一世界的事件写入串行化——语义上本就该串行，
-  且 `commit_tick` 的事务在模型调用**之后**才开启、纯 DB 无外部 IO，故锁窗很短。
-  未在本批次落地的理由：改的是全仓最关键的写路径，而并发正确性**无法靠现有单连接测试池验证**
-  （`testkit` 的 PG 池 `max_connections(1)`），需要专门的并发压测 + 评审。
+**落地方案**：迁移 `0043_world_event_seq` 加发号器表 `world_event_seq(world_id PK, next_seq)`，
+全仓唯一分配入口收敛为 `events::allocate_sequences_tx`，同事务三步领号
+`INSERT ... ON CONFLICT(world_id) DO NOTHING` → `UPDATE ... SET next_seq = next_seq + n`
+→ `SELECT next_seq`。正确性来自第二步 `UPDATE` 的**行级排他锁**（并发事务阻塞到前者提交/回滚，
+再在更新后的值上叠加，无丢失更新），不是唯一约束；两个库都有这条语义，
+故不需要 `FOR UPDATE`（PG 方言）也不需要 `RETURNING`（SQLite 3.35+）。
+自增与事务同生共死 ⇒ **不产生空洞**（与 PG 原生 sequence 不同）。
+
+- **存量回填**：迁移第二条语句 `INSERT INTO world_event_seq SELECT world_id, MAX(sequence)+1
+  FROM world_events GROUP BY world_id`。不回填 = 升级后第一条事件拿 0，把整段历史重新撞一遍，
+  比原 bug 更严重。**迁移完成到服务接客之间没有窗口**（`db::connect()` 先跑完 `migrate!()`，
+  之后 `main` 才 bind 端口）；唯一残余窗口是**多实例滚动发布**，兜底在代码侧——
+  `allocate_sequences_tx` 建行时初值取 `COALESCE((SELECT MAX(sequence)+1 ...), 0)` 而非常数 0，
+  任何尚未登记进发号器的世界首次分配即自动对齐到历史之后。
+  「旧实例继续往**已登记**世界写」这一种仍会撞号，处置是发布纪律（先停旧再放新），不是迁移能解决的。
+- **存量重复数据普查**：仓内唯一持久库 `server/muse-demo.db`（dev 演示 SQLite）26 条事件 / 1 个世界，
+  `sequence` 0-25 全互异，**无重复**；生产 PG 部署尚不存在（T0 未开测）。即撞号事故迄今未实际发生，
+  修的是**打开 PG 那一刻就会踩到**的雷。回填取 `MAX` 对已有重复也是安全的（继续往后发即可）。
+- **锁的持有范围**：从 `insert_events_tx` 到 `tx.commit()`。`commit_tick` 的事务在**模型调用之后**
+  才开启，整段纯 DB 语句零外部 IO（第 3 层语义审核是网络调用，早已被明确排除在事务外）；
+  分配点又排在该事务尾部（CAS → 贡献 → 终局 → world_ticks → critic → **落库** → 干预 → 预算 → commit），
+  持锁期间只剩两条小 UPDATE。代价是同一世界的事件写入串行化——语义上本就该串行。
+- 唯一索引作为**兜底**可以在此之后再加（仍需先扫存量重复），本批次未加。
+
+**怎么验的（证据是双库对照，不是"CI 绿了"）**：新增多连接测试池 `testkit::test_pool_concurrent(n)`
+——🔴 **没有动默认 `test_pool` 的 `max_connections(1)`**（那个 1 是刻意的，改了会让大量既有用例
+以与被测点无关的理由失败）。并发用例 `concurrent_sequence_allocation_never_collides_or_gaps`
+起 24 个任务对**同一个世界**并发落 48 条事件，且**两个分配站点同时打**（半数走
+`persist_events` = `commit_tick` 批量侧，半数走 `persist_and_broadcast_public_event`
+= `arena::emit_arena_event` 的 HTTP 侧），断言「无重复 + 无空洞 + 总数正确」。
+在**一次性 Postgres 16.9 实例**上把分配临时回退成旧口径：48 条事件只拿到 **23 个不同的号**
+（25 条撞号），用例立刻变红；改回发号器后是连续的 0..47，重复跑 5 次稳定全绿。
+**同一次回退在 SQLite 上那三条断言全绿**——单写者锁把读-改-写事实上串行掉了，
+这正是「SQLite 绿不能作为并发证据」的直接实证。
+双库全量同源对照：`billing,arena` 与 default 两个 feature 组合在 SQLite 与 PG 上跑出**相同的通过数**，
+golden `14`，`runtime/simulation/baseline.json` 与 golden 基线**一个字节未动**。
+（PG 实例的数据目录建在临时目录、跑完 `pg_ctl stop` + `rm -rf`，未在仓库或系统留任何残留。）
+
+⚠️ 按 §0.3，本项状态是 **`Implemented`**：压测通过 ≠ 生产验证。真实并发规模、真实数据量、
+真实部署下的锁竞争与迁移锁行为**一律未验证**，不得表述为「并发安全已验证」。
 
 **② `sms_challenges` 的「最新那条」（`auth/mod.rs:304`，登录时校验哪条 OTP hash）**
 
@@ -675,6 +740,11 @@ record-and-replay `ModelClient`：**工具已建**（`muse_engine::replay`，202
 > 另注意上段说的是「可视化**与调参**」，三维**都只做了可视化，没做调参**：全部端点只读，
 > 校准参数的写入路径仍是建模板。境界档另有一层更弱的限定——`runtime` 还不读它，
 > 这一维目前**对玩家零可见**（§3.1.1「境界档的三条限定」第 2 条）。
+>
+> **2026-07-27 再更新**：最后那句「`runtime` 还不读它 / 对玩家零可见」**已不再成立**——
+> 境界档的 `briefing` 与 `flavorNotes` 已接进每拍的入场导演 prompt，
+> 叙事感知层由 `Missing` 升到 `Integrated`（详见 §3.1.1 末尾的接通更新块）。
+> **只可视化、不可调参**这一条不变；**校准闭环仍然缺失**这一条也不变。
 
 ### 4.5 录制-回放接线（新增于 2026-07-27 · 任务 #46 · 状态 `Implemented`）
 

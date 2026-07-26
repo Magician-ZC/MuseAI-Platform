@@ -35,7 +35,7 @@ use muse_engine::host::{CancelFlag, EngineEvent, EngineHost, HostEvents, HostFs,
 use muse_engine::model::{HttpModelClient, ModelClient, ModelProfile};
 use muse_engine::narrative::types::{
     CharacterState, ConstraintLevel, DomainEvent, DomainEventType, ForbiddenPredicate, LocationDef,
-    NarrativeState, NodeStatus, OutlineNode, RoundBudget, RunMode,
+    NarrativeState, NodeStatus, OutlineNode, RealmCostume, RoundBudget, RunMode,
 };
 use muse_engine::narrative::{ModelRoutes, NarrativeEngine, NarrativePrompts, RoundInput, Terminal};
 
@@ -1406,6 +1406,74 @@ fn brief_with_identity(name: &str, display: Option<&String>) -> String {
     }
 }
 
+// ---------- 境界档叙事接线（总规格 §6【拍板 3】：戏服原则——境界即布景） ----------
+//
+// §6 原文两句定死了接法：「境界档**全员统一**（数值层，平权）：进黑角域篇全员领斗王档戏服，
+// **入场导演统一设定**」+「跨体系靠**风味翻译**，不靠数值换算」。
+// 于是本节接的就是「入场导演统一设定」这一步，且**只**接这一步：
+// 装配层钉住的 `/assembly/realmTier` → `RoundInput.realm_costume` → 引擎 `call_director`
+// 的设局 prompt。它改变的是模型**怎么描写**（这一篇大家什么水位、招式译成什么风味），
+// 不是**谁赢谁输**。
+//
+// 🔴 **平权红线（§0.1 + §6，锁进测试）**：境界是布景不是战力。本节读回的戏服
+//   - **绝不进 `active_cards`**（角色卡不可变 DNA 快照，污染它等于篡改玩家的卡——同身份池口径）；
+//   - **绝不进 `CharacterState.resources`** 或任何引擎判定域（仲裁 / 不变量 / reducer /
+//     StatePatch / DomainEvent / 同意门控 / 关系演化 / 里程碑强度一概不读它）；
+//   - **绝不写回角色卡**（§6「角色带走道具与历练，永不带走境界——境界留在那个世界的那场戏里」）；
+//   - 也**绝不**被任何下游用来改判定 / 改发奖 / 开权限 / 调难度 / 改准入。
+//   守卫用例：engine 侧 `realm_costume_never_reaches_state_or_events` /
+//   `realm_costume_only_reaches_director`，server 侧 `realm_tier_reaches_only_the_director_prompt`。
+//
+// 🔴 **七个字段里只有两个进模型上下文**，其余五个刻意留在服务端：
+//   - `briefing` / `flavorNotes` → 导演 prompt（§6「入场导演统一设定」「风味翻译」，就是它俩）；
+//   - `id` / `label` → 审计与运营展示（校准面），不是给模型看的；
+//   - `cosmology` / `genre` → 建模板期取值域校验与运营分类标注；
+//   - `conflictIntensity` → **尤其不进**：它长得像「生死开关」，但世界是否致命由建房参数
+//     `lethality`（§11【拍板 24】）独立决定。把 `lethal` 喂给导演等于让一个叙事标注去撬动
+//     生死判定的观感，属平权红线违规（见 `assembly::RealmTier::conflict_intensity` 的警告）。
+//
+// 退化契约：老世界 / 未装配 / 模板未声明 `realmTier` / JSON 结构损坏 / 两段文案皆空
+// → 一律 `None` → 导演 prompt **逐字节**与接线前一致；不 panic、不阻断 tick
+//（同 `load_identity_display_names` 与 `seed_narrative_layer` 的防御式口径）。
+//
+// 确定性：全员统一 ⇒ **零抽样、不占任何 RNG 域常量**（域清单里下一个可用的仍是 `0x5C`）。
+// 本节纯读、纯拼接，无随机、不依赖 map 迭代序 —— 同一实例恒得同一件戏服。
+
+/// 从实例 `assembled_json` 读回本篇戏服（`/assembly/realmTier` 的 `briefing` + `flavorNotes`）。
+///
+/// 只取这两段（其余五个字段留在服务端，理由见上方小节注释）。任一层结构不符
+///（未装配 / 非 JSON / 无该键 / 不是对象）→ `None`；两段都空 → 同样 `None`
+///（"声明了一件没词儿的戏服" 不该让导演 prompt 多出一个空标题）。
+///
+/// **刻意不复用 `assembly::RealmTier` 反序列化**：与 `parse_identity_assignments` /
+/// `worldCharacterEntries` 同款防御式解析——tick 路径读的是可能由更老版本代码写下的快照，
+/// 强类型反序列化会因任何一个陌生/畸形字段整份失败，而这里应当「能读多少读多少、读不到就退化」。
+fn parse_realm_costume(assembled_json: Option<&str>) -> Option<RealmCostume> {
+    let v: Value = serde_json::from_str(assembled_json?).ok()?;
+    let rt = v.pointer("/assembly/realmTier")?;
+    if !rt.is_object() {
+        return None; // 境界不是池：数组 / 字符串一律当没声明。
+    }
+    let briefing = rt.get("briefing").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let flavor_notes: Vec<String> = rt
+        .get("flavorNotes")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let costume = RealmCostume { briefing, flavor_notes };
+    if costume.is_blank() {
+        return None; // 两段皆空 = 无可说的戏服 → 与未声明逐字节等价。
+    }
+    Some(costume)
+}
+
 // ---------- tick 收尾工具 ----------
 
 /// **空转拍**收尾：置 done + note，成本恒 0。
@@ -2197,6 +2265,15 @@ async fn process_tick_inner(
     //    叙事特权，且**绝不进 active_cards**（角色卡快照不可变）。详见 `load_identity_display_names` 注释。
     let identity_display = load_identity_display_names(db, &world).await;
 
+    // 境界档叙事接线（总规格 §6【拍板 3】戏服原则）：读回装配钉住的本篇戏服 —— **全员统一一件**。
+    // 与身份池正相反：身份各不相同（cid → 展示名的表），境界人人一样（一个 Option）。
+    // None = 老世界 / 模板未声明 realmTier / 结构损坏 / 两段文案皆空 → 导演 prompt 逐字节退化为接线前。
+    // 🔴 只进 `RoundInput.realm_costume`（→ 引擎导演 prompt）这一条通道：不进 active_cards、
+    //    不进 CharacterState.resources、不改任何判定。详见上方 `parse_realm_costume` 小节注释。
+    // 纯读已钉住的实例快照（无 DB 查询、无模型调用），置于此处与身份池同一段，读的是同一份
+    // reload 后的 `world`（首 tick 兜底装配已在 5.5 完成，故首 tick 就能穿上戏服）。
+    let realm_costume = parse_realm_costume(world.assembled_json.as_deref());
+
     let mut members_projection: Vec<ProjectionMember> = Vec::new();
     let mut member_ids: Vec<String> = Vec::new();
     let mut active_cards: BTreeMap<String, CharacterCardV2> = BTreeMap::new();
@@ -2482,6 +2559,13 @@ async fn process_tick_inner(
             // 两处保守降级都在该函数内：非法/未知值 → 同意制；生死状但运营开关未开 → 同意制
             //（未验证功能默认关闭，VALIDATION.md §0.1）。历史世界落库即 'consent'，行为零变化。
             lethality: effective_lethality(&world.lethality),
+            // 境界档 / 本篇戏服（总规格 §6【拍板 3】「戏服原则」）：装配钉住的戏服 → 引擎入场导演。
+            // 「境界档全员统一，入场导演统一设定」——所以是一个 Option 而不是 per-character 的表，
+            // 多地点组时每组导演也拿同一件（分地点分化就成了数值差）。
+            // 🔴 布景不是战力：它只影响导演怎么描写这一篇的水位与招式风味，绝不改判定、不改发奖、
+            //    不开权限、不调难度；不进 active_cards（卡不可变），不进 CharacterState.resources。
+            // None（老世界 / 未声明 / 文案皆空）→ 导演 prompt 与接线前逐字节一致。
+            realm_costume: realm_costume.clone(),
         };
         let cancel = CancelFlag::new();
         // 时间线模式分派（第二块 Phase 2）：event 世界走 DES 调度器 run_event_step（内部做 cohort 过滤 +

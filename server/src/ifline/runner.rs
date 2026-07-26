@@ -744,6 +744,12 @@ pub(super) async fn advance_one_beat(
             now_hint: 0,
             stall_hint: None,
             lethality,
+            // 境界档 / 本篇戏服（总规格 §6【拍板 3】）：本次接线**只覆盖世界线 `runtime`**，
+            // if 线保持 `None` = 与接线前逐字节一致。口径同上面的 `self_identities`——
+            // 装配层的实例级叙事装饰不在这条私人分叉线上重新发放；要不要让 if 线继承原世界的
+            // 那件戏服，等世界线这一维真的被观察过之后再单独决定（未验证功能默认关闭，
+            // VALIDATION §0.1），而不是顺手跟着接线一起悄悄开出去。
+            realm_costume: None,
         };
         let cancel = CancelFlag::new();
         // 🔴 恒走 `run_round`，**不走 `run_event_step`**：DES 调度依赖 `timeline.next_time`

@@ -146,6 +146,10 @@ pub async fn start_narrative_round(app: AppHandle, request: RoundRequestDto) -> 
             // 分配、钉进 assembled_json。本地模式没有装配层、没有世界实例，故恒为空表
             // （引擎对空表的处理与本字段落地前完全一致）。
             self_identities: BTreeMap::new(),
+            // 境界档 / 本篇戏服（规格 §6）同样只存在于平台的副本装配产物里（模板 skeleton 声明 →
+            // assemble_instance 钉进 assembled_json）。本地模式没有副本、没有阶段模板，故恒 None
+            // ——引擎对 None 的处理与本字段落地前逐字节一致（导演 prompt 不多一个字节）。
+            realm_costume: None,
         };
         let result = engine.run_round(&routes, &prompts, input, &flag).await;
         let payload = match &result {

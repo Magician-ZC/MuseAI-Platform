@@ -804,12 +804,21 @@ Schema（全部字符串或字符串数组，**一个数字都没有**——§6�
 |---|---|---|
 | 声明层 `declarationLayer` | `Implemented` | `assembly::RealmTier` schema + `validate_skeleton_refs` 第 6 段取值域校验 |
 | 钉住层 `pinningLayer` | `Implemented` | 装配时原样钉进 `assembled_json./assembly/realmTier`（**零抽样、不占 RNG 域常量**，下一个可用域仍是 `0x5C`） |
-| 叙事感知层 `narrativeLayer` | **`Missing`** | `runtime` **不读**这个键——境界档目前对玩家**零可见**，戏服挂在衣架上没人穿 |
-| 数值层 `numericLayer` | `NeverByDesign` | §6 + §0.1 平权：`RealmTier` 全字段是字符串 / 字符串数组，`realm_tier_carries_no_numeric_field` 锁住 |
+| 叙事感知层 `narrativeLayer` | **`Integrated`**（2026-07-27 接通） | `runtime::parse_realm_costume` 读回 `briefing` + `flavorNotes` → `RoundInput.realm_costume` → 引擎 `call_director` 的入场导演设局 prompt（§6「入场导演统一设定」） |
+| 数值层 `numericLayer` | `NeverByDesign` | §6 + §0.1 平权：`RealmTier` 全字段是字符串 / 字符串数组，`realm_tier_carries_no_numeric_field` 锁住；接进叙事层后同样只改描写，不进任何判定域 |
 | 校准闭环 `calibrationLoop` | `Missing` | 没有任何指标度量「换境界档 → 叙事变化」 |
 
-所以这一维现在只到 **Implemented**（VALIDATION §0.3），**不是 Integrated**：
-调整境界档在玩家侧观察不到任何变化，本页的「已声明 / 已钉住」只证明数据在库里。
+🔴 **七个字段里只有两个进模型上下文**：`briefing` 与 `flavorNotes` 织进入场导演 prompt；
+`id`/`label` 只用于本页展示与审计，`cosmology`/`genre` 只是取值域标注，
+**`conflictIntensity` 刻意不进**——它长得像生死开关，但世界是否致命由建房参数 `lethality`
+与 §11 独立决定，让一个叙事标注去撬动生死判定属平权红线违规。
+导演 prompt 里那段戏服恒附一句「只改描写、不得据此判定谁能赢」的免责话术，
+它是红线的一部分而非修辞（守卫用例 `realm_tier_reaches_only_the_director_prompt` /
+`realm_costume_only_reaches_director` / `realm_costume_never_reaches_state_or_events`）。
+
+所以这一维现在到 **Integrated**（VALIDATION §0.3）：戏服真的会改变这一篇被怎么描写，
+但**到此为止**——它不改判定 / 发奖 / 权限 / 难度 / 准入，也**没有任何指标**能回答
+「这件戏服配得对不对」（`calibrationLoop` 仍是 `Missing`）。**Integrated ≠ 已验证 ≠ 可上线**。
 
 **未声明即零影响（逐字节）**：`Skeleton.realm_tier` 与 `AssembledInstance.realm_tier` 都是
 `Option` + `skip_serializing_if`（同 `payoutTable` 范式），模板不写 `realmTier` 时

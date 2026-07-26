@@ -56,11 +56,35 @@ pub fn on_postgres() -> bool {
 }
 
 /// 建一个跑完全部迁移的空库。SQLite → 进程内独立内存库；PG → 独立 schema。
+///
+/// **单连接**（两个库都是）。绝大多数用例都该用它。
 pub async fn test_pool() -> AnyPool {
     INIT.call_once(sqlx::any::install_default_drivers);
     let url = test_database_url();
     if is_postgres(&url) {
-        postgres_pool(&url).await
+        postgres_pool(&url, 1).await
+    } else {
+        sqlite_pool(&url).await
+    }
+}
+
+/// **多连接**测试池：只给需要「两个事务真的同时在跑」的并发用例使用。
+///
+/// 🔴 **不要改 [`test_pool`] 的 `max_connections`**。那里的 1 是刻意的（见 `postgres_pool`
+/// 里的注释）：多连接下「A 未提交的写 B 看不见」会让大量既有用例以与被测点无关的理由失败，
+/// 把真正的问题淹掉。所以并发能力是**按用例显式索取**的，不是全局放开的。
+///
+/// ⚠️ **SQLite 那遍拿不到真并发，这条必须清楚**：`sqlite::memory:` 每条连接是一个**独立空库**，
+/// 多连接会直接把用例变成「各写各的库」。故 SQLite 分支原样回落到单连接池，
+/// 并发用例在 SQLite 上退化为顺序执行——它仍然验证分配口径本身（连续、不重、不漏），
+/// 但**不构成任何并发安全的证据**（SQLite 的单写者锁本就让 read-modify-write 事实上串行，
+/// 旧口径在这里同样会绿 = 假绿）。并发结论只能来自
+/// `MUSE_TEST_DATABASE_URL=postgres://...` 那一遍。
+pub async fn test_pool_concurrent(max_connections: u32) -> AnyPool {
+    INIT.call_once(sqlx::any::install_default_drivers);
+    let url = test_database_url();
+    if is_postgres(&url) {
+        postgres_pool(&url, max_connections.max(1)).await
     } else {
         sqlite_pool(&url).await
     }
@@ -80,7 +104,8 @@ async fn sqlite_pool(url: &str) -> AnyPool {
     pool
 }
 
-async fn postgres_pool(url: &str) -> AnyPool {
+/// `max_connections`：默认 1（见下方注释）；只有 [`test_pool_concurrent`] 会传 >1。
+async fn postgres_pool(url: &str, max_connections: u32) -> AnyPool {
     let n = SCHEMA_SEQ.fetch_add(1, Ordering::SeqCst);
     let prefix =
         std::env::var("MUSE_TEST_SCHEMA_PREFIX").unwrap_or_else(|_| "muse_test".to_string());
@@ -107,12 +132,14 @@ async fn postgres_pool(url: &str) -> AnyPool {
         .expect("create test schema");
     admin.close().await;
 
-    // 连接数与 SQLite 那遍对齐（1）：不是性能取舍，是为了两遍的**可见性语义一致**——
+    // 连接数**默认**与 SQLite 那遍对齐（1）：不是性能取舍，是为了两遍的**可见性语义一致**——
     // 多连接时「A 连接未提交的写 B 连接看不见」会让用例以与 SQL 方言无关的理由失败，
     // 把真正的可移植性问题淹掉。
+    // 例外只有 `test_pool_concurrent`：并发正确性（如 `world_event_seq` 发号）在单连接池上
+    // **根本无法验证**——两个事务从来不会同时在跑。那类用例按需索取连接数，其余一律走 1。
     let hook_schema = schema.clone();
     let pool = AnyPoolOptions::new()
-        .max_connections(1)
+        .max_connections(max_connections)
         .min_connections(1)
         .idle_timeout(None)
         .max_lifetime(None)

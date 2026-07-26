@@ -461,6 +461,47 @@ impl Default for Lethality {
     }
 }
 
+/// 本篇戏服（世界生态总规格 §6【拍板 3】「境界即布景」）：**入场导演的统一设定**，
+/// 随 `RoundInput` 每回合由调用方传入（后端无状态约定：引擎不持有世界配置）。
+///
+/// §6 原文两句定死了它的性质：「境界档**全员统一**（数值层，平权）：进黑角域篇全员领斗王档戏服，
+/// **入场导演统一设定**」+「跨体系靠**风味翻译**，不靠数值换算」。据此：
+///
+/// 1. **不是 per-character 的** ⇒ 落点是**一个** `Option<RealmCostume>`，不是 `cid → …` 的表
+///    （对比 `self_identities`：身份各不相同，境界人人一样）。谁把它改成表，就等于开了
+///    「同一篇里有人穿斗皇、有人穿斗者」的口子，那是数值差，不是布景。
+/// 2. **零数值** ⇒ 全字段是字符串 / 字符串数组，**一个数字都没有**
+///    （`realm_costume_carries_no_numeric_field` 锁死；server 侧同名锁在 `assembly::RealmTier`）。
+/// 3. **只进导演 prompt** ⇒ 引擎里唯一的消费者是 `call_director`：它只改变模型**怎么描写**
+///    （水位口吻、招式称谓），**绝不进入任何判定域**——仲裁 / 确定性不变量 / reducer /
+///    StatePatch / DomainEvent / 同意门控 / 关系演化 / 里程碑强度一律不读它；更不进
+///    `active_cards`（角色卡不可变 DNA 快照）与 `CharacterState.resources`（引擎判定域）。
+///    `realm_costume_never_reaches_state_or_events` 与 `realm_costume_only_reaches_director`
+///    把这两条锁进测试。
+///
+/// `None`（默认）= 本篇无戏服 ⇒ 导演 prompt 逐字节与接线前一致。平台由 runtime 从
+/// `assembled_json` 的 `/assembly/realmTier` 回灌；桌面壳恒 `None`。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RealmCostume {
+    /// 一句话交代「这一篇全员是什么水位」（§6「入场导演统一设定」）。
+    #[serde(default)]
+    pub briefing: String,
+    /// 跨体系风味翻译提示（§6「唐三入斗破世界，魂技译为斗气招式风味，内核不变」）。
+    #[serde(default)]
+    pub flavor_notes: Vec<String>,
+}
+
+impl RealmCostume {
+    /// 两段都空 = 没有任何可说的戏服 ⇒ 等价于未声明（导演 prompt 不加任何字节）。
+    /// 调用方给的 `Some(RealmCostume::default())` 与 `None` 因此行为完全一致，
+    /// 不会凭空多出一个空标题把导演 prompt 撑变形。
+    pub fn is_blank(&self) -> bool {
+        self.briefing.trim().is_empty()
+            && self.flavor_notes.iter().all(|n| n.trim().is_empty())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SceneRecord {

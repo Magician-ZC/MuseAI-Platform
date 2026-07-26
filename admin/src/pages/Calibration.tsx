@@ -13,9 +13,10 @@
 //   ① **只可视化，不可编辑**：后端六个端点全只读，恒下发 `editable:false` + `editPath`。
 //      页面把这两个字段渲染出来，而不是自己写死一句「只读」——后端哪天开了写入面，界面自动跟上。
 //   ② **每一维的真实效力**：身份池的分配层与叙事感知层都已落地（但永不进数值层）；
-//      境界档的**叙事感知层是缺的**——runtime 不读 realmTier，这件戏服目前没人穿。
+//      境界档的叙事感知层**已接通**（runtime 把 briefing/flavorNotes 喂给入场导演），
+//      但只影响「这一篇被怎么描写」，永不进数值层，且**校准闭环仍然是空的**。
 //      这些层状态一律由后端 `effect` 段下发，本页原样渲染（`EffectPanel`），
-//      **不得只画一张「已配置」的绿标**。
+//      **不得只画一张「已配置」的绿标**，也不得把「已接通」读成「已验证」。
 //
 // 数据诚实纪律（设计文档 §9.1）：只渲染接口真实返回的字段，null 一律显示 `—`，
 // 比率为 null 时不得当 0% 渲染（formatPercent 已处理）。
@@ -369,6 +370,11 @@ const LAYER_STATE: Record<string, { text: string; tone: 'ok' | 'never' | 'missin
     tone: 'ok',
     note: '代码已落地并有测试覆盖；这不等于「已验证值得上线」。',
   },
+  Integrated: {
+    text: '已接通（Integrated）',
+    tone: 'ok',
+    note: '已跨模块接进真实链路并有测试覆盖；仍不等于「已验证值得上线」——没有真实用户数据。',
+  },
   NeverByDesign: {
     text: '设计上永不生效',
     tone: 'never',
@@ -389,7 +395,11 @@ const IDENTITY_LAYERS: { key: string; label: string }[] = [
   { key: 'calibrationLoop', label: '校准闭环' },
 ];
 
-/** 境界档五层（§6）。比身份池多一层，且**叙事感知层是缺的**——这正是要让运营看见的事。 */
+/**
+ * 境界档五层（§6）。比身份池多一层（多出「钉住层」：戏服随实例钉死在 assembled_json）。
+ * 叙事感知层已接通，但**校准闭环仍是缺的**——「换一件戏服，叙事真的变了吗」没有任何指标能答，
+ * 这正是要让运营看见的事。
+ */
 const REALM_LAYERS: { key: string; label: string }[] = [
   { key: 'declarationLayer', label: '声明层' },
   { key: 'pinningLayer', label: '钉住层' },
@@ -1354,8 +1364,8 @@ function RealmTiers({ deepLink }: { deepLink?: string }) {
 
   return (
     <div>
-      {/* 🔴 效力自述放在最上面：这一维的叙事感知层是缺的，运营在列表页就该知道，
-          而不是点进详情才发现「配了半天玩家看不到」。 */}
+      {/* 🔴 效力自述放在最上面：这一维哪层生效、哪层永不生效、哪层还是空的，运营在列表页就该知道，
+          而不是点进详情才发现「配了半天不知道有没有用」。 */}
       {data && <EffectPanel title="境界档现在到底有什么用" effect={data.effect} layers={REALM_LAYERS} />}
       <ReadOnlyBanner editable={data?.editable} editPath={data?.editPath} />
 

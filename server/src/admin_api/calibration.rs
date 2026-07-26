@@ -28,18 +28,19 @@
 //! 所以本页能回答的是「**分配结果长什么样、是否失衡**」，**不能**回答「这样分配是不是更好」。
 //! 后者要先把身份维接进质量指标（`slo/`），那是另一件事。
 //!
-//! # 🔴 境界档的真实效力：比身份池还弱一层
+//! # 🔴 境界档的真实效力：叙事层已接通，校准闭环仍是空的
 //!
 //! | 层 | 状态（§0.3 七档） | 事实 |
 //! |---|---|---|
 //! | 声明层 | **Implemented** | `assembly::RealmTier` schema + `validate_skeleton_refs` 第 6 段取值域校验 |
 //! | 钉住层 | **Implemented** | 装配时原样钉进 `assembled_json./assembly/realmTier`（零抽样、不占 RNG 域） |
-//! | 叙事感知层 | **缺失** | `runtime` **不读**这个键——境界档目前对玩家**零可见**，戏服挂在衣架上没人穿 |
-//! | 数值层 | **设计上永不生效** | §6「跨体系靠风味翻译，不靠数值换算」+ §0.1 平权：`RealmTier` 结构里一个数字都没有，有测试锁 |
+//! | 叙事感知层 | **Integrated** | `runtime::parse_realm_costume` 读回 `briefing` + `flavorNotes` → `RoundInput.realm_costume` → 引擎 `call_director` 的入场导演设局 prompt（§6「入场导演统一设定」）。**只有这两个字段进模型上下文** |
+//! | 数值层 | **设计上永不生效** | §6「跨体系靠风味翻译，不靠数值换算」+ §0.1 平权：`RealmTier` 结构里一个数字都没有，有测试锁；接进叙事层后同样只改描写，不进任何判定域（`realm_tier_reaches_only_the_director_prompt`） |
 //! | 校准闭环 | **缺失** | 没有任何指标度量「换境界档 → 叙事变化」 |
 //!
-//! 所以境界档这一维能回答的只是「**配了没有、各阶是不是在换、实例钉住没有**」，
-//! 连「玩家能不能感知到」都还回答不了。前端 `EffectPanel` 必须把这五层原样渲染。
+//! 所以境界档这一维现在能回答「**配了没有、各阶是不是在换、实例钉住没有、玩家那一篇会不会
+//! 被这样描写**」，仍**不能**回答「这件戏服配得对不对」——后者要先有指标。
+//! 前端 `EffectPanel` 必须把这五层原样渲染。
 //!
 //! # 双库可移植 SQL（db.rs 约定）
 //!
@@ -857,8 +858,9 @@ pub(super) async fn template_identity_pool(
 //   - 境界档（§6）：**全员统一**的一件戏服，无池、无配额、**零抽样** → 该看
 //     「这一阶有没有戏服、同系列各阶是不是在换戏服、已开出的实例钉住了没有」。
 //
-// 🔴 **本维度的效力比身份池弱一层，必须说清楚**：声明层与钉住层已落地，
-// 但 `runtime` **不读** `assembled_json./assembly/realmTier` —— 境界档目前对玩家**零可见**。
+// 🔴 **本维度的效力必须说清楚，不许只画一张「已配置」的绿标**：声明层、钉住层、叙事感知层
+// 都已落地（`runtime::parse_realm_costume` → 入场导演 prompt），但**只有 `briefing` 与
+// `flavorNotes` 进模型上下文**，且它只改描写、不改判定；校准闭环仍然是空的。
 // 详见 `realm_tier_effect()` 下发的五层自述。
 
 /// 境界档的**只读投影**（同 `IdentityEntry` 的哲学：对脏数据宽容，照样报出来供运营发现）。
@@ -953,19 +955,20 @@ fn parse_pinned_realm(assembled_json: Option<&str>) -> Option<(String, String)> 
 
 /// 🔴 境界档的效力自述（五层）。前端必须显式渲染，不得只画一张"已配置"的绿标。
 ///
-/// 与身份池的四层相比多一层、且**关键的那层是缺的**：runtime 不读 `realmTier`，
-/// 于是境界档现在**对玩家零可见**——它是一件挂在衣架上、没人穿的戏服。
+/// 与身份池的四层相比多一层（「钉住层」：戏服随实例钉死在 `assembled_json`）。
+/// 叙事感知层已由 `runtime::parse_realm_costume` 接通到入场导演 prompt——但**只接了描写这一头**，
+/// 而且**校准闭环仍然是空的**：没有任何指标能回答「换一件戏服，叙事真的变了吗」。
 fn realm_tier_effect() -> Value {
     json!({
         "declarationLayer": "Implemented",
         "pinningLayer": "Implemented",
-        "narrativeLayer": "Missing",
+        "narrativeLayer": "Integrated",
         "numericLayer": "NeverByDesign",
         "calibrationLoop": "Missing",
         // 🔴 下发文案一律**纯文本**：前端把它当普通字符串渲染，写 Markdown 星号只会在界面上
         // 露出两个字面的 `**`。强调一律用中文引号「」。
-        "summary": "境界档 = 世界发给全员的同一件戏服（总规格 §6「境界跟着副本走，不跟着角色走」）。它全员统一、无配额、装配层零抽样，只是把模板声明原样钉进实例 assembled_json。与身份池正相反：身份各不相同，境界人人一样。",
-        "warning": "钉住不等于生效：runtime 目前不读 assembled_json 的 realmTier，境界档还没有进入任何引擎上下文、也不出现在任何玩家可见文案里——本页的「已声明 / 已钉住」只证明数据在库里，不证明这一篇的戏服真的穿到了角色身上。叙事感知层接通之前，调整境界档在玩家侧观察不到任何变化。",
+        "summary": "境界档 = 世界发给全员的同一件戏服（总规格 §6「境界跟着副本走，不跟着角色走」）。它全员统一、无配额、装配层零抽样，只是把模板声明原样钉进实例 assembled_json，再由 runtime 把其中的 briefing 与 flavorNotes 喂给每拍的入场导演。与身份池正相反：身份各不相同，境界人人一样。",
+        "warning": "叙事感知层已接通，但只接通了「描写」这一头：七个字段里只有 briefing 与 flavorNotes 进入引擎的入场导演 prompt，改变的是这一篇被怎么写（大家什么水位、招式译成什么风味）；id 与 label 只用于本页展示与审计，cosmology 与 genre 只是取值域标注，conflictIntensity 刻意不进模型上下文——世界是否致命由建房参数 lethality 独立决定，与它无关。境界档一个数字都没有，也永远不改判定、发奖、权限、难度与准入。另外没有任何指标度量「换一件戏服，叙事真的变了吗」，所以本页仍然回答不了「这件戏服配得对不对」。",
     })
 }
 
@@ -1439,16 +1442,31 @@ mod tests {
         );
     }
 
-    /// 🔴 效力自述：叙事感知层必须是 `Missing`，数值层必须是 `NeverByDesign`。
-    /// 哪天 runtime 真读了 `realmTier`，改的是这里 —— 而不是让界面自己猜。
+    /// 🔴 效力自述：叙事感知层已接通（`Integrated`），数值层必须**永远**是 `NeverByDesign`，
+    /// 校准闭环仍是 `Missing`。
+    ///
+    /// 七档语言（VALIDATION §0.3）在此的边界：接通 = `Integrated`，**不是** `Validated`
+    /// 更不是 `Enabled` —— 没有任何真实用户数据证明「这样穿戏服更好」。谁把它往上抬，
+    /// 先去补 `slo/` 里那条度量「换戏服 → 叙事变化」的指标（`calibrationLoop` 转绿才配）。
     #[test]
-    fn realm_tier_effect_states_narrative_layer_is_missing() {
+    fn realm_tier_effect_states_narrative_layer_is_integrated() {
         let e = realm_tier_effect();
         assert_eq!(e["declarationLayer"], "Implemented");
         assert_eq!(e["pinningLayer"], "Implemented");
-        assert_eq!(e["narrativeLayer"], "Missing", "runtime 不读 realmTier，境界档对玩家零可见");
+        assert_eq!(
+            e["narrativeLayer"], "Integrated",
+            "runtime::parse_realm_costume → RoundInput.realm_costume → 入场导演 prompt"
+        );
         assert_eq!(e["numericLayer"], "NeverByDesign", "§6 跨体系靠风味翻译，不靠数值换算");
-        assert_eq!(e["calibrationLoop"], "Missing");
+        assert_eq!(e["calibrationLoop"], "Missing", "没有指标度量「换戏服 → 叙事变化」，不许标更高");
+        // 🔴 七档天花板：接通之后最多到 Integrated，任何一层都不许出现「已验证 / 可上线」口径。
+        for k in ["declarationLayer", "pinningLayer", "narrativeLayer", "numericLayer", "calibrationLoop"] {
+            let v = e[k].as_str().unwrap();
+            assert!(
+                !matches!(v, "Production-ready" | "Validated" | "Enabled"),
+                "{k} = {v}：境界档没有任何真实用户数据，不得标到 Integrated 之上"
+            );
+        }
         // 下发文案必须是纯文本（前端按普通字符串渲染，Markdown 星号会在界面上露出字面量）。
         for k in ["summary", "warning"] {
             assert!(!e[k].as_str().unwrap().contains("**"), "{k} 混入了 Markdown 强调");

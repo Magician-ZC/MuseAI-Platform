@@ -244,6 +244,67 @@ fn build_payload(
     .to_string()
 }
 
+/// 事务内领取 `count` 个连续 sequence，返回区间首号（即 `[base, base + count)`）。
+///
+/// 🔴 **这是全仓唯一的 sequence 分配入口。** 改造前两处（本文件 `insert_events_tx` 与
+/// `persist_and_broadcast_public_event`）各自跑 `SELECT COALESCE(MAX(sequence),-1)+1`
+/// 读-改-写，而 `idx_world_events_world(world_id, sequence)` 非唯一：SQLite 的单写者锁让它
+/// 事实上串行，**Postgres 在 READ COMMITTED 下不会**——`SELECT MAX()` 不取锁，两个并发事务
+/// 读到同一个 MAX 就各写一条同号事件并**静默提交**。竞态真实可达：`arena::emit_arena_event`
+/// 是玩家/运营触发的 HTTP 路径，与 `runtime::commit_tick` 并行写同一个世界。
+///
+/// 撞号最重的后果不是显示顺序，是 [`VISIBLE_EVENTS_SQL`] 拿 `sequence > $cursor` 当
+/// **WS 断线补偿游标**：同号的两条里有一条**永远不会补给重连的客户端**。
+///
+/// ## 正确性来自 ② 的行级排他锁，不是唯一约束
+///
+/// 并发事务对同一 `world_id` 行的 `UPDATE` 会阻塞到前者提交/回滚，随后在**更新后**的值上
+/// 叠加 —— 无丢失更新。两个库都有这条语义，故不需要 `FOR UPDATE`（PG 方言）
+/// 也不需要 `RETURNING`（SQLite 3.35+ 才有）。迁移 `0043` 的文件头有完整推导。
+///
+/// 事务回滚时自增一并回滚 ⇒ **不产生空洞**（与 PG 原生 sequence 不同，这一点被用例断言）。
+///
+/// ## ① 的初值为什么不是常数 0
+///
+/// 取 `MAX(sequence)+1` 是对「这个世界有事件、却没有发号器行」的兜底：迁移 `0043` 已把存量
+/// 一次性回填，但滚动发布期间旧实例仍可能用老口径写入。初值一对齐，该世界后续分配就恒在
+/// 历史之后。`ON CONFLICT DO NOTHING` 保证这条子查询只在建行那一次起作用，
+/// 之后每次分配它都不产生任何写；PG 下并发首次分配也安全——冲突方会等到对方提交后再 DO NOTHING。
+///
+/// `count <= 0` 直接短路：空 tick（本轮无投影事件）不必去碰那把行锁。
+async fn allocate_sequences_tx(
+    tx: &mut Transaction<'_, Any>,
+    world_id: &str,
+    count: i64,
+) -> Result<i64, ApiError> {
+    if count <= 0 {
+        return Ok(0);
+    }
+    // ① 幂等建行；初值对齐既有历史（理由见上）。
+    sqlx::query(
+        "INSERT INTO world_event_seq (world_id, next_seq) \
+         VALUES ($1, COALESCE((SELECT MAX(sequence) + 1 FROM world_events WHERE world_id = $2), 0)) \
+         ON CONFLICT(world_id) DO NOTHING",
+    )
+    .bind(world_id)
+    .bind(world_id)
+    .execute(&mut **tx)
+    .await?;
+    // ② 领号 —— 行级排他锁在这里拿到，持有到本事务 commit/rollback 为止。
+    sqlx::query("UPDATE world_event_seq SET next_seq = next_seq + $1 WHERE world_id = $2")
+        .bind(count)
+        .bind(world_id)
+        .execute(&mut **tx)
+        .await?;
+    // ③ 回读（事务内看得见自己的写）。
+    let next: i64 = sqlx::query("SELECT next_seq FROM world_event_seq WHERE world_id = $1")
+        .bind(world_id)
+        .fetch_one(&mut **tx)
+        .await?
+        .try_get("next_seq")?;
+    Ok(next - count)
+}
+
 /// 在事务内落库投影事件（分配 per-world 单调 sequence），返回落库结果供 ws 广播。
 ///
 /// `moderation` 从 `ProjectedEvent` 取（原先硬编码字面量 `'approved'`，等于运行时产出零审核）；
@@ -256,15 +317,12 @@ pub async fn insert_events_tx(
     tick_no: i64,
     projected: &[ProjectedEvent],
 ) -> Result<Vec<StoredEvent>, ApiError> {
-    let base: i64 = sqlx::query("SELECT COALESCE(MAX(sequence), -1) AS m FROM world_events WHERE world_id = $1")
-        .bind(world_id)
-        .fetch_one(&mut **tx)
-        .await?
-        .try_get("m")?;
+    // 整批一次领号（`[base, base + projected.len())`），批内按投影次序逐条落位。
+    let base = allocate_sequences_tx(tx, world_id, projected.len() as i64).await?;
     let now = now_ms();
     let mut out = Vec::with_capacity(projected.len());
     for (i, pe) in projected.iter().enumerate() {
-        let sequence = base + 1 + i as i64;
+        let sequence = base + i as i64;
         let id = new_id("we");
         let actors_json = serde_json::to_string(&pe.actor_ids).unwrap_or_else(|_| "[]".into());
         let (audience_json, public_proj, private_proj) = if pe.visibility == "public" {
@@ -332,7 +390,8 @@ pub async fn persist_events(
 /// 双硬隔离天然满足：`visibility='public'` + `audience_json=NULL` + 无私有投影 → 推送层 `ws_visible`
 /// 与查询层 `row_to_event` 对 public 一律放行，任何观战者可见、且不携带任一 principal 的私密投影。
 /// `extra` 合并进 public 投影（如 arenaKind/characterId/sku/aggregatedCount，纯展示层）。
-/// 单事务分配 per-world 单调 sequence（复用 `insert_events_tx` 的 `MAX(sequence)+1` 口径）。
+/// 单事务分配 per-world 单调 sequence（与 `insert_events_tx` 共用 [`allocate_sequences_tx`]——
+/// 🔴 **本函数正是与 `commit_tick` 撞号的那条 HTTP 路径**，共用同一把行锁才谈得上安全）。
 #[allow(dead_code)]
 pub async fn persist_and_broadcast_public_event(
     state: &AppState,
@@ -344,12 +403,7 @@ pub async fn persist_and_broadcast_public_event(
     extra: Value,
 ) -> Result<StoredEvent, ApiError> {
     let mut tx = state.db.begin().await?;
-    let base: i64 = sqlx::query("SELECT COALESCE(MAX(sequence), -1) AS m FROM world_events WHERE world_id = $1")
-        .bind(world_id)
-        .fetch_one(&mut *tx)
-        .await?
-        .try_get("m")?;
-    let sequence = base + 1;
+    let sequence = allocate_sequences_tx(&mut tx, world_id, 1).await?;
     let id = new_id("we");
     let domain_event_id = new_id("sys"); // 合成来源标识（非引擎 DomainEvent）
     let now = now_ms();
@@ -1227,5 +1281,223 @@ mod tests {
         seed_world(&state.db, "w1", 0, "running").await;
         let (s, _) = get_summary(&state, None, "w1").await;
         assert_eq!(s, StatusCode::UNAUTHORIZED, "AuthUser 守卫：缺凭证应 401");
+    }
+
+    // ---------- sequence 发号器（迁移 0043 / `allocate_sequences_tx`） ----------
+
+    /// 读回某世界全部事件的 sequence，升序（`id` 作次级键：撞号时并列行在 PG 上顺序不定，
+    /// 补齐次级键才是全序——口径同 `docs/VALIDATION.md` §3.3 第 1 类处置）。
+    async fn sequences_of(db: &AnyPool, world: &str) -> Vec<i64> {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT sequence FROM world_events WHERE world_id = $1 ORDER BY sequence ASC, id ASC",
+        )
+        .bind(world)
+        .fetch_all(db)
+        .await
+        .unwrap()
+    }
+
+    /// 发号器行的当前值（未建行则 None）。
+    async fn next_seq_of(db: &AnyPool, world: &str) -> Option<i64> {
+        sqlx::query_scalar::<_, i64>("SELECT next_seq FROM world_event_seq WHERE world_id = $1")
+            .bind(world)
+            .fetch_optional(db)
+            .await
+            .unwrap()
+    }
+
+    /// 基础口径：从 0 起、批内连续、跨批续上，且发号器行与已落库事件严格对齐。
+    ///
+    /// 这条同时锁住「空世界首条事件拿 0」——改造前 `COALESCE(MAX(sequence), -1) + 1` 给的也是 0，
+    /// 发号器的 `DEFAULT 0` 必须与之逐值一致，否则全仓断言 `sequence == 0` 的用例会集体漂移。
+    #[tokio::test]
+    async fn sequence_allocation_is_contiguous_across_batches() {
+        let state = test_state().await;
+        seed_world(&state.db, "w1", 0, "running").await;
+        assert_eq!(next_seq_of(&state.db, "w1").await, None, "建世界不建发号器行（惰性建行）");
+
+        persist_events(&state.db, "w1", 0, &[projected("de-1", "一", MODERATION_APPROVED, &[])])
+            .await
+            .unwrap();
+        persist_events(
+            &state.db,
+            "w1",
+            1,
+            &[
+                projected("de-2", "二", MODERATION_APPROVED, &[]),
+                projected("de-3", "三", MODERATION_APPROVED, &[]),
+            ],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(sequences_of(&state.db, "w1").await, vec![0, 1, 2]);
+        assert_eq!(next_seq_of(&state.db, "w1").await, Some(3), "发号器停在下一个待发号上");
+
+        // 世界之间互不干扰：每个世界一把独立的号（也就是一把独立的行锁）。
+        seed_world(&state.db, "w2", 0, "running").await;
+        persist_events(&state.db, "w2", 0, &[projected("de-x", "别处", MODERATION_APPROVED, &[])])
+            .await
+            .unwrap();
+        assert_eq!(sequences_of(&state.db, "w2").await, vec![0], "另一个世界仍从 0 起");
+        assert_eq!(next_seq_of(&state.db, "w1").await, Some(3), "w2 的分配不动 w1 的号");
+    }
+
+    /// 发号器行**缺失**、而世界已有事件时，首次分配必须续在历史之后而不是从 0 重来。
+    ///
+    /// 这正是迁移 `0043` 回填语句所保证的性质（`MAX(sequence)+1`），此处用等价的运行时路径
+    /// （`allocate_sequences_tx` 建行时同一条子查询）把它钉住：
+    /// - 覆盖**滚动发布**残余窗口——旧实例用老口径写入的世界尚未登记进发号器；
+    /// - 也覆盖全仓大量「先 raw INSERT 造 world_events 再走落库路径」的既有 fixture，
+    ///   它们依赖的正是"接着历史往下发号"，改造后必须逐值不变。
+    #[tokio::test]
+    async fn allocation_resumes_after_rows_written_outside_the_counter() {
+        let state = test_state().await;
+        seed_world(&state.db, "w1", 0, "running").await;
+        // 模拟存量：绕过发号器直接落三行（sequence 0/1/2）。
+        for seq in 0..3i64 {
+            sqlx::query(
+                "INSERT INTO world_events (id, world_id, tick_no, sequence, domain_event_id, \
+                 event_type, visibility, occurred_at) \
+                 VALUES ($1, 'w1', 0, $2, $3, 'dialogue', 'public', 0)",
+            )
+            .bind(new_id("we"))
+            .bind(seq)
+            .bind(new_id("de"))
+            .execute(&state.db)
+            .await
+            .unwrap();
+        }
+        assert_eq!(next_seq_of(&state.db, "w1").await, None, "存量世界此刻没有发号器行");
+
+        persist_events(&state.db, "w1", 1, &[projected("de-new", "新", MODERATION_APPROVED, &[])])
+            .await
+            .unwrap();
+
+        assert_eq!(sequences_of(&state.db, "w1").await, vec![0, 1, 2, 3], "必须续号，不得从 0 重来");
+        assert_eq!(next_seq_of(&state.db, "w1").await, Some(4));
+    }
+
+    /// 事务回滚 ⇒ 号一并回滚，**不留空洞**（与 PG 原生 sequence 的语义差别，值得钉死）。
+    ///
+    /// 空洞不是无害的美观问题：`VISIBLE_EVENTS_SQL` 的断线补偿游标按 `sequence > cursor` 推进，
+    /// 空洞本身可容忍，但「回滚会烧号」意味着号与事件条数不再对应，后续任何按号做的计数/对账
+    /// （SLO 戏份聚合、回放 seek 分页）都会失真。
+    #[tokio::test]
+    async fn rolled_back_allocation_leaves_no_gap() {
+        let state = test_state().await;
+        seed_world(&state.db, "w1", 0, "running").await;
+
+        let mut tx = state.db.begin().await.unwrap();
+        let base = allocate_sequences_tx(&mut tx, "w1", 5).await.unwrap();
+        assert_eq!(base, 0);
+        tx.rollback().await.unwrap();
+
+        assert_eq!(next_seq_of(&state.db, "w1").await, None, "回滚连建行一起撤销");
+        persist_events(&state.db, "w1", 0, &[projected("de-1", "一", MODERATION_APPROVED, &[])])
+            .await
+            .unwrap();
+        assert_eq!(sequences_of(&state.db, "w1").await, vec![0], "回滚掉的 5 个号没有被烧掉");
+    }
+
+    /// 🔴 **本任务的核心用例：同一世界的并发写不得撞号。**
+    ///
+    /// 形状刻意复刻 `docs/VALIDATION.md` §3.3 ① 点名的那条真实竞态——**两个分配站点同时打**：
+    /// - 偶数任务走 `persist_events`（= `runtime::commit_tick` 的批量落库，每次 3 条）；
+    /// - 奇数任务走 `persist_and_broadcast_public_event`（= `arena::emit_arena_event` 的
+    ///   玩家/运营 HTTP 路径，每次 1 条）。
+    ///
+    /// 断言三条——① 分配出的 sequence 无重复；② 无空洞；③ 总条数正确。三条合起来等价于
+    /// 「结果集恰好是 `0..总数` 的连续整数」，故直接断言相等。
+    ///
+    /// ⚠️ **只有 Postgres 那一遍是证据。** SQLite 的 `:memory:` 不支持多连接（每连接一个独立库），
+    /// 池回落到单连接 ⇒ 本用例退化为顺序执行；且即便用文件库，SQLite 的单写者锁也会让
+    /// 旧的 `MAX(sequence)+1` 口径同样通过 = 假绿。跑 PG 那遍：
+    /// `MUSE_TEST_DATABASE_URL=postgres://... cargo test concurrent_sequence`。
+    ///
+    /// **实测（PG 16.9，`TASKS=24` ⇒ 48 条事件）**：把分配临时回退成改造前的
+    /// `SELECT COALESCE(MAX(sequence),-1)+1` 之后，48 条事件只拿到 **23 个不同的号**
+    /// （`[0,1,1,2,2,2,3,3,4,5,5,…]`，25 条撞号），本条立刻变红；改回发号器后是连续的 0..47。
+    /// 同一次回退在 **SQLite 上①②③三条断言全绿**（只有末尾那条发号器行的对账断言红，
+    /// 而那条是新设计特有的）——单写者锁把读-改-写事实上串行掉了。
+    /// 这两组对照才是本用例的证据，「CI 绿了」不是。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_sequence_allocation_never_collides_or_gaps() {
+        const TASKS: usize = 24;
+        const BATCH_EVENTS: usize = 3;
+
+        let pool = crate::testkit::test_pool_concurrent(TASKS as u32).await;
+        let state = AppState::new(pool.clone(), crate::config::ServerConfig::from_env());
+        let mut handles = Vec::with_capacity(TASKS);
+        for t in 0..TASKS {
+            let state = state.clone();
+            handles.push(tokio::spawn(async move {
+                if t % 2 == 0 {
+                    // commit_tick 侧：整批一次领号。
+                    let batch: Vec<ProjectedEvent> = (0..BATCH_EVENTS)
+                        .map(|i| {
+                            projected(&format!("de-{t}-{i}"), "并发事实", MODERATION_APPROVED, &[])
+                        })
+                        .collect();
+                    persist_events(&state.db, "w_race", t as i64, &batch)
+                        .await
+                        .expect("并发批量落库不应报错");
+                } else {
+                    // arena 侧：玩家/运营 HTTP 路径，单条领号。
+                    persist_and_broadcast_public_event(
+                        &state,
+                        "w_race",
+                        t as i64,
+                        "arena_gift",
+                        "并发系统事件",
+                        &["c1".to_string()],
+                        json!({ "arenaKind": "gift" }),
+                    )
+                    .await
+                    .expect("并发系统事件落库不应报错");
+                }
+            }));
+        }
+        for h in handles {
+            h.await.expect("任务不应 panic");
+        }
+
+        let seqs = sequences_of(&pool, "w_race").await;
+        // 偶数任务各 3 条 + 奇数任务各 1 条。
+        let total = TASKS / 2 * BATCH_EVENTS + TASKS / 2;
+
+        // ③ 总数正确（先查这条：条数不对说明有事务整体失败，后两条的诊断会被带偏）。
+        assert_eq!(seqs.len(), total, "落库条数应为 {total}");
+        // ① 无重复。
+        let uniq: BTreeSet<i64> = seqs.iter().copied().collect();
+        assert_eq!(uniq.len(), seqs.len(), "sequence 撞号：{seqs:?}");
+        // ②（+①+③）无空洞 —— 合起来即「恰好是 0..total 的连续整数」。
+        assert_eq!(seqs, (0..total as i64).collect::<Vec<_>>(), "sequence 应连续无空洞");
+
+        // 发号器自身的终值也必须与事件条数对齐（防「号发了但事件没落」的静默错位）。
+        assert_eq!(next_seq_of(&pool, "w_race").await, Some(total as i64));
+    }
+
+    /// 批内每一条都拿到**自己**的号（批量领号不是"整批共用一个号"）。
+    ///
+    /// 与上一条互补：并发用例每任务 3 条，若批内共号，`uniq.len()` 会掉下来但很难定位到成因。
+    #[tokio::test]
+    async fn batch_allocation_hands_out_one_number_per_event() {
+        let state = test_state().await;
+        seed_world(&state.db, "w1", 0, "running").await;
+        let batch: Vec<ProjectedEvent> = (0..4)
+            .map(|i| projected(&format!("de-{i}"), "批内", MODERATION_APPROVED, &[]))
+            .collect();
+        let stored = persist_events(&state.db, "w1", 0, &batch).await.unwrap();
+        assert_eq!(stored.len(), 4);
+        assert_eq!(sequences_of(&state.db, "w1").await, vec![0, 1, 2, 3]);
+        // 广播载荷里的 sequence 与落库值同源（客户端按它去重 + 推进补偿游标）。
+        let in_payload: Vec<i64> = stored
+            .iter()
+            .map(|s| serde_json::from_str::<Value>(&s.payload_json).unwrap()["sequence"]
+                .as_i64()
+                .unwrap())
+            .collect();
+        assert_eq!(in_payload, vec![0, 1, 2, 3]);
     }
 }

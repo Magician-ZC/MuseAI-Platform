@@ -3418,8 +3418,9 @@ async fn realm_tier_directory_separates_saga_gap_from_standalone() {
     assert_eq!(body["undeclaredInSagaCount"], 1, "系列里缺戏服的阶段 = 真正的校准缺口");
     assert_eq!(body["undeclaredStandaloneCount"], 1, "独立模板不算缺口，单列对照");
     assert_eq!(body["editable"], false, "🔴 校准面只可视化，不可编辑");
-    // 🔴 效力自述必须随目录一起下发（运营在列表页就该知道这一维现在没有叙事可见性）。
-    assert_eq!(body["effect"]["narrativeLayer"], "Missing");
+    // 🔴 效力自述必须随目录一起下发（运营在列表页就该知道这一维现在到底有什么用）。
+    assert_eq!(body["effect"]["narrativeLayer"], "Integrated", "戏服已接进入场导演 prompt");
+    assert_eq!(body["effect"]["calibrationLoop"], "Missing", "仍无指标度量「换戏服 → 叙事变化」");
 }
 
 /// 境界档详情：同系列各阶对照（缺档 / 复用同一档 / 跨体系）+ 实例钉住情况（含钉着旧档）。
@@ -3477,13 +3478,16 @@ async fn realm_tier_detail_reports_stage_progression_and_pinning() {
     assert!(w3["pinnedTierId"].is_null(), "没钉住 → null，不得编一个空串");
     assert!(w3["matchesTemplate"].is_null(), "没钉住时「是否一致」不成立 → null，不得当 false 读");
 
-    // 🔴 效力自述五层：叙事感知层缺失、数值层永不生效。
+    // 🔴 效力自述五层：叙事感知层已接通、数值层永不生效、校准闭环仍缺。
     let e = &body["effect"];
     assert_eq!(e["declarationLayer"], "Implemented");
     assert_eq!(e["pinningLayer"], "Implemented");
-    assert_eq!(e["narrativeLayer"], "Missing", "runtime 不读 realmTier → 境界档对玩家零可见");
+    assert_eq!(
+        e["narrativeLayer"], "Integrated",
+        "runtime::parse_realm_costume → RoundInput.realm_costume → 入场导演 prompt"
+    );
     assert_eq!(e["numericLayer"], "NeverByDesign", "§6 跨体系靠风味翻译，不靠数值换算");
-    assert_eq!(e["calibrationLoop"], "Missing");
+    assert_eq!(e["calibrationLoop"], "Missing", "没有指标度量「换戏服 → 叙事变化」");
     assert_eq!(body["editable"], false);
 
     // 模板不存在 → 404（同身份池维）。

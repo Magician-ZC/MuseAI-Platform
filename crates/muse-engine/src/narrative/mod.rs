@@ -89,13 +89,18 @@ impl ModelRoutes {
     }
 }
 
-/// ⚠️ **加字段前先读这条**：`RoundInput` 有**两个宿主构造点**，且都是穷尽式结构体字面量
+/// ⚠️ **加字段前先读这条**：`RoundInput` 有**三个宿主构造点**，且都是穷尽式结构体字面量
 /// （没有 `..Default::default()`），所以加字段会让它们**同时编译失败**：
-///   - 平台轨 `server/src/runtime/mod.rs`（约 :1717）
+///   - 平台轨世界线 `server/src/runtime/mod.rs`（约 :2520）
+///   - 平台轨的 if 线推进模块（`server/src/` 下另起的一条私人分叉线，后加的第三处）
+///     ← 这两处 `cargo build --manifest-path server/Cargo.toml` 都会当场报出来
 ///   - **桌面轨 `src-tauri/src/commands/narrative.rs`（约 :123）** ← 历史上两次都漏了这个
 /// 桌面轨漏掉的代价是 CI 的 `rust-test` job 与 `npm run tauri build` 一起红，
 /// 而只跑 `cargo test --manifest-path server/Cargo.toml` 是发现不了的。
-/// 加字段时请一并更新：本结构体、`Default for RoundInput`、上述两个构造点、本文件内的测试助手。
+/// 加字段时请一并更新：本结构体、`Default for RoundInput`、上述三个构造点、本文件内的测试助手。
+///
+/// （本文件按红线**不得出现 if 线的模块名**：server 侧有一条静态扫描用例守着
+/// 「平行线永远进不了原世界的引擎决策」，故此处只描述、不写那个路径字面量。）
 pub struct RoundInput {
     pub run_id: String,
     pub mode: RunMode,
@@ -164,6 +169,18 @@ pub struct RoundInput {
     /// 「不传即默认」由 `Default for RoundInput` + `Default for Lethality` 保证；
     /// 跨进程边界（server DTO / Tauri 命令入参）的 `#[serde(default)]` 由各自的请求结构负责。
     pub lethality: Lethality,
+    /// 本篇戏服（总规格 §6【拍板 3】「境界即布景」）：**全员统一**的入场导演设定。
+    /// 语义、三条设计约束与红线见 [`RealmCostume`]。
+    ///
+    /// 引擎内**唯一**消费者是 `call_director`（织进导演设局 prompt，影响描写口吻与称谓）。
+    /// 🔴 它**不是判定输入**：不进 `active_cards` / `CharacterState.resources` / 仲裁 /
+    /// StatePatch / DomainEvent / 同意门控，谁也不能据它决定谁赢谁输、谁能压过谁
+    /// （§6「跨体系靠风味翻译，不靠数值换算」+ §0.1 平权宪法）。
+    ///
+    /// `None`（默认）= 本篇无戏服 → 导演 prompt 与接线前逐字节一致；
+    /// `Some(空戏服)` 与 `None` 等价（`RealmCostume::is_blank`）。
+    /// 平台由 runtime 从 `assembled_json./assembly/realmTier` 回灌；桌面壳恒 `None`。
+    pub realm_costume: Option<RealmCostume>,
 }
 
 impl Default for RoundInput {
@@ -188,6 +205,8 @@ impl Default for RoundInput {
             stall_hint: None,
             // 生死契约默认档 = 同意制（现行机制）：不传 = 行为与历史零差异。
             lethality: Lethality::default(),
+            // 本篇无戏服（§6）：不传 → 导演 prompt 一个字节都不多，与接线前完全一致。
+            realm_costume: None,
         }
     }
 }
@@ -329,6 +348,9 @@ impl NarrativeEngine {
                 members,
                 loc,
                 input.stall_hint.as_deref(),
+                // 本篇戏服（§6【拍板 3】）：**全员统一** ⇒ 多地点组时每组导演拿到的是**同一件**，
+                // 不按地点分化（分化就成了「这个院子里的人更强」，那是数值差不是布景）。
+                input.realm_costume.as_ref(),
                 cancel,
             )
             .await?;
@@ -1055,6 +1077,7 @@ async fn call_director(
     active_ids: &[String],
     location_id: &str,
     stall_hint: Option<&str>,
+    realm_costume: Option<&RealmCostume>,
     cancel: &CancelFlag,
 ) -> Result<String, EngineError> {
     let outline: Vec<Value> = state
@@ -1084,8 +1107,32 @@ async fn call_director(
         ),
         _ => String::new(),
     };
+    // 本篇戏服（§6【拍板 3】「境界即布景」）：入场导演的统一设定，全员同一件。
+    // 🔴 末句的免责话术是**红线的一部分**，不是修辞：戏服只改「怎么描写」（水位口吻、招式称谓），
+    //    不改「谁能赢」。少了它，模型很容易把「全员斗王档」读成一条战力刻度去裁强弱，
+    //    而 §6 明说「跨体系靠风味翻译，不靠数值换算」。改这段文案前请先读 §6 与 §0.1 平权宪法。
+    // 空戏服（两段皆空）与未声明等价 → 空串 → prompt 逐字节不变（`RealmCostume::is_blank`）。
+    let costume = match realm_costume.filter(|c| !c.is_blank()) {
+        None => String::new(),
+        Some(c) => {
+            let mut s = String::from("本篇戏服（全员统一，同一水位）：");
+            let brief = c.briefing.trim();
+            s.push_str(if brief.is_empty() { "（未给出说明）" } else { brief });
+            s.push('\n');
+            let notes: Vec<&str> =
+                c.flavor_notes.iter().map(|n| n.trim()).filter(|n| !n.is_empty()).collect();
+            if !notes.is_empty() {
+                s.push_str(&format!("跨体系风味翻译：{}\n", notes.join("；")));
+            }
+            s.push_str(
+                "以上只决定本篇怎么描写——大家处在什么水位、招式与称谓译成什么风味；\
+它不代表任何人更强或更弱，不得据此判定谁能赢、谁能压过谁，也不得凭它给任何角色额外的能力或特权。\n",
+            );
+            s
+        }
+    };
     let user = format!(
-        "{place}{stall}当前活跃角色：{active}\n大纲节点：{outline}\n公共世界状态：{world}\n\n\
+        "{costume}{place}{stall}当前活跃角色：{active}\n大纲节点：{outline}\n公共世界状态：{world}\n\n\
 你是入场导演：为本回合设定一个把当前待推进节点自然展开的开放局势，给在场角色留出做出不同选择的空间，\
 不要替角色决定他们会怎么做。严格输出 JSON：{{\"situation\":\"...\"}}",
         active = active_ids.join("、"),
@@ -1918,6 +1965,8 @@ mod tests {
             stall_hint: None,
             // 默认档 = 同意制：既有全部用例走的都是历史路径（回归保护）。
             lethality: Lethality::default(),
+            // 默认档 = 无戏服：既有全部用例的导演 prompt 与接线前逐字节一致（回归保护）。
+            realm_costume: None,
         }
     }
 
@@ -2571,6 +2620,8 @@ mod tests {
             stall_hint: None,
             // 默认档 = 同意制：既有全部用例走的都是历史路径（回归保护）。
             lethality: Lethality::default(),
+            // 默认档 = 无戏服：既有全部用例的导演 prompt 与接线前逐字节一致（回归保护）。
+            realm_costume: None,
         }
     }
 
@@ -3370,6 +3421,127 @@ mod tests {
         assert!(!director.user.contains("打破僵局"));
     }
 
+    // ===== 本篇戏服（境界档，总规格 §6【拍板 3】「境界即布景」）=====
+
+    fn douwang_costume() -> RealmCostume {
+        RealmCostume {
+            briefing: "本篇全员领斗王档戏服：能御空短距、能扛一记斗皇余威，仅此而已。".into(),
+            flavor_notes: vec!["魂技译为斗气招式风味，内核不变".into()],
+        }
+    }
+
+    /// 传入戏服 → **只**织进入场导演 prompt（§6「入场导演统一设定」），
+    /// 且必带那句「不得据此判定谁能赢」的免责话术。
+    /// 🔴 决策 / 仲裁 / 写作 / 审校四个环节一个字都不许看到它：戏服是给导演布景用的，
+    ///    漏进决策就等于给角色发了一条「你现在是斗王」的自我暗示，那是能力暗示不是布景。
+    #[tokio::test]
+    async fn realm_costume_only_reaches_director() {
+        let (host, specs) = recording_host(happy_script());
+        init_run(host.as_ref(), "run-1", false);
+        let engine = NarrativeEngine::new(host.clone());
+        let mut input = round_input("run-1", big_budget());
+        input.realm_costume = Some(douwang_costume());
+        let out = engine.run_round(&routes(), &prompts(), input, &CancelFlag::new()).await.unwrap();
+        assert!(out.blocked.is_none());
+
+        let specs = specs.lock().unwrap();
+        let director = specs.iter().find(|s| s.agent == "director").expect("应有导演调用");
+        assert!(director.user.contains("本篇戏服（全员统一，同一水位）"), "导演应看到戏服标题：{}", director.user);
+        assert!(director.user.contains("能扛一记斗皇余威"), "briefing 必须原文进导演 prompt");
+        assert!(director.user.contains("跨体系风味翻译：魂技译为斗气招式风味，内核不变"), "flavorNotes 必须进导演 prompt");
+        // 🔴 免责话术是红线的一部分：没有它，「全员斗王档」会被模型读成一把战力刻度。
+        assert!(director.user.contains("不得据此判定谁能赢"), "必须带「只改描写、不改胜负」的免责话术");
+
+        for s in specs.iter().filter(|s| s.agent != "director") {
+            assert!(
+                !s.user.contains("斗王档") && !s.user.contains("斗气招式"),
+                "戏服泄漏到了 {} 环节：{}",
+                s.agent,
+                s.user
+            );
+        }
+    }
+
+    /// 🔴 **戏服绝不进判定域**：跑完一整回合后，StatePatch / DomainEvent / 提交后的世界状态
+    /// （含 `CharacterState.resources`）与角色 DNA 卡上下文里都不得出现戏服的任何一个字。
+    /// 它只活在导演那一次调用的 prompt 里，落地即消失——这正是「布景不是数值」的可执行定义。
+    #[tokio::test]
+    async fn realm_costume_never_reaches_state_or_events() {
+        let model = Arc::new(CapturingModel::new(two_char_script()));
+        let host = host_capturing(model.clone());
+        init_run(host.as_ref(), "run-1", true);
+        let engine = NarrativeEngine::new(host.clone());
+        let mut input = round_input("run-1", big_budget());
+        input.realm_costume = Some(douwang_costume());
+
+        let out = engine.run_round(&routes(), &prompts(), input, &CancelFlag::new()).await.unwrap();
+        assert!(out.blocked.is_none());
+
+        let dumped = serde_json::to_string(&out.scene.state_patch).unwrap()
+            + &serde_json::to_string(&out.scene.events).unwrap()
+            + &serde_json::to_string(&out.new_state).unwrap();
+        for needle in ["斗王档", "斗皇余威", "斗气招式"] {
+            assert!(!dumped.contains(needle), "红线：戏服「{needle}」渗进了 patch/事件/世界状态");
+        }
+        // 角色卡快照（active_cards → yourDna）与角色私有状态同样一个字节都不许被戏服改写。
+        let ctx_li = decide_ctx_json(&model.decide_prompt_of("li"));
+        assert!(!ctx_li["yourDna"].to_string().contains("斗王"), "红线：戏服不得进 DNA 卡");
+        assert!(!ctx_li["yourState"].to_string().contains("斗王"), "红线：戏服不得进角色状态");
+        // resources 是引擎判定域（谓词/仲裁读它）：戏服绝不能物化成持有事实。
+        let resources = serde_json::to_string(
+            &out.new_state.characters.get("li").map(|c| c.resources.clone()).unwrap_or_default(),
+        )
+        .unwrap();
+        assert!(!resources.contains("斗王"), "红线：戏服不得物化进 CharacterState.resources");
+    }
+
+    /// 不传戏服（默认档）→ 导演 prompt 里**一个字节都不多**。
+    /// 空戏服（两段皆空）必须与不传**逐字节等价**——否则"声明了一件没词儿的戏服"会悄悄改写
+    /// 所有已声明世界的导演输入，而黄金骨架恰恰不声明 realmTier，那正是回归基线赖以不变的前提。
+    #[tokio::test]
+    async fn absent_or_blank_realm_costume_keeps_director_prompt_byte_identical() {
+        async fn director_user(costume: Option<RealmCostume>) -> String {
+            let (host, specs) = recording_host(happy_script());
+            init_run(host.as_ref(), "run-1", false);
+            let engine = NarrativeEngine::new(host.clone());
+            let mut input = round_input("run-1", big_budget());
+            input.realm_costume = costume;
+            engine.run_round(&routes(), &prompts(), input, &CancelFlag::new()).await.unwrap();
+            let specs = specs.lock().unwrap();
+            specs.iter().find(|s| s.agent == "director").expect("应有导演调用").user.clone()
+        }
+
+        let none = director_user(None).await;
+        assert!(!none.contains("本篇戏服"), "不传戏服时导演 prompt 不得出现戏服段：{none}");
+
+        let blank = director_user(Some(RealmCostume::default())).await;
+        assert_eq!(blank, none, "空戏服必须与不传逐字节等价");
+
+        let blank_ws = director_user(Some(RealmCostume {
+            briefing: "   ".into(),
+            flavor_notes: vec!["".into(), "  ".into()],
+        }))
+        .await;
+        assert_eq!(blank_ws, none, "只有空白字符的戏服同样等价于不传");
+
+        // 反向守卫：真戏服确实会改变导演 prompt（否则上面三条断言可能只是「什么都没接」）。
+        let dressed = director_user(Some(douwang_costume())).await;
+        assert_ne!(dressed, none, "真戏服必须真的进导演 prompt");
+    }
+
+    /// 🔴 **平权红线锁**（§6「跨体系靠风味翻译，不靠数值换算」+ §0.1）：戏服序列化后
+    /// **一个数字 / 布尔都不许有**。与 server 侧 `assembly::realm_tier_carries_no_numeric_field`
+    /// 是同一条红线的两端——谁想给它加 `level` / `powerTier` / `combatBonus`，两端都会先红。
+    #[test]
+    fn realm_costume_carries_no_numeric_field() {
+        let v = serde_json::to_value(douwang_costume()).unwrap();
+        for (k, val) in v.as_object().expect("戏服应序列化为对象") {
+            let ok = val.is_string()
+                || val.as_array().is_some_and(|a| a.iter().all(Value::is_string));
+            assert!(ok, "戏服字段 `{k}` 不是字符串 / 字符串数组：{val} —— 数值化 = 平权红线违规");
+        }
+    }
+
     // ===== LLM 鲁棒性：role_decide 单角色确定性降级（空 content 兜底）=====
 
     /// 初始化含 a/b/c 三角色（无硬节点）的 run。
@@ -3406,6 +3578,8 @@ mod tests {
             stall_hint: None,
             // 默认档 = 同意制：既有全部用例走的都是历史路径（回归保护）。
             lethality: Lethality::default(),
+            // 默认档 = 无戏服：既有全部用例的导演 prompt 与接线前逐字节一致（回归保护）。
+            realm_costume: None,
         }
     }
 

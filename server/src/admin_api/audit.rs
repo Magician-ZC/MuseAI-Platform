@@ -130,7 +130,30 @@ pub(super) async fn detail(
         "cardJson": Value::Null,
         "manifest": Value::Null,
         "authorHistory": json!([]),
+        "subjectImageUrl": Value::Null,
     });
+
+    // 位图主体（立绘 / 世界封面）：把图本身给人审看。
+    //
+    // 🔴 没有这一段，位图入队就是让人**盲审**——工作台上只有一行 `subjectKind=character_avatar`
+    // 和一个空的命中列表，人审无从判断该通过还是驳回，于是「有再审通道」在实践中等于没有。
+    // 下发范围与 `cardJson`（整张卡原文）一致：本端点已经是 reviewer 守卫的后台面，
+    // 审核者要看的正是未过审的那份内容——玩家侧的「仅 approved 才下发」闸门不受影响。
+    if let Some((table, url_column)) = match subject_kind.as_str() {
+        "character_avatar" => Some(("cloud_characters", "avatar_url")),
+        "world_cover" => Some(("worlds", "cover_url")),
+        _ => None,
+    } {
+        // 表名/列名来自上面这个静态白名单，主体 id 走 $1 绑定。
+        let url: Option<Option<String>> =
+            sqlx::query_scalar(&format!("SELECT {url_column} FROM {table} WHERE id = $1"))
+                .bind(&subject_id)
+                .fetch_optional(&state.db)
+                .await?;
+        if let Some(url) = url.flatten().filter(|u| !u.trim().is_empty()) {
+            out["subjectImageUrl"] = json!(url);
+        }
+    }
 
     if subject_kind == "character" {
         if let Some(crow) =
@@ -196,6 +219,27 @@ pub(super) async fn reject(
     review(&state, &admin.0, &id, "rejected", q.reason()).await
 }
 
+/// 队列主体 → 裁决回写的 `(表, 展示态列)`。返回 `None` = 该主体尚无回写路径（仅登记裁决）。
+///
+/// 🔴 **本表是「哪些主体可以入队」的事实上限**。往 `audit_queue` 塞一个这里没有分支的
+/// `subject_kind`，等于制造一条人审点了通过/驳回也无处落地的**死队列项**——迁移 0027 的注释
+/// 正是因为这个原因，让世界封面的机审裁决一直不入队。所以扩队列主体和扩本表必须同一批做：
+/// `safety::queue_operator_recheck_image` 与下面两条位图分支是一对，缺任何一半都是回归。
+///
+/// 位图两列可空（无立绘 / 无封面的行留 NULL），调用点的下架守卫因此必须写成 NULL 安全形式。
+pub(super) fn writeback_target(subject_kind: &str) -> Option<(&'static str, &'static str)> {
+    match subject_kind {
+        "character" => Some(("cloud_characters", "moderation")),
+        // "template"（admin 官方模板）与 "world_template"（创作者 /assets/worlds 资产）同落 world_templates。
+        "template" | "world_template" => Some(("world_templates", "moderation")),
+        // 位图两类：迁移 0016 / 0027 起就有展示态列与读取面闸门，缺的一直是人审入队 + 回写这一段。
+        "character_avatar" => Some(("cloud_characters", "avatar_moderation")),
+        "world_cover" => Some(("worlds", "cover_moderation")),
+        // intervention / world_event 等主体的回写路径随对应模块接入（当前仅登记裁决）。
+        _ => None,
+    }
+}
+
 async fn review(
     state: &AppState,
     actor: &AuthUser,
@@ -230,44 +274,37 @@ async fn review(
     .execute(&state.db)
     .await?;
 
-    // 回写主体 moderation：character→cloud_characters，template→world_templates。
+    // 回写主体展示态。四类主体各落一张表的一列，见 `writeback_target`。
     let moderation = if verdict == "approved" { "approved" } else { "rejected" };
 
-    // 🔴 **已被运营下架的主体不得经人审队列悄悄复活**（migration 0044 / `super::takedown`）。
-    // 场景：先对已过审内容发起再审（入队），期间又把它下架了，随后有人在工作台点「通过」——
-    // 若不设防，回写会把 `moderation` 写回 `'approved'`，等于**绕过 `restore` 的可逆性台阶与
-    // 权限台阶**把下架撤销掉，而且 `content_takedowns` 里还留着一条自称仍在下架的记录。
-    //
-    // 守卫只加在 **approve 方向**：reject 写 `'rejected'` 是比下架更强的处置，让它落地是对的。
-    // 恢复展示的唯一路径是 POST /admin/content/{kind}/{id}/restore。
-    let takedown_guard = if verdict == "approved" {
-        format!(" AND moderation <> '{}'", super::takedown::TAKEDOWN)
-    } else {
-        String::new()
-    };
-
-    match subject_kind.as_str() {
-        "character" => {
-            sqlx::query(&format!(
-                "UPDATE cloud_characters SET moderation = $1 WHERE id = $2{takedown_guard}"
-            ))
-            .bind(moderation)
-            .bind(&subject_id)
-            .execute(&state.db)
-            .await?;
-        }
-        // "template"（admin 官方模板）与 "world_template"（创作者 /assets/worlds 资产）同落 world_templates。
-        "template" | "world_template" => {
-            sqlx::query(&format!(
-                "UPDATE world_templates SET moderation = $1 WHERE id = $2{takedown_guard}"
-            ))
-            .bind(moderation)
-            .bind(&subject_id)
-            .execute(&state.db)
-            .await?;
-        }
-        // intervention / event 等主体的回写路径随对应模块接入（当前仅登记裁决）。
-        _ => {}
+    if let Some((table, column)) = writeback_target(&subject_kind) {
+        // 🔴 **已被运营下架的主体不得经人审队列悄悄复活**（migration 0044 / `super::takedown`）。
+        // 场景：先对已过审内容发起再审（入队），期间又把它下架了，随后有人在工作台点「通过」——
+        // 若不设防，回写会把展示态写回 `'approved'`，等于**绕过 `restore` 的可逆性台阶与
+        // 权限台阶**把下架撤销掉，而且 `content_takedowns` 里还留着一条自称仍在下架的记录。
+        //
+        // 守卫只加在 **approve 方向**：reject 写 `'rejected'` 是比下架更强的处置，让它落地是对的。
+        // 恢复展示的唯一路径是 POST /admin/content/{kind}/{id}/restore。
+        //
+        // ⚠️ 位图两列（`avatar_moderation` / `cover_moderation`）**可空**，而 `col <> 'takedown'`
+        // 在 col 为 NULL 时求值为 NULL 而非 TRUE，整条 WHERE 会静默命中 0 行——那会表现为
+        // 「人审点了通过但什么都没发生」。故写成 NULL 安全形式（两个库口径一致）。
+        let takedown_guard = if verdict == "approved" {
+            format!(
+                " AND ({column} IS NULL OR {column} <> '{}')",
+                crate::safety::disposal::TAKEDOWN
+            )
+        } else {
+            String::new()
+        };
+        // 表名/列名只可能来自 `writeback_target` 的静态白名单，请求字段永远不进 SQL 文本。
+        sqlx::query(&format!(
+            "UPDATE {table} SET {column} = $1 WHERE id = $2{takedown_guard}"
+        ))
+        .bind(moderation)
+        .bind(&subject_id)
+        .execute(&state.db)
+        .await?;
     }
 
     audit(

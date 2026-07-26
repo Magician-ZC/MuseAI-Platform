@@ -910,9 +910,14 @@ async fn recheck_queues_via_safety_without_changing_display_state() {
     );
 }
 
-/// 位图主体没有文本再审通道 → 400 如实告知，而不是假装排了队。
+/// 🔴 **位图主体的再审通道**（本批次补齐 0027 记着的那处缺口）：立绘 / 封面能进人审队列，
+/// 且人审的裁决**真的能回写到位图那一列上**。
+///
+/// 缺后半段的话就是 0027 当初警告过的「无法被改判的死队列项」——所以这条用例一路走到
+/// `POST /admin/audit-queue/{id}/reject`，断言 `avatar_moderation` 真的变了。
+/// 只断言「入队成功」是不够的：那恰恰是 0027 拒绝做的那件事。
 #[tokio::test]
-async fn recheck_refuses_bitmap_subjects_honestly() {
+async fn bitmap_subjects_can_be_rechecked_and_the_verdict_writes_back() {
     let state = test_state().await;
     seed_user(&state, "u1").await;
     seed_char(&state, "c1", "u1", "approved").await;
@@ -924,11 +929,98 @@ async fn recheck_refuses_bitmap_subjects_honestly() {
         "POST",
         "/api/admin/content/character_avatar/c1/recheck",
         &reviewer,
+        Some(json!({ "reason": "立绘被举报涉黄，请人审复看" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(body["created"], true);
+    assert_eq!(body["queueSubjectKind"], "character_avatar");
+    // 再审不改展示态（与文本主体同一条口径）。
+    assert_eq!(
+        moderation_of(&state.db, "cloud_characters", "avatar_moderation", "c1").await.as_deref(),
+        Some("approved"),
+        "再审期间立绘照常在线",
+    );
+    // 走的是 safety 入口 ③（记险 kind 与文本变体共用一个）。
+    assert_eq!(
+        count_rows(&state.db, "SELECT COUNT(*) FROM risk_events WHERE kind='content_recheck'").await,
+        1,
+    );
+
+    // 人审要看得到图本身，否则只能盲审。
+    let queue_id = body["queueId"].as_str().unwrap().to_string();
+    let (st, detail) =
+        send(&state, "GET", &format!("/api/admin/audit-queue/{queue_id}"), &reviewer, None).await;
+    assert_eq!(st, StatusCode::OK, "{detail}");
+    assert!(
+        detail["subjectImageUrl"].is_string(),
+        "🔴 位图队列项必须把图给人审看，否则「有再审通道」等于让人盲审：{detail}"
+    );
+
+    // 🔴 裁决回写：没有这一段，入队就是制造一条永远悬空的队列项（0027 迁移注释里的原话）。
+    let (st, _) = send(
+        &state,
+        "POST",
+        &format!("/api/admin/audit-queue/{queue_id}/reject?reason=%E6%B6%89%E9%BB%84"),
+        &reviewer,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        moderation_of(&state.db, "cloud_characters", "avatar_moderation", "c1").await.as_deref(),
+        Some("rejected"),
+        "🔴 人审驳回必须落到 avatar_moderation 上——落不下去就是死队列项",
+    );
+    // 卡文那一列不受牵连：卡与立绘分开审、分开改判。
+    assert_eq!(
+        moderation_of(&state.db, "cloud_characters", "moderation", "c1").await.as_deref(),
+        Some("approved"),
+        "驳回立绘不得顺带把卡文也判了",
+    );
+}
+
+/// 🔴 **每一个能入队的主体都必须有回写分支**（源码级不变式，防的是「加了入队忘了回写」）。
+///
+/// 迁移 0027 因为缺回写分支而让封面一直不入队；这条用例把那个判断变成编译后可自动检查的约束：
+/// 新加一类可再审主体时，若忘了在 `audit::writeback_target` 里补分支，测试立刻红。
+#[test]
+fn red_line_every_recheck_kind_has_a_writeback_branch() {
+    for spec in SUBJECTS {
+        assert!(
+            super::super::audit::writeback_target(spec.recheck_queue_kind).is_some(),
+            "🔴 主体 `{}` 的再审队列名 `{}` 在 audit::writeback_target 里没有回写分支——\
+             人审点了通过/驳回也无处落地，等于制造一条永远悬空的队列项（0027 迁移注释）",
+            spec.kind,
+            spec.recheck_queue_kind
+        );
+    }
+}
+
+/// 位图字节没了（例如永久移除已清字节）→ 409 如实告知，而不是排一条打不开图的队。
+#[tokio::test]
+async fn recheck_refuses_bitmap_subjects_whose_bytes_are_gone() {
+    let state = test_state().await;
+    seed_user(&state, "u1").await;
+    seed_char(&state, "c1", "u1", "approved").await;
+    let key = seed_avatar(&state, "c1").await;
+    state.objects.delete(&key).unwrap();
+    let reviewer = admin_token(&state, "reviewer");
+
+    let (st, body) = send(
+        &state,
+        "POST",
+        "/api/admin/content/character_avatar/c1/recheck",
+        &reviewer,
         Some(json!({ "reason": "立绘可疑" })),
     )
     .await;
-    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(count_rows(&state.db, "SELECT COUNT(*) FROM audit_queue").await, 0, "不得留下悬空队列项");
+    assert_eq!(st, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        count_rows(&state.db, "SELECT COUNT(*) FROM audit_queue").await,
+        0,
+        "取不到字节时不得留下悬空队列项"
+    );
 }
 
 /// 🔴 **人审队列的 approve 不得复活已下架主体。**
@@ -1272,4 +1364,705 @@ async fn owner_status_discloses_takedown_without_leaking_internal_reason() {
     .await;
     let (_, body) = send(&state, "GET", "/api/assets/characters/c1/status", &tk, None).await;
     assert!(body["takedown"].is_null(), "已恢复 → 不下发下架告知");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ⑧ 卡名读取面闸门（`safety::disposal::NameGate`）
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 打开卡名闸门（global 作用域）。默认关闭，只有显式写这一行才生效。
+async fn open_name_gate(state: &AppState) {
+    sqlx::query(
+        "INSERT INTO runtime_flags (id, flag, scope, target_id, enabled, starts_at, ends_at, \
+         updated_by, updated_at, reason, created_at) \
+         VALUES ('rf_gate', $1, 'global', '', 1, 0, 0, 'tester', $2, '用例', $3)",
+    )
+    .bind(crate::safety::disposal::FLAG_NAME_GATE)
+    .bind(now_ms())
+    .bind(now_ms())
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+/// 往世界线里写一条**正文里就有角色真名**的已落定事件。
+///
+/// 这是红线用例的关键布景：没有它，「事实表逐字节不变」可能只是因为事实表里根本没提过这个名字。
+async fn seed_event_naming_the_character(state: &AppState, world_id: &str) {
+    sqlx::query(
+        "INSERT INTO world_events (id, world_id, tick_no, sequence, domain_event_id, event_type, \
+         actors_json, visibility, public_projection_json, occurred_at) \
+         VALUES ('ev_named', $1, 3, 3, 'de_named', 'dialogue', '[\"c1\"]', 'public', \
+         '{\"text\":\"沈砚推开城门，雪落了他一肩\"}', $2)",
+    )
+    .bind(world_id)
+    .bind(now_ms())
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+async fn roster_of(state: &AppState, world_id: &str, tk: &str) -> Value {
+    let (st, body) = send(state, "GET", &format!("/api/worlds/{world_id}"), tk, None).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    body["roster"].clone()
+}
+
+/// 🔴 **闸门开着时，roster 上的名字换掉了，`world_events` 里的同一个名字一个字节没动。**
+///
+/// 这条用例是本批次最重要的边界证明。§0.3 公共事实不可回滚：已落定的事件正文是**已经发生的
+/// 世界事实**，下架一张卡不意味着它演过的戏要被改写。所以「处置彻底」的正确含义是
+/// **停止解引用**（现在去读卡拿名字的地方换成占位），不是**回溯改写**（把历史文本里的名字抹掉）。
+///
+/// 断言分三层，缺一层都可能给出假绿：
+/// ① 八张事实表逐字节快照全等；② 事件正文里的真名逐字仍在；③ roster 上的真名确实被换掉了
+/// （否则「事实没动」可能只是因为闸门压根没生效）。
+#[tokio::test]
+async fn red_line_name_gate_leaves_world_events_byte_identical() {
+    let state = test_state().await;
+    let wid = seed_world_with_history(&state).await;
+    seed_event_naming_the_character(&state, &wid).await;
+    open_name_gate(&state).await;
+    let tk = user_token(&state, "u1");
+    let reviewer = admin_token(&state, "reviewer");
+
+    let before = dump_facts(&state.db).await;
+    assert_eq!(roster_of(&state, &wid, &tk).await[0]["name"], "沈砚", "布景前提：闸门开着但没下架 → 原名");
+
+    let (st, body) = send(
+        &state,
+        "POST",
+        "/api/admin/content/character/c1/takedown",
+        &reviewer,
+        Some(json!({ "reason": "举报核实：冒充真人" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+
+    // ① 事实表一个字节都不许动。
+    assert_facts_identical(&before, &dump_facts(&state.db).await, "闸门开启 + 下架后");
+
+    // ② 已落定的事件正文里，真名逐字仍在。
+    let text: String = sqlx::query_scalar(
+        "SELECT public_projection_json FROM world_events WHERE domain_event_id = 'de_named'",
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert!(
+        text.contains("沈砚"),
+        "🔴 §0.3 公共事实不可回滚：已落定的事件正文里的名字不得被回溯改写，实际：{text}"
+    );
+    // 事件读取面同样原样下发（不是只有库里没改、下发时才悄悄替换）。
+    let (st, feed) = send(&state, "GET", &format!("/api/worlds/{wid}/events"), &tk, None).await;
+    assert_eq!(st, StatusCode::OK, "{feed}");
+    assert!(
+        feed.to_string().contains("沈砚"),
+        "🔴 事件读取面也必须原样下发历史文本：{feed}"
+    );
+
+    // ③ 而「现读现解」的那一处确实换掉了——证明上面两条不是因为闸门没生效。
+    let roster = roster_of(&state, &wid, &tk).await;
+    assert_ne!(roster[0]["name"], "沈砚", "🔴 闸门开着时 roster 必须停止解引用被处置的卡名");
+    assert!(
+        roster[0]["name"].as_str().unwrap().starts_with("暂不可见的角色"),
+        "{roster}"
+    );
+}
+
+/// 🔴 **闸门默认关闭，且关闭态下架前后的读取面输出逐字节一致**——即与本闸门存在之前完全一样。
+///
+/// 「能力先就位、什么时候开由产品定」的工程含义就是这一条：合并这批代码**不会**改变任何一个
+/// 玩家现在看到的东西。断言比的是整段 `roster` 的序列化结果，不是挑几个字段。
+#[tokio::test]
+async fn red_line_disabled_gate_is_byte_identical_to_today() {
+    let state = test_state().await;
+    let wid = seed_world_with_history(&state).await;
+    let tk = user_token(&state, "u1");
+    let reviewer = admin_token(&state, "reviewer");
+
+    // 不写 runtime_flags、不设 env → 解析必然落到「代码内默认值 = 关闭」。
+    let before = roster_of(&state, &wid, &tk).await.to_string();
+
+    let (st, _) = send(
+        &state,
+        "POST",
+        "/api/admin/content/character/c1/takedown",
+        &reviewer,
+        Some(json!({ "reason": "举报核实" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let after = roster_of(&state, &wid, &tk).await.to_string();
+    assert_eq!(
+        before, after,
+        "🔴 闸门默认关闭：下架前后 roster 必须逐字节一致（合并这批代码不得改变任何玩家现在看到的东西）"
+    );
+    assert!(after.contains("沈砚"), "关闭态就是今天的行为：真名照常下发。实际：{after}");
+}
+
+/// 闸门只对哨兵值 `'takedown'` 生效：发布期的 `rejected` 不归它管。
+///
+/// 混起来的话，「从未过审」与「过审后被下架」在展示上就分不清了——那正是 0044 刻意不复用
+/// `'rejected'` 要避免的事。
+#[tokio::test]
+async fn name_gate_ignores_publish_time_rejection() {
+    let state = test_state().await;
+    let wid = seed_world_with_history(&state).await;
+    open_name_gate(&state).await;
+    let tk = user_token(&state, "u1");
+
+    sqlx::query("UPDATE cloud_characters SET moderation = 'rejected' WHERE id = 'c1'")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        roster_of(&state, &wid, &tk).await[0]["name"],
+        "沈砚",
+        "🔴 闸门只认下架哨兵值；发布期驳回的内容从来没在读取面露过面，不归它管"
+    );
+}
+
+/// 恢复后名字回来：闸门是**当前展示态**的函数，不是一次性的写操作。
+#[tokio::test]
+async fn restoring_brings_the_name_back_on_the_read_surface() {
+    let state = test_state().await;
+    let wid = seed_world_with_history(&state).await;
+    open_name_gate(&state).await;
+    let tk = user_token(&state, "u1");
+    let reviewer = admin_token(&state, "reviewer");
+
+    send(
+        &state,
+        "POST",
+        "/api/admin/content/character/c1/takedown",
+        &reviewer,
+        Some(json!({ "reason": "举报核实" })),
+    )
+    .await;
+    assert_ne!(roster_of(&state, &wid, &tk).await[0]["name"], "沈砚");
+
+    let (st, _) = send(
+        &state,
+        "POST",
+        "/api/admin/content/character/c1/restore",
+        &reviewer,
+        Some(json!({ "reason": "复核后认为不构成违规" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        roster_of(&state, &wid, &tk).await[0]["name"],
+        "沈砚",
+        "恢复后展示面必须完全回到下架前——闸门不留痕迹"
+    );
+}
+
+/// 同一份 roster 上的两张被处置的卡必须**读得出是两个人**。
+///
+/// 不带判别位的话会渲染成两行一模一样的占位符，读者会读成同一个人来了两次——那是**另一个
+/// 假信息**，而且比露出真名更难被发现。
+#[tokio::test]
+async fn two_disposed_cards_never_collapse_into_one_placeholder() {
+    let state = test_state().await;
+    let wid = seed_world_with_history(&state).await;
+    seed_char(&state, "c2", "u1", "approved").await;
+    sqlx::query(
+        "INSERT INTO world_members (id, world_id, user_id, cloud_character_id, boundary_json, \
+         status, joined_at) VALUES ('wm2', $1, 'u1', 'c2', '{}', 'active', $2)",
+    )
+    .bind(&wid)
+    .bind(now_ms() + 1)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    open_name_gate(&state).await;
+    let tk = user_token(&state, "u1");
+    let reviewer = admin_token(&state, "reviewer");
+
+    for cid in ["c1", "c2"] {
+        let (st, _) = send(
+            &state,
+            "POST",
+            &format!("/api/admin/content/character/{cid}/takedown"),
+            &reviewer,
+            Some(json!({ "reason": "举报核实" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+    }
+
+    let roster = roster_of(&state, &wid, &tk).await;
+    let a = roster[0]["name"].as_str().unwrap();
+    let b = roster[1]["name"].as_str().unwrap();
+    assert_ne!(a, b, "🔴 两张被处置的卡渲染成同一串 → 读者会读成同一个人：{roster}");
+    // 但各自稳定：同一次查询之外再查一次，串不变（无时间、无随机）。
+    let again = roster_of(&state, &wid, &tk).await;
+    assert_eq!(again[0]["name"].as_str().unwrap(), a, "占位符必须稳定，否则同一个角色像是换了人");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ⑨ 处置申诉（migration 0045）
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 内部处置理由——所有作者侧断言都拿它当探针。
+const INTERNAL_REASON: &str = "内部研判：疑似引流账号，配合风控 R-2291";
+
+async fn takedown_c1(state: &AppState, permanent: bool) {
+    let tk = admin_token(state, if permanent { "admin" } else { "reviewer" });
+    let (st, body) = send(
+        state,
+        "POST",
+        "/api/admin/content/character/c1/takedown",
+        &tk,
+        Some(json!({ "reason": INTERNAL_REASON, "permanent": permanent })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+}
+
+async fn file_appeal(state: &AppState, tk: &str, text: &str) -> (StatusCode, Value) {
+    send(
+        state,
+        "POST",
+        "/api/assets/characters/c1/disposal-appeal",
+        tk,
+        Some(json!({ "text": text })),
+    )
+    .await
+}
+
+/// 处置申诉的正路：作者提交 → 后台改判 → **走 restore 台阶**恢复到下架前的展示态。
+#[tokio::test]
+async fn disposal_appeal_overturn_restores_through_the_same_restore_path() {
+    let state = test_state().await;
+    seed_user(&state, "u1").await;
+    seed_char(&state, "c1", "u1", "approved").await;
+    let tk = user_token(&state, "u1");
+    let reviewer = admin_token(&state, "reviewer");
+    takedown_c1(&state, false).await;
+
+    let (st, appeal) = file_appeal(&state, &tk, "这是我原创的角色，被误判为冒充真人").await;
+    assert_eq!(st, StatusCode::OK, "{appeal}");
+    assert_eq!(appeal["status"], "pending");
+    assert_eq!(appeal["disposalState"], "restricted");
+    // 🔴 提交不改展示态：处置继续生效到裁决为止。
+    assert_eq!(appeal["moderation"], "takedown");
+    let appeal_id = appeal["id"].as_str().unwrap().to_string();
+
+    // 后台队列看得到，且**看得到运营内部理由**（这是后台面，人审要据以裁决）。
+    let (st, list) = send(&state, "GET", "/api/admin/content/appeals", &reviewer, None).await;
+    assert_eq!(st, StatusCode::OK, "{list}");
+    assert_eq!(list["items"].as_array().unwrap().len(), 1);
+    assert_eq!(list["items"][0]["disposal"]["reason"], INTERNAL_REASON);
+
+    let (st, out) = send(
+        &state,
+        "POST",
+        &format!("/api/admin/content/appeals/{appeal_id}/resolve"),
+        &reviewer,
+        Some(json!({ "decision": "overturn", "reason": "核实为原创，处置有误，已恢复" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    assert_eq!(out["status"], "overturned");
+    assert_eq!(out["restored"], true);
+    assert_eq!(out["worldlineUntouched"], true);
+
+    // 展示态回到**下架前的值**（不是常量 approved——恢复的语义是「回到下架前」）。
+    assert_eq!(
+        moderation_of(&state.db, "cloud_characters", "moderation", "c1").await.as_deref(),
+        Some("approved"),
+    );
+    // 台账翻成 restored（改判必须走 restore 那一整套，不能只改展示态列）。
+    let ledger_state: String = sqlx::query_scalar(
+        "SELECT state FROM content_takedowns WHERE subject_kind='character' AND subject_id='c1'",
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        ledger_state, "restored",
+        "🔴 改判若只改展示态不翻台账，作者侧告知与后台台账会开始互相打架"
+    );
+    // 留痕：改判本身 + 恢复动作各一条审计。
+    assert_eq!(
+        count_rows(
+            &state.db,
+            "SELECT COUNT(*) FROM audit_logs WHERE action='content.appeal_overturn'"
+        )
+        .await,
+        2,
+    );
+    assert!(
+        count_rows(&state.db, "SELECT COUNT(*) FROM risk_events WHERE kind='content_disposal'")
+            .await
+            >= 2,
+    );
+}
+
+/// 🔴 **作者侧一个字都看不到运营内部处置理由**（口径同 `audit_logs.reason`）。
+///
+/// 作者能看到的是：处置状态 + 时间 + 固定说明 + 自己的申诉 + 复审人**写给他的**答复。
+/// 内部研判备注不在其列——它出现在后台队列里，不出现在这里。
+#[tokio::test]
+async fn red_line_author_facing_appeal_never_echoes_internal_reason() {
+    let state = test_state().await;
+    seed_user(&state, "u1").await;
+    seed_char(&state, "c1", "u1", "approved").await;
+    let tk = user_token(&state, "u1");
+    let reviewer = admin_token(&state, "reviewer");
+    takedown_c1(&state, false).await;
+
+    let (_, appeal) = file_appeal(&state, &tk, "我不认可这个处置").await;
+    let appeal_id = appeal["id"].as_str().unwrap().to_string();
+    assert!(
+        !appeal.to_string().contains(INTERNAL_REASON),
+        "🔴 提交回执泄露了内部理由：{appeal}"
+    );
+
+    let (st, status) = send(&state, "GET", "/api/assets/characters/c1/status", &tk, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(status["disposalAppeal"]["status"], "pending");
+    assert!(
+        !status.to_string().contains(INTERNAL_REASON),
+        "🔴 作者侧 status 泄露了内部理由：{status}"
+    );
+    assert!(status["disposalAppeal"]["disposal"].is_null(), "作者侧不得内联处置台账全行");
+
+    // 裁决后同理：回显的是复审人写给作者的答复，不是内部备注。
+    send(
+        &state,
+        "POST",
+        &format!("/api/admin/content/appeals/{appeal_id}/resolve"),
+        &reviewer,
+        Some(json!({ "decision": "uphold", "reason": "经复核维持原处置" })),
+    )
+    .await;
+    let (_, status) = send(&state, "GET", "/api/assets/characters/c1/status", &tk, None).await;
+    assert_eq!(status["disposalAppeal"]["resolutionReason"], "经复核维持原处置");
+    assert!(
+        !status.to_string().contains(INTERNAL_REASON),
+        "🔴 裁决后作者侧泄露了内部理由：{status}"
+    );
+    // uphold 不动展示态。
+    assert_eq!(
+        moderation_of(&state.db, "cloud_characters", "moderation", "c1").await.as_deref(),
+        Some("takedown"),
+    );
+}
+
+/// 申诉权挂在**处置事件**上，不挂在主体上。
+///
+/// 0018 的「每主体终身一次」放到这里就是错的：一张卡可以被下架、恢复、再被下架，
+/// 第二次被处置的人若因为第一次申诉过就再也不能申诉，那等于处置第二次起不受任何制衡。
+#[tokio::test]
+async fn appeal_rights_attach_to_the_disposal_event_not_the_subject() {
+    let state = test_state().await;
+    seed_user(&state, "u1").await;
+    seed_char(&state, "c1", "u1", "approved").await;
+    let tk = user_token(&state, "u1");
+    let reviewer = admin_token(&state, "reviewer");
+
+    // 第一次处置 → 申诉 → 同一次处置重复提交 409。
+    takedown_c1(&state, false).await;
+    let (st, _) = file_appeal(&state, &tk, "第一次申诉").await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, body) = file_appeal(&state, &tk, "再来一次").await;
+    assert_eq!(st, StatusCode::CONFLICT, "同一次处置只受理一次：{body}");
+
+    // 恢复 → 重新下架 = **新的一次处置**，申诉权重开。
+    send(
+        &state,
+        "POST",
+        "/api/admin/content/character/c1/restore",
+        &reviewer,
+        Some(json!({ "reason": "先恢复" })),
+    )
+    .await;
+    // 处置事件靠 (takedown_id, disposal_at) 区分，同毫秒会撞唯一键 —— 让时钟走过 1ms。
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    takedown_c1(&state, false).await;
+    let (st, body) = file_appeal(&state, &tk, "这是第二次处置，我仍然不认可").await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "🔴 第二次被处置必须能重新申诉，否则处置第二次起不受制衡：{body}"
+    );
+    assert_eq!(count_rows(&state.db, "SELECT COUNT(*) FROM disposal_appeals").await, 2);
+}
+
+/// 永久移除不可恢复：改判恒 409（口径与 `restore` 逐字一致，不给不可逆开申诉侧门）；
+/// 但**受理申诉本身**是允许的——作者有权提异议，运营有义务给一个答复。
+#[tokio::test]
+async fn permanent_removal_can_be_appealed_but_never_overturned() {
+    let state = test_state().await;
+    seed_user(&state, "u1").await;
+    seed_char(&state, "c1", "u1", "approved").await;
+    let tk = user_token(&state, "u1");
+    let reviewer = admin_token(&state, "reviewer");
+    takedown_c1(&state, true).await;
+
+    let (st, appeal) = file_appeal(&state, &tk, "永久移除过重了").await;
+    assert_eq!(st, StatusCode::OK, "{appeal}");
+    assert_eq!(appeal["disposalState"], "removed");
+    let appeal_id = appeal["id"].as_str().unwrap().to_string();
+
+    let (st, body) = send(
+        &state,
+        "POST",
+        &format!("/api/admin/content/appeals/{appeal_id}/resolve"),
+        &reviewer,
+        Some(json!({ "decision": "overturn", "reason": "想恢复" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "🔴 永久移除不得经申诉复活：{body}");
+
+    // uphold 仍可用：作者拿到一个明确的答复，申诉不会永远挂着。
+    let (st, out) = send(
+        &state,
+        "POST",
+        &format!("/api/admin/content/appeals/{appeal_id}/resolve"),
+        &reviewer,
+        Some(json!({ "decision": "uphold", "reason": "该内容涉及监管要求，维持永久移除" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    assert_eq!(out["status"], "upheld");
+}
+
+/// 运营在裁决前已自行恢复 → 改判如实记 `overturned` 且不再动状态，**不制造一条卡死的 pending**。
+#[tokio::test]
+async fn overturning_an_already_restored_disposal_records_the_outcome_without_touching_state() {
+    let state = test_state().await;
+    seed_user(&state, "u1").await;
+    seed_char(&state, "c1", "u1", "approved").await;
+    let tk = user_token(&state, "u1");
+    let reviewer = admin_token(&state, "reviewer");
+    takedown_c1(&state, false).await;
+    let (_, appeal) = file_appeal(&state, &tk, "请复核").await;
+    let appeal_id = appeal["id"].as_str().unwrap().to_string();
+
+    // 运营先自己恢复了（申诉往往只是催办）。
+    send(
+        &state,
+        "POST",
+        "/api/admin/content/character/c1/restore",
+        &reviewer,
+        Some(json!({ "reason": "自查后主动恢复" })),
+    )
+    .await;
+
+    let (st, out) = send(
+        &state,
+        "POST",
+        &format!("/api/admin/content/appeals/{appeal_id}/resolve"),
+        &reviewer,
+        Some(json!({ "decision": "overturn", "reason": "申诉成立，内容此前已恢复" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    assert_eq!(out["status"], "overturned");
+    assert_eq!(out["restored"], false, "状态本就已恢复，本次不再动它");
+    assert_eq!(out["alreadyRestored"], true);
+}
+
+/// 入参与权限守卫：没有生效中的处置不受理、非 owner 404、越权 403、重复裁决 409。
+#[tokio::test]
+async fn disposal_appeal_guards() {
+    let state = test_state().await;
+    seed_user(&state, "u1").await;
+    seed_user(&state, "u2").await;
+    seed_char(&state, "c1", "u1", "approved").await;
+    let tk = user_token(&state, "u1");
+    let other = user_token(&state, "u2");
+    let reviewer = admin_token(&state, "reviewer");
+
+    // 没有生效中的处置 → 400（不是 404：卡是存在的，只是没被处置）。
+    let (st, _) = file_appeal(&state, &tk, "随便申诉一下").await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    takedown_c1(&state, false).await;
+    // 非 owner → 404，不泄露存在性（口径同 status / appeal）。
+    let (st, _) = send(
+        &state,
+        "POST",
+        "/api/assets/characters/c1/disposal-appeal",
+        &other,
+        Some(json!({ "text": "不是我的卡" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    // 空正文 → 400。
+    let (st, _) = file_appeal(&state, &tk, "   ").await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    let (_, appeal) = file_appeal(&state, &tk, "正常申诉").await;
+    let appeal_id = appeal["id"].as_str().unwrap().to_string();
+
+    // 后台队列与裁决都走既有角色矩阵：finance 无权。
+    let finance = admin_token(&state, "finance");
+    let (st, _) = send(&state, "GET", "/api/admin/content/appeals", &finance, None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let resolve_uri = format!("/api/admin/content/appeals/{appeal_id}/resolve");
+    let (st, _) = send(
+        &state,
+        "POST",
+        &resolve_uri,
+        &finance,
+        Some(json!({ "decision": "uphold", "reason": "越权尝试" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    // 裁决理由必填。
+    let (st, _) =
+        send(&state, "POST", &resolve_uri, &reviewer, Some(json!({ "decision": "uphold" }))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    // 未知 decision → 400。
+    let (st, _) = send(
+        &state,
+        "POST",
+        &resolve_uri,
+        &reviewer,
+        Some(json!({ "decision": "delete", "reason": "x" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    let (st, _) = send(
+        &state,
+        "POST",
+        &resolve_uri,
+        &reviewer,
+        Some(json!({ "decision": "uphold", "reason": "维持原处置" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    // 重复裁决 409。
+    let (st, _) = send(
+        &state,
+        "POST",
+        &resolve_uri,
+        &reviewer,
+        Some(json!({ "decision": "overturn", "reason": "改主意了" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+}
+
+/// 申诉队列的复合游标：同毫秒并列行跨页不丢（单列游标会把跨页的并列组整组跳过）。
+#[tokio::test]
+async fn appeal_queue_compound_cursor_never_drops_rows_on_timestamp_ties() {
+    let state = test_state().await;
+    let reviewer = admin_token(&state, "reviewer");
+    let ts = now_ms();
+    // 六条**同毫秒**申诉行（真实场景：一次批量处置后作者们同时申诉）。
+    for i in 0..6 {
+        sqlx::query(
+            "INSERT INTO disposal_appeals (id, takedown_id, disposal_at, subject_kind, subject_id, \
+             owner_id, appeal_text, disposal_state, status, created_at) \
+             VALUES ($1, $2, $3, 'character', $4, 'u1', '申诉', 'restricted', 'pending', $5)",
+        )
+        .bind(format!("dap_{i}"))
+        .bind(format!("ctd_{i}"))
+        .bind(ts)
+        .bind(format!("c{i}"))
+        .bind(ts)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..6 {
+        let uri = match &cursor {
+            Some(c) => format!("/api/admin/content/appeals?limit=2&cursor={c}"),
+            None => "/api/admin/content/appeals?limit=2".to_string(),
+        };
+        let (st, body) = send(&state, "GET", &uri, &reviewer, None).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        for it in body["items"].as_array().unwrap() {
+            seen.push(it["id"].as_str().unwrap().to_string());
+        }
+        match body["nextCursor"].as_str() {
+            Some(c) => cursor = Some(c.to_string()),
+            None => break,
+        }
+    }
+    seen.sort();
+    seen.dedup();
+    assert_eq!(
+        seen.len(),
+        6,
+        "🔴 同毫秒并列行跨页丢失（单列游标的经典数据丢失，见 pagination.rs）：{seen:?}"
+    );
+}
+
+/// 立绘被下架也能申诉，且作者侧回显认得出那是**立绘**那一次处置。
+///
+/// 这条同时是 `latest_for_subjects` 的 `IN (...)` 形状的覆盖：它只有走到白名单里的**第二项**
+/// 才会暴露占位符错位（`$N` 在 SQLite 上按文本首次出现顺序派号，错位时两个库都不报错）。
+#[tokio::test]
+async fn avatar_disposal_can_be_appealed_and_shows_up_on_the_author_side() {
+    let state = test_state().await;
+    seed_user(&state, "u1").await;
+    seed_char(&state, "c1", "u1", "approved").await;
+    seed_avatar(&state, "c1").await;
+    let tk = user_token(&state, "u1");
+    let reviewer = admin_token(&state, "reviewer");
+
+    let (st, _) = send(
+        &state,
+        "POST",
+        "/api/admin/content/character_avatar/c1/takedown",
+        &reviewer,
+        Some(json!({ "reason": INTERNAL_REASON })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, appeal) = send(
+        &state,
+        "POST",
+        "/api/assets/characters/c1/disposal-appeal",
+        &tk,
+        Some(json!({ "text": "这张立绘是我自己画的", "subjectKind": "character_avatar" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{appeal}");
+    assert_eq!(appeal["subjectKind"], "character_avatar");
+    // 提交不改展示态：立绘继续下架到裁决为止。
+    assert_eq!(appeal["moderation"], "takedown");
+
+    let (_, status) = send(&state, "GET", "/api/assets/characters/c1/status", &tk, None).await;
+    assert_eq!(
+        status["disposalAppeal"]["subjectKind"], "character_avatar",
+        "🔴 作者侧没回显立绘那一次申诉（若占位符错位，这里会拿到 null）：{status}"
+    );
+    assert!(!status.to_string().contains(INTERNAL_REASON), "{status}");
+    // 卡文没被处置 → 卡文维度的告知为空（两个维度分开处置、分开告知）。
+    assert!(status["takedown"].is_null(), "卡文未被处置，不该有卡文的下架告知：{status}");
+
+    // 改判恢复的是**立绘那一列**，卡文那一列不受牵连。
+    let appeal_id = appeal["id"].as_str().unwrap().to_string();
+    let (st, out) = send(
+        &state,
+        "POST",
+        &format!("/api/admin/content/appeals/{appeal_id}/resolve"),
+        &reviewer,
+        Some(json!({ "decision": "overturn", "reason": "核实为原创立绘，已恢复" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    assert_eq!(
+        moderation_of(&state.db, "cloud_characters", "avatar_moderation", "c1").await.as_deref(),
+        Some("approved"),
+    );
+    assert_eq!(
+        moderation_of(&state.db, "cloud_characters", "moderation", "c1").await.as_deref(),
+        Some("approved"),
+        "卡文那一列全程没被动过",
+    );
 }

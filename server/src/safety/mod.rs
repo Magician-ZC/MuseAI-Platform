@@ -19,23 +19,33 @@
 //!    **默认不写 `audit_queue`**，只有高危分类才入队（策略见 `MUSE_SAFETY_RUNTIME_AUDIT`）。
 //!    理由：运行时每 tick 每事件都可能命中，若比照 ① 逐条入队，人审队列会被淹到不可用——
 //!    「记险不入队」保证留痕完整、队列可用，人审仍可从 risk_events 反查。
-//! 3. `queue_operator_recheck`：**已发布内容的运营再审**（人工发起，非机器判定）。
-//!    ①② 都是「内容刚产生时」的闸；已过审内容事后被举报出问题时，没有任何一条既有路径能把它
-//!    送回人审队列——`admin_api::takedown` 需要的正是这条。它与 ① 跑同一套机审（provider +
-//!    注入检测，让人审看到同样的机审命中），但**无论裁决如何都入队**：入队理由是「有人举报」
-//!    而不是「机器判定可疑」，机审直过恰恰是需要人来看的情形。
+//! 3. `queue_operator_recheck` / `queue_operator_recheck_image`：**已发布内容的运营再审**
+//!    （人工发起，非机器判定）。①② 都是「内容刚产生时」的闸；已过审内容事后被举报出问题时，
+//!    没有任何一条既有路径能把它送回人审队列——`admin_api::takedown` 需要的正是这条。
+//!    它与 ① 跑同一套机审（让人审看到同样的机审上下文），但**无论裁决如何都入队**：入队理由是
+//!    「有人举报」而不是「机器判定可疑」，机审直过恰恰是需要人来看的情形。
+//!
+//!    两个变体只差在跑哪一路机审：文本主体（角色卡 / 世界模板）跑 `check_text` + 注入检测；
+//!    位图主体（立绘 / 世界封面）跑 `check_image`。入队、幂等、留痕三段**共用同一份实现**
+//!    （`queue_recheck_inner`），所以位图接进来不会长出第二套口径。
 //!
 //!    🔴 它**不是**给 admin 开的侧门 —— 侧门的定义是绕过本模块直接 INSERT。这是同一扇门加宽一格：
 //!    写入仍然只发生在本文件里，机审、留痕、字段口径与 ① 逐字一致。
 //!
 //! 换言之「唯一写入方」的旧契约现在读作：**静态内容走 ①，运行时产出走 ②，已发布内容的运营再审
 //! 走 ③，此外任何模块都不得直接 INSERT audit_queue / risk_events**。
+//!
+//! ## 读取面的处置闸门：`disposal` 子模块
+//!
+//! 上面三条都是**入口**（内容怎么进人审）。`disposal` 是**出口**：一个已被下架的主体，它的
+//! 名字还该不该从 `card_json` 里解引用出来摆给别人看。见该模块头注释。
 
 use crate::app::AppState;
 use crate::error::ApiError;
 use crate::events::ProjectedEvent;
 use crate::providers::ModerationVerdict;
 
+pub mod disposal;
 mod inject;
 mod lexicon;
 pub use inject::{card_scan_text, detect_injection, InjectionHit};
@@ -154,6 +164,62 @@ pub async fn queue_operator_recheck(
         ModerationVerdict::Approved => ModerationVerdict::Approved,
     };
 
+    queue_recheck_inner(state, subject_kind, subject_id, verdict, provider, &hits, actor_id, reason)
+        .await
+}
+
+/// 入口 ③ 的**位图**变体：把已发布的立绘 / 世界封面重新送回人审队列。
+///
+/// ## 补的是哪个缺口
+///
+/// `ModerationProvider::check_image` 自迁移 0016（立绘）/ 0027（封面）起就在**发布路径**上跑，
+/// 但裁决落列之后**没有任何人审入队路径**——0027 的迁移注释把这件事记成了已知缺口：
+/// 「人审改判的回写路径（`admin_api::audit` 的 `subject_kind` 分支）尚无 `world_cover` 分支，
+/// 故本波次封面机审裁决不入 `audit_queue`（避免制造无法被改判的死队列项）」。
+/// 于是位图主体一直只有「下架」没有「再审」，0044 的再审端点遇到位图只能 400 如实告知。
+///
+/// 本函数与 `admin_api::audit::review` 里新增的两个回写分支（`character_avatar` →
+/// `cloud_characters.avatar_moderation`、`world_cover` → `worlds.cover_moderation`）是**一对**：
+/// 🔴 少了任何一半，入队就重新变成 0027 警告过的那种「无法被改判的死队列项」。
+///
+/// ## 与文本变体的差别只有一处
+///
+/// 机审走 `check_image`，且 `machine_hits` **恒为空数组**——注入检测是文本管线（归一化 →
+/// 紧凑串匹配），对图片字节跑它只会得到噪声。这里显式给空，而不是让它「碰巧没命中」：
+/// 人审工作台上一个空的命中列表读作「图审没给出可展示的命中点」，那是真话。
+///
+/// 入队、幂等、留痕三段与文本变体**共用同一份实现**，口径逐字一致。
+pub async fn queue_operator_recheck_image(
+    state: &AppState,
+    subject_kind: &str,
+    subject_id: &str,
+    bytes: &[u8],
+    actor_id: &str,
+    reason: &str,
+) -> Result<(String, ModerationVerdict, bool), ApiError> {
+    let provider = state
+        .moderation
+        .check_image(bytes)
+        .await
+        .map_err(|e| ApiError::internal(std::io::Error::other(e)))?;
+    // 位图路径没有注入检测这一路信号，故裁决就是 provider 裁决（不做 ① 的折叠）。
+    queue_recheck_inner(state, subject_kind, subject_id, provider, provider, &[], actor_id, reason)
+        .await
+}
+
+/// 入口 ③ 的共用实现：入队（幂等）+ 留痕。两个变体只在**跑哪一路机审**上分叉，
+/// 分叉之后的写入路径必须只有一条——否则位图与文本会各自长出一套 `audit_queue` 字段口径。
+#[allow(clippy::too_many_arguments)]
+async fn queue_recheck_inner(
+    state: &AppState,
+    subject_kind: &str,
+    subject_id: &str,
+    verdict: ModerationVerdict,
+    provider: ModerationVerdict,
+    hits: &[InjectionHit],
+    actor_id: &str,
+    reason: &str,
+) -> Result<(String, ModerationVerdict, bool), ApiError> {
     // 幂等：已有 open 行就复用。全序取一行（`created_at DESC, id DESC`）——同毫秒并列时
     // 不加次级键会取到不确定的那一行，回执里的 queueId 就会在两次调用间跳变。
     let existing: Option<String> = sqlx::query_scalar(
@@ -177,7 +243,7 @@ pub async fn queue_operator_recheck(
             .bind(subject_kind)
             .bind(subject_id)
             .bind(verdict_str(verdict))
-            .bind(serde_json::to_string(&hits).unwrap_or_else(|_| "[]".into()))
+            .bind(serde_json::to_string(hits).unwrap_or_else(|_| "[]".into()))
             .bind(crate::db::now_ms())
             .execute(&state.db)
             .await?;

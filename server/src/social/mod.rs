@@ -426,22 +426,34 @@ pub fn router() -> Router<AppState> {
 
 /// 角色展示名（`card_json.identity.name`）。取不到（卡结构异常/无名/空 id）时兜底，
 /// **绝不因取名失败改变任何判定**（口径抄 `invitations::character_name`）。
+///
+/// 本模块的每一处调用都是在把**对手方**的角色名摆给人看（羁绊列表 / 解锁请求 / 拉黑名单），
+/// 所以被处置的卡在这里过 `NameGate`（默认关闭 → 恒等，输出与本闸门存在前逐字节一致）。
+/// 闸门在函数内部逐次解析而不是由调用方传入：本模块的六个调用点各自只取 1-2 个名字，
+/// 不存在 roster 那样的 N 行循环，逐次解析既不会放大查库次数，也免得六处各自记着传参。
 async fn character_name(db: &AnyPool, character_id: &str) -> String {
     if character_id.trim().is_empty() {
         return "该角色".to_string();
     }
-    let card: Option<String> =
-        sqlx::query_scalar("SELECT card_json FROM cloud_characters WHERE id = $1")
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT card_json, moderation FROM cloud_characters WHERE id = $1")
             .bind(character_id)
             .fetch_optional(db)
             .await
             .ok()
             .flatten();
-    card.as_deref()
+    let (card, moderation) = match row {
+        Some((c, m)) => (Some(c), Some(m)),
+        None => (None, None),
+    };
+    let name = card
+        .as_deref()
         .and_then(|text| serde_json::from_str::<Value>(text).ok())
         .and_then(|v| v.pointer("/identity/name").and_then(|n| n.as_str()).map(str::to_string))
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "该角色".to_string())
+        .unwrap_or_else(|| "该角色".to_string());
+    let gate = crate::safety::disposal::NameGate::resolve(db, crate::flags::FlagCtx::global()).await;
+    gate.display_name(character_id, moderation.as_deref(), name)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

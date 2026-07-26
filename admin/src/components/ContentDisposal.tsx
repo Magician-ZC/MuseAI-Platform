@@ -2,6 +2,8 @@
 //   GET  /admin/content/takedowns?state=&kind=&cursor=&limit=   处置台账
 //   GET  /admin/content/{kind}/{id}                             单主体处置态
 //   POST /admin/content/{kind}/{id}/recheck|takedown|restore    再审 / 下架 / 恢复
+//   GET  /admin/content/appeals?status=&cursor=&limit=          处置申诉队列（migration 0045）
+//   POST /admin/content/appeals/{id}/resolve                    处置申诉裁决（uphold / overturn）
 //
 // 🔴 这个分区必须说清楚、且在结构上守住的四件事：
 //
@@ -81,6 +83,28 @@ interface SubjectStatus {
   affectedRunningWorlds: AffectedWorld[];
   worldlineUntouched: boolean;
   notes: string[];
+}
+
+/** 处置申诉行（对齐 server/src/admin_api/takedown/appeals.rs，migration 0045）。 */
+interface DisposalAppealRow {
+  id: string;
+  takedownId: string;
+  disposalAt: number;
+  subjectKind: string;
+  subjectId: string;
+  ownerId: string;
+  appealText: string;
+  /** 提交时的处置态快照（restricted / removed）。 */
+  disposalState: string;
+  /** pending / upheld（维持处置）/ overturned（改判恢复） */
+  status: string;
+  /** 🔴 复审人写给**作者**的答复（会回显给作者）。不是下架时填的内部理由。 */
+  resolutionReason: string | null;
+  reviewerId: string | null;
+  createdAt: number;
+  resolvedAt: number | null;
+  /** 后台专属：当前处置台账全行，含运营内部处置理由。作者侧永不下发。 */
+  disposal: TakedownRow | null;
 }
 
 // ---------------- 展示映射（未知取值一律原样回显，不吞） ----------------
@@ -386,20 +410,11 @@ function SubjectPanel({
       />
 
       <Space style={{ marginTop: 12 }} wrap>
-        <Tooltip
-          title={
-            subject.canRecheck
-              ? subject.moderation === 'approved'
-                ? undefined
-                : '仅可对已过审内容发起再审'
-              : '位图资产没有文本再审通道（图片机审尚无人审入队路径）；如需处置请直接下架'
-          }
-        >
+        {/* 四类主体（含立绘 / 世界封面两类位图）现在都有再审通道：位图走图片机审入队 +
+            人审工作台回写。此前位图只能下架不能再审，是 migration 0027 记着的那处缺口。 */}
+        <Tooltip title={subject.canRecheck ? undefined : '仅可对已过审内容发起再审'}>
           <span>
-            <Button
-              disabled={!subject.canRecheck || subject.moderation !== 'approved'}
-              onClick={() => onAction('recheck')}
-            >
+            <Button disabled={!subject.canRecheck} onClick={() => onAction('recheck')}>
               送回人审队列（再审）
             </Button>
           </span>
@@ -630,6 +645,8 @@ export default function ContentDisposal({
         </div>
       )}
 
+      <DisposalAppealQueue onResolved={reload} />
+
       <Typography.Paragraph type="secondary" style={{ marginTop: 20 }}>
         处置全程写审计日志（<code>content.takedown</code> / <code>content.takedown_permanent</code> /
         <code> content.restore</code> / <code>content.recheck</code>）与风控留痕
@@ -638,5 +655,244 @@ export default function ContentDisposal({
         与时间，<b>看不到此处填写的内部理由</b>。
       </Typography.Paragraph>
     </div>
+  );
+}
+
+// ---------------- 处置申诉队列（migration 0045） ----------------
+//
+// 🔴 与上方「申诉复审」分区（`/admin/appeals`）是**两件事**，界面上不合并：
+//   - 那条受理「发布时被驳回」，改判 = 直接放行；
+//   - 这条受理「过审后被处置」，改判 = 走恢复台阶写回下架前的状态、并把处置台账翻成已恢复。
+// 合并会诱导运营用错的入口做错的改判，而错的那条会绕过恢复台阶。
+//
+// 🔴 这里**显示**下架时填的运营内部理由（`disposal.reason`）——人审要据以判断当初为什么下架。
+// 它只出现在本后台面；作者侧看到的永远只有下方「答复」框里写的那段话。
+
+const APPEAL_STATUS_TEXT: Record<string, { color: string; text: string }> = {
+  pending: { color: 'gold', text: '待裁决' },
+  upheld: { color: 'default', text: '维持处置' },
+  overturned: { color: 'green', text: '改判 · 已恢复' },
+};
+
+function ResolveAppealModal({
+  appeal,
+  onClose,
+  onDone,
+}: {
+  appeal: DisposalAppealRow | null;
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const [reason, setReason] = useState('');
+  const [decision, setDecision] = useState<'uphold' | 'overturn'>('uphold');
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (appeal) {
+      setReason('');
+      setDecision('uphold');
+    }
+  }, [appeal]);
+
+  if (!appeal) return null;
+  // 永久移除不可恢复：改判在服务端恒 409，界面提前说清楚而不是让人点了才吃报错。
+  const permanentlyRemoved = appeal.disposal?.state === 'removed';
+
+  const submit = async () => {
+    if (!reason.trim()) {
+      message.warning('答复必填');
+      return;
+    }
+    setBusy(true);
+    try {
+      await adminFetch(`/admin/content/appeals/${encodeURIComponent(appeal.id)}/resolve`, 'POST', {
+        decision,
+        reason: reason.trim(),
+      });
+      message.success(decision === 'overturn' ? '已改判并恢复' : '已维持处置');
+      onDone();
+      onClose();
+    } catch (e) {
+      message.error(friendlyError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal
+      open
+      title="裁决处置申诉"
+      okText={decision === 'overturn' ? '改判并恢复' : '维持处置'}
+      confirmLoading={busy}
+      onOk={submit}
+      onCancel={onClose}
+    >
+      <Descriptions size="small" column={1} bordered style={{ marginBottom: 12 }}>
+        <Descriptions.Item label="主体">
+          {KIND_TEXT[appeal.subjectKind] || appeal.subjectKind} · <code>{appeal.subjectId}</code>
+        </Descriptions.Item>
+        <Descriptions.Item label="作者申诉">{appeal.appealText}</Descriptions.Item>
+        {/* 内部理由：本页可见，作者侧永不下发。 */}
+        <Descriptions.Item label="当初的下架理由（内部）">
+          {appeal.disposal?.reason ?? '—'}
+        </Descriptions.Item>
+      </Descriptions>
+
+      <Space direction="vertical" style={{ width: '100%' }} size="middle">
+        <Select
+          style={{ width: '100%' }}
+          value={decision}
+          onChange={(v) => setDecision(v)}
+          options={[
+            { value: 'uphold', label: '维持处置（内容保持下架）' },
+            {
+              value: 'overturn',
+              label: '改判并恢复（写回下架前的展示态）',
+              disabled: permanentlyRemoved,
+            },
+          ]}
+        />
+        {permanentlyRemoved && (
+          <Alert
+            type="warning"
+            showIcon
+            message="该内容已被永久移除，不可恢复"
+            description="永久移除是不可逆处置（位图连对象字节一并删除）。此处只能维持，并在答复里向作者说明；如需重新上线，由作者重新发布。"
+          />
+        )}
+        <Input.TextArea
+          rows={4}
+          value={reason}
+          onChange={(e) => setReason(e.target.value)}
+          placeholder="填写答复（必填，最长 500 字）。🔴 这段话会原样展示给作者，请按对外口径书写。"
+        />
+      </Space>
+    </Modal>
+  );
+}
+
+function DisposalAppealQueue({ onResolved }: { onResolved: () => void }) {
+  const [statusFilter, setStatusFilter] = useState('pending');
+  const [target, setTarget] = useState<DisposalAppealRow | null>(null);
+
+  const queue = usePagedList<DisposalAppealRow>(async (cursor) => {
+    const qs = new URLSearchParams({ limit: '20', status: statusFilter });
+    if (cursor) qs.set('cursor', cursor);
+    const res = await adminFetch<{ items: DisposalAppealRow[]; nextCursor: string | null }>(
+      `/admin/content/appeals?${qs.toString()}`,
+    );
+    return { items: res.items, nextCursor: res.nextCursor };
+  });
+  const { reload } = queue;
+  useEffect(() => {
+    reload();
+  }, [statusFilter, reload]);
+
+  const columns: TableColumnsType<DisposalAppealRow> = [
+    {
+      title: '主体',
+      key: 'subject',
+      render: (_, r) => (
+        <Space direction="vertical" size={0}>
+          <span>{KIND_TEXT[r.subjectKind] || r.subjectKind}</span>
+          <code style={{ fontSize: 12 }}>{r.subjectId}</code>
+        </Space>
+      ),
+    },
+    { title: '作者申诉', dataIndex: 'appealText', width: 260 },
+    {
+      title: '处置态',
+      key: 'disposalState',
+      render: (_, r) => stateTag(r.disposal?.state ?? r.disposalState),
+    },
+    {
+      title: '状态',
+      key: 'status',
+      render: (_, r) => {
+        const meta = APPEAL_STATUS_TEXT[r.status];
+        return <Tag color={meta?.color}>{meta?.text ?? r.status}</Tag>;
+      },
+    },
+    {
+      title: '答复（作者可见）',
+      key: 'resolution',
+      render: (_, r) => r.resolutionReason ?? '—',
+    },
+    { title: '提交时刻', key: 'createdAt', render: (_, r) => formatTime(r.createdAt) },
+    {
+      title: '操作',
+      key: 'op',
+      render: (_, r) =>
+        r.status === 'pending' ? (
+          <Button size="small" onClick={() => setTarget(r)}>
+            裁决
+          </Button>
+        ) : (
+          '—'
+        ),
+    },
+  ];
+
+  return (
+    <>
+      <Typography.Title level={5} style={{ marginTop: 28 }}>
+        处置申诉
+      </Typography.Title>
+      <Typography.Paragraph type="secondary">
+        被下架的作者对<b>处置本身</b>提的异议。与上方「申诉复审」分属两条路径：那条受理「发布时被驳回」、
+        改判即放行；这条受理「过审后被处置」、改判走恢复台阶写回下架前的展示态并把台账翻成已恢复。
+        每<b>一次处置</b>受理一次申诉——内容恢复后又被重新下架的，作者重新获得申诉权。
+      </Typography.Paragraph>
+      <Space style={{ marginBottom: 12 }}>
+        <span>申诉状态：</span>
+        <Select
+          style={{ width: 180 }}
+          value={statusFilter}
+          onChange={setStatusFilter}
+          options={[
+            { value: 'pending', label: '待裁决' },
+            { value: 'upheld', label: '维持处置' },
+            { value: 'overturned', label: '改判 · 已恢复' },
+            { value: 'all', label: '全部' },
+          ]}
+        />
+        <Button onClick={reload}>刷新</Button>
+      </Space>
+
+      {queue.error && <ErrorAlert message={queue.error} onRetry={reload} />}
+
+      <Table
+        rowKey="id"
+        size="small"
+        columns={columns}
+        dataSource={queue.items}
+        loading={queue.loading}
+        pagination={false}
+        scroll={{ x: 1100 }}
+        locale={{
+          emptyText: queue.error
+            ? '取数失败，见上方错误提示'
+            : '该筛选条件下没有处置申诉（这是真实结果，不是加载失败）',
+        }}
+      />
+
+      {queue.hasMore && (
+        <div style={{ textAlign: 'center', marginTop: 16 }}>
+          <Button onClick={queue.loadMore} loading={queue.loading}>
+            加载更多
+          </Button>
+        </div>
+      )}
+
+      <ResolveAppealModal
+        appeal={target}
+        onClose={() => setTarget(null)}
+        onDone={() => {
+          reload();
+          onResolved();
+        }}
+      />
+    </>
   );
 }

@@ -36,6 +36,7 @@ use crate::db::{new_id, now_ms, Placeholders};
 use crate::error::ApiError;
 use crate::idempotency;
 use crate::providers::ModerationVerdict;
+use crate::safety::disposal::NameGate;
 
 use muse_engine::narrative::types::Lethality;
 
@@ -599,7 +600,7 @@ async fn world_detail(
     // 一向是全绿的——`assembly::load_active_cards` 就是这么漏过去的）。
     // 阵容顺序是用户可见的展示序，抖动即前端列表乱跳。口径与 assembly/runtime 同名查询逐字一致。
     let member_rows = sqlx::query(
-        "SELECT wm.cloud_character_id AS cid, cc.card_json AS card, \
+        "SELECT wm.cloud_character_id AS cid, cc.card_json AS card, cc.moderation AS moderation, \
          cc.avatar_url AS avatar_url, cc.avatar_moderation AS avatar_moderation \
          FROM world_members wm JOIN cloud_characters cc ON cc.id = wm.cloud_character_id \
          WHERE wm.world_id = $1 AND wm.status='active' \
@@ -608,6 +609,11 @@ async fn world_detail(
     .bind(&id)
     .fetch_all(&state.db)
     .await?;
+    // 被处置内容的卡名闸门（默认关闭 → 下面那行是恒等函数，输出与本闸门存在前逐字节一致）。
+    // 🔴 **循环外解析一次**：`is_enabled` 会查库，逐行解析会把一次 roster 渲染变成 N 次查库。
+    let gate =
+        NameGate::resolve(&state.db, crate::flags::FlagCtx::user(&user.user_id).with_world(&id))
+            .await;
     let mut roster = Vec::new();
     for r in &member_rows {
         let cid: String = r.try_get("cid")?;
@@ -616,6 +622,9 @@ async fn world_detail(
             .ok()
             .and_then(|v| v["identity"]["name"].as_str().map(str::to_string))
             .unwrap_or_default();
+        // 卡被下架 → 名字换成中性占位（`world_events` 里已经落定的那些名字一个字节不动）。
+        let moderation: String = r.try_get("moderation")?;
+        let name = gate.display_name(&cid, Some(moderation.as_str()), name);
         let mut item = json!({ "cloudCharacterId": cid, "name": name, "aiLabel": { "visible": true } });
         // 红线：仅头像机审 approved 才带 avatarUrl，否则不带该字段（前端回退首字头像）。
         let avatar_url: Option<String> = r.try_get("avatar_url")?;
@@ -829,19 +838,29 @@ fn star_mileage_gate(star: i64) -> Option<i64> {
 /// 同源冲突拒绝文案里的角色名（`card_json.identity.name`）。
 /// 只在拒绝路径调用——正常 join 不反序列化整张卡（同源判定读的是物化列）。
 /// 取不到名字（卡结构异常/无名）时兜底为「该角色」，文案仍可读，绝不因取名失败改变判定。
-async fn character_display_name(db: &AnyPool, character_id: &str) -> String {
-    let card: Option<String> =
-        sqlx::query_scalar("SELECT card_json FROM cloud_characters WHERE id = $1")
+///
+/// 这段文案也是一处「现读现解 `card_json`」的展示面：它把**世界里已有的那个成员**的名字
+/// 报给正在尝试入场的另一个人看。所以被处置的卡在这里同样过闸门，否则下架的名字会从一条
+/// 409 文案里漏出去——而那正是最容易被拿来探测的一条路径。
+async fn character_display_name(db: &AnyPool, gate: NameGate, character_id: &str) -> String {
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT card_json, moderation FROM cloud_characters WHERE id = $1")
             .bind(character_id)
             .fetch_optional(db)
             .await
             .ok()
             .flatten();
-    card.as_deref()
+    let (card, moderation) = match row {
+        Some((c, m)) => (Some(c), Some(m)),
+        None => (None, None),
+    };
+    let name = card
+        .as_deref()
         .and_then(|text| serde_json::from_str::<Value>(text).ok())
         .and_then(|v| v.pointer("/identity/name").and_then(|n| n.as_str()).map(str::to_string))
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "该角色".to_string())
+        .unwrap_or_else(|| "该角色".to_string());
+    gate.display_name(character_id, moderation.as_deref(), name)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -981,7 +1000,13 @@ async fn join_world(
             .try_get("n")?;
             if same_source > 0 {
                 // 引导型拒绝（面向玩家）→ 用中文长句文案派，与机器码 world_not_joinable 一类区分。
-                let name = character_display_name(&state.db, &body.cloud_character_id).await;
+                let gate = NameGate::resolve(
+                    &state.db,
+                    crate::flags::FlagCtx::user(&user.user_id).with_world(&id),
+                )
+                .await;
+                let name =
+                    character_display_name(&state.db, gate, &body.cloud_character_id).await;
                 return Err(ApiError::Conflict(format!(
                     "这个世界已经有一个「{name}」了。编辑出你自己的版本，或换一个世界实例"
                 )));

@@ -7,7 +7,11 @@
 //! GET    /assets/characters/mine       我的云端版本列表（含审核态）
 //! GET    /assets/characters/{id}/status     审核态 + rejectReason（驳回理由回显）+ appeal（申诉状态）
 //!                                      + takedown（事后下架告知，migration 0044；只给状态与时间，不给运营内部理由）
+//!                                      + disposalAppeal（处置申诉最近一条，migration 0045）
 //! POST   /assets/characters/{id}/appeal     对机审/人审驳回发起申诉（owner-only，每主体终身一次；不改 moderation）
+//! POST   /assets/characters/{id}/disposal-appeal  对**过审后被处置**发起申诉（owner-only，每次处置一次；不改 moderation）
+//!                                      —— 与上一条分属两件事：那条受理 rejected（发布时被驳回），
+//!                                      这条受理 restricted/removed（过审后被下架）。表与改判路径都不同，见 migration 0045
 //! POST   /assets/characters/{id}/withdraw   停止后续投放（withdrawn=1；运行中世界按入场协议处理，S3 消费）
 //! DELETE /assets/characters/{id}       异步删除任务（data_requests）：从未投放 → 立删；已投放 → 标记 + 任务清理
 //!
@@ -44,6 +48,7 @@ pub fn router() -> Router<AppState> {
         .route("/assets/characters/mine", get(list_mine))
         .route("/assets/characters/{id}/status", get(status))
         .route("/assets/characters/{id}/appeal", post(appeal))
+        .route("/assets/characters/{id}/disposal-appeal", post(disposal_appeal))
         .route("/assets/characters/{id}/manifest", get(manifest))
         .route("/assets/characters/{id}/avatar", post(upload_avatar))
         .route("/assets/characters/{id}/withdraw", post(withdraw))
@@ -489,6 +494,17 @@ async fn status(State(state): State<AppState>, user: AuthUser, Path(id): Path<St
     // 面向作者的说明用固定文案，避免内部备注经由本端点外泄。
     let takedown = fetch_takedown_notice(&state, "character", &id).await?;
 
+    // 处置申诉（migration 0045）：作者对**处置本身**提的异议及其裁决结论。
+    //
+    // 🔴 与 `takedown` 字段并列而**不是**嵌在它里面，是因为两者的生命周期不同：处置被恢复后
+    // `takedown` 就不再下发（已恢复的内容对作者而言就是正常内容），而申诉记录必须留在原地——
+    // 否则「我申诉成功了」这条结论会随着内容恢复一起从作者眼前消失。
+    //
+    // 🔴 回显的 `resolutionReason` 是复审人**写给作者**的答复，与 `content_takedowns.reason`
+    // （运营内部处置备注）不是一回事。后者本端点一个字都不取。
+    let disposal_appeal =
+        crate::admin_api::disposal_appeal_view(&state.db, &id).await?.unwrap_or(serde_json::Value::Null);
+
     let resp = serde_json::json!({
         "id": id,
         "moderation": moderation,
@@ -498,8 +514,139 @@ async fn status(State(state): State<AppState>, user: AuthUser, Path(id): Path<St
         "rejectReason": reject_reason,
         "appeal": appeal,
         "takedown": takedown,
+        "disposalAppeal": disposal_appeal,
     });
     Ok(json_response(serde_json::to_string(&resp).unwrap()))
+}
+
+/// 处置申诉请求。`subjectKind` 缺省为 `character`（卡文被下架是主要情形）。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DisposalAppealReq {
+    text: String,
+    #[serde(default)]
+    subject_kind: Option<String>,
+}
+
+/// POST /assets/characters/{id}/disposal-appeal body {text, subjectKind?}：对**过审后被处置**发起申诉。
+///
+/// ## 与 `/appeal`（0018）的分工
+///
+/// `/appeal` 受理 `rejected`——「我发布的东西没通过审核」；本端点受理 `restricted` / `removed`
+/// ——「我已经过审、已经在线上的东西被拿下来了」。两者是**两次独立的处置事件**，
+/// 各有各的表、各有各的改判路径（本端点的改判走 `restore` 台阶，不会写常量 `approved`）。
+/// 详见 migration 0045 头注释。
+///
+/// ## 红线
+///
+/// - **提交不改任何 moderation**：下架继续生效到裁决为止（口径同 `/appeal`）。
+///   唯一的恢复路径仍是 `POST /admin/content/{kind}/{id}/restore` 或申诉改判，两者共用同一段实现。
+/// - **非 owner → 404**，不泄露存在性（口径同 `status` / `appeal`）。
+/// - **每次处置一次**：唯一索引 `(takedown_id, disposal_at)` 冲突 → 409。恢复后又被重新下架
+///   是一次**新的**处置（`disposal_at` 变了），作者重新获得申诉权——申诉权挂在处置事件上，
+///   不挂在主体上，否则第二次被下架的人永远申诉不了。
+async fn disposal_appeal(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<String>,
+    Json(req): Json<DisposalAppealReq>,
+) -> Result<Response, ApiError> {
+    let subject_kind = req.subject_kind.unwrap_or_else(|| "character".into());
+    if !crate::admin_api::APPEALABLE_SUBJECT_KINDS.contains(&subject_kind.as_str()) {
+        return Err(ApiError::BadRequest(format!(
+            "subjectKind 仅支持 {}",
+            crate::admin_api::APPEALABLE_SUBJECT_KINDS.join(" / ")
+        )));
+    }
+
+    // owner 鉴权：非本人或不存在 → 404（硬隔离，口径同 status/appeal）。
+    let owner: Option<String> =
+        sqlx::query_scalar("SELECT owner_id FROM cloud_characters WHERE id = $1 AND owner_id = $2")
+            .bind(&id)
+            .bind(&user.user_id)
+            .fetch_optional(&state.db)
+            .await?;
+    let owner = owner.ok_or(ApiError::NotFound)?;
+
+    let text = req.text.trim().to_string();
+    let chars = text.chars().count();
+    if chars == 0 || chars > 500 {
+        return Err(ApiError::BadRequest("申诉内容必填且不超过 500 字符".into()));
+    }
+
+    // 必须有一次**生效中**的处置才谈得上申诉。`restored` 不受理：内容已经回来了。
+    let disposal: Option<(String, String, i64)> = sqlx::query_as(
+        "SELECT id, state, created_at FROM content_takedowns \
+         WHERE subject_kind = $1 AND subject_id = $2 AND state IN ('restricted', 'removed')",
+    )
+    .bind(&subject_kind)
+    .bind(&id)
+    .fetch_optional(&state.db)
+    .await?;
+    let (takedown_id, disposal_state, disposal_at) = disposal.ok_or_else(|| {
+        ApiError::BadRequest("该内容当前没有生效中的处置，无需申诉".into())
+    })?;
+
+    let appeal_id = new_id("dap");
+    let now = now_ms();
+    let inserted = sqlx::query(
+        "INSERT INTO disposal_appeals \
+         (id, takedown_id, disposal_at, subject_kind, subject_id, owner_id, appeal_text, \
+          disposal_state, status, resolution_reason, reviewer_id, created_at, resolved_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', NULL, NULL, $9, NULL)",
+    )
+    .bind(&appeal_id)
+    .bind(&takedown_id)
+    .bind(disposal_at)
+    .bind(&subject_kind)
+    .bind(&id)
+    .bind(&owner)
+    .bind(&text)
+    .bind(&disposal_state)
+    .bind(now)
+    .execute(&state.db)
+    .await;
+    match inserted {
+        Ok(_) => {}
+        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+            return Err(ApiError::Conflict(
+                "本次处置已申诉过，每次处置仅可申诉一次（如内容被恢复后再次处置，可重新申诉）"
+                    .into(),
+            ));
+        }
+        Err(e) => return Err(e.into()),
+    }
+
+    let resp = serde_json::json!({
+        "id": appeal_id,
+        "subjectKind": subject_kind,
+        "subjectId": id,
+        "disposalState": disposal_state,
+        "status": "pending",
+        "appealText": text,
+        "resolutionReason": serde_json::Value::Null,
+        "createdAt": now,
+        "resolvedAt": serde_json::Value::Null,
+        // 提交不改展示态：处置继续生效到裁决为止。写进回执，避免被读成「申诉即恢复」。
+        "moderation": moderation_of_subject(&state, &subject_kind, &id).await?,
+    });
+    Ok(json_response(serde_json::to_string(&resp).unwrap()))
+}
+
+/// 回执里如实报当前展示态（证明「提交不改 moderation」）。
+async fn moderation_of_subject(
+    state: &AppState,
+    subject_kind: &str,
+    id: &str,
+) -> Result<Option<String>, ApiError> {
+    let col = if subject_kind == "character_avatar" { "avatar_moderation" } else { "moderation" };
+    // 列名来自上面这个二选一，主体 id 走 $1 绑定。
+    let v: Option<Option<String>> =
+        sqlx::query_scalar(&format!("SELECT {col} FROM cloud_characters WHERE id = $1"))
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await?;
+    Ok(v.flatten())
 }
 
 /// 申诉提交请求。

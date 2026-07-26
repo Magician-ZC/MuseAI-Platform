@@ -230,21 +230,32 @@ async fn expire_stale_invitations(db: &AnyPool) -> Result<u64, ApiError> {
 
 /// 角色展示名（`card_json.identity.name`）——面具身份，唯一对外可见的"人"的标识。
 /// 取不到名字（卡结构异常/无名/空 id）时兜底，绝不因取名失败改变任何判定。
+///
+/// 被处置的卡在这里过 `NameGate`（默认关闭 → 恒等）：邀请两侧看到的都是**对方**的角色名，
+/// 与 `social::character_name` 同一条口径。
 async fn character_name(db: &AnyPool, character_id: &str) -> String {
     if character_id.trim().is_empty() {
         return "房主".to_string();
     }
-    let card: Option<String> = sqlx::query_scalar("SELECT card_json FROM cloud_characters WHERE id = $1")
-        .bind(character_id)
-        .fetch_optional(db)
-        .await
-        .ok()
-        .flatten();
-    card.as_deref()
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT card_json, moderation FROM cloud_characters WHERE id = $1")
+            .bind(character_id)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+    let (card, moderation) = match row {
+        Some((c, m)) => (Some(c), Some(m)),
+        None => (None, None),
+    };
+    let name = card
+        .as_deref()
         .and_then(|text| serde_json::from_str::<Value>(text).ok())
         .and_then(|v| v.pointer("/identity/name").and_then(|n| n.as_str()).map(str::to_string))
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "该角色".to_string())
+        .unwrap_or_else(|| "该角色".to_string());
+    let gate = crate::safety::disposal::NameGate::resolve(db, crate::flags::FlagCtx::global()).await;
+    gate.display_name(character_id, moderation.as_deref(), name)
 }
 
 /// 世界的邀请相关投影：状态 / 房主 / 契约档落库值 / 标题。

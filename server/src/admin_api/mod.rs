@@ -10,6 +10,9 @@
 //!            POST /admin/content/{kind}/{id}/recheck|takedown|restore（migration 0044）
 //!            —— 前四项作用于**仍在队列里**的条目，这一组作用于**已经在线上**的内容。
 //!            🔴 处置的是展示面（主体的审核态列），已落定的世界事实一个字节不动，见 takedown.rs 模块头
+//!   处置申诉：GET /admin/content/appeals?status=&kind=、POST /admin/content/appeals/{id}/resolve
+//!            （migration 0045）——被处置的作者对**处置本身**提异议。与「申诉复审」分立：
+//!            那条受理发布期驳回、改判即写 approved；这条受理过审后被处置、改判走 restore 台阶
 //!   世界运营：GET /admin/worlds?status=、GET /admin/worlds/{id}/diagnostics（脱敏诊断）、
 //!            POST /admin/worlds/{id}/pause|resume、POST /admin/worlds（官方建房）、GET/POST /admin/world-templates、
 //!            POST /admin/world-templates/{id}/star（星级 curation：3-5★ 唯一晋升路径）
@@ -53,6 +56,14 @@ mod worlds_ops;
 #[cfg(test)]
 mod tests;
 
+/// 处置申诉的两件**作者侧**需要的东西（提交面在 `assets`，裁决面在本模块）。
+///
+/// 从这里再导出而不是让 `assets` 直接查表，是为了让「申诉行长什么样」只有一处定义——
+/// 尤其是那处定义**刻意不含** `content_takedowns.reason`（运营内部备注不进作者侧）。
+pub(crate) use takedown::appeals::{
+    latest_for_subjects as disposal_appeal_view, APPEALABLE_SUBJECT_KINDS,
+};
+
 /// dev-login 约定密钥（本地/CI 引导用）。可用环境变量 MUSE_ADMIN_DEV_SECRET 覆盖。
 const DEFAULT_DEV_ADMIN_SECRET: &str = "muse-dev-admin";
 
@@ -80,6 +91,11 @@ pub fn router() -> Router<AppState> {
         // 台账 `/admin/content/takedowns` 比 `/admin/content/{kind}/{id}` 少一段，
         // 两者在 matchit 里根本不在同一层，不存在「静态段被参数段吃掉」的歧义。
         .route("/admin/content/takedowns", get(takedown::list_takedowns))
+        // 处置申诉（migration 0045）：被下架的作者对**处置本身**提异议的裁决面。
+        // 与 `/admin/appeals`（0018 发布期驳回申诉）分立——改判动作不同，见 takedown/appeals.rs 模块头。
+        // 两条静态段 `takedowns` / `appeals` 与参数段 `{kind}` 在 matchit 里各自匹配，无歧义。
+        .route("/admin/content/appeals", get(takedown::appeals::list_appeals))
+        .route("/admin/content/appeals/{id}/resolve", post(takedown::appeals::resolve_appeal))
         .route("/admin/content/{kind}/{id}", get(takedown::subject_status))
         .route("/admin/content/{kind}/{id}/recheck", post(takedown::recheck))
         .route("/admin/content/{kind}/{id}/takedown", post(takedown::takedown))

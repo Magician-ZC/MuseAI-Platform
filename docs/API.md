@@ -64,8 +64,9 @@
 |---|---|---|---|
 | POST | `/api/assets/characters` | JWT | 发布角色卡到云端（字段级选择权在客户端落实） |
 | GET | `/api/assets/characters/mine` | JWT | 我的云端角色卡列表 |
-| GET | `/api/assets/characters/{id}/status` | JWT | 审核状态查询。含 `rejectReason`（人审驳回理由）、`appeal`（申诉行）、`takedown`（事后下架告知，见 §7「已过审内容处置」——只给状态与时间，**不含运营内部理由**）|
+| GET | `/api/assets/characters/{id}/status` | JWT | 审核状态查询。含 `rejectReason`（人审驳回理由）、`appeal`（发布期申诉行）、`takedown`（事后下架告知——只给状态与时间，**不含运营内部理由**）、`disposalAppeal`（处置申诉最近一条）。见 §7「已过审内容处置」/「处置申诉」|
 | POST | `/api/assets/characters/{id}/appeal` | JWT | 审核驳回后申诉 |
+| POST | `/api/assets/characters/{id}/disposal-appeal` | JWT owner | 对**过审后被处置**发起申诉（每次处置一次；不改 `moderation`）。与上一条分属两条路径，见 §7「处置申诉」|
 | GET | `/api/assets/characters/{id}/manifest` | JWT | 角色卡清单（钉住版本） |
 | POST | `/api/assets/characters/{id}/avatar` | JWT | 上传立绘 |
 | POST | `/api/assets/characters/{id}/withdraw` | JWT | 停止后续投放（幂等） |
@@ -706,9 +707,11 @@ if 线：   从终局那一拍岔出去的、只属于你的一条平行线   �
 | POST | `/api/admin/appeals/{id}/resolve` | reviewer | 申诉复审（overturn/uphold，**唯一改判路径**） |
 | GET | `/api/admin/content/takedowns?state=&kind=&cursor=&limit=` | reviewer | 已过审内容处置台账（复合游标 `createdAt:id`）。`state` ∈ `restricted`/`removed`/`restored`/`all`；未知 `state`/`kind` → 400（空列表会被读成「这类内容没被处置过」）|
 | GET | `/api/admin/content/{kind}/{id}` | reviewer | 单主体处置态 + `affectedRunningWorlds`（该主体仍在哪些运行中的世界里）|
-| POST | `/api/admin/content/{kind}/{id}/recheck` | reviewer | **再审**：把已过审内容送回人审队列，**不改展示态**。经 `safety::queue_operator_recheck`（入队/记险入口③）；同主体已有 `open` 队列行时幂等复用（`created:false`）|
+| POST | `/api/admin/content/{kind}/{id}/recheck` | reviewer | **再审**：把已过审内容送回人审队列，**不改展示态**。四类主体均可（文本走 `queue_operator_recheck`、位图走 `queue_operator_recheck_image`，同为入队/记险入口③）；同主体已有 `open` 队列行时幂等复用（`created:false`）|
 | POST | `/api/admin/content/{kind}/{id}/takedown` | reviewer；`permanent:true` 为 **admin 专属** | **下架**：展示态列置 `'takedown'`。默认 `restricted`（可恢复）；`permanent:true` → `removed`（不可恢复，位图主体连对象字节一并删除）|
 | POST | `/api/admin/content/{kind}/{id}/restore` | reviewer | **恢复**：写回台账里的 `prevModeration`。仅 `restricted` 可恢复，`removed` 恒 409 |
+| GET | `/api/admin/content/appeals?status=&kind=&cursor=&limit=` | reviewer | **处置申诉**队列（复合游标 `createdAt:id`）。`status` ∈ `pending`/`upheld`/`overturned`/`all`。每条附 `disposal` 段（处置台账全行，**含运营内部理由**——后台面才有）|
+| POST | `/api/admin/content/appeals/{id}/resolve` | reviewer | 处置申诉裁决 `{decision: uphold\|overturn, reason}`。`overturn` **走 `restore` 那一段实现**（写回 `prevModeration` + 台账翻 `restored`），不直接写 `approved`。`reason` 是**写给作者的答复**，会回显 |
 
 ### 已过审内容处置（migration 0044）
 
@@ -722,8 +725,8 @@ if 线：   从终局那一拍岔出去的、只属于你的一条平行线   �
 
 | kind | 表.列 | 关掉的既有闸门 |
 |---|---|---|
-| `character` | `cloud_characters.moderation` | `join` 409 `character_not_approved`；邀请接受同判 |
-| `character_avatar` | `cloud_characters.avatar_moderation` | `CharacterView` / world roster / backpack 三处「仅 approved 才下发 avatarUrl」|
+| `character` | `cloud_characters.moderation` | `join` 409 `character_not_approved`；邀请接受同判；**卡名解引用闸门**（roster / 遗作馆 / 悼念名单 / 社交与邀请对手方名，见下「卡名读取面闸门」）|
+| `character_avatar` | `cloud_characters.avatar_moderation` | `CharacterView` / world roster / backpack / 遗作馆 **四处**「仅 approved 才下发 avatarUrl」（遗作馆那处是后补的：0016 立规矩时它还不存在，此前无条件下发）|
 | `world_cover` | `worlds.cover_moderation` | `worlds::visible_cover_url`（大厅 / 世界详情 / 后台世界列表唯一闸门）|
 | `world_template` | `world_templates.moderation` | `create_room` 409 `template_not_approved`；assembly 蓝图解引用同判 |
 
@@ -732,11 +735,56 @@ if 线：   从终局那一拍岔出去的、只属于你的一条平行线   �
 | 🔴 边界 | 处置的是**展示面**，不是已发生的世界事实。`world_events` / `world_ticks` / `world_members` / `world_contributions` / `world_biographies` **一个字节不改**（§0.3 公共事实不可回滚），回执 `worldlineUntouched:true` 自述，用例逐字节快照守死 |
 | 🔴 运行中的世界 | **不受影响**：入场闸只在入场时判一次，被下架的卡会继续参演存量世界。回执与后台界面直接列出 `affectedRunningWorlds`，中止请走既有 `POST /admin/worlds/{id}/pause`；本端点**不代做强制离场**（那要改世界线相关表，需红线评审）|
 | 哨兵值 | `'takedown'`，**不复用 `'rejected'`**——后者是「发布时被驳回」的语义，复用会被 `POST /admin/appeals/{id}/resolve` 的改判路径悄悄翻转，且从此分不清「从未过审」与「过审后被下架」|
-| 队列不得复活 | `POST /admin/audit-queue/{id}/approve` 的回写带 `AND moderation <> 'takedown'` 守卫：已下架主体不得经人审队列绕过 `restore` 的权限与可逆性台阶复活。**reject 方向不设守卫**（驳回是更强的处置，应当落地）|
-| 再审可用范围 | 仅文本主体（`character` / `world_template`）。位图主体 400 如实告知：`check_image` 至今没有人审入队路径（见 migration 0027 注释），不假装排了队 |
+| 队列不得复活 | `POST /admin/audit-queue/{id}/approve` 的回写带 `<> 'takedown'` 守卫（位图两列可空，故写成 NULL 安全形式）：已下架主体不得经人审队列绕过 `restore` 的权限与可逆性台阶复活。**reject 方向不设守卫**（驳回是更强的处置，应当落地）|
+| 再审可用范围 | **四类主体全覆盖**。文本主体送 `card_json` / `skeleton_json` 的机审拼接文本；位图主体送对象存储里的那份字节走 `check_image`，人审详情附 `subjectImageUrl` 供查看（否则只能盲审）。字节取不到 → 409 如实告知，不排一条打不开图的队。🔴 位图入队与 `audit::review` 的两条位图回写分支是**一对**，缺任一半即 migration 0027 警告过的「无法被改判的死队列项」|
 | 留痕 | `audit_logs`（`content.takedown` / `content.takedown_permanent` / `content.restore` / `content.recheck`）+ `risk_events`（`content_disposal` / `content_recheck`，经 `safety` 入口，本模块不直写）。下架/恢复与留痕**同事务** |
 | 作者告知 | `GET /api/assets/characters/{id}/status` 增 `takedown` 字段（`state`/`reversible`/`takenDownAt`/固定 `notice`）。🔴 **不回显运营内部处置理由**（口径同 `audit_logs.reason`；对比人审驳回理由走的是专为回显而设的 `audit_queue.reject_reason`）。已恢复 → 不下发 |
-| 运营开关 | **无**。内容安全处置属于合规设施，定位同 `MUSE_SAFETY_LEXICON`——一个能被关掉的下架入口，在需要它的那一刻恰好可能是关的 |
+| 运营开关 | **处置能力无开关**（合规设施，定位同 `MUSE_SAFETY_LEXICON`——一个能被关掉的下架入口，在需要它的那一刻恰好可能是关的）。⚠️ **卡名读取面闸门另有开关且默认关闭**，两者不是一回事，见下 |
+| 作者申诉 | `POST /api/assets/characters/{id}/disposal-appeal`（migration 0045），见下「处置申诉」|
+
+### 卡名读取面闸门（`MUSE_DISPOSAL_NAME_GATE`，**默认关闭**）
+
+上表 `character` 那一行的既有闸门只管「进新世界」。roster / 遗作馆 / 悼念名单 / 社交与邀请的对手方名
+都是拿着 `card_json` **现读现解**出一个名字，从来不看审核态——于是下架一张卡断得掉入场与立绘，
+断不掉它在**存量世界里已经露出的名字**。实现 `server/src/safety/disposal.rs`。
+
+| 项 | 口径 |
+|---|---|
+| 🔴 边界 | 闸门只作用于「现在去读卡拿名字」的展示面。`world_events` 正文、`world_biographies.summary_json` 封卷快照是**已落定的事实**，一个字节不改（§0.3）。判据：关掉闸门这段文字会不会变——会变的才归它管 |
+| 接了哪些 | world roster（`GET /worlds/{id}`）· 同源冲突 409 文案 · 遗作馆四处（馆列表 / 传世卡详情的 `name` 与整段 `identity` / 悼念名单 / 我的悼念）· `social` 与 `invitations` 的对手方角色名 |
+| 刻意没接 | **引擎输入**（`assembly::load_active_cards`、`runtime` 的 `other_cards_brief`、`ifline`）——改它等于改运行中世界的叙事，是产品决策且会让黄金世界回归对不上；**已封卷快照**（`GET /worlds/{id}/biography`）——§0.3；**后台审核面**——人审要看的正是真名与全文；**作者自查面**（`GET /me/memberships` 是自己看自己）——替代文本是为了不把名字摆给**别人**看 |
+| 🔴 为什么有开关 | 打开它会改变**运行中世界**对玩家的显示（昨天还在的名字今天变成占位）。那是产品决策（什么时候开、开了给玩家看什么），不是工程能自作主张的事。故按 §0.1 登记进 `flags` 体系、默认关闭；关闭时各读取面输出与本闸门存在之前**逐字节一致** |
+| 替代文本 | `暂不可见的角色·<4 位十六进制>`，前缀参数化 `MUSE_DISPOSAL_DISPLAY_NAME`。判别位是主体 id 的 FNV-1a 折叠——**稳定**（无时间无随机）、**可区分**（同一列表上两张被处置的卡不塌成一个人）、**不泄露新信息**（这些响应体本就明文带着 `cloudCharacterId`）。刻意中性：它渲染在**第三方**页面上，平台不借占位符对被处置者做公开定性 |
+| 只认哨兵值 | 仅 `'takedown'` 触发。发布期的 `pending` / `rejected` 不归它管——那条路上的内容从来没在读取面露过面，混起来会让「从未过审」与「过审后被下架」在展示上分不清 |
+
+### 处置申诉（migration 0045）
+
+| | 发布期申诉 `/api/admin/appeals`（0018） | **处置申诉** `/api/admin/content/appeals`（0045） |
+|---|---|---|
+| 受理 | `rejected`（发布时被驳回） | `restricted` / `removed`（过审后被处置） |
+| 次数 | 每**主体**终身一次 | 每**次处置**一次（恢复后再被下架 = 新的一次，申诉权重开） |
+| 改判动作 | 直接写 `moderation='approved'` | 走 `restore` 那一段实现：写回 `prevModeration` + 台账翻 `restored` + 审计 + 风控 |
+
+**为什么不合表**：`content_takedowns` 每主体只留当前一行（重复下架 ON CONFLICT 覆盖、`id` 不变、
+`created_at` 刷新），故「哪一次处置」的标识是 `(takedownId, disposalAt)` 这一对，与 0018 的主体键
+不是一个形状。若把处置申诉塞进 0018 并把唯一索引扩成含可空的 `takedown_ref`，两个库的唯一索引
+**都不认为两个 NULL 相等**，0018「终身一次」的保证会在扩索引那一刻无声失效。更要命的是 0018 的
+`overturn` 直接写 `approved`——那正是 0044 给 `audit::review` 加守卫要防的洞（绕过恢复台阶，
+且台账还留着一条自称仍在下架的记录）。
+
+| 端点 | 鉴权 | 说明 |
+|---|---|---|
+| POST `/api/assets/characters/{id}/disposal-appeal` `{text, subjectKind?}` | JWT owner | `subjectKind` ∈ `character`（默认）/ `character_avatar`。非 owner → 404（不泄露存在性）；无生效中的处置 → 400；同一次处置重复提交 → 409。**提交不改任何 `moderation`** |
+| GET `/api/assets/characters/{id}/status` | JWT owner | 增 `disposalAppeal`（最近一条）。与 `takedown` **并列**而非嵌套：处置被恢复后 `takedown` 不再下发，申诉结论必须留在原地 |
+
+🔴 **两种"理由"不得互相顶替**：`content_takedowns.reason` 是运营内部处置备注，**作者侧一个字都不下发**
+（口径同 `audit_logs.reason`）；`disposal_appeals.resolution_reason` 是复审人**写给作者**的答复，会回显。
+后台队列的 `disposal` 段带前者，作者侧的 `disposalAppeal` 不带。
+
+**`removed` 的救济边界**：可以申诉（作者有权提异议、运营有义务答复），但 `overturn` 恒 409——
+永久移除不可逆（位图连对象字节一并删除），口径与 `restore` 逐字一致，不给不可逆开申诉侧门；
+重新上线的路径是作者重新发布。若运营在裁决前已自行恢复，`overturn` 如实记 `overturned` 且不再动状态
+（`restored:false` + `alreadyRestored:true`）——报 409 只会留下一条永远卡在 `pending` 的僵尸行。
 | GET | `/api/admin/worlds` | operator | 世界列表。含 `participantCount`、`successRate`（**0..1 小数**，无已终结 tick 时为 null）、`todayTokens`/`todayCostCents`/`todayCostCny` |
 | POST | `/api/admin/worlds` | operator | 官方建房。可选 `cover`（一次建完带图）· 可选 `series: {maxInstances}`（**登记为世界系列 1 号实例**，migration 0035；开关未开时 400，见 §3「世界系列自动扩容」）|
 | GET | `/api/admin/worlds/{id}/diagnostics` | operator | 脱敏诊断（采样种子不外泄）。`budget` 含金额换算与用量比：`spentCny`/`dailyCnyBudget`/`usageRatio`（**0..1**，取 token 与 cny 两维较大者）/`spentTokensTodayEffective`（跨日已归零）。另含 `series`（系列队列态；**不受 env 开关门控**——关阀时运营更需要看得见队列，开关状态另作 `autoscaleEnabled` 明示）与 `beBiography`（崩塌封卷元信息，正文另走玩家读取面）|

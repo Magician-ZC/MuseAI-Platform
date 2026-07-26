@@ -260,6 +260,18 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
         desc: "运行时敏感词库（审核链，默认开启；fail-safe 方向是「继续过滤」）",
         wired: false,
     },
+    FlagDef {
+        name: "MUSE_DISPOSAL_NAME_GATE",
+        default_enabled: false,
+        owner: "safety",
+        desc: "被处置内容在读取面上的卡名解引用闸门（roster / 遗作馆 / 悼念名单 / 社交与邀请对手方名）。\
+               🔴 与 `admin_api::takedown` 的处置能力**分属两件事**：处置能力是合规设施、恒开、不登记开关；\
+               本开关只决定「已经露在存量世界里的名字要不要换成中性占位」——那会改变运行中世界的显示，\
+               是产品决策，故默认关闭。🔴 闸门只作用于「现读现解 `card_json`」的展示面，\
+               `world_events` / 已封卷传记快照一个字节不动（§0.3）",
+        // 🔵 与 R3 那批新建件同理：新建件，没有需要保留的历史 env 语义，建成即接线。
+        wired: true,
+    },
 ];
 
 /// 按名字查登记项。未登记 → None（调用方按 fail-closed 处理）。

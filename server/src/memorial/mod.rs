@@ -73,6 +73,7 @@ use crate::auth::AuthUser;
 use crate::db::{new_id, now_ms};
 use crate::error::ApiError;
 use crate::idempotency;
+use crate::safety::disposal::NameGate;
 
 #[cfg(test)]
 mod tests;
@@ -573,6 +574,32 @@ fn display_name(card_json: &str) -> String {
         .unwrap_or_else(|| "无名者".to_string())
 }
 
+/// 遗作馆的展示名 = [`display_name`] 再过一道被处置内容的闸门（默认关闭 → 恒等）。
+///
+/// 遗作馆是**任何登录用户都能翻的公共陈列**（`_user` 只用于鉴权、不做归属过滤），
+/// 所以它是被处置的卡名最容易长期露出的地方：卡已封卷、不会再被谁"退出世界"带走。
+fn gated_name(gate: NameGate, character_id: &str, moderation: Option<&str>, card_json: &str) -> String {
+    gate.display_name(character_id, moderation, display_name(card_json))
+}
+
+/// 🔴 立绘读取面双过滤（`providers::ModerationProvider::check_image` 红线）：
+/// 仅 `avatar_moderation == 'approved'` 才下发 URL，其余（未过审 / 已下架 / 无立绘）一律 `null`。
+///
+/// **本函数是补上来的**：遗作馆是这条红线的**第四处**读取面，而 0016 立下这条规矩时它还不存在
+/// （`admin_api::takedown` 的不变式表里至今只列着「CharacterView / world roster / backpack 三处」）。
+/// 缺这一道，一张被下架的立绘照样能在遗作馆里对全体登录用户下发——下架在这条路径上是失效的。
+fn visible_avatar_url(avatar_url: Option<String>, avatar_moderation: Option<&str>) -> Value {
+    match avatar_moderation {
+        Some(MODERATION_APPROVED) => {
+            avatar_url.filter(|u| !u.trim().is_empty()).map(Value::String).unwrap_or(Value::Null)
+        }
+        _ => Value::Null,
+    }
+}
+
+/// 立绘/卡片「已过审」的字面量（与 `safety::disposal::APPROVED` 同源）。
+const MODERATION_APPROVED: &str = crate::safety::disposal::APPROVED;
+
 #[derive(Debug, Deserialize)]
 struct HallQuery {
     #[serde(default)]
@@ -603,7 +630,8 @@ async fn memorial_hall(
     // 次级排序键 id 不可省：同毫秒封卷时行序由 DB 决定，分页会漏行/重行。
     let rows = sqlx::query(
         "SELECT cc.id AS id, cc.card_json AS card_json, cc.mileage AS mileage, \
-                cc.avatar_url AS avatar_url, cc.memorial_sealed_at AS sealed_at, \
+                cc.moderation AS moderation, cc.avatar_url AS avatar_url, \
+                cc.avatar_moderation AS avatar_moderation, cc.memorial_sealed_at AS sealed_at, \
                 cc.memorial_world_id AS world_id, w.title AS world_title \
          FROM cloud_characters cc LEFT JOIN worlds w ON w.id = cc.memorial_world_id \
          WHERE cc.memorial_status = $1 \
@@ -615,13 +643,21 @@ async fn memorial_hall(
     .fetch_all(&state.db)
     .await?;
 
+    // 🔴 循环外解析一次（`is_enabled` 会查库）。遗作馆无世界维度，按查看者解析。
+    let gate = NameGate::resolve(&state.db, crate::flags::FlagCtx::user(&_user.user_id)).await;
     let mut characters = Vec::with_capacity(rows.len());
     for r in &rows {
         let card_json: String = r.try_get("card_json")?;
+        let cid: String = r.try_get("id")?;
+        let moderation: Option<String> = r.try_get("moderation")?;
+        let avatar_moderation: Option<String> = r.try_get("avatar_moderation")?;
         characters.push(json!({
-            "id": r.try_get::<String, _>("id")?,
-            "name": display_name(&card_json),
-            "avatarUrl": r.try_get::<Option<String>, _>("avatar_url")?,
+            "id": cid,
+            "name": gated_name(gate, &cid, moderation.as_deref(), &card_json),
+            "avatarUrl": visible_avatar_url(
+                r.try_get::<Option<String>, _>("avatar_url")?,
+                avatar_moderation.as_deref(),
+            ),
             // 历练：显性资产之一（§12「卡的价值 = 累计人生」）。只作陈列，绝不进引擎决策。
             "mileage": r.try_get::<i64, _>("mileage")?,
             "sealedAt": r.try_get::<Option<i64>, _>("sealed_at")?,
@@ -656,6 +692,7 @@ async fn memorial_detail(
     ensure_enabled()?;
     let row = sqlx::query(
         "SELECT cc.card_json AS card_json, cc.mileage AS mileage, cc.avatar_url AS avatar_url, \
+                cc.moderation AS moderation, cc.avatar_moderation AS avatar_moderation, \
                 cc.memorial_sealed_at AS sealed_at, cc.memorial_world_id AS world_id, \
                 w.title AS world_title \
          FROM cloud_characters cc LEFT JOIN worlds w ON w.id = cc.memorial_world_id \
@@ -667,6 +704,9 @@ async fn memorial_detail(
     .await?
     .ok_or(ApiError::NotFound)?;
     let card_json: String = row.try_get("card_json")?;
+    let moderation: Option<String> = row.try_get("moderation")?;
+    let avatar_moderation: Option<String> = row.try_get("avatar_moderation")?;
+    let gate = NameGate::resolve(&state.db, crate::flags::FlagCtx::user(&_user.user_id)).await;
 
     // 足迹：这张卡走过的世界（含已退场的——**足迹是履历，不因死亡消失**）。
     let foot_rows = sqlx::query(
@@ -692,7 +732,7 @@ async fn memorial_detail(
     // 羁绊：谁还记得他（带着他的「故人」印记的在世角色）。同样只出角色面具，不出主人。
     let mark_rows = sqlx::query(
         "SELECT mm.character_id AS character_id, mm.world_id AS world_id, \
-                mm.granted_at AS granted_at, cc.card_json AS card_json \
+                mm.granted_at AS granted_at, cc.card_json AS card_json, cc.moderation AS moderation \
          FROM memorial_marks mm LEFT JOIN cloud_characters cc ON cc.id = mm.character_id \
          WHERE mm.deceased_character_id = $1 ORDER BY mm.granted_at ASC, mm.character_id ASC",
     )
@@ -702,25 +742,41 @@ async fn memorial_detail(
     let mut remembered_by = Vec::with_capacity(mark_rows.len());
     for r in &mark_rows {
         let card: Option<String> = r.try_get("card_json")?;
+        let mourner: String = r.try_get("character_id")?;
+        let mourner_moderation: Option<String> = r.try_get("moderation")?;
         remembered_by.push(json!({
-            "characterId": r.try_get::<String, _>("character_id")?,
-            "name": card.as_deref().map(display_name),
+            "characterId": mourner,
+            // 悼念名单上的是**别人**的角色：被处置的那些同样过闸门。
+            "name": card
+                .as_deref()
+                .map(|c| gated_name(gate, &mourner, mourner_moderation.as_deref(), c)),
             "worldId": r.try_get::<String, _>("world_id")?,
             "grantedAt": r.try_get::<i64, _>("granted_at")?,
         }));
     }
 
     let card: Value = serde_json::from_str(&card_json).unwrap_or_else(|_| json!({}));
+    // 🔴 `biography.identity` 是**整张 `identity` 子对象原样透传**——闸门只改 `name` 一个字段
+    // 是不够的，真名会从这里整块漏出去。被处置时整段隐去（`null`），与「卡面不可下发」同义；
+    // 未被处置（含闸门关闭）时逐字节原样，快照一个字节不改。
+    let identity = if gate.hides(moderation.as_deref()) {
+        Value::Null
+    } else {
+        card.get("identity").cloned().unwrap_or(json!(null))
+    };
     Ok(Json(json!({
         "id": character_id,
-        "name": display_name(&card_json),
-        "avatarUrl": row.try_get::<Option<String>, _>("avatar_url")?,
+        "name": gated_name(gate, &character_id, moderation.as_deref(), &card_json),
+        "avatarUrl": visible_avatar_url(
+            row.try_get::<Option<String>, _>("avatar_url")?,
+            avatar_moderation.as_deref(),
+        ),
         "memorialStatus": STATUS_SEALED,
         "readOnly": true,
         "mileage": row.try_get::<i64, _>("mileage")?,
         "biography": {
-            // 卡面身份原样陈列（不可变快照的一部分，一个字节不改）。
-            "identity": card.get("identity").cloned().unwrap_or(json!(null)),
+            // 卡面身份原样陈列（不可变快照的一部分，一个字节不改）；被处置时整段隐去，见上。
+            "identity": identity,
             "sealedAt": row.try_get::<Option<i64>, _>("sealed_at")?,
             "sealedIn": {
                 "worldId": row.try_get::<Option<String>, _>("world_id")?,
@@ -744,7 +800,9 @@ async fn my_marks(State(state): State<AppState>, user: AuthUser) -> Result<Json<
     let rows = sqlx::query(
         "SELECT mm.character_id AS character_id, mm.deceased_character_id AS deceased_id, \
                 mm.world_id AS world_id, mm.kind AS kind, mm.granted_at AS granted_at, \
-                mine.card_json AS mine_card, gone.card_json AS gone_card, w.title AS world_title \
+                mine.card_json AS mine_card, mine.moderation AS mine_moderation, \
+                gone.card_json AS gone_card, gone.moderation AS gone_moderation, \
+                w.title AS world_title \
          FROM memorial_marks mm \
          LEFT JOIN cloud_characters mine ON mine.id = mm.character_id \
          LEFT JOIN cloud_characters gone ON gone.id = mm.deceased_character_id \
@@ -755,19 +813,29 @@ async fn my_marks(State(state): State<AppState>, user: AuthUser) -> Result<Json<
     .fetch_all(&state.db)
     .await?;
 
+    let gate = NameGate::resolve(&state.db, crate::flags::FlagCtx::user(&user.user_id)).await;
     let mut marks = Vec::with_capacity(rows.len());
     for r in &rows {
         let mine_card: Option<String> = r.try_get("mine_card")?;
         let gone_card: Option<String> = r.try_get("gone_card")?;
+        let mine_id: String = r.try_get("character_id")?;
+        let gone_id: String = r.try_get("deceased_id")?;
+        let mine_moderation: Option<String> = r.try_get("mine_moderation")?;
+        let gone_moderation: Option<String> = r.try_get("gone_moderation")?;
         marks.push(json!({
             "kind": r.try_get::<String, _>("kind")?,
             "character": {
-                "id": r.try_get::<String, _>("character_id")?,
-                "name": mine_card.as_deref().map(display_name),
+                "id": mine_id,
+                "name": mine_card
+                    .as_deref()
+                    .map(|c| gated_name(gate, &mine_id, mine_moderation.as_deref(), c)),
             },
             "departed": {
-                "id": r.try_get::<String, _>("deceased_id")?,
-                "name": gone_card.as_deref().map(display_name),
+                // 🔴 逝者是**别人**的角色（这正是这条印记的意义），故同样过闸门。
+                "id": gone_id,
+                "name": gone_card
+                    .as_deref()
+                    .map(|c| gated_name(gate, &gone_id, gone_moderation.as_deref(), c)),
             },
             "worldId": r.try_get::<String, _>("world_id")?,
             "worldTitle": r.try_get::<Option<String>, _>("world_title")?,

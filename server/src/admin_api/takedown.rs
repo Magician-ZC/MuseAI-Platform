@@ -15,10 +15,16 @@
 //!
 //! | kind | 表 | 展示态列 | 该列既有的读取面闸门 |
 //! |---|---|---|---|
-//! | `character` | `cloud_characters` | `moderation` | `worlds::join_world` 非 approved → 409；`invitations` 接受邀请同判 |
-//! | `character_avatar` | `cloud_characters` | `avatar_moderation` | `CharacterView` / world roster / backpack 三处「仅 approved 才下发 avatarUrl」 |
+//! | `character` | `cloud_characters` | `moderation` | `worlds::join_world` 非 approved → 409；`invitations` 接受邀请同判；**卡名解引用**见下 |
+//! | `character_avatar` | `cloud_characters` | `avatar_moderation` | `CharacterView` / world roster / backpack / **遗作馆** 四处「仅 approved 才下发 avatarUrl」 |
 //! | `world_cover` | `worlds` | `cover_moderation` | `worlds::visible_cover_url`（大厅 / 世界详情 / 后台世界列表共用的唯一闸门） |
 //! | `world_template` | `world_templates` | `moderation` | `worlds::create_room` 非 approved → 409；`assembly` 蓝图解引用同判 |
+//!
+//! ⚠️ **`moderation` 那一行的闸门此前只管「进新世界」，不管「已经露出的名字」**：roster / 遗作馆 /
+//! 悼念名单都是拿着 `card_json` 现读现解出一个名字，从来不看审核态。于是下架一张卡断得掉入场与
+//! 立绘，断不掉它在存量世界里的名字——处置不彻底。补在 `safety::disposal::NameGate`
+//! （**默认关闭**，见该模块头「为什么是开关」）。立绘那一行的「遗作馆」也是本批次补的：
+//! 0016 立下双过滤规矩时遗作馆还不存在，那处一直在无条件下发 `avatar_url`。
 //!
 //! 加上处置台账 `content_takedowns`、审计 `audit_logs`、风控 `risk_events`、人审队列 `audit_queue`
 //! ——**七张表，一张世界线表都不在其中**。`world_events` / `world_ticks` / `world_members` /
@@ -89,15 +95,18 @@ use super::{audit_tx, clamp_limit, parse_cursor, require_role};
 
 /// 展示态列被下架时写入的哨兵值。**必须是非 `'approved'` 值**——四个读取面闸门判的都是
 /// 「等于 approved」，本模块的全部拦截力都由这一条不变式提供。
-pub(super) const TAKEDOWN: &str = "takedown";
+///
+/// 🔴 定义在 `safety::disposal`（读取面闸门那边）并在此再导出，**全仓只有那一处字面量**：
+/// 写入侧与读取侧各写一份的话，哪天改了其中一处，下架会静默失效且两边都不报错。
+pub(super) use crate::safety::disposal::TAKEDOWN;
 
 /// 处置台账 `state` 的三个取值。
-const STATE_RESTRICTED: &str = "restricted";
-const STATE_REMOVED: &str = "removed";
-const STATE_RESTORED: &str = "restored";
+pub(super) const STATE_RESTRICTED: &str = "restricted";
+pub(super) const STATE_REMOVED: &str = "removed";
+pub(super) const STATE_RESTORED: &str = "restored";
 
 /// 只有当前展示态是它的主体才谈得上「下架」（本模块补的是**已过审**内容的入口）。
-const APPROVED: &str = "approved";
+pub(super) use crate::safety::disposal::APPROVED;
 
 /// 处置理由长度上限（口径同申诉复审 / 举报处置）。
 const REASON_MAX_CHARS: usize = 500;
@@ -106,26 +115,26 @@ const REASON_MAX_CHARS: usize = 500;
 const AFFECTED_WORLDS_LIMIT: i64 = 50;
 
 /// 风控留痕 kind（`risk_events.kind`）。处置动作与机审判定分开计，否则风控面上的机审命中率会失真。
-const DISPOSAL_RISK_KIND: &str = "content_disposal";
+pub(super) const DISPOSAL_RISK_KIND: &str = "content_disposal";
 
 /// 一类可处置主体的静态描述。
 ///
 /// 🔴 `table` / `moderation_column` / `object_key_column` 会被 `format!` 拼进 SQL——它们
 /// **只能**来自本文件的 [`SUBJECTS`] 常量数组，绝不接受任何请求字段。路径上的 `kind` 先经
 /// [`spec_of`] 在白名单里查表，查不到直接 400，因此请求内容永远不会到达 SQL 文本里。
-struct SubjectSpec {
-    kind: &'static str,
-    label: &'static str,
+pub(super) struct SubjectSpec {
+    pub(super) kind: &'static str,
+    pub(super) label: &'static str,
     table: &'static str,
     moderation_column: &'static str,
     /// 位图主体的对象键列；永久移除时据此删除字节。文本主体为 `None`（不删字节，见模块头）。
     object_key_column: Option<&'static str>,
     /// 该主体送人审队列时用的 `audit_queue.subject_kind`。
     ///
-    /// 🔴 必须是 `admin_api::audit::review` 的 `match subject_kind` **认识**的值，否则人审
-    /// 点了通过/驳回也无处回写主体，等于制造一条永远悬空的队列项（0027 迁移注释里记着封面
-    /// 正是因为这个原因至今不入队）。位图主体为 `None` = 没有文本再审通道，见 [`recheck`]。
-    recheck_queue_kind: Option<&'static str>,
+    /// 🔴 必须是 `admin_api::audit::writeback_target` **认识**的值，否则人审点了通过/驳回也
+    /// 无处回写主体，等于制造一条永远悬空的队列项（0027 迁移注释里记着封面正是因为这个原因
+    /// 一度不入队）。该不变式由 `tests::red_line_every_recheck_kind_has_a_writeback_branch` 守死。
+    recheck_queue_kind: &'static str,
 }
 
 const SUBJECTS: &[SubjectSpec] = &[
@@ -135,7 +144,7 @@ const SUBJECTS: &[SubjectSpec] = &[
         table: "cloud_characters",
         moderation_column: "moderation",
         object_key_column: None,
-        recheck_queue_kind: Some("character"),
+        recheck_queue_kind: "character",
     },
     SubjectSpec {
         kind: "character_avatar",
@@ -143,8 +152,9 @@ const SUBJECTS: &[SubjectSpec] = &[
         table: "cloud_characters",
         moderation_column: "avatar_moderation",
         object_key_column: Some("avatar_object_key"),
-        // 立绘是位图：`ModerationProvider::check_text` 对它无意义，没有文本再审通道。
-        recheck_queue_kind: None,
+        // 位图再审走 `check_image`（`safety` 入口 ③ 的位图变体）+ audit::review 的
+        // `character_avatar` 回写分支。两者是一对，见 `queue_operator_recheck_image` 注释。
+        recheck_queue_kind: "character_avatar",
     },
     SubjectSpec {
         kind: "world_cover",
@@ -152,7 +162,7 @@ const SUBJECTS: &[SubjectSpec] = &[
         table: "worlds",
         moderation_column: "cover_moderation",
         object_key_column: Some("cover_object_key"),
-        recheck_queue_kind: None,
+        recheck_queue_kind: "world_cover",
     },
     SubjectSpec {
         kind: "world_template",
@@ -161,11 +171,11 @@ const SUBJECTS: &[SubjectSpec] = &[
         moderation_column: "moderation",
         object_key_column: None,
         // 创作者资产与官方模板同落 world_templates，audit::review 两个字面量都认。
-        recheck_queue_kind: Some("world_template"),
+        recheck_queue_kind: "world_template",
     },
 ];
 
-fn spec_of(kind: &str) -> Result<&'static SubjectSpec, ApiError> {
+pub(super) fn spec_of(kind: &str) -> Result<&'static SubjectSpec, ApiError> {
     SUBJECTS.iter().find(|s| s.kind == kind).ok_or_else(|| {
         let known: Vec<&str> = SUBJECTS.iter().map(|s| s.kind).collect();
         ApiError::BadRequest(format!("未知处置主体 {kind:?}；支持：{}", known.join(" / ")))
@@ -173,7 +183,7 @@ fn spec_of(kind: &str) -> Result<&'static SubjectSpec, ApiError> {
 }
 
 /// 处置理由：必填、trim 后 1..=500 字符。理由不是可选的——没有理由的处置无法复盘。
-fn validate_reason(raw: &str) -> Result<String, ApiError> {
+pub(super) fn validate_reason(raw: &str) -> Result<String, ApiError> {
     let reason = raw.trim().to_string();
     let n = reason.chars().count();
     if n == 0 || n > REASON_MAX_CHARS {
@@ -236,7 +246,7 @@ fn takedown_json(row: &sqlx::any::AnyRow) -> Result<Value, ApiError> {
 const TAKEDOWN_COLUMNS: &str = "id, subject_kind, subject_id, state, prev_moderation, reason, \
      actor_id, actor_role, bytes_purged, created_at, restored_at, restored_by, restore_reason";
 
-async fn fetch_takedown(
+pub(super) async fn fetch_takedown(
     db: &sqlx::AnyPool,
     kind: &str,
     subject_id: &str,
@@ -280,7 +290,7 @@ async fn current_moderation(
 
 /// 主体归属：`character*` → owner 用户 id；`world_cover` → 世界 id。用于风控留痕的维度。
 /// 模板无用户维度（官方/创作者两种来源，`world_templates` 无 owner 列）→ 两维皆空。
-async fn subject_dimensions(
+pub(super) async fn subject_dimensions(
     db: &sqlx::AnyPool,
     spec: &SubjectSpec,
     id: &str,
@@ -461,7 +471,8 @@ pub(super) async fn subject_status(
         "takenDown": moderation.as_deref() == Some(TAKEDOWN),
         // 只有当前处于 approved 的主体谈得上「下架」——本模块补的是已过审内容的入口。
         "canTakedown": moderation.as_deref() == Some(APPROVED),
-        "canRecheck": spec.recheck_queue_kind.is_some(),
+        // 四类主体现在都有再审通道（位图那两条在本批次接上）；能不能真的发起仍看展示态是否 approved。
+        "canRecheck": moderation.as_deref() == Some(APPROVED),
         "takedown": fetch_takedown(&state.db, spec.kind, &id).await?.unwrap_or(Value::Null),
         "affectedRunningWorldCount": affected_count,
         "affectedRunningWorlds": affected,
@@ -690,64 +701,12 @@ pub(super) async fn restore(
     }
     let prev = row["prevModeration"].as_str().unwrap_or(APPROVED).to_string();
 
-    let (user_dim, world_dim) = subject_dimensions(&state.db, spec, &id).await?;
+    // 维度在开事务前取完（见 `restore_in_tx` 的 `dims` 参数注释）。
+    let dims = subject_dimensions(&state.db, spec, &id).await?;
     let now = now_ms();
-
     let mut tx = state.db.begin().await?;
-    // CAS 到 'takedown'：若期间人审在队列里把它判成了 rejected，这里命中 0 行 → 409，
-    // 恢复不会把一个刚被驳回的主体重新点亮。
-    let res = sqlx::query(&format!(
-        "UPDATE {table} SET {col} = $1 WHERE id = $2 AND {col} = $3",
-        table = spec.table,
-        col = spec.moderation_column
-    ))
-    .bind(&prev)
-    .bind(&id)
-    .bind(TAKEDOWN)
-    .execute(&mut *tx)
-    .await?;
-    if res.rows_affected() == 0 {
-        tx.rollback().await.ok();
-        return Err(ApiError::Conflict("该主体审核态已被并发修改，请刷新后重试".into()));
-    }
-
-    let res = sqlx::query(
-        "UPDATE content_takedowns SET state = $1, restored_at = $2, restored_by = $3, \
-         restore_reason = $4 WHERE subject_kind = $5 AND subject_id = $6 AND state = $7",
-    )
-    .bind(STATE_RESTORED)
-    .bind(now)
-    .bind(&admin.0.user_id)
-    .bind(&reason)
-    .bind(spec.kind)
-    .bind(&id)
-    .bind(STATE_RESTRICTED)
-    .execute(&mut *tx)
-    .await?;
-    if res.rows_affected() == 0 {
-        tx.rollback().await.ok();
-        return Err(ApiError::Conflict("该处置记录已被并发修改，请刷新后重试".into()));
-    }
-
-    audit_tx(&mut tx, &admin.0, "content.restore", &format!("{}:{}", spec.kind, id), &reason)
+    restore_in_tx(&mut tx, spec, &id, &admin.0, "content.restore", &reason, &prev, &dims, now)
         .await?;
-    crate::safety::record_risk_tx(
-        &mut tx,
-        user_dim.as_deref(),
-        world_dim.as_deref(),
-        DISPOSAL_RISK_KIND,
-        json!({
-            "action": "content.restore",
-            "subjectKind": spec.kind,
-            "subjectId": id,
-            "state": STATE_RESTORED,
-            "restoredTo": prev,
-            "actorId": admin.0.user_id,
-            "actorRole": admin.0.role,
-            "reason": reason,
-        }),
-    )
-    .await?;
     tx.commit().await?;
 
     Ok(Json(json!({
@@ -759,6 +718,86 @@ pub(super) async fn restore(
         "restoredAt": now,
         "worldlineUntouched": true,
     })))
+}
+
+/// 恢复的**唯一实现**：展示态写回 + 台账翻 `restored` + 审计 + 风控，全在调用方的事务里。
+///
+/// 🔴 抽出来是为了让「恢复」在全仓只有一份代码。它有两个调用方——运营主动恢复
+/// （[`restore`]）与处置申诉改判（[`appeals::resolve_appeal`]）。两条路各写一遍的话，
+/// 迟早有一条会漏掉其中一步（最容易漏的是台账那一步：展示态回来了，`content_takedowns`
+/// 却仍自称在下架中，于是作者侧的告知与后台台账开始互相打架）。
+///
+/// 两处 CAS 各挡一种并发：
+/// - 展示态 CAS 到 `'takedown'` —— 期间若人审在队列里把它判成了 `rejected`，这里命中 0 行 → 409，
+///   恢复不会把一个刚被驳回的主体重新点亮；
+/// - 台账 CAS 到 `restricted` —— 期间若它被升级成了 `removed`，同样 409（不可逆就是不可逆）。
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn restore_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    spec: &SubjectSpec,
+    id: &str,
+    actor: &crate::auth::AuthUser,
+    action: &str,
+    reason: &str,
+    prev: &str,
+    // 🔴 风控维度由调用方**在 `begin()` 之前**取好传进来，本函数绝不再向池借连接：
+    // 单连接池（测试 / SQLite dev）下事务持有唯一连接，事务内再借一条必然 PoolTimedOut
+    // （同 `safety::record_risk_tx` 的注释）。这是本函数签名上带着 `dims` 而不是 `state` 的原因。
+    dims: &(Option<String>, Option<String>),
+    now: i64,
+) -> Result<(), ApiError> {
+    let (user_dim, world_dim) = dims;
+
+    let res = sqlx::query(&format!(
+        "UPDATE {table} SET {col} = $1 WHERE id = $2 AND {col} = $3",
+        table = spec.table,
+        col = spec.moderation_column
+    ))
+    .bind(prev)
+    .bind(id)
+    .bind(TAKEDOWN)
+    .execute(&mut **tx)
+    .await?;
+    if res.rows_affected() == 0 {
+        return Err(ApiError::Conflict("该主体审核态已被并发修改，请刷新后重试".into()));
+    }
+
+    let res = sqlx::query(
+        "UPDATE content_takedowns SET state = $1, restored_at = $2, restored_by = $3, \
+         restore_reason = $4 WHERE subject_kind = $5 AND subject_id = $6 AND state = $7",
+    )
+    .bind(STATE_RESTORED)
+    .bind(now)
+    .bind(&actor.user_id)
+    .bind(reason)
+    .bind(spec.kind)
+    .bind(id)
+    .bind(STATE_RESTRICTED)
+    .execute(&mut **tx)
+    .await?;
+    if res.rows_affected() == 0 {
+        return Err(ApiError::Conflict("该处置记录已被并发修改，请刷新后重试".into()));
+    }
+
+    audit_tx(tx, actor, action, &format!("{}:{}", spec.kind, id), reason).await?;
+    crate::safety::record_risk_tx(
+        tx,
+        user_dim.as_deref(),
+        world_dim.as_deref(),
+        DISPOSAL_RISK_KIND,
+        json!({
+            "action": action,
+            "subjectKind": spec.kind,
+            "subjectId": id,
+            "state": STATE_RESTORED,
+            "restoredTo": prev,
+            "actorId": actor.user_id,
+            "actorRole": actor.role,
+            "reason": reason,
+        }),
+    )
+    .await?;
+    Ok(())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -774,13 +813,18 @@ pub(super) async fn restore(
 /// INSERT `audit_queue` / `risk_events`。随后人审在既有工作台上 approve/reject，裁决经
 /// `audit::review` 回写主体 moderation——闭环由既有路径完成，不另造一套。
 ///
-/// 前置条件是当前展示态 `approved`：
-/// - 已下架的主体不允许再审。原因是 `audit::review` 的 approve 分支会把主体写成 `'approved'`，
-///   那会**绕过 `restore` 的可逆性台阶**把下架悄悄撤销掉。（另有一道保险在 `audit::review`
-///   里：approve 回写带 `AND moderation <> 'takedown'` 守卫。前置条件与守卫是同一件事的两道锁。）
-/// - 位图主体（立绘 / 封面）没有文本再审通道：`ModerationProvider::check_text` 对图片无意义，
-///   而 `check_image` 至今没有人审入队路径（0027 迁移注释里记着封面因此不入队）。
-///   对它们只提供下架，且如实报 400 而不是假装排了队。
+/// 前置条件是当前展示态 `approved`：已下架的主体不允许再审。原因是 `audit::review` 的 approve
+/// 分支会把主体写成 `'approved'`，那会**绕过 `restore` 的可逆性台阶**把下架悄悄撤销掉。
+/// （另有一道保险在 `audit::review` 里：approve 回写带 NULL 安全的 `<> 'takedown'` 守卫。
+/// 前置条件与守卫是同一件事的两道锁。）
+///
+/// ## 位图主体（立绘 / 封面）
+///
+/// 曾经**只能下架、不能再审**：`check_image` 有裁决却没有人审入队路径（0027 迁移注释记着这处
+/// 缺口），本端点遇到位图只能 400 如实告知「没有排队这回事」。现已接上——走
+/// `safety::queue_operator_recheck_image`（入口 ③ 的位图变体）+ `audit::review` 的两条位图回写
+/// 分支。送审的是**对象存储里那份字节本身**，取不到字节则 409 如实报错（凭空排一条队，
+/// 人审点开只会看到一张打不开的图）。
 pub(super) async fn recheck(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -790,14 +834,7 @@ pub(super) async fn recheck(
     require_role(&admin, &["reviewer"])?;
     let spec = spec_of(&kind)?;
     let reason = validate_reason(&req.reason)?;
-
-    let queue_kind = spec.recheck_queue_kind.ok_or_else(|| {
-        ApiError::BadRequest(format!(
-            "{}是位图资产，暂无文本再审通道（图片机审 check_image 尚无人审入队路径）；\
-             如需处置请直接下架",
-            spec.label
-        ))
-    })?;
+    let queue_kind = spec.recheck_queue_kind;
 
     let cur = current_moderation(&state.db, spec, &id).await?.ok_or(ApiError::NotFound)?;
     let cur = cur.unwrap_or_default();
@@ -808,40 +845,72 @@ pub(super) async fn recheck(
         )));
     }
 
-    // 送审文本必须与**发布时机审看的那一段逐字一致**，否则两次机审看的不是同一份内容，
-    // 「上次过了这次没过」就无从归因。故复用发布路径的同两个拼接函数。
-    let scan_text = match spec.kind {
-        "character" => {
-            let card: String =
-                sqlx::query_scalar("SELECT card_json FROM cloud_characters WHERE id = $1")
-                    .bind(&id)
-                    .fetch_optional(&state.db)
-                    .await?
-                    .ok_or(ApiError::NotFound)?;
-            let card: Value = serde_json::from_str(&card).unwrap_or(Value::Null);
-            crate::safety::card_scan_text(&card)
+    // 送审内容必须与**发布时机审看的那一份逐字一致**，否则两次机审看的不是同一个东西，
+    // 「上次过了这次没过」就无从归因：文本主体复用发布路径的同两个拼接函数，
+    // 位图主体取对象存储里的同一份字节。
+    let (queue_id, verdict, created) = match spec.object_key_column {
+        // ── 位图主体 ─────────────────────────────────────────────────────────
+        Some(key_col) => {
+            let key: Option<Option<String>> = sqlx::query_scalar(&format!(
+                "SELECT {key_col} FROM {table} WHERE id = $1",
+                table = spec.table
+            ))
+            .bind(&id)
+            .fetch_optional(&state.db)
+            .await?;
+            let key = key.ok_or(ApiError::NotFound)?.filter(|k| !k.trim().is_empty()).ok_or_else(
+                || ApiError::Conflict(format!("该主体没有可再审的{}（无对象键）", spec.label)),
+            )?;
+            let bytes = state.objects.get(&key).map_err(|e| {
+                // 不 500：字节读不到是数据面的真实状态，且下架这条路仍然可用。
+                tracing::warn!(kind = spec.kind, subject = %id, key = %key, error = %e, "位图再审取字节失败");
+                ApiError::Conflict(format!(
+                    "该{}的对象字节读取失败（可能已被永久移除时清除）；无法送人审，如需处置请直接下架",
+                    spec.label
+                ))
+            })?;
+            crate::safety::queue_operator_recheck_image(
+                &state,
+                queue_kind,
+                &id,
+                &bytes,
+                &admin.0.user_id,
+                &reason,
+            )
+            .await?
         }
-        _ => {
-            let skeleton: String =
-                sqlx::query_scalar("SELECT skeleton_json FROM world_templates WHERE id = $1")
-                    .bind(&id)
-                    .fetch_optional(&state.db)
-                    .await?
-                    .ok_or(ApiError::NotFound)?;
-            let skeleton: Value = serde_json::from_str(&skeleton).unwrap_or(Value::Null);
-            crate::assets::worlds::world_scan_text(&skeleton)
+        // ── 文本主体 ─────────────────────────────────────────────────────────
+        None => {
+            let scan_text = if spec.kind == "character" {
+                let card: String =
+                    sqlx::query_scalar("SELECT card_json FROM cloud_characters WHERE id = $1")
+                        .bind(&id)
+                        .fetch_optional(&state.db)
+                        .await?
+                        .ok_or(ApiError::NotFound)?;
+                let card: Value = serde_json::from_str(&card).unwrap_or(Value::Null);
+                crate::safety::card_scan_text(&card)
+            } else {
+                let skeleton: String =
+                    sqlx::query_scalar("SELECT skeleton_json FROM world_templates WHERE id = $1")
+                        .bind(&id)
+                        .fetch_optional(&state.db)
+                        .await?
+                        .ok_or(ApiError::NotFound)?;
+                let skeleton: Value = serde_json::from_str(&skeleton).unwrap_or(Value::Null);
+                crate::assets::worlds::world_scan_text(&skeleton)
+            };
+            crate::safety::queue_operator_recheck(
+                &state,
+                queue_kind,
+                &id,
+                &scan_text,
+                &admin.0.user_id,
+                &reason,
+            )
+            .await?
         }
     };
-
-    let (queue_id, verdict, created) = crate::safety::queue_operator_recheck(
-        &state,
-        queue_kind,
-        &id,
-        &scan_text,
-        &admin.0.user_id,
-        &reason,
-    )
-    .await?;
 
     super::audit(
         &state.db,
@@ -869,9 +938,12 @@ pub(super) async fn recheck(
             "需要立刻断掉展示请另行调用 takedown；两个动作正交。",
             "人审在既有审核工作台裁决（POST /admin/audit-queue/{id}/approve|reject），裁决回写主体审核态。",
             "同一主体已有待审队列行时不重复入队（回执 created=false），避免同一张卡被多人举报后刷屏人审队列。",
+            "位图主体（立绘 / 世界封面）送审的是对象存储里的那份字节，走图片机审；人审工作台上会附图（subjectImageUrl）。",
         ],
     })))
 }
+
+pub(super) mod appeals;
 
 #[cfg(test)]
 mod tests;

@@ -1006,3 +1006,145 @@ async fn auto_seal_is_disabled_with_the_switch_off() {
     assert_eq!(sealed, 0);
     assert_eq!(memorial_status_of(&state, "chA").await, "living");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 被处置内容在遗作馆上的读取面闸门 + 立绘双过滤（0044 的第四条腿）
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 打开卡名闸门（global 作用域）。默认关闭，只有显式写这一行才生效。
+async fn open_name_gate(state: &AppState) {
+    sqlx::query(
+        "INSERT INTO runtime_flags (id, flag, scope, target_id, enabled, starts_at, ends_at, \
+         updated_by, updated_at, reason, created_at) \
+         VALUES ('rf_gate', $1, 'global', '', 1, 0, 0, 'tester', $2, '用例', $3)",
+    )
+    .bind(crate::safety::disposal::FLAG_NAME_GATE)
+    .bind(now_ms())
+    .bind(now_ms())
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+async fn take_down(state: &AppState, char_id: &str) {
+    sqlx::query(
+        "INSERT INTO content_takedowns (id, subject_kind, subject_id, state, prev_moderation, \
+         reason, actor_id, actor_role, bytes_purged, created_at) \
+         VALUES ($1, 'character', $2, 'restricted', 'approved', '举报核实', 'adm', 'reviewer', 0, $3)",
+    )
+    .bind(new_id("ctd"))
+    .bind(char_id)
+    .bind(now_ms())
+    .execute(&state.db)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE cloud_characters SET moderation = 'takedown' WHERE id = $1")
+        .bind(char_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+}
+
+/// 🔴 遗作馆是被处置卡名**最容易长期露出**的地方：卡已封卷，不会再被谁「退出世界」带走，
+/// 而馆列表对任何登录用户开放。闸门开启后四处（馆列表 / 详情名 / 详情 `identity` 整块 /
+/// 悼念名单）都必须停止解引用。
+#[tokio::test]
+async fn disposed_cards_stop_being_dereferenced_across_the_memorial_hall() {
+    let state = test_state().await;
+    let _sw = MemorialSwitch::set(true);
+    seed_landed_death(&state).await;
+    send(&state, "POST", "/api/me/characters/chA/memorial", "u1", None, None).await;
+    open_name_gate(&state).await;
+
+    // 逝者（陈列主体）与悼念者（别人的角色）各处置一张，四个位置一次看全。
+    take_down(&state, "chA").await;
+    take_down(&state, "chB").await;
+
+    let (st, hall) = send(&state, "GET", "/api/memorial/characters", "u2", None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_ne!(hall["characters"][0]["name"], json!("裴照"), "馆列表仍在解引用被处置的卡名：{hall}");
+    assert!(!hall.to_string().contains("裴照"), "{hall}");
+
+    let (st, detail) = send(&state, "GET", "/api/memorial/characters/chA", "u2", None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        !detail.to_string().contains("裴照"),
+        "🔴 `biography.identity` 是整块原样透传——只换 `name` 一个字段是不够的：{detail}"
+    );
+    assert!(detail["biography"]["identity"].is_null(), "被处置时整段 identity 隐去：{detail}");
+    assert!(
+        !detail.to_string().contains("沈砚"),
+        "🔴 悼念名单上是**别人**的角色，同样要过闸门：{detail}"
+    );
+    // 陈列本身不消失：足迹、历练、封卷落款照旧（下架的是名字的解引用，不是这张卡存在过这件事）。
+    assert_eq!(detail["mileage"], json!(420));
+    assert_eq!(detail["memorialStatus"], json!("sealed"));
+
+    let (_, marks) = send(&state, "GET", "/api/me/memorial/marks", "u2", None, None).await;
+    assert!(!marks.to_string().contains("裴照"), "我的悼念里的逝者名同样过闸门：{marks}");
+}
+
+/// 🔴 闸门默认关闭 → 遗作馆输出与本闸门存在之前**逐字节一致**。
+#[tokio::test]
+async fn red_line_disabled_gate_leaves_the_memorial_hall_byte_identical() {
+    let state = test_state().await;
+    let _sw = MemorialSwitch::set(true);
+    seed_landed_death(&state).await;
+    send(&state, "POST", "/api/me/characters/chA/memorial", "u1", None, None).await;
+
+    // 不写 runtime_flags、不设 env → 解析必然落到「代码内默认值 = 关闭」。
+    let (_, before) = send(&state, "GET", "/api/memorial/characters/chA", "u2", None, None).await;
+    take_down(&state, "chA").await;
+    take_down(&state, "chB").await;
+    let (_, after) = send(&state, "GET", "/api/memorial/characters/chA", "u2", None, None).await;
+
+    assert_eq!(
+        before.to_string(),
+        after.to_string(),
+        "🔴 闸门默认关闭：处置前后遗作馆详情必须逐字节一致"
+    );
+    assert!(after.to_string().contains("裴照"), "关闭态就是今天的行为：真名照常下发");
+}
+
+/// 🔴 **立绘读取面双过滤在遗作馆上此前是缺的**（0016 立规矩时遗作馆还不存在，
+/// `admin_api::takedown` 的不变式表至今只列着「CharacterView / world roster / backpack 三处」）。
+///
+/// 缺这一道，一张**被下架的立绘**照样能在遗作馆里对全体登录用户下发——下架在这条路径上是失效的。
+/// 本用例把遗作馆钉成第四处：非 approved 一律不下发，与另外三处逐字同口径。
+#[tokio::test]
+async fn red_line_memorial_never_serves_unapproved_avatars() {
+    let state = test_state().await;
+    let _sw = MemorialSwitch::set(true);
+    seed_landed_death(&state).await;
+    send(&state, "POST", "/api/me/characters/chA/memorial", "u1", None, None).await;
+
+    sqlx::query(
+        "UPDATE cloud_characters SET avatar_url = '/api/assets/objects/a.png', \
+         avatar_moderation = 'approved' WHERE id = 'chA'",
+    )
+    .execute(&state.db)
+    .await
+    .unwrap();
+    let (_, hall) = send(&state, "GET", "/api/memorial/characters", "u2", None, None).await;
+    assert_eq!(hall["characters"][0]["avatarUrl"], json!("/api/assets/objects/a.png"));
+
+    // 三种非 approved 态逐一走一遍：下架 / 待人审 / 已驳回，一个都不许下发。
+    for state_value in ["takedown", "pending", "rejected"] {
+        sqlx::query("UPDATE cloud_characters SET avatar_moderation = $1 WHERE id = 'chA'")
+            .bind(state_value)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let (_, hall) = send(&state, "GET", "/api/memorial/characters", "u2", None, None).await;
+        assert!(
+            hall["characters"][0]["avatarUrl"].is_null(),
+            "🔴 遗作馆下发了 avatar_moderation='{state_value}' 的立绘：{hall}"
+        );
+        let (_, detail) =
+            send(&state, "GET", "/api/memorial/characters/chA", "u2", None, None).await;
+        assert!(
+            detail["avatarUrl"].is_null(),
+            "🔴 传世卡详情下发了 avatar_moderation='{state_value}' 的立绘：{detail}"
+        );
+    }
+}

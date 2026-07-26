@@ -6,18 +6,25 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 MuseAI-Platform 是 MuseAI 的**双轨仓库**：
 - **本地轨**：Tauri 2 桌面应用——本地 AI 伴侣 / 角色扮演 / 文字冒险 / 穿书互动 + 小说辅助创作。前端 React 19 + TypeScript + Vite + antd v6 + Zustand（`src/`），桌面后端 Rust（`src-tauri/`，lib 名 `tauri_app_lib`）。本地数据存 `~/Documents/MuseAI/`，LLM 用用户自己的 API Key。
-- **平台轨**：多人世界平台——`crates/muse-engine`（宿主无关叙事引擎，trait 注入 ModelClient/fs/clock）+ `server/`（axum + sqlx AnyPool，SQLite dev / Postgres prod，迁移 `server/migrations/0001-0020` 启动自动执行）+ `admin/`（运营后台 React）+ `src/pages/platform/`（玩家端）。产品总规格 `docs/build/spec-world-ecosystem.md`，验证节奏 `docs/VALIDATION.md`，启动文档 `docs/STARTUP.md`。
+- **平台轨**：多人世界平台——`crates/muse-engine`（宿主无关叙事引擎，trait 注入 ModelClient/fs/clock）+ `server/`（axum + sqlx AnyPool，SQLite dev / Postgres prod，迁移 `server/migrations/0001-0031` 启动自动执行（0023/0028 是有意跳过的空号，见 STARTUP.md §5））+ `admin/`（运营后台 React）+ `src/pages/platform/`（玩家端）。产品总规格 `docs/build/spec-world-ecosystem.md`，验证节奏 `docs/VALIDATION.md`，启动文档 `docs/STARTUP.md`。
 
 平台轨常用命令（**仓库根没有 workspace `Cargo.toml`**，每个 crate 独立成包，cargo 命令必须 `cd` 进目录或带 `--manifest-path`）：
 ```bash
 cd server && cargo run --features billing,arena                 # 起平台 server(:8787)
-cargo test --manifest-path server/Cargo.toml                    # 273 passed（default）
-cargo test --manifest-path server/Cargo.toml --features billing,arena   # 349 passed
-cargo test --manifest-path crates/muse-engine/Cargo.toml        # 226 passed
+cargo test --manifest-path server/Cargo.toml                    # 464 passed（default，含黄金世界回归）
+cargo test --manifest-path server/Cargo.toml --features billing,arena   # 542 passed
+cargo test --manifest-path crates/muse-engine/Cargo.toml        # 244 passed
+cargo test --manifest-path server/Cargo.toml golden             # 12 项黄金世界回归（换模型/Prompt/引擎版本后必跑）
 cd admin && npm run build                                       # admin 类型检查+构建（端口 1430）
 ```
 
-接口清单见 `docs/API.md`（84 条路由 / 鉴权级别 / feature 门控 / admin 角色矩阵）。
+接口清单见 `docs/API.md`（路由 / 鉴权级别 / feature 门控 / admin 角色矩阵；改路由必须同步改它）。
+
+R1 批次（总规格 §19 地基批）后新增的 server 模块：
+- `slo/` — 叙事质量 SLO 指标（基尼/无戏份/收尾/二次入世/状态-文本矛盾），只读聚合，进 `/admin/metrics/overview` 的 `narrativeSlo`
+- `invitations/` — 房间邀请（默认关闭）。🔴 接受邀请**只置状态、不写 `world_members`**，真正入场仍走 `join`，故所有资格校验一条不少
+- `onboarding/` — 新手动线（预制卡 + 单人微本 + 礼包）
+- `runtime/golden.rs` — 黄金世界回归（`#[cfg(test)]`，自动进 CI 的 platform-test job）
 
 ## 常用命令
 

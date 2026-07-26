@@ -39,6 +39,11 @@ interface WorldApiRow {
   /** 今日成本：cents 为账面整数分，cny 为展示派生值。 */
   todayCostCents: number | null;
   todayCostCny: number | null;
+  /**
+   * 世界封面（迁移 0027）。**仅机审 approved 才会下发**；无封面 / 未过审 → 后端**不写该键**
+   *（不是空串、不是 null），故此处可选；缺席时走 `thumbnailFor` 的确定性兜底图。
+   */
+  coverUrl?: string | null;
 }
 
 interface TickMeta {
@@ -94,7 +99,6 @@ interface CostOverview {
 }
 
 interface ConsoleWorld extends WorldApiRow {
-  thumbnail: string;
   roomTypeLabel: string;
   /** 以下两项接口暂未提供，正式模式恒 null → 表格显示空态。 */
   moderationLatency: number | null;
@@ -145,9 +149,11 @@ const TICK_ERROR_TEXT: Record<string, string> = {
 };
 
 /**
- * 世界封面占位图。
- * TODO(接口缺字段): coverUrl —— /admin/worlds 未返回封面，正式模式按 world.id 哈希确定性取图
- *（同一世界恒定同一张，既不全站同图也不随机）。接口补齐后直接改读 coverUrl。
+ * 世界封面**兜底图**（不是假数据，是"这个世界没有可展示封面"的确定性占位）。
+ *
+ * 真实封面走 `/admin/worlds` 的 `coverUrl`：后端只在机审 approved 时下发该键，
+ * 无封面 / 待人审 / 被拒 → 键缺席，此时按 `world.id` 哈希取本表中的一张——
+ * 同一世界恒定同一张，既不全站同图（分不清哪行是哪个世界）也不随机（每次刷新换图）。
  */
 const WORLD_THUMBNAILS = [
   '/assets/worlds/mist-sea-world.png',
@@ -220,7 +226,7 @@ const PREVIEW_WORLDS: ConsoleWorld[] = [
     modelRouteVersion: 'qwen-max-primary', stateRevision: 1842391, spentTokensToday: 642000, dailyTokenBudget: 1000000,
     fused: false, createdAt: 1753392753000, successRate: 0.962, todayTokens: 642000, todayCostCents: 12864,
     todayCostCny: 128.64, moderationLatency: 1.6,
-    lastActivityAt: 1753428000000, thumbnail: '/assets/worlds/mist-sea-world.png',
+    lastActivityAt: 1753428000000, coverUrl: '/assets/worlds/mist-sea-world.png',
   },
   {
     id: 'world_1002', title: '静止山脉', roomType: 'exploration', roomTypeLabel: '探索房', status: 'running', visibility: 'public',
@@ -228,7 +234,7 @@ const PREVIEW_WORLDS: ConsoleWorld[] = [
     modelRouteVersion: 'qwen-max-primary', stateRevision: 812104, spentTokensToday: 483000, dailyTokenBudget: 800000,
     fused: false, createdAt: 1753392100000, successRate: 0.978, todayTokens: 483000, todayCostCents: 9671,
     todayCostCny: 96.71, moderationLatency: 1.2,
-    lastActivityAt: 1753427880000, thumbnail: '/assets/worlds/still-mountains.png',
+    lastActivityAt: 1753427880000, coverUrl: '/assets/worlds/still-mountains.png',
   },
   {
     id: 'world_1003', title: '星火酒馆', roomType: 'social', roomTypeLabel: '社交房', status: 'attention', visibility: 'public',
@@ -236,7 +242,7 @@ const PREVIEW_WORLDS: ConsoleWorld[] = [
     modelRouteVersion: 'qwen-max-primary', stateRevision: 302768, spentTokensToday: 321000, dailyTokenBudget: 500000,
     fused: false, createdAt: 1753391800000, successRate: 0.906, todayTokens: 321000, todayCostCents: 6433,
     todayCostCny: 64.33, moderationLatency: 3.8,
-    lastActivityAt: 1753427940000, thumbnail: '/assets/worlds/ember-tavern.png',
+    lastActivityAt: 1753427940000, coverUrl: '/assets/worlds/ember-tavern.png',
   },
   {
     id: 'world_1004', title: '机械之城', roomType: 'quest', roomTypeLabel: '任务房', status: 'running', visibility: 'official',
@@ -244,7 +250,7 @@ const PREVIEW_WORLDS: ConsoleWorld[] = [
     modelRouteVersion: 'qwen-max-primary', stateRevision: 1231009, spentTokensToday: 1051000, dailyTokenBudget: 1400000,
     fused: false, createdAt: 1753391600000, successRate: 0.951, todayTokens: 1051000, todayCostCents: 21038,
     todayCostCny: 210.38, moderationLatency: 1.4,
-    lastActivityAt: 1753428000000, thumbnail: '/assets/worlds/mechanical-city.png',
+    lastActivityAt: 1753428000000, coverUrl: '/assets/worlds/mechanical-city.png',
   },
   {
     id: 'world_1005', title: '沙海旅途', roomType: 'story', roomTypeLabel: '剧情房', status: 'attention', visibility: 'public',
@@ -252,7 +258,7 @@ const PREVIEW_WORLDS: ConsoleWorld[] = [
     modelRouteVersion: 'qwen-max-backup', stateRevision: 213557, spentTokensToday: 210000, dailyTokenBudget: 400000,
     fused: false, createdAt: 1753391300000, successRate: 0.883, todayTokens: 210000, todayCostCents: 4219,
     todayCostCny: 42.19, moderationLatency: 4.5,
-    lastActivityAt: 1753427820000, thumbnail: '/assets/worlds/desert-journey.png',
+    lastActivityAt: 1753427820000, coverUrl: '/assets/worlds/desert-journey.png',
   },
   {
     id: 'world_1006', title: '永夜之境', roomType: 'side', roomTypeLabel: '副本房', status: 'fused', visibility: 'official',
@@ -260,7 +266,7 @@ const PREVIEW_WORLDS: ConsoleWorld[] = [
     modelRouteVersion: 'qwen-max-backup', stateRevision: 87662, spentTokensToday: 0, dailyTokenBudget: 300000,
     fused: true, createdAt: 1753390900000, successRate: null, todayTokens: 0, todayCostCents: 0,
     todayCostCny: 0, moderationLatency: null,
-    lastActivityAt: 1753426980000, thumbnail: '/assets/worlds/evernight-realm.png',
+    lastActivityAt: 1753426980000, coverUrl: '/assets/worlds/evernight-realm.png',
   },
 ];
 
@@ -278,6 +284,15 @@ function hashOf(text: string): number {
 
 function thumbnailFor(id: string): string {
   return WORLD_THUMBNAILS[hashOf(id) % WORLD_THUMBNAILS.length];
+}
+
+/**
+ * 世界缩略图取图：**有真实过审封面就用真封面**，否则按 id 哈希取确定性兜底图。
+ * 正式模式与预览模式共用本函数——预览样本同样只给 `coverUrl`，不额外造一条渲染路径。
+ * 后端对未过审封面是"不下发该键"，这里再挡一次空串/空白，避免任何来源的空值渲染成碎图。
+ */
+function coverSrc(world: { id: string; coverUrl?: string | null }): string {
+  return world.coverUrl?.trim() || thumbnailFor(world.id);
 }
 
 /**
@@ -369,7 +384,7 @@ function apiRowToConsole(row: WorldApiRow): ConsoleWorld {
     moderationLatency: null,
     // TODO(接口缺字段): lastActivityAt —— worlds.updated_at 已存在但未投影；createdAt ≠ 最后活动，不可顶替。
     lastActivityAt: null,
-    thumbnail: thumbnailFor(row.id),
+    // coverUrl 由 ...row 原样带入（后端只在机审 approved 时下发该键），取图统一走 coverSrc。
     status: deriveStatus(row),
   };
 }
@@ -838,7 +853,7 @@ export default function WorldsMonitorConsole() {
                     >
                       <td>
                         <span className="world-table__world">
-                          <img src={world.thumbnail} alt="" />
+                          <img src={coverSrc(world)} alt="" />
                           <strong>{world.title}</strong>
                         </span>
                       </td>
@@ -914,7 +929,7 @@ export default function WorldsMonitorConsole() {
           {selected ? (
             <>
               <header className="world-inspector__identity">
-                <img src={selected.thumbnail} alt={`${selected.title}缩略图`} />
+                <img src={coverSrc(selected)} alt={`${selected.title}缩略图`} />
                 <div>
                   <div><h2>{selected.title}</h2><span className={`world-status ${statusClass(selected.status)}`}><i />{STATUS_TEXT[selected.status] ?? selected.status}</span></div>
                   <p>世界ID：{selected.id}　 房间类型：{selected.roomTypeLabel}</p>

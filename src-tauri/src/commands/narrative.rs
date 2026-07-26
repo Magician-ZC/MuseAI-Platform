@@ -142,6 +142,10 @@ pub async fn start_narrative_round(app: AppHandle, request: RoundRequestDto) -> 
             // 没有实名与未成年门，故桌面壳恒用默认档（同意制：不可逆事件仍走临场同意）。
             // 双模式红线：本地能力与平台能力物理隔离，桌面壳不读也不暴露平台契约配置。
             lethality: Lethality::default(),
+            // 身份池（规格 §5）同样是平台世界的装配层产物——身份由 assemble_instance 按实例种子
+            // 分配、钉进 assembled_json。本地模式没有装配层、没有世界实例，故恒为空表
+            // （引擎对空表的处理与本字段落地前完全一致）。
+            self_identities: BTreeMap::new(),
         };
         let result = engine.run_round(&routes, &prompts, input, &flag).await;
         let payload = match &result {

@@ -2457,3 +2457,240 @@ async fn narrative_slo_role_gate_operator_finance_admin_only() {
     assert_eq!(get(&app, ov, Some(&user_token(&state))).await.0, StatusCode::FORBIDDEN);
     assert_eq!(get(&app, ov, None).await.0, StatusCode::UNAUTHORIZED);
 }
+
+// ---------------- 世界封面（迁移 0027）：后台列表投影 + 官方建房带图 ----------------
+
+/// 封面 base64 载荷（形态与 `POST /worlds/{id}/cover` 逐字一致）。
+fn admin_cover_body(bytes: &[u8], mime: &str) -> Value {
+    use base64::Engine as _;
+    json!({
+        "imageBase64": base64::engine::general_purpose::STANDARD.encode(bytes),
+        "mime": mime,
+    })
+}
+
+/// 直接写封面三列（模拟已上传 + 指定机审裁决）。DevModeration::check_image 恒直过，
+/// 从上传路径造不出 pending/rejected，范式同 worlds::tests 的 force_cover_moderation。
+async fn set_world_cover(state: &AppState, world_id: &str, url: &str, moderation: &str) {
+    sqlx::query(
+        "UPDATE worlds SET cover_object_key = ?, cover_url = ?, cover_moderation = ? WHERE id = ?",
+    )
+    .bind(format!("covers/{world_id}.png"))
+    .bind(url)
+    .bind(moderation)
+    .bind(world_id)
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+fn find_admin_world<'a>(body: &'a Value, id: &str) -> &'a Value {
+    body["worlds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["id"] == id)
+        .unwrap_or_else(|| panic!("列表里没有 {id}: {body}"))
+}
+
+/// 🔴 后台世界列表的 coverUrl 与玩家大厅同一个闸门（`worlds::visible_cover_url`）：
+/// 只有 approved 才下发；pending/rejected/无封面/空白 URL 一律**键缺席**（不是空串、不是 null）。
+#[tokio::test]
+async fn admin_worlds_list_projects_only_approved_cover() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+    let now = now_ms();
+
+    ins_world(&state, "w_cov_ok", "running", now).await;
+    ins_world(&state, "w_cov_pending", "running", now - 1000).await;
+    ins_world(&state, "w_cov_rejected", "running", now - 2000).await;
+    ins_world(&state, "w_cov_blank", "running", now - 3000).await;
+    ins_world(&state, "w_cov_none", "running", now - 4000).await;
+    let ok_url = "/api/assets/objects/covers/w_cov_ok.png";
+    set_world_cover(&state, "w_cov_ok", ok_url, "approved").await;
+    set_world_cover(&state, "w_cov_pending", "/api/assets/objects/covers/w_cov_pending.png", "pending").await;
+    set_world_cover(&state, "w_cov_rejected", "/api/assets/objects/covers/w_cov_rejected.png", "rejected").await;
+    // 空白 URL + approved：闸门 trim 后归零，绝不下发空串。
+    set_world_cover(&state, "w_cov_blank", "   ", "approved").await;
+
+    let (st, body) = get(&app, "/api/admin/worlds", Some(&admin)).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+
+    assert_eq!(find_admin_world(&body, "w_cov_ok")["coverUrl"], ok_url, "过审封面应下发");
+    for id in ["w_cov_pending", "w_cov_rejected"] {
+        let item = find_admin_world(&body, id);
+        assert!(item.get("coverUrl").is_none(), "🔴 未过审封面不得出现在后台列表: {item}");
+    }
+    let blank = find_admin_world(&body, "w_cov_blank");
+    assert!(blank.get("coverUrl").is_none(), "空白 URL 不得下发（更不得下发空串）: {blank}");
+    let none = find_admin_world(&body, "w_cov_none");
+    assert!(none.get("coverUrl").is_none(), "无封面世界须**键缺席**，让前端走确定性兜底图: {none}");
+    assert_ne!(none.get("coverUrl").and_then(|v| v.as_str()), Some(""), "绝不下发空串");
+
+    // 人审改判 approved 后无需重传即恢复下发（证明后台读的是同一个动态闸门，不是建房那一刻的快照）。
+    set_world_cover(&state, "w_cov_pending", "/api/assets/objects/covers/w_cov_pending.png", "approved").await;
+    let (_, body) = get(&app, "/api/admin/worlds", Some(&admin)).await;
+    assert_eq!(
+        find_admin_world(&body, "w_cov_pending")["coverUrl"],
+        "/api/assets/objects/covers/w_cov_pending.png",
+        "改判 approved 后应恢复下发"
+    );
+}
+
+/// 官方建房可一次带封面：建房后内部复用 `worlds::upload_cover`（同一套图审与落库），
+/// 回执给裁决与 URL，三列真落库、对象真写入，建房留痕带上封面裁决。
+#[tokio::test]
+async fn admin_create_world_accepts_cover_and_reuses_upload_pipeline() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+    let raw: &[u8] = b"\x89PNG\r\n\x1a\n-admin-cover-\x00\x01\xff";
+
+    let (st, body) = post(
+        &app,
+        "/api/admin/worlds",
+        Some(&admin),
+        json!({
+            "templateId": "tpl_cover", "templateVersion": 1, "title": "带封面的官方世界",
+            "roomType": "idle", "cover": admin_cover_body(raw, "image/png"),
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let wid = body["worldId"].as_str().unwrap().to_string();
+    assert_eq!(body["coverModeration"], "approved", "dev 图审直过");
+    assert_eq!(body["coverUrl"], format!("/api/assets/objects/covers/{wid}.png"));
+
+    // 三列落库，键以世界 id 命名（与单独调用上传端点完全同源）。
+    let row = sqlx::query("SELECT cover_object_key, cover_url, cover_moderation FROM worlds WHERE id = ?")
+        .bind(&wid)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(row.try_get::<String, _>("cover_object_key").unwrap(), format!("covers/{wid}.png"));
+    assert_eq!(row.try_get::<String, _>("cover_url").unwrap(), format!("/api/assets/objects/covers/{wid}.png"));
+    assert_eq!(row.try_get::<String, _>("cover_moderation").unwrap(), "approved");
+    // 对象真的写进了对象存储（不是只落了个 URL 字符串）。
+    assert_eq!(state.objects.get(&format!("covers/{wid}.png")).unwrap(), raw);
+
+    // 列表随即带上封面（同一个闸门）。
+    let (_, list) = get(&app, "/api/admin/worlds", Some(&admin)).await;
+    assert_eq!(
+        find_admin_world(&list, &wid)["coverUrl"],
+        format!("/api/assets/objects/covers/{wid}.png"),
+    );
+
+    // 建房留痕带上封面裁决（"谁在什么时候给哪个世界配了什么图"可溯）。
+    let reason: String = sqlx::query("SELECT reason FROM audit_logs WHERE action = 'world.create' AND subject = ?")
+        .bind(&wid)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+        .try_get("reason")
+        .unwrap();
+    assert!(reason.contains("cover=approved"), "建房留痕须含封面裁决: {reason}");
+
+    // 不带 cover：不凭空造封面键（前端据键缺席走兜底图）。
+    let (st, plain) = post(
+        &app,
+        "/api/admin/worlds",
+        Some(&admin),
+        json!({ "templateId": "tpl_cover", "templateVersion": 1, "title": "无封面官方世界" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{plain}");
+    assert!(plain.get("coverUrl").is_none(), "未带封面不得下发 coverUrl: {plain}");
+    assert!(plain.get("coverModeration").is_none(), "未带封面不得下发裁决: {plain}");
+}
+
+/// 封面非法（MIME 不在白名单）：**世界照建**且回执明示 coverError——
+/// 建房已落库不可回滚，报 4xx 会诱导运营重试建出重复房；封面可事后单独重传。
+#[tokio::test]
+async fn admin_create_world_reports_cover_failure_without_failing_the_world() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+
+    let (st, body) = post(
+        &app,
+        "/api/admin/worlds",
+        Some(&admin),
+        json!({
+            "templateId": "tpl_cover", "templateVersion": 1, "title": "坏封面世界",
+            "cover": admin_cover_body(b"gif89a-not-allowed", "image/gif"),
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let wid = body["worldId"].as_str().unwrap().to_string();
+    assert_eq!(body["coverError"]["code"], "bad_request", "{body}");
+    assert!(body.get("coverUrl").is_none(), "失败不得下发 URL: {body}");
+
+    // 世界确实建成了，封面三列保持空（没有半吊子落库）。
+    let row = sqlx::query("SELECT cover_url, cover_moderation FROM worlds WHERE id = ?")
+        .bind(&wid)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert!(row.try_get::<Option<String>, _>("cover_url").unwrap().is_none());
+    assert!(row.try_get::<Option<String>, _>("cover_moderation").unwrap().is_none());
+
+    // 失败同样进建房留痕。
+    let reason: String = sqlx::query("SELECT reason FROM audit_logs WHERE action = 'world.create' AND subject = ?")
+        .bind(&wid)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+        .try_get("reason")
+        .unwrap();
+    assert!(reason.contains("cover_error=bad_request"), "封面失败须留痕: {reason}");
+}
+
+/// 封面不改 RBAC：读列表（含 coverUrl）与带封面建房仍限 operator（admin 直通），
+/// 其余后台角色 403、普通用户 403、匿名 401，且被拒时不得建出世界、不得写对象存储。
+#[tokio::test]
+async fn admin_cover_paths_keep_existing_rbac() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let now = now_ms();
+    ins_world(&state, "w_cov_rbac", "running", now).await;
+    set_world_cover(&state, "w_cov_rbac", "/api/assets/objects/covers/w_cov_rbac.png", "approved").await;
+
+    let operator = role_token(&state, "operator");
+
+    // 读：operator/admin 拿得到 coverUrl；其余角色连列表都进不来。
+    let (st, body) = get(&app, "/api/admin/worlds", Some(&operator)).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(find_admin_world(&body, "w_cov_rbac")["coverUrl"], "/api/assets/objects/covers/w_cov_rbac.png");
+    for role in ["reviewer", "support", "finance"] {
+        assert_eq!(
+            get(&app, "/api/admin/worlds", Some(&role_token(&state, role))).await.0,
+            StatusCode::FORBIDDEN,
+            "{role} 不得读世界列表（含封面）"
+        );
+    }
+    assert_eq!(get(&app, "/api/admin/worlds", Some(&user_token(&state))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(get(&app, "/api/admin/worlds", None).await.0, StatusCode::UNAUTHORIZED);
+
+    // 写：带封面建房仍只认 operator/admin。
+    let body = json!({
+        "templateId": "tpl_cover", "templateVersion": 1, "title": "越权带图建房",
+        "cover": admin_cover_body(b"\x89PNG-rbac", "image/png"),
+    });
+    let before = count(&state, "SELECT COUNT(*) AS n FROM worlds").await;
+    for role in ["reviewer", "support", "finance"] {
+        assert_eq!(
+            post(&app, "/api/admin/worlds", Some(&role_token(&state, role)), body.clone()).await.0,
+            StatusCode::FORBIDDEN,
+            "{role} 不得带封面建房"
+        );
+    }
+    assert_eq!(post(&app, "/api/admin/worlds", Some(&user_token(&state)), body.clone()).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(post(&app, "/api/admin/worlds", None, body.clone()).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(count(&state, "SELECT COUNT(*) AS n FROM worlds").await, before, "越权请求不得建出世界");
+
+    let (st, ok) = post(&app, "/api/admin/worlds", Some(&operator), body).await;
+    assert_eq!(st, StatusCode::OK, "{ok}");
+    assert_eq!(ok["coverModeration"], "approved");
+}

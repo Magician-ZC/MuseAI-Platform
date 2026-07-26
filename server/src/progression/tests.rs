@@ -465,7 +465,8 @@ fn collapse_policy_constants_and_reasons() {
     assert_eq!(COLLAPSE_WORLDLINE_FACTOR, 0.0, "③ 世界线层崩塌归零");
 
     // 默认值来自 progression 常量（单一事实源，不散落魔数）。
-    let default_ctx = PayoutContext { table: None, star_rating: 1 };
+    let default_ctx =
+        PayoutContext { table: None, star_rating: 1, subplot_cards: Default::default() };
     assert_eq!(default_ctx.baseline_factor(true), COLLAPSE_BASELINE_FACTOR);
     assert_eq!(default_ctx.worldline_factor(true), COLLAPSE_WORLDLINE_FACTOR);
     assert_eq!(default_ctx.baseline_factor(false), 1.0, "正常收束不打折");
@@ -478,6 +479,7 @@ fn collapse_policy_constants_and_reasons() {
             ..Default::default()
         }),
         star_rating: 3,
+        subplot_cards: Default::default(),
     };
     assert_eq!(tuned.baseline_factor(true), 0.25);
     assert_eq!(tuned.worldline_factor(true), 0.5);
@@ -503,6 +505,36 @@ fn payout_context_degrades_conservatively() {
     assert_eq!(ctx.table.as_ref().unwrap().worldline_tiers.len(), 1);
     // 未声明的权重字段回落引擎默认值（口径一致）。
     assert_eq!(ctx.weights().success, IntensityWeights::default().success);
+}
+
+/// R2 产出接点：同一份 `assembled_json` 同时解析出**历练/道具视图**与**副本卡视图**——
+/// 一次读取、同一个 `worldlineTiers` 数组、同一档。未声明 `subplotCard` 的表 → 副本卡视图为空
+/// （数据侧默认关闭）；解析失败/无表 → 两个视图一起退化为"什么都不发"。
+/// （铸卡行为本身的用例在 `subplot::tests`，此处只钉住结算上下文的接点契约。）
+#[test]
+fn payout_context_carries_subplot_card_view_of_the_same_table() {
+    // 无 assembled_json / 坏 JSON / 无产出表 → 副本卡视图同样为空。
+    for raw in [None, Some("not json"), Some("{}"), Some(r#"{"assembly":{}}"#)] {
+        let ctx = payout_context_from_wrapper(raw);
+        assert!(ctx.subplot_cards.resolve(1_000.0).is_none(), "无表时副本卡视图必须为空: {raw:?}");
+    }
+
+    // 声明了 subplotCard 的档 → 两个视图命中同一档；未声明的档 → 只有历练/道具。
+    let raw = json!({
+        "starRating": 4,
+        "assembly": { "payoutTable": { "worldlineTiers": [
+            { "label": "见证", "minScore": 1.0, "mileage": 20 },
+            { "label": "推动", "minScore": 3.0, "mileage": 80,
+              "subplotCard": { "starRating": 2, "label": "星陨之夜" } }
+        ]}}
+    })
+    .to_string();
+    let ctx = payout_context_from_wrapper(Some(&raw));
+    let table = ctx.table.as_ref().expect("产出表");
+    assert_eq!(resolve_payout_tier(table, 2.0).unwrap().label, "见证");
+    assert!(ctx.subplot_cards.resolve(2.0).is_none(), "该档未声明副本卡 → 不发卡");
+    assert_eq!(resolve_payout_tier(table, 5.0).unwrap().label, "推动");
+    assert!(ctx.subplot_cards.resolve(5.0).is_some(), "同一档在副本卡视图里也必须命中");
 }
 
 /// 产出表的**确定性完整性**由建模板期校验前置守住（`assembly::validate_skeleton_refs` 第 5 段）：

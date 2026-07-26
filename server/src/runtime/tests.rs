@@ -2500,6 +2500,56 @@ async fn identity_never_pollutes_active_cards_redline() {
     );
 }
 
+/// 有身份分配 → **角色本人**也看得见自己的开局站位（`RoundInput.self_identities` 回灌）。
+///
+/// 这是本节修的产品缺陷：引擎 `decide` 组装可见上下文时恒剔除自己，故 brief 里的身份
+/// 只有别人看得见，角色本人反而感知不到自己的站位。
+#[tokio::test]
+async fn identity_assignments_reach_own_decide_context() {
+    let state = test_state().await;
+    let wid = running_world_with_identities(
+        &state,
+        "self",
+        standard_identity_pool(),
+        json!([["chA", "official"], ["chB", "merchant"]]),
+    )
+    .await;
+    let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let model: Arc<dyn ModelClient> = Arc::new(CapturingMock { decide_prompts: prompts.clone() });
+
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 0, model.clone()).await.unwrap(), TickStatus::Done);
+
+    let tick0 = prompts.lock().unwrap().clone();
+    let a = ctx_of(&tick0, "chA");
+    let b = ctx_of(&tick0, "chB");
+    assert_eq!(a["yourIdentity"]["display"], json!("户部主事"), "本人必须看得见自己的开局站位");
+    assert_eq!(b["yourIdentity"]["display"], json!("漕帮商贾"));
+    assert!(
+        a["yourIdentity"]["note"].as_str().unwrap_or_default().contains("开局站位"),
+        "措辞必须让模型明白这是开局站位"
+    );
+    // 与感知层同源同值：别人怎么看你（brief）和你知道自己是谁（self_identities）不可能错位。
+    assert_eq!(b["others"], json!({ "chA": "李（户部主事）" }));
+    // 信息边界：他人的自身身份条目绝不越界（他人身份只经 brief 呈现）。
+    assert!(a["yourIdentity"].to_string().contains("户部主事"));
+    assert!(!a["yourIdentity"].to_string().contains("漕帮商贾"), "chA 不得看见 chB 的自身身份");
+    assert!(!b["yourIdentity"].to_string().contains("户部主事"), "chB 不得看见 chA 的自身身份");
+    // 🔴 红线：身份**只**进感知层，绝不进角色卡快照（active_cards → yourDna）。
+    assert_eq!(a["yourDna"]["identity"]["name"], json!("李"));
+    assert!(!a["yourDna"].to_string().contains("户部主事"), "红线：身份不得进角色卡");
+
+    // 确定性：下一 tick 逐字节相同（同 world_id / 阵容 / 模板版本 → 同一份身份呈现）。
+    prompts.lock().unwrap().clear();
+    insert_tick(&state.db, &wid, 1, 1).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 1, model).await.unwrap(), TickStatus::Done);
+    assert_eq!(
+        ctx_of(&prompts.lock().unwrap().clone(), "chA")["yourIdentity"],
+        a["yourIdentity"],
+        "自身身份呈现必须确定性：不得随 tick / 迭代序漂移"
+    );
+}
+
 /// 老世界（模板无 identityPool、实例无 identityAssignments）→ 感知层逐字段与接线前一致。
 #[tokio::test]
 async fn legacy_world_without_identity_pool_is_byte_identical() {
@@ -2514,6 +2564,94 @@ async fn legacy_world_without_identity_pool_is_byte_identical() {
     let captured = prompts.lock().unwrap().clone();
     assert_eq!(ctx_of(&captured, "chA")["others"], json!({ "chB": "王" }), "老世界：brief 只放名字");
     assert_eq!(ctx_of(&captured, "chB")["others"], json!({ "chA": "李" }), "老世界：brief 只放名字");
+}
+
+/// 老世界的**自身身份通道**同样完全退化：上下文里根本不出现 `yourIdentity`（不传即零变化）。
+#[tokio::test]
+async fn legacy_world_has_no_self_identity_field() {
+    let state = test_state().await;
+    let wid = running_world_with_two_members(&state).await; // tpl-x：无 identityPool
+    let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let model: Arc<dyn ModelClient> = Arc::new(CapturingMock { decide_prompts: prompts.clone() });
+
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 0, model).await.unwrap(), TickStatus::Done);
+
+    let captured = prompts.lock().unwrap().clone();
+    for cid in ["chA", "chB"] {
+        assert!(
+            ctx_of(&captured, cid).get("yourIdentity").is_none(),
+            "老世界：{cid} 的上下文里不得出现 yourIdentity"
+        );
+    }
+}
+
+/// `assembled_json` 结构损坏 → 自身身份通道静默退化为空，**不 panic、不阻断 tick**。
+/// （与 brief 同一份 `load_identity_display_names` 读回结果，故退化口径必然一致。）
+#[tokio::test]
+async fn broken_assembled_json_leaves_self_identity_absent() {
+    let state = test_state().await;
+    let wid = running_world_with_identities(
+        &state,
+        "broken-self",
+        standard_identity_pool(),
+        json!("这不是数组"),
+    )
+    .await;
+    let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let model: Arc<dyn ModelClient> = Arc::new(CapturingMock { decide_prompts: prompts.clone() });
+
+    // ① identityAssignments 字段类型不符。
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(
+        process_tick_with_model(&state, &wid, 0, model.clone()).await.unwrap(),
+        TickStatus::Done,
+        "结构损坏不得阻断 tick"
+    );
+    assert!(
+        ctx_of(&prompts.lock().unwrap().clone(), "chA").get("yourIdentity").is_none(),
+        "结构损坏 → 自身身份字段完全不出现"
+    );
+
+    // ② 整段 assembled_json 直接是非 JSON 文本。
+    sqlx::query("UPDATE worlds SET assembled_json='{ 这不是 JSON' WHERE id=?")
+        .bind(&wid)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    prompts.lock().unwrap().clear();
+    insert_tick(&state.db, &wid, 1, 1).await.unwrap();
+    assert_eq!(
+        process_tick_with_model(&state, &wid, 1, model).await.unwrap(),
+        TickStatus::Done,
+        "assembled_json 非 JSON 同样静默退化，不阻断 tick"
+    );
+    assert!(ctx_of(&prompts.lock().unwrap().clone(), "chA").get("yourIdentity").is_none());
+}
+
+/// 分配只覆盖一部分成员（池配额 < 人数）→ 未分配者不出现该字段，已分配者照常可见；
+/// 退化是**逐角色**的，不是全有全无。
+#[tokio::test]
+async fn partial_assignment_degrades_per_character() {
+    let state = test_state().await;
+    let wid = running_world_with_identities(
+        &state,
+        "partial",
+        standard_identity_pool(),
+        json!([["chA", "official"]]), // chB 未分配
+    )
+    .await;
+    let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let model: Arc<dyn ModelClient> = Arc::new(CapturingMock { decide_prompts: prompts.clone() });
+
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 0, model).await.unwrap(), TickStatus::Done);
+
+    let captured = prompts.lock().unwrap().clone();
+    assert_eq!(ctx_of(&captured, "chA")["yourIdentity"]["display"], json!("户部主事"));
+    assert!(ctx_of(&captured, "chB").get("yourIdentity").is_none(), "未分配 → 字段完全不出现");
+    // 感知层同口径：chB 无身份 → 别人看他也只是名字。
+    assert_eq!(ctx_of(&captured, "chA")["others"], json!({ "chB": "王" }));
 }
 
 /// `label` 为空 → 展示名回落身份 `id`（模板字段说明的既定口径）。

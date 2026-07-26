@@ -2,7 +2,8 @@
 //!
 //! 信息边界铁律：给角色 X 组装的上下文只允许包含——
 //! 公共 world 层、X 自己的 CharacterState、from==X 或 to==X 且 known_to 含 X 的关系、
-//! 公开场景描述、X 的 DNA 卡、绑定到 X 的知识片段、主人托梦（平台注入，低优先层）。
+//! 公开场景描述、X 的 DNA 卡、绑定到 X 的知识片段、主人托梦（平台注入，低优先层）、
+//! **X 自己的开局站位（身份）**（平台注入，纯展示层，见 `assemble_visible_context` 第 7 段）。
 //! 其他角色的 DNA 内容只能以第三人称一句话摘要出现（防卡片注入，平台规格 §14.1）。
 
 use std::collections::BTreeMap;
@@ -41,6 +42,11 @@ fn dna_view(card: &CharacterCardV2) -> Result<Value, EngineError> {
 ///
 /// 铁律实现要点：只读 `state.characters[character_id]` 这一格自身私有状态，
 /// 绝不遍历其他角色的 secrets/misconceptions/plans；他人仅以调用方给定的第三人称摘要出现。
+///
+/// `self_identity` = **本角色自己**的开局站位展示名（如 `户部主事`，平台由 runtime 回灌）。
+/// 传 `None`/空白 → 上下文里根本不出现该字段，与接线前逐字节一致。调用方只允许传本人那一条，
+/// 他人的自身身份绝不进来（他人身份如何被感知仍走且只走 `other_cards_brief`）。
+#[allow(clippy::too_many_arguments)] // 白名单上下文的全量入参，逐项都是信息边界的一条通道
 pub fn assemble_visible_context(
     state: &NarrativeState,
     character_id: &str,
@@ -49,6 +55,7 @@ pub fn assemble_visible_context(
     situation: &str,
     fragments: &[RetrievedFragment],
     whisper: Option<&str>,
+    self_identity: Option<&str>,
 ) -> Result<String, EngineError> {
     // 1) 自己的私有状态：只取自己这一格（缺失视为空态），不触碰任何他人条目。
     let own = state.characters.get(character_id).cloned().unwrap_or_default();
@@ -105,6 +112,36 @@ pub fn assemble_visible_context(
         "others": others_v,
         "knowledge": Value::Array(knowledge),
     });
+    // 7) 自身开局站位（平台总规格 §5【拍板 4、5】：身份 = 开局站位）。
+    //
+    // 为何要单开一条通道：上面第 4 段的 `others` 恒**剔除自己**，于是「你在这个世界是户部主事」
+    // 只有别人看得见、角色本人反而看不见——玩家感知不到自己的开局站位。此处把本人那一条单独喂入。
+    //
+    // 🔴 平权宪法（总规格 §0.1 真红线 1）：身份**不携带任何数值差异、准入门槛、产出加成、
+    //    难度优待或叙事特权**。本字段是**纯展示层**，只影响角色如何自述与自我定位；
+    //    引擎内**没有任何判定读它**——仲裁（rule/model）、确定性不变量、reducer/StatePatch、
+    //    同意门控、关系演化、里程碑强度全都不引用它，它也绝不写回 `NarrativeState`。
+    //    下游任何「据身份改判定 / 改发奖 / 开权限 / 调难度」都是红线违规。
+    //
+    // 🔒 不进 DNA：身份只挂在上下文顶层这一格，`yourDna`（来自 `active_cards` 的不可变卡快照）
+    //    一个字节都不改（红线由 `self_identity_never_touches_dna_redline` 守着）。
+    //
+    // 退化：`None` 或空白展示名 → 该字段完全不出现，产物与接线前逐字节一致。
+    // 确定性：纯函数、单值拼接，无随机、不依赖任何迭代序。
+    if let Some(d) = self_identity.map(str::trim).filter(|d| !d.is_empty()) {
+        if let Some(obj) = ctx.as_object_mut() {
+            obj.insert(
+                "yourIdentity".to_string(),
+                json!({
+                    "display": d,
+                    "note": "这是你在这个世界的开局站位：你就是以这个身份出场的，别人也这样看你、这样称呼你。\
+它只说明你从哪里起步、与谁相熟、手边有什么，不给你任何额外优势、特权、豁免或更高的成功率——\
+所有人一律平等，戏份要靠你自己玩出来。",
+                }),
+            );
+        }
+    }
+
     // 主人托梦：最低优先层，仅在提供时附加。
     if let Some(w) = whisper {
         if let Some(obj) = ctx.as_object_mut() {
@@ -250,7 +287,8 @@ mod tests {
         let brief: BTreeMap<String, String> =
             [("A".to_string(), "A 是一名沉默寡言的侍卫。".to_string())].into_iter().collect();
 
-        let ctx = assemble_visible_context(&s, "B", &card_b, &brief, "宫廷大厅", &[], None).unwrap();
+        let ctx =
+            assemble_visible_context(&s, "B", &card_b, &brief, "宫廷大厅", &[], None, None).unwrap();
 
         // A 的 secrets / plans / misconceptions / goals 原文一律不得出现在 B 的上下文里。
         assert!(!ctx.contains("私生子"), "泄漏了 A 的 secret：{ctx}");
@@ -275,7 +313,8 @@ mod tests {
         let brief: BTreeMap<String, String> =
             [("B".to_string(), "B 是宫廷侍女。".to_string())].into_iter().collect();
 
-        let ctx = assemble_visible_context(&s, "A", &card_a, &brief, "宫廷大厅", &[], None).unwrap();
+        let ctx =
+            assemble_visible_context(&s, "A", &card_a, &brief, "宫廷大厅", &[], None, None).unwrap();
 
         // A 自己能看到自己的私密（证明组装器确实注入了自身状态，只是不注入他人的）。
         assert!(ctx.contains("私生子"));
@@ -303,8 +342,8 @@ mod tests {
             notes: vec!["公开的同僚关系".into()],
         });
         let card_b = minimal_card("B");
-        let ctx =
-            assemble_visible_context(&s, "B", &card_b, &BTreeMap::new(), "场景", &[], None).unwrap();
+        let ctx = assemble_visible_context(&s, "B", &card_b, &BTreeMap::new(), "场景", &[], None, None)
+            .unwrap();
         assert!(ctx.contains("公开的同僚关系"), "已知情客体应能看到关系：{ctx}");
     }
 
@@ -320,6 +359,7 @@ mod tests {
             "场景",
             &[],
             Some("主人提示：小心那个侍卫"),
+            None,
         )
         .unwrap();
         assert!(ctx.contains("小心那个侍卫"));
@@ -338,9 +378,133 @@ mod tests {
             score: 1.0,
         }];
         let ctx =
-            assemble_visible_context(&s, "B", &card_b, &BTreeMap::new(), "场景", &frags, None).unwrap();
+            assemble_visible_context(&s, "B", &card_b, &BTreeMap::new(), "场景", &frags, None, None)
+                .unwrap();
         assert!(ctx.contains("宫廷礼仪"));
         assert!(ctx.contains("躬身礼"));
+    }
+
+    // ===== 自身开局站位（身份池自身感知，总规格 §5【拍板 4、5】）=====
+
+    /// 默认档（不传自身身份）：上下文里根本不出现 `yourIdentity`，顶层键集与接线前逐字段一致。
+    /// 这是「默认行为零变化」的守卫——键集写死，将来任何人往里塞字段都会在这里炸。
+    #[test]
+    fn self_identity_absent_keeps_context_identical() {
+        let s = state_with_secrets();
+        let card_b = minimal_card("B");
+        let brief: BTreeMap<String, String> =
+            [("A".to_string(), "A 是一名沉默寡言的侍卫。".to_string())].into_iter().collect();
+
+        let ctx =
+            assemble_visible_context(&s, "B", &card_b, &brief, "宫廷大厅", &[], None, None).unwrap();
+
+        assert!(!ctx.contains("yourIdentity"), "不传身份 → 该字段必须完全不出现：{ctx}");
+        let v: Value = serde_json::from_str(&ctx).unwrap();
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            vec!["knowledge", "others", "situation", "world", "you", "yourDna", "yourRelations", "yourState"],
+            "默认档顶层键集必须与接线前逐字段一致（serde_json Map 有序 → 断言确定性）"
+        );
+
+        // 空白展示名同样退化（与 server 侧 brief 拼接的空白口径一致）。
+        let blank =
+            assemble_visible_context(&s, "B", &card_b, &brief, "宫廷大厅", &[], None, Some("  "))
+                .unwrap();
+        assert_eq!(blank, ctx, "空白身份 → 与不传时逐字节一致");
+    }
+
+    /// 传入后：角色**本人**看得见自己的开局站位，且措辞讲清「这是你在这个世界的开局站位」。
+    #[test]
+    fn self_identity_visible_to_owner_as_opening_position() {
+        let s = state_with_secrets();
+        let card_b = minimal_card("B");
+        let ctx = assemble_visible_context(
+            &s,
+            "B",
+            &card_b,
+            &BTreeMap::new(),
+            "宫廷大厅",
+            &[],
+            None,
+            Some("户部主事"),
+        )
+        .unwrap();
+
+        let v: Value = serde_json::from_str(&ctx).unwrap();
+        assert_eq!(v["yourIdentity"]["display"], json!("户部主事"), "本人必须看得见自己的身份");
+        let note = v["yourIdentity"]["note"].as_str().unwrap_or_default();
+        assert!(note.contains("开局站位"), "措辞必须讲明这是开局站位：{note}");
+        // 🔴 平权（§0.1）：措辞本身必须否掉任何优待联想，绝不能被模型读成「我有特权」。
+        assert!(note.contains("不给你任何额外优势"), "措辞必须显式声明零特权：{note}");
+    }
+
+    /// 🔴 红线：身份只挂上下文顶层，**绝不写进 DNA 卡视图**（`active_cards` 是不可变快照）。
+    #[test]
+    fn self_identity_never_touches_dna_redline() {
+        let s = state_with_secrets();
+        let card_b = minimal_card("B");
+        let ctx = assemble_visible_context(
+            &s,
+            "B",
+            &card_b,
+            &BTreeMap::new(),
+            "场景",
+            &[],
+            None,
+            Some("户部主事"),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&ctx).unwrap();
+        assert_eq!(v["yourDna"]["identity"]["name"], json!("B"), "卡上的名字必须原样");
+        assert!(
+            !v["yourDna"].to_string().contains("户部主事"),
+            "红线：身份不得出现在 DNA 卡的任何字段里"
+        );
+        assert!(
+            !v["yourState"].to_string().contains("户部主事"),
+            "红线：身份不得渗进角色私有状态（那会随 reducer 落回世界状态）"
+        );
+    }
+
+    /// 信息边界：调用方只喂本人那一条 → 他人的自身身份绝不出现在本角色上下文里。
+    /// （他人身份如何被感知，仍走且只走 `other_cards_brief`。）
+    #[test]
+    fn other_players_self_identity_never_leaks() {
+        let s = state_with_secrets();
+        let card_a = minimal_card("A");
+        let card_b = minimal_card("B");
+
+        let ctx_a = assemble_visible_context(
+            &s,
+            "A",
+            &card_a,
+            &BTreeMap::new(),
+            "场景",
+            &[],
+            None,
+            Some("户部主事"),
+        )
+        .unwrap();
+        let ctx_b = assemble_visible_context(
+            &s,
+            "B",
+            &card_b,
+            &BTreeMap::new(),
+            "场景",
+            &[],
+            None,
+            Some("漕帮商贾"),
+        )
+        .unwrap();
+
+        assert!(ctx_a.contains("户部主事") && !ctx_a.contains("漕帮商贾"), "A 不得看见 B 的自身身份");
+        assert!(ctx_b.contains("漕帮商贾") && !ctx_b.contains("户部主事"), "B 不得看见 A 的自身身份");
+        // 本人有身份、他人没传 → 上下文里也不得凭空出现他人的身份字段。
+        let plain =
+            assemble_visible_context(&s, "B", &card_b, &BTreeMap::new(), "场景", &[], None, None)
+                .unwrap();
+        assert!(!plain.contains("yourIdentity"), "未传身份的角色不得被别人的身份污染");
     }
 
     // ===== role_decide：补齐 id + targets 白名单 =====

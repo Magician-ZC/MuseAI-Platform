@@ -79,6 +79,13 @@ impl ModelRoutes {
     }
 }
 
+/// ⚠️ **加字段前先读这条**：`RoundInput` 有**两个宿主构造点**，且都是穷尽式结构体字面量
+/// （没有 `..Default::default()`），所以加字段会让它们**同时编译失败**：
+///   - 平台轨 `server/src/runtime/mod.rs`（约 :1717）
+///   - **桌面轨 `src-tauri/src/commands/narrative.rs`（约 :123）** ← 历史上两次都漏了这个
+/// 桌面轨漏掉的代价是 CI 的 `rust-test` job 与 `npm run tauri build` 一起红，
+/// 而只跑 `cargo test --manifest-path server/Cargo.toml` 是发现不了的。
+/// 加字段时请一并更新：本结构体、`Default for RoundInput`、上述两个构造点、本文件内的测试助手。
 pub struct RoundInput {
     pub run_id: String,
     pub mode: RunMode,
@@ -86,6 +93,27 @@ pub struct RoundInput {
     pub active_cards: BTreeMap<String, CharacterCardV2>,
     /// 其他角色的一句话第三人称摘要（防注入：不注原文）
     pub other_cards_brief: BTreeMap<String, String>,
+    /// 各角色**自己**的开局站位展示名（平台总规格 §5【拍板 4、5】：身份 = 开局站位）：
+    /// `cid → 展示名`（如 `户部主事`）。**只读感知通道**。
+    ///
+    /// 为何单开一条：`other_cards_brief` 在 `decide::assemble_visible_context` 里恒**剔除自己**，
+    /// 于是「你在这个世界是户部主事」只有别人看得见、角色本人看不见。本字段把本人那一条补上
+    /// （`run_round` 只把 `self_identities[cid]` 喂给 `cid` 本人，绝不外泄给他人 —— 信息边界）。
+    ///
+    /// 🔴 平权宪法（总规格 §0.1 真红线 1）：身份**不携带任何数值差异、准入门槛、产出加成、
+    /// 难度优待或叙事特权**。本字段**只**流向 `assemble_visible_context` 的展示层 JSON；
+    /// 引擎内没有任何判定读它（仲裁 / 确定性不变量 / reducer / StatePatch / 同意门控 /
+    /// 关系演化 / 里程碑强度一律不引用），也绝不写回 `NarrativeState`。它更不进
+    /// `active_cards`（角色卡不可变 DNA 快照，污染它等于篡改玩家的卡），
+    /// 也不进 `whispers`（那是「主人托梦」，有配额且会被标 applied，语义完全不同）。
+    ///
+    /// 默认空 = 老世界 / 模板未声明身份池 → 上下文里根本不出现该字段，逐字节退化为接线前。
+    /// 平台由 runtime 从 `assembled_json` 的 `identityAssignments` 回灌；桌面壳恒默认空。
+    ///
+    /// 注：`RoundInput` 不派生 serde（纯进程内入参，无 `#[serde(default)]` 可用），
+    /// 「不传即默认」由 `Default for RoundInput` 保证。
+    /// 确定性：`BTreeMap` 键有序，纯读纯拼接，无随机、不依赖迭代序产生分支。
+    pub self_identities: BTreeMap<String, String>,
     /// 各角色的主人托梦（可空；平台/交互模式注入）
     pub whispers: BTreeMap<String, String>,
     /// 各角色本回合检索片段（P1 集成；由调用方按绑定与时间边界取得）
@@ -135,6 +163,8 @@ impl Default for RoundInput {
             mode: RunMode::Observe,
             active_cards: BTreeMap::new(),
             other_cards_brief: BTreeMap::new(),
+            // 自身开局站位默认空 = 不传 → 可见上下文里根本不出现该字段，行为与接线前逐字节一致。
+            self_identities: BTreeMap::new(),
             whispers: BTreeMap::new(),
             fragments: BTreeMap::new(),
             temperature_decide: 0.0,
@@ -353,9 +383,14 @@ impl NarrativeEngine {
                         let card = &inp_ref.active_cards[cid];
                         let frags = inp_ref.fragments.get(cid).unwrap_or(ef_ref);
                         let whisper = inp_ref.whispers.get(cid).map(|s| s.as_str());
+                        // 自身开局站位（§5【拍板 4、5】）：**只**取 `cid` 自己那一条喂给 `cid` 本人。
+                        // 信息边界：他人的自身身份条目绝不进入本角色上下文（他人身份仍只走 brief）。
+                        // 🔴 平权（§0.1）：纯展示层，本回合的仲裁/落定/事件/不变量一概不读它。
+                        let self_identity = inp_ref.self_identities.get(cid).map(|s| s.as_str());
                         let dctx = &dc_ref[cid];
                         let ctx = decide::assemble_visible_context(
                             cur_ref, cid, card, &dctx.brief, &dctx.situation, frags, whisper,
+                            self_identity,
                         )?;
                         decide::role_decide(
                             host, decide_stage, dp_ref, inp_ref.temperature_decide,
@@ -1585,6 +1620,93 @@ mod tests {
         (host, events)
     }
 
+    /// 捕获每次模型调用 `(agent, user prompt)` 的脚本化模型：用于断言「谁的可见上下文里有什么」。
+    /// 响应消费顺序与 `ScriptedModel` 完全一致（并发决策在无 yield 的 mock 下按 poll 序确定性消费）。
+    struct CapturingModel {
+        responses: std::sync::Mutex<Vec<Result<String, EngineError>>>,
+        captured: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl CapturingModel {
+        fn new(responses: Vec<Result<String, EngineError>>) -> Self {
+            Self {
+                responses: std::sync::Mutex::new(responses),
+                captured: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        /// 取指定角色的 roleDecide user prompt（`build_decide_user_prompt` 的固定包裹前缀）。
+        fn decide_prompt_of(&self, cid: &str) -> String {
+            let needle = format!("以下是【仅你（{cid}）可见】");
+            self.captured
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(agent, user)| agent == "roleDecide" && user.starts_with(&needle))
+                .map(|(_, user)| user.clone())
+                .unwrap_or_else(|| panic!("未捕获到 {cid} 的决策上下文"))
+        }
+
+        /// 全部 roleDecide user prompt。
+        fn decide_prompts(&self) -> Vec<String> {
+            self.captured
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(agent, _)| agent == "roleDecide")
+                .map(|(_, user)| user.clone())
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::model::ModelClient for CapturingModel {
+        async fn complete(
+            &self,
+            spec: &crate::model::ModelCallSpec,
+            cancel: &CancelFlag,
+        ) -> Result<crate::model::ModelOutput, EngineError> {
+            cancel.check()?;
+            self.captured.lock().unwrap().push((spec.agent.clone(), spec.user.clone()));
+            let mut lock = self.responses.lock().unwrap();
+            if lock.is_empty() {
+                return Err(EngineError::Model { message: "脚本响应耗尽".into(), retryable: false });
+            }
+            lock.remove(0).map(|content| crate::model::ModelOutput {
+                content,
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+            })
+        }
+    }
+
+    /// 从 roleDecide user prompt 中切出可见上下文 JSON（`build_decide_user_prompt` 的固定包裹）。
+    fn decide_ctx_json(user: &str) -> Value {
+        let start = user.find('{').expect("可见上下文 JSON 起点");
+        let end = user.rfind("\n\n请完全代入").expect("可见上下文 JSON 终点");
+        serde_json::from_str(&user[start..end]).expect("可见上下文必须是合法 JSON")
+    }
+
+    fn host_capturing(model: Arc<CapturingModel>) -> Arc<EngineHost> {
+        Arc::new(EngineHost {
+            fs: Arc::new(MemFs::default()),
+            clock: Arc::new(FixedClock(1000)),
+            events: Arc::new(CollectEvents::default()),
+            model,
+        })
+    }
+
+    /// 两角色 happy path 的模型脚本：director → decide(li) → decide(wang) → writer → critic。
+    fn two_char_script() -> Vec<Result<String, EngineError>> {
+        vec![
+            Ok(r#"{"situation":"堂前灯火通明，众人各自落座"}"#.to_string()),
+            Ok(benign_decision()),
+            Ok(benign_decision()),
+            Ok(r#"{"prose":"堂中礼数周全，暗流未起。"}"#.to_string()),
+            Ok(r#"{"characterConsistencyIssues":[],"causalIssues":[],"revisionSuggestions":[]}"#.to_string()),
+        ]
+    }
+
     /// 初始化含 li/wang 两角色 + 一个 pending 硬节点的 run。
     fn init_run(host: &EngineHost, run_id: &str, with_hard_node: bool) {
         let mut s = NarrativeState { schema_version: 1, run_id: run_id.into(), ..Default::default() };
@@ -1617,6 +1739,8 @@ mod tests {
             mode: RunMode::Observe,
             active_cards: cards(),
             other_cards_brief: BTreeMap::new(),
+            // 默认档 = 不传自身身份：既有全部用例走的都是历史路径（回归保护）。
+            self_identities: BTreeMap::new(),
             whispers: BTreeMap::new(),
             fragments: BTreeMap::new(),
             temperature_decide: 0.0,
@@ -1715,6 +1839,102 @@ mod tests {
             .filter(|e| matches!(e, EngineEvent::Narrative { .. }))
             .count();
         assert_eq!(narrative_events, 4);
+    }
+
+    // ===== 自身开局站位（身份池自身感知，总规格 §5【拍板 4、5】）=====
+
+    /// 默认档（`self_identities` 不传）：整条回合链路上没有任何角色的上下文出现身份字段，
+    /// 且回合产物与历史一致（提交、推进大纲）。这是「不传即零变化」的端到端守卫。
+    #[tokio::test]
+    async fn run_round_without_self_identities_is_unchanged() {
+        let model = Arc::new(CapturingModel::new(two_char_script()));
+        let host = host_capturing(model.clone());
+        init_run(host.as_ref(), "run-1", true);
+        let engine = NarrativeEngine::new(host.clone());
+
+        let out = engine
+            .run_round(&routes(), &prompts(), round_input("run-1", big_budget()), &CancelFlag::new())
+            .await
+            .unwrap();
+
+        assert!(out.blocked.is_none());
+        assert_eq!(out.new_state.revision, 1);
+        let prompts_seen = model.decide_prompts();
+        assert_eq!(prompts_seen.len(), 2);
+        for p in &prompts_seen {
+            assert!(!p.contains("yourIdentity"), "不传身份 → 上下文里不得出现该字段：{p}");
+            assert!(!p.contains("开局站位"), "不传身份 → 措辞也不得出现");
+        }
+    }
+
+    /// 传入后：每个角色**只**看得见自己的开局站位；他人的自身身份绝不越界（信息边界）。
+    /// 🔴 同时守红线：身份不进 DNA 卡（`active_cards` 不可变快照），不进角色私有状态，
+    ///    不进 StatePatch / DomainEvent（下游一概读不到它，无从据身份改判定）。
+    #[tokio::test]
+    async fn run_round_feeds_self_identity_only_to_its_owner() {
+        let model = Arc::new(CapturingModel::new(two_char_script()));
+        let host = host_capturing(model.clone());
+        init_run(host.as_ref(), "run-1", true);
+        let engine = NarrativeEngine::new(host.clone());
+
+        let mut input = round_input("run-1", big_budget());
+        input.self_identities = [
+            ("li".to_string(), "户部主事".to_string()),
+            ("wang".to_string(), "漕帮商贾".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        let out = engine.run_round(&routes(), &prompts(), input, &CancelFlag::new()).await.unwrap();
+        assert!(out.blocked.is_none());
+
+        let li = model.decide_prompt_of("li");
+        let wang = model.decide_prompt_of("wang");
+        // 本人看得见自己的站位。
+        assert!(li.contains("户部主事"), "li 必须看得见自己的开局站位");
+        assert!(wang.contains("漕帮商贾"), "wang 必须看得见自己的开局站位");
+        // 信息边界：他人的自身身份条目绝不外泄。
+        assert!(!li.contains("漕帮商贾"), "信息边界：li 不得看见 wang 的自身身份");
+        assert!(!wang.contains("户部主事"), "信息边界：wang 不得看见 li 的自身身份");
+
+        let ctx_li = decide_ctx_json(&li);
+        assert_eq!(ctx_li["yourIdentity"]["display"], json!("户部主事"));
+        assert!(
+            ctx_li["yourIdentity"]["note"].as_str().unwrap_or_default().contains("开局站位"),
+            "措辞必须讲明这是开局站位"
+        );
+        // 🔴 红线①：角色卡快照（active_cards → yourDna）一个字节都不许被身份改写。
+        assert_eq!(ctx_li["yourDna"]["identity"]["name"], json!("李"), "红线：卡上的名字必须原样");
+        assert!(!ctx_li["yourDna"].to_string().contains("户部主事"), "红线：身份不得进 DNA 卡");
+        // 🔴 红线②：身份不得渗进角色私有状态（那会被 reducer 落回世界状态并被下游读到）。
+        assert!(!ctx_li["yourState"].to_string().contains("户部主事"), "红线：身份不得进角色状态");
+
+        // 🔴 红线③：身份不进任何落定物——StatePatch / DomainEvent / 提交后的世界状态。
+        let dumped = serde_json::to_string(&out.scene.state_patch).unwrap()
+            + &serde_json::to_string(&out.scene.events).unwrap()
+            + &serde_json::to_string(&out.new_state).unwrap();
+        assert!(!dumped.contains("户部主事"), "红线：身份绝不进 patch/事件/世界状态");
+        assert!(!dumped.contains("漕帮商贾"), "红线：身份绝不进 patch/事件/世界状态");
+    }
+
+    /// 只给一部分角色分配了身份（池配额小于人数）→ 未分配者上下文里根本没有该字段，
+    /// 与默认档逐字段一致；已分配者照常看得见。退化路径可局部生效，不是全有全无。
+    #[tokio::test]
+    async fn run_round_partial_self_identities_degrade_per_character() {
+        let model = Arc::new(CapturingModel::new(two_char_script()));
+        let host = host_capturing(model.clone());
+        init_run(host.as_ref(), "run-1", true);
+        let engine = NarrativeEngine::new(host.clone());
+
+        let mut input = round_input("run-1", big_budget());
+        input.self_identities =
+            [("li".to_string(), "户部主事".to_string())].into_iter().collect();
+
+        engine.run_round(&routes(), &prompts(), input, &CancelFlag::new()).await.unwrap();
+
+        assert!(model.decide_prompt_of("li").contains("户部主事"));
+        let wang = decide_ctx_json(&model.decide_prompt_of("wang"));
+        assert!(wang.get("yourIdentity").is_none(), "未分配身份的角色：字段完全不出现");
     }
 
     // ===== 预算硬停：不提交、返回 BudgetExhausted =====
@@ -2172,6 +2392,8 @@ mod tests {
             mode: RunMode::Observe,
             active_cards,
             other_cards_brief: BTreeMap::new(),
+            // 默认档 = 不传自身身份：既有全部用例走的都是历史路径（回归保护）。
+            self_identities: BTreeMap::new(),
             whispers: BTreeMap::new(),
             fragments: BTreeMap::new(),
             temperature_decide: 0.0,
@@ -3005,6 +3227,8 @@ mod tests {
             mode: RunMode::Observe,
             active_cards: cards3(),
             other_cards_brief: BTreeMap::new(),
+            // 默认档 = 不传自身身份：既有全部用例走的都是历史路径（回归保护）。
+            self_identities: BTreeMap::new(),
             whispers: BTreeMap::new(),
             fragments: BTreeMap::new(),
             temperature_decide: 0.0,

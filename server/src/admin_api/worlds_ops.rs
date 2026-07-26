@@ -14,7 +14,7 @@ use crate::db::{new_id, now_ms};
 use crate::error::ApiError;
 use crate::worlds::{
     create_world as create_world_inner, deathmatch_enabled, is_valid_lethality, load_world,
-    CreateWorldParams, LETHALITY_DEATHMATCH,
+    upload_cover, CoverReq, CreateWorldParams, LETHALITY_DEATHMATCH,
 };
 
 use super::dashboards::{cents_to_cny, tokens_to_cents, utc_day_start_ms, DAY_MS};
@@ -97,6 +97,10 @@ async fn tick_stats_by_world(
 /// 除世界主表字段外，另给运营表格三列派生数据（R1 成本仪表，§17【拍板 16】）：
 /// `participantCount` 在场人数 / `successRate` tick 成功率 / `todayCostCents|todayCostCny` 今日成本。
 /// 三列各来自一条页内 GROUP BY 聚合，总查询数恒为 3（列表 1 + 聚合 2），与页大小无关。
+///
+/// 🔴 封面 `coverUrl`（迁移 0027）：本端点同样是**封面读取面**，一律经 `worlds::visible_cover_url`
+/// 这一个闸门——后台不豁免机审，运营列表看到的和玩家大厅看到的必须是同一套「什么算可见封面」。
+/// 无封面/未过审 → **不下发该键**（不是空串、不是 null），前端据"键缺席"走确定性内置位图兜底。
 pub(super) async fn list_worlds(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -108,6 +112,7 @@ pub(super) async fn list_worlds(
         "SELECT w.id, w.title, w.room_type, w.status, w.visibility, w.member_limit, \
          w.tick_per_day, w.template_id, w.template_version, w.engine_version, w.prompt_set_version, \
          w.model_route_version, w.state_revision, w.created_at, \
+         w.cover_url, w.cover_moderation, \
          COALESCE(b.spent_tokens_today, 0) AS spent_tokens_today, \
          COALESCE(b.daily_token_budget, 0) AS daily_token_budget, \
          COALESCE(b.fused, 0) AS fused \
@@ -162,7 +167,7 @@ pub(super) async fn list_worlds(
         let terminal = done_n + failed_n;
         let success_rate: Option<f64> =
             if terminal > 0 { Some(done_n as f64 / terminal as f64) } else { None };
-        items.push(json!({
+        let mut item = json!({
             "id": id,
             "title": row.try_get::<String, _>("title")?,
             "roomType": row.try_get::<String, _>("room_type")?,
@@ -193,7 +198,15 @@ pub(super) async fn list_worlds(
             // 补齐路径：safety 侧在 moderate_* 调用两端取时钟差 → 落一张 moderation_calls(world_id, latency_ms,…)
             // 或复用 risk_events.detail_json 增列，再在此按 world_id 聚合 avg/p95。属 safety 模块职责，不在本项范围。
             // 在此之前**不下发该字段**（前端 null 判定 → 显示 —），诚实空缺胜过假数字（VALIDATION §0.3）。
-        }));
+        });
+        // 🔴 封面：复用 worlds 侧那一个 approved 闸门（不在此另写判断），未过审等同没有封面。
+        let cover_moderation: Option<String> = row.try_get("cover_moderation")?;
+        if let Some(url) =
+            crate::worlds::visible_cover_url(row.try_get("cover_url")?, cover_moderation.as_deref())
+        {
+            item["coverUrl"] = json!(url);
+        }
+        items.push(item);
     }
     if !has_more {
         next_cursor = None;
@@ -425,6 +438,14 @@ pub(super) struct CreateWorldReq {
     /// 庇护场与生死场（同剧情、不同契约、不同产出表），把映射写成代码规则会直接堵死这个产品形态。
     /// 故此处不做任何星级联动，只收显式入参。
     lethality: Option<String>,
+    /// 可选封面（迁移 0027）：与 `POST /worlds/{id}/cover` **同一个载荷类型**（imageBase64 + mime），
+    /// 让运营一次调用建完房即带图，不必再单独调一次上传端点。
+    ///
+    /// 落地方式是「建房后内部调用同一段逻辑」——见 `create_world` 里对 `worlds::upload_cover` 的调用：
+    /// MIME 白名单、1MB 上限、对象存储写入、`ModerationProvider::check_image` 图审、三列落库、
+    /// 未过审不回传 URL，全部由那一个函数负责，此处不复制任何一条。
+    #[serde(default)]
+    cover: Option<CoverReq>,
 }
 
 fn default_template_version() -> i64 {
@@ -432,6 +453,10 @@ fn default_template_version() -> i64 {
 }
 
 /// POST /admin/worlds：官方放置世界。调 worlds::create_world 建房（钉住引擎/prompt/模型/模板版本 + 预算）。
+///
+/// 可带 `cover`（迁移 0027）一次建完带图的房：建房落库后**内部调用 `worlds::upload_cover`**，
+/// 权限（`can_set_cover`：官方房归运营）、图审、落库、未过审不回传 URL 全部由那一个函数裁定，
+/// 本端点不复制任何一条判断。RBAC 不变：建房仍是 operator（admin 直通）。
 pub(super) async fn create_world(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -534,8 +559,42 @@ pub(super) async fn create_world(
 
     let lethality = p.lethality.clone();
     let world_id = create_world_inner(&state.db, p).await?;
-    audit(&state.db, &admin.0, "world.create", &world_id, &host_note).await?;
-    Ok(Json(json!({ "worldId": world_id, "lethality": lethality })))
+
+    let mut out = json!({ "worldId": &world_id, "lethality": lethality });
+    // 封面（可选）：**世界已落库**，故封面环节一律不把整个请求判失败——
+    // 建房已写 worlds + world_budgets 且不可回滚，若此处返回 4xx，运营多半会重试建房，
+    // 结果是留下一个又一个无人认领的重复世界（比"房建好了但图没上"糟得多）。
+    // 因此：成功 → 回传裁决（过审才带 URL）；失败 → 回传 coverError，运营据此单独重传
+    // `POST /worlds/{id}/cover` 即可。两条分支都进 audit_logs 的建房留痕，不静默吞掉。
+    let mut cover_note = String::new();
+    if let Some(cover) = req.cover {
+        let attempt =
+            upload_cover(State(state.clone()), admin.0.clone(), Path(world_id.clone()), Json(cover));
+        match attempt.await {
+            Ok(Json(res)) => {
+                let moderation = res["moderation"].as_str().unwrap_or("unknown").to_string();
+                // 🔴 未过审绝不下发 URL：upload_cover 已卡门（非 approved 时回执 coverUrl 为 null），
+                // 此处仅在拿到真 URL 时才写该键，口径与列表投影一致（无 URL → 键缺席）。
+                if let Some(url) = res["coverUrl"].as_str() {
+                    out["coverUrl"] = json!(url);
+                }
+                out["coverModeration"] = json!(&moderation);
+                cover_note = format!(", cover={moderation}");
+            }
+            Err(e) => {
+                let code = e.code();
+                // 内部错误不外泄细节（口径同 ApiError::into_response）。
+                let message = match &e {
+                    ApiError::Internal(_) => "内部错误".to_string(),
+                    other => other.to_string(),
+                };
+                out["coverError"] = json!({ "code": code, "message": message });
+                cover_note = format!(", cover_error={code}");
+            }
+        }
+    }
+    audit(&state.db, &admin.0, "world.create", &world_id, &format!("{host_note}{cover_note}")).await?;
+    Ok(Json(out))
 }
 
 // ---------------- 世界模板库 ----------------

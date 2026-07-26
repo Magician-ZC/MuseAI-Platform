@@ -18,6 +18,10 @@
 //!   查表即发、**零随机数**（§16 去抽卡化是合规定性防线）。
 //! - 崩塌：`is_collapse_reason` + 具名系数常量 → ③ 归零 + ① 减半 + ② 已锁定保留。
 //!
+//! R2 追加：③ 层命中的那一档若声明了 `subplotCard`，同一事务内再铸一张**副本卡**
+//! （总规格 §10【拍板 1、6、7、11、17】，实现在 `crate::subplot`）——同一张表、同一档、
+//! 同一次结算，产出仍是查表所得、零随机。副本卡运营开关默认关闭时该接点恒不发放。
+//!
 //! 端点：
 //! GET  /me/progression        → { totalMileage, cardSlots, maxSlots, nextSlotAt }
 //! POST /me/card-slots/unlock  → 达下一阈值则 card_slots+1；未达/已到上限 → 400
@@ -131,6 +135,11 @@ pub(crate) struct PayoutContext {
     pub table: Option<PayoutTable>,
     /// 装配时快照的模板星级；缺失（老实例 / 无装配）→ 1★，即最保守封顶。
     pub star_rating: i64,
+    /// 同一张产出表的**副本卡侧视图**（R2，总规格 §10【拍板 1、6、7、11、17】）：
+    /// 与 `table` 解析自同一个 `worldlineTiers` 数组、用同一条查表规则命中同一档，
+    /// 只是各取所需的字段（历练/道具在 `table`，副本卡星级与卡面在这里）。
+    /// 装配层因此不必知道有"副本卡"这种资产——少一处耦合、少一处口径漂移。
+    pub subplot_cards: crate::subplot::SubplotCardPayouts,
 }
 
 impl PayoutContext {
@@ -176,13 +185,18 @@ pub(crate) async fn load_payout_context_tx(
 /// 从 `assembled_json` 文本解析结算上下文（纯函数，可单测；解析失败一律退化为"不发放 + 1★ 封顶"）。
 pub(crate) fn payout_context_from_wrapper(raw: Option<&str>) -> PayoutContext {
     let Some(v) = raw.and_then(|s| serde_json::from_str::<Value>(s).ok()) else {
-        return PayoutContext { table: None, star_rating: 1 };
+        return PayoutContext {
+            table: None,
+            star_rating: 1,
+            subplot_cards: crate::subplot::SubplotCardPayouts::default(),
+        };
     };
     let table = v
         .pointer("/assembly/payoutTable")
         .and_then(|t| serde_json::from_value::<PayoutTable>(t.clone()).ok());
     let star_rating = v.get("starRating").and_then(Value::as_i64).unwrap_or(1);
-    PayoutContext { table, star_rating }
+    let subplot_cards = crate::subplot::SubplotCardPayouts::from_wrapper_value(Some(&v));
+    PayoutContext { table, star_rating, subplot_cards }
 }
 
 /// 终局 reason 是否构成「世界线崩塌」（关键 NPC 退场等）。runtime 只传 reason 串，判定收在本模块。
@@ -330,8 +344,10 @@ pub(crate) fn resolve_payout_tier(table: &PayoutTable, score: f64) -> Option<&Pa
 /// ③ `backpacks (user_id, reward_hook_key)` DB 唯一键（hook_key = `{world_id}:{cid}:worldline`）——
 ///    最后一道防线，即使前两层被绕过也不会二次发货。
 ///
-/// **产出封顶不可绕过**：道具 `powerTier > 实例星级` 即剔除（不降级、不替换），与装配层封顶同口径。
-/// **单一写入路径**：道具一律 `backpack::grant_item_tx`，历练一律 `grant_mileage_tx`，不直插任何表。
+/// **产出封顶不可绕过**：道具 `powerTier > 实例星级`、副本卡 `starRating > 实例星级` 即剔除
+/// （不降级、不替换），与装配层封顶同口径。
+/// **单一写入路径**：道具一律 `backpack::grant_item_tx`，历练一律 `grant_mileage_tx`，
+/// 副本卡一律 `subplot::grant_card_tx`（自带 DB 幂等键），一律不直插任何表。
 ///
 /// 返回已发放明细（供 chapters::finish 回给前端；无产出表 / 无贡献者 → 空 Vec，不报错）。
 pub(crate) async fn settle_worldline_tx(
@@ -423,12 +439,28 @@ async fn settle_worldline_with_ctx_tx(
                 }
             }
         }
+        // 副本卡（R2，§10【拍板 1、6、7、11、17】）：与道具/历练**同事务、同一档、同幂等口径**。
+        // 幂等不共用 ③ 层的 reward_hook_key（那把键锁的是 backpacks 行），副本卡自带
+        // `subplot_cards(owner_id, grant_key)` 唯一键——它是 INSERT 类资产，没有"未通关→通关"
+        // 那种天然转变沿可寄生（见 subplot 模块 ⑤）。开关默认关闭时本调用恒返回 None，不发卡。
+        let subplot_card = crate::subplot::settle_subplot_card_tx(
+            tx,
+            &ctx.subplot_cards,
+            world_id,
+            cid,
+            user_id,
+            score,
+            ctx.star_rating,
+        )
+        .await?;
+
         granted.push(json!({
             "characterId": cid,
             "tier": tier.label,
             "contributionScore": score,
             "mileage": tier.mileage,
             "itemId": item_id,
+            "subplotCard": subplot_card,
         }));
     }
 

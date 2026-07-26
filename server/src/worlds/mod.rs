@@ -173,7 +173,12 @@ const MODERATION_APPROVED: &str = "approved";
 /// 另一条硬约束：**绝不下发空串**。无封面 / 未过审 → 返回 None → 调用方**不写该字段**，
 /// 让前端走它已实现的"按 world.id 哈希确定性挑一张内置位图"兜底；下发 `""` 会被前端
 /// `coverUrl?.trim() || 兜底` 之外的任何直接消费点渲染成碎图。
-fn visible_cover_url(cover_url: Option<String>, cover_moderation: Option<&str>) -> Option<String> {
+/// 可见性放宽至 `pub(crate)`（逻辑一字未改）：后台世界列表 `/admin/worlds` 同样是封面读取面，
+/// 必须经**这一个**闸门，不得另写一套 approved 判断——两套口径一旦漂移就是未过审图片外泄。
+pub(crate) fn visible_cover_url(
+    cover_url: Option<String>,
+    cover_moderation: Option<&str>,
+) -> Option<String> {
     if cover_moderation != Some(MODERATION_APPROVED) {
         return None;
     }
@@ -659,13 +664,16 @@ async fn world_detail(
 
 /// 世界封面上传请求（base64 JSON，形态与角色立绘 `POST /assets/characters/{id}/avatar` 逐字一致，
 /// 复用现有 JSON 栈，不引入 multipart）。
+///
+/// 可见性 `pub(crate)`（逻辑一字未改）：admin 官方建房把它作为可选入参内嵌，建房后**原样转交**
+/// 下面的 `upload_cover`，两条路径的封面载荷形态因此恒定同源。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CoverReq {
+pub(crate) struct CoverReq {
     /// 标准 base64 编码的原始图片字节（不含 data: 前缀）。
-    image_base64: String,
+    pub(crate) image_base64: String,
     /// image/png | image/jpeg | image/webp
-    mime: String,
+    pub(crate) mime: String,
 }
 
 /// 可为**官方世界**设封面的角色。
@@ -703,7 +711,11 @@ fn can_set_cover(world: &WorldRow, user: &AuthUser) -> bool {
 /// 🔴 红线：cover_url 无论裁决都落库（人审改判后无需重传），但**响应与所有读取面仅 approved 才给 URL**
 /// （`visible_cover_url`）。私密房不豁免——封面上传与房间可见性无关，恒过机审。
 /// 世界不存在 → 404；无权限 → 403（口径同 `world_detail` 对私有房的 Forbidden）。
-async fn upload_cover(
+///
+/// 可见性 `pub(crate)`（逻辑一字未改）：admin 官方建房（`admin_api::worlds_ops::create_world`）
+/// 建房后**直接调用本函数**完成封面落地，而不是把权限判定/图审/落库复制一份——
+/// 复制一份必然与本函数漂移（尤其是 `ModerationProvider::check_image` 这道内容安全闸）。
+pub(crate) async fn upload_cover(
     State(state): State<AppState>,
     user: AuthUser,
     Path(id): Path<String>,

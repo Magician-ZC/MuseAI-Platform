@@ -19,6 +19,9 @@ mod interventions;
 // 接受邀请只点亮引导入口，入场仍走 worlds::join_world 的全部校验。
 mod invitations;
 mod notifications;
+// 新手动线（总规格 §13【拍板 21】）：预制卡库 + 单人微本模板 + 新人礼包发放。
+// 默认关闭的运营开关 `MUSE_ONBOARDING`；礼包只发卡 + 建房，入场仍走 worlds::join_world 的全部校验。
+mod onboarding;
 // 波次 2：历练值 + 卡位制（成长值只作准入与解锁，绝不进引擎决策）。
 mod progression;
 mod providers;
@@ -28,6 +31,9 @@ mod runtime;
 mod safety;
 // 叙事质量 SLO（VALIDATION §4.2）：只读观测口径 + 平台级聚合，供运营看板消费。
 mod slo;
+// R2 副本卡（总规格 §10【拍板 1、6、7、11、17】）：结算产出的剧情结晶 + 同星合成回收口。
+// 默认关闭的运营开关 `MUSE_SUBPLOT_CARDS`；零 RNG（查公示产出表）、无任何交易/转让路径、永不加战力。
+mod subplot;
 mod worlds;
 
 #[cfg(feature = "arena")]

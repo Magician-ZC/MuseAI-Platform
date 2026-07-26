@@ -100,7 +100,7 @@
 
 ### 6.2 活跃世界表格
 
-当前字段包括世界名称、状态、房间类型、参与人数、当前 Tick、成功率、今日成本、风控延迟和最后活动时间。世界名称带缩略图（预览模式为真实封面；正式模式在 `coverUrl` 接口字段补齐前按 `world.id` 哈希确定性取占位图，同一世界恒定同一张）。**点击整行**即为主入口，键盘 Enter / 空格等效，随即更新右侧诊断栏。
+当前字段包括世界名称、状态、房间类型、参与人数、当前 Tick、成功率、今日成本、风控延迟和最后活动时间。世界名称带缩略图：真实封面取 `GET /admin/worlds` 的 `coverUrl`（**仅机审 approved 才下发**，未过审等同没有封面）；该键缺席时按 `world.id` 哈希确定性取兜底图，同一世界恒定同一张，既不全站同图也不随机。**点击整行**即为主入口，键盘 Enter / 空格等效，随即更新右侧诊断栏。
 
 状态筛选、刷新和时间范围切换属于核心操作，必须保持可用：
 
@@ -160,17 +160,17 @@
 | 健康指标条 运行中/需关注/已熔断 | 按“已加载世界”本地统计，翻页未完时标注“未加载完” | 平台级汇总（`GET /admin/worlds/summary`）。`metrics/overview` 的 `worlds.active/fused` 是另一套口径（无“需关注”档、与本页派生态不一致），不能顶替 |
 | 表格 风控延迟 | `—` | `moderationLatency`（`GET /admin/worlds`）。全仓无任何一处记录**机审调用耗时**；`audit_queue.created_at/reviewed_at` 是**人审周转**（小时/天量级），与本列按秒渲染的语义不同，**不得充数**。补齐路径：safety 侧在 `moderate_*` 两端取时钟差落表后按 world 聚合 |
 | 表格 最后活动 | `—` | `lastActivityAt`（`GET /admin/worlds`）。`worlds.updated_at` 已存在但未投影；`createdAt` ≠ 最后活动 |
-| 表格 世界缩略图 | 按 `world.id` 哈希确定性取占位图 | `coverUrl`（`GET /admin/worlds`） |
 | 诊断栏 启动时间 | `—`，另显示真实创建时间 | `startedAt`（diagnostics.world） |
 | 诊断栏 风险命中 | 口径改为“累计”，日环比 `—` | 按日聚合的 `riskEventCountsToday` 与昨日值 |
 | 诊断栏 备用路由 / 路由错误率 | `—`，当前路由旁改显示真实 Tick 失败率 | `backupRoute`、`routeErrorRate` |
 | 诊断栏 Prompt 更新人 / 更新时间 | `—` | `promptSetUpdatedBy`、`promptSetUpdatedAt` |
 | 延迟曲线与时间线取数窗口 | 客户端按时间范围过滤 diagnostics 最近 10 个 tick | diagnostics 支持 `?since=` / `?window=` 与更大采样量 |
 
-已由成本仪表（`server/src/admin_api/worlds_ops.rs`、`dashboards.rs`）补齐并接线的字段，前端不再留空态；**单位口径必须照下表渲染**：
+已由成本仪表与世界封面（`server/src/admin_api/worlds_ops.rs`、`dashboards.rs`）补齐并接线的字段，前端不再留空态；**单位口径必须照下表渲染**：
 
 | 界面位置 | 数据来源 | 单位与空值口径 |
 |---|---|---|
+| 表格 / 诊断栏 世界缩略图 | `GET /admin/worlds` → `coverUrl` | 🔴 只有机审 `approved` 的封面才下发（服务端经 `worlds::visible_cover_url` 这一个闸门，与玩家大厅同源）；无封面 / `pending` / `rejected` → **该键缺席**（不是空串、不是 `null`），前端按 `world.id` 哈希取确定性兜底图，**不得随机、不得全站同图** |
 | 表格 参与人数 | `GET /admin/worlds` → `participantCount` | active 成员数；无成员即 `0`（0 是真实答案，不是缺数据） |
 | 表格 成功率 | `GET /admin/worlds` → `successRate` | **0..1 小数**，渲染必须 ×100；分母只含已终结 tick（done+failed）；无已终结 tick → `null`，显示 `—` 且不着色，**不得当 0% 渲染** |
 | 表格 今日成本 | `GET /admin/worlds` → `todayCostCents`（账面整数分）/ `todayCostCny`（展示派生）/ `todayTokens` | UTC 日界；单元格显示 `¥x.xx`，tooltip 附今日 token |

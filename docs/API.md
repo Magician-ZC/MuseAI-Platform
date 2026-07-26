@@ -1,6 +1,6 @@
 # 平台后端 API 清单（server）
 
-> 全部端点 nest 在 `/api` 下（`server/src/app.rs`），共 **89 条路由声明 / 98 个方法-路径组合**。
+> 全部端点 nest 在 `/api` 下（`server/src/app.rs`），共 **95 条路由声明 / 104 个方法-路径组合**。
 > 鉴权列语义：**JWT** = 需 `Authorization: Bearer <accessToken>`（`AuthUser` 提取器）；
 > **公开** = 无需 token；**admin+角色** = 需管理员 token 且 `require_role` 通过（`admin` 角色恒通过）。
 > 校验于 2026-07-26。**改路由必须同步改本文件**——与 `docs/VALIDATION.md` §3 台账同级纪律。
@@ -9,7 +9,7 @@
 
 | 模块 | feature | 说明 |
 |---|---|---|
-| auth / assets / worlds / events / interventions / consents / invitations / notifications / reports / backpack / chapters / progression / admin_api | 默认 | 默认构建即含 |
+| auth / assets / worlds / events / interventions / consents / invitations / notifications / reports / backpack / chapters / progression / subplot / onboarding / admin_api | 默认 | 默认构建即含 |
 | arena / livegate | `arena` | 赛事房与直播礼物网关 |
 | billing | `billing` | 计费闭环 |
 | shop | `billing` 或 `arena` | 依赖复式账本，与 ledger 同门控（`app.rs:61`） |
@@ -17,8 +17,10 @@
 未启用 feature 时对应路由**不注册**，请求返回 404。
 
 **运行时开关**（与 feature 门控正交，同样"未验证功能默认关闭"）：`invitations` 全部端点由
-`MUSE_ROOM_INVITATIONS` 控制，**默认关闭 → 404**；世界的生死状档由 `MUSE_LETHALITY_DEATHMATCH`
-控制，默认关闭 → 读取侧降级为同意制。
+`MUSE_ROOM_INVITATIONS` 控制，**默认关闭 → 404**；`onboarding`（新手动线）全部端点由
+`MUSE_ONBOARDING` 控制，**默认关闭 → 404**；`subplot`（副本卡）全部端点**与结算铸卡**由
+`MUSE_SUBPLOT_CARDS` 控制，**默认关闭 → 端点 404 且结算一张不铸**；世界的生死状档由
+`MUSE_LETHALITY_DEATHMATCH` 控制，默认关闭 → 读取侧降级为同意制。
 
 ---
 
@@ -100,7 +102,7 @@
 > 未成年保护另有**前门拒绝 + 接受时复查**双保险：生效档为生死状的世界，未声明成年者既收不到邀请、
 > 也接受不了（拒绝文案统一为通用句，不得让端点变成年龄探测器）。
 
-## 4. 玩家账户（me / backpack / progression / reports / notifications）
+## 4. 玩家账户（me / backpack / progression / subplot / onboarding / reports / notifications）
 
 | 方法 | 路径 | 鉴权 | 说明 |
 |---|---|---|---|
@@ -112,6 +114,72 @@
 | GET | `/api/me/reports/{id}` | JWT | 日报详情 |
 | GET | `/api/me/notifications` | JWT | 通知列表 |
 | GET/PUT | `/api/me/notification-preferences` | JWT | 通知偏好读写 |
+
+### 新手动线（onboarding，migration 0031；总规格 §13【拍板 21】）
+
+| 方法 | 路径 | 鉴权 | 说明 |
+|---|---|---|---|
+| GET | `/api/onboarding/presets` | JWT | 预制精品卡库（只给 id/名字/一句话卖点，**不下发卡全文**）。**开关默认关闭** |
+| POST | `/api/me/onboarding/gift` | JWT | 领取新人大礼包 `{presetId?}`：发 1 张预制卡 + 建 1 个单人微本世界。幂等 |
+| GET | `/api/me/onboarding` | JWT | 我的动线状态（领没领 / 投放没投放 / 已跑拍数 / 下一步）。T0 门槛的客户端读口径 |
+| POST | `/api/me/onboarding/microworld/start` | JWT | 开演：微本世界 `open → running`（须已投放；幂等） |
+
+| 项 | 取值 |
+|---|---|
+| 运营开关 | `MUSE_ONBOARDING`，**默认关闭**（VALIDATION.md §0.1）。关闭时四个端点全 404，且**已领过的礼包也读不出、开不了演**（读取侧降级，可逆急停阀，范式同 `MUSE_ROOM_INVITATIONS`） |
+| 每人一次 | `onboarding_grants.user_id` **PRIMARY KEY**（迁移 0031）——不是应用层读-判-写。领取事务把「发卡 + 建房 + 登记」放一起、登记行最后写，撞主键即整体回滚并返回与首次**逐字节相同**的回执。`Idempotency-Key` 是另一层（覆盖同一次点击的 HTTP 重试），两层都要 |
+| 卡位 | 预制卡**占卡位**（`users.card_slots` 默认 3）。卡位满 → 409，撤回一张即可领取。不占位等于开了「白得一个养成容器」的侧路 |
+| 微本参数（全部可 env 覆盖，VALIDATION.md §0.2） | `MUSE_ONBOARDING_MAX_TICKS`（默认 3，**兜底保证微本必然收束**）· `MUSE_ONBOARDING_MIN_TICKS`（默认 1，防秒结束地板）· `MUSE_ONBOARDING_TICK_PER_DAY`（默认 1440 ≈ 每分钟一拍）· `MUSE_ONBOARDING_TOKEN_BUDGET`（默认 8 万）· `MUSE_ONBOARDING_CNY_BUDGET_CENTS`（默认 20 分） |
+| 微本世界形态 | 模板 `tpl_onboarding_micro`（`room_type='idle'`、1★、代码 `ensure_template` 幂等入库、骨架变更即升版）· `visibility='private'`（不进大厅）· `member_limit=1` · `lethality='sanctuary'`（庇护档，教学场死亡不可能） |
+| 托梦「3 条」 | **不单独发放**：配额已是全局参数 `MUSE_DREAM_QUOTA_PER_STAGE`（默认 3，每卡每阶段），新卡自动享有 |
+| 未实现 | 礼包的「1 张低星副本卡」待副本卡资产落地后补（见下方 TODO） |
+
+> 🔴 **领取 ≠ 入场**：礼包只发卡 + 建房，**不写 `world_members`**；真正入场仍须调用
+> `POST /api/worlds/{id}/join`，于是 join 的全部服务端权威校验（角色属本人/approved/未撤回 ·
+> 人数上限 · 一人一卡防自刷 · **同源唯一** · 星级历练准入 · 生死契约签署 · 未成年门）一条不少地生效。
+> 该性质由源码断言测试 `onboarding::tests::module_never_writes_world_members` 锁死（体例同 invitations）。
+>
+> 🔴 **单角色微本 ≠ 世界里只有一个角色**：`runtime` 的推进门 `active_cards.len() < 2` 把 NPC 也算在内，
+> 故微本骨架**自带 2 个 NPC**（玩家 1 张卡 + NPC 2 = 3 张活跃卡）。骨架不带 NPC 的单人房会**永远**卡在
+> `insufficient_members`。集成测试 `microworld_advances_at_least_one_tick_with_single_player` 钉住这条链路。
+>
+> **同源唯一取舍**：**一人一世界实例**（主因是「5 分钟速通 + 从头教学」的节奏隔离，回避撞车是顺带红利）；
+> 另有两道正交保险——预制卡原创虚构无 `sourceWork` → `source_fingerprint` 落 NULL；落库显式 `pristine=0`。
+>
+> **TODO(副本卡)**：礼包规格里的「1 张低星副本卡」本批次未实现（副本卡资产表当时尚未落地，
+> 刻意不造临时表）。副本卡项落地后，在领取事务里追加一次发放即可，开关与幂等键无需改动。
+> **现已可接**：在领取事务内调 `subplot::grant_card_tx(&mut tx, &NewSubplotCard{ origin_kind:
+> ORIGIN_GRANT, grant_key: format!("grant:starter:{user_id}"), star_rating: 1, .. })`，
+> 幂等由 `subplot_cards(owner_id, grant_key)` 唯一键自带，无需 onboarding 侧再做去重。
+
+### 副本卡（subplot，migration 0032；总规格 §10【拍板 1、6、7、11、17】）
+
+| 方法 | 路径 | 鉴权 | 说明 |
+|---|---|---|---|
+| GET | `/api/me/subplot-cards?status=owned\|consumed\|all` | JWT | 我的副本卡（星级 / 卡面 / 来源世界与模板 / 合成血缘）。默认只出在手的（`owned`）；响应带 `synthesisRule` 公示合成规则。**开关默认关闭** |
+| POST | `/api/me/subplot-cards/synthesize` | JWT | 同星合成 `{cardIds:[...]}`：N×n★ → 1×(n+1)★。源卡销毁 + 新卡铸成同事务。`Idempotency-Key` 可选 |
+
+| 项 | 取值 |
+|---|---|
+| 运营开关 | `MUSE_SUBPLOT_CARDS`，**默认关闭**（VALIDATION.md §0.1）。关闭时两个端点全 404，**且世界线结算一张卡都不铸**（前门 + 产出侧双保险）；已铸出的卡不因关阀而丢失——那是资产，不是功能。范式同 `MUSE_LETHALITY_DEATHMATCH` |
+| 产出（唯一来源） | 三层结算 ③ 世界线层：贡献分 → 查**公示产出表**（`worlds.assembled_json` 的 `/assembly/payoutTable/worldlineTiers[].subplotCard`）→ 确定发放。接点在 `progression::settle_worldline_tx`，与道具/历练**同事务、同一档** |
+| 🔴 零 RNG | **无概率字段、无爆率、无开箱**（§10【拍板 17】+ §16「去抽卡化是定性防线的关键」）。同一贡献分恒得同一张卡，可 replay 复算。运营话术同步避开"开箱/抽卡/爆率"，统一用"结算产出 / 产出表" |
+| 🔴 无交易 | 无提现红线下道具交易 = RMT 侧门（§10「玩家间交易暂不开」）。**没有任何转让/赠送/挂单端点**，`owner_id` 只在 INSERT 时写入。由路由白名单 + 源码断言 + 运行时 404 探测三重锁死 |
+| 🔴 永不加战力 | 副本卡不进任何引擎决策路径（`runtime/mod.rs` 与 `muse-engine` 源码级零 `subplot` 引用，grep 级断言，口径同历练 mileage） |
+| 星级封顶 | 卡 `starRating > 实例 starRating` → **整张剔除**（不降级、不替换），与装配层 `culled_over_tier` 同口径 |
+| 幂等 | `subplot_cards(owner_id, grant_key)` DB 唯一键（**自带**，不寄生在调用方转变沿上）：结算 `settlement:{world_id}:{character_id}:worldline` · 合成 `synthesis:{升序源卡 id}` · 礼包 `grant:...` |
+| 参数化（VALIDATION.md §0.2） | `MUSE_SUBPLOT_SYNTHESIS_N`（配方张数，默认 3，clamp [2,10]）· `MUSE_SUBPLOT_MAX_STAR`（星级上限，默认 5，clamp [1,10]）。规格里的「3×2★→1×3★」是初值不是承诺 |
+| 数据侧默认关闭 | 模板产出表未声明 `subplotCard` → 该档不发卡。开闸靠运营录数据，不靠代码合并 |
+
+> 🔴 **为何独立于 `items`/`backpacks`**：副本卡是**永久蓝图**（装进自定义房，房散卡还在），
+> 而 `backpacks` 是可携带、可被引擎消费的道具持有关系，`items` 更是**引擎可见的世界物**
+> （随 `carry` 进 `RoundInput`）。塞在一起就得给 carry/admission 全链路开一串「这个 tag 不参与」的
+> 例外——例外即漏点。合成还需要销毁语义与血缘（`consumed_into` / `synthesized_from_json`），
+> 道具的 `consumed`（用掉）与副本卡的 `consumed`（熔成另一张）不是同一件事。§18 衔接表亦明写新表。
+>
+> 合成的三重幂等：① 事务原子性（先铸后熔，任一步失败整笔回滚，绝不"熔了却没出卡"）·
+> ② 源卡 `status='owned'` 条件 UPDATE 的 CAS（并发/重放抢不到即回滚）· ③ `grant_key` 唯一键。
+> 销毁是**软删**（`status='consumed'` + 反向指针），回收口必须可溯（§0.2 全链审计）。
 
 ## 5. 计费与商城（billing / shop）
 
@@ -183,8 +251,8 @@
 ## 8. 本清单的生成与校验
 
 ```bash
-# 路由与方法（应得 98 个方法-路径）
-grep -rhoE '\.route\("[^"]+"' server/src | wc -l           # 89 条 route 声明
+# 路由与方法（应得 104 个方法-路径）
+grep -rhoE '\.route\("[^"]+"' server/src | wc -l           # 95 条 route 声明
 # admin 角色矩阵
 grep -rn "require_role" server/src/admin_api/*.rs
 ```

@@ -50,6 +50,8 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::backpack::router())
         .merge(crate::chapters::router())
         .merge(crate::progression::router())
+        .merge(crate::subplot::router())
+        .merge(crate::onboarding::router())
         .merge(crate::admin_api::router());
 
     #[cfg(feature = "arena")]

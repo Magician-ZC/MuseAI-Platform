@@ -682,13 +682,18 @@ async fn load_carried_item_facts(
 //
 // 🔴 **平权宪法（总规格 §0.1 真红线 1，锁进测试）**：身份只是「这个角色在这个世界的开局站位」
 //（户部主事 / 漕帮商贾 / 被退婚的嫡女），**不携带任何数值差异、准入门槛、产出加成、难度优待
-// 或叙事特权**。本节读回的分配结果**只**用于拼接 `RoundInput.other_cards_brief`——即「他人如何
-// 被本角色感知」的第三人称一句话摘要，**绝不进入 `active_cards`**（角色卡不可变快照，污染它
-// 等于篡改玩家的卡），也绝不得被任何下游用来改判定 / 改发奖 / 开权限 / 调难度。戏份靠玩出来。
+// 或叙事特权**。本节读回的分配结果**只**流向引擎的两条**感知**通道，别无他处：
+//   ① `RoundInput.other_cards_brief`——「他人如何被本角色感知」的第三人称一句话摘要（`唐三（户部主事）`）；
+//   ② `RoundInput.self_identities`——「本角色自己的开局站位」（引擎 decide 组装上下文时恒剔除自己，
+//      少了这条角色本人反而看不见自己的站位）。两条同源同值，故不可能出现「别人叫你户部主事、
+//      你自己却不知道」的错位。
+// **绝不进入 `active_cards`**（角色卡不可变快照，污染它等于篡改玩家的卡）、绝不占用 `whispers`
+// （托梦有配额且会被标 applied，语义完全不同），也绝不得被任何下游用来改判定 / 改发奖 / 开权限 /
+// 调难度。戏份靠玩出来。
 //
 // 退化契约：老世界 / 未装配 / 模板未声明 `identityPool` / JSON 结构损坏 → 一律静默退化为
-// 「brief 只放名字」的现状，逐字段零行为变化；不 panic、不阻断 tick（同本文件 `seed_narrative_layer`
-// 的防御式解析口径）。
+// 「brief 只放名字 + 上下文里根本没有身份字段」的现状，逐字段零行为变化；不 panic、不阻断 tick
+// （同本文件 `seed_narrative_layer` 的防御式解析口径）。
 //
 // 确定性：分配结果由装配层按 cid 升序钉死在 `assembled_json`，本节纯读、纯拼接，无随机、
 // 不依赖 map 迭代序产生分支 —— 同一 (world_id, 阵容, template_version) 恒得同一份身份呈现。
@@ -1714,6 +1719,16 @@ async fn process_tick_inner(
             mode: RunMode::Observe,
             active_cards: active_cards.clone(),
             other_cards_brief: other_brief.clone(),
+            // 身份池「自身感知」（总规格 §5【拍板 4、5】）：把开局站位喂给**角色本人**。
+            // 引擎 decide 组装可见上下文时恒剔除自己，故 brief 里的身份只有别人看得见；
+            // 此通道补上「你在这个世界是户部主事」这一句，玩家才感知得到自己的开局站位。
+            // 复用同一份 `load_identity_display_names` 读回结果（不另起第二套解析）：
+            // 「别人怎么看你」（brief）与「你知道自己是谁」（self_identities）永远同源同值、同确定性。
+            // 🔴 平权红线（§0.1）：只进感知层，不携带数值差异 / 准入门槛 / 产出加成 / 难度优待 /
+            //    叙事特权；绝不进 active_cards（角色卡不可变快照），也绝不占用托梦（whispers）配额。
+            // 退化：空表（老世界 / 模板未声明 identityPool / assembled_json 结构损坏）→ 引擎上下文
+            //    里根本不出现该字段，逐字节与接线前一致，且任何解析失败都不阻断 tick。
+            self_identities: identity_display.clone(),
             whispers: whispers.clone(),
             fragments: BTreeMap::new(),
             temperature_decide: 0.0,

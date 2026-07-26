@@ -1,6 +1,7 @@
 //! P2 自主叙事引擎：回合编排（规格 §12.1）。
 //!
-//! 回合：导演设局 → 活跃角色并发 role_decide → 仲裁（规则→模型）→ 场景写作
+//! 回合：导演设局 → 活跃角色并发 role_decide → 底线硬约束闸（人设保险第 1 级，违反自己卡的底线
+//! → 拒绝提案并重新生成，见 §7 与 `arbiter::screen_bottom_lines`）→ 仲裁（规则→模型）→ 场景写作
 //! → 确定性不变量检查（失败阻断）→ narrative_critic（建议）→ reducer 生成校验 StatePatch
 //! → 原子提交 → DomainEvent 发射 → 下一场景 / 章节停止点。
 //!
@@ -16,7 +17,7 @@ pub mod snapshot;
 pub mod state;
 pub mod types;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use futures::future::join_all;
@@ -41,6 +42,15 @@ pub const MIN_DURATION: i64 = 1;
 pub const MAX_DURATION: i64 = 1_000_000;
 /// blocked/gated 后 cohort next_time 的兜底推进量（防同一 T 反复重试锁死 → 饿死）。
 pub const RETRY_STEP: i64 = 30;
+
+/// 【人设保险 第 1 级】提案违反角色自己卡上的底线时的**重新生成上限**（每拍、每角色）。
+/// **参数化集中点**（VALIDATION §0.2：产品规则不写死）。
+///
+/// 为什么默认只给 1 次：重生成是真实的模型调用，成本与延迟随它线性上涨（§17 成本工程）；
+/// 而回执里已经把被违反的底线原文当硬约束钉死了，一次改不过来的，多来几次多半也改不过来
+/// （decide 温度通常很低，重复采样收益递减）。改不过来就走降级序列（拦下该提案 → 整拍延后），
+/// 而不是无限重试把一拍拖成天价。
+pub const MAX_BOTTOM_LINE_REGEN: usize = 1;
 use crate::host::{CancelFlag, EngineEvent, EngineHost, ModelCallLog};
 use crate::model::{json_call, ModelCallSpec, ModelProfile};
 use crate::EngineError;
@@ -434,16 +444,155 @@ impl NarrativeEngine {
         }
         decisions.sort_by(|a, b| a.character_id.cmp(&b.character_id));
 
+        // 2.5) 【人设保险 第 1 级 · 事前 · 底线硬约束】（总规格 §7）
+        //
+        // 规格：卡的 bottomLines/refusalRules/immutableCore 升级为仲裁硬约束——角色行为违反自己卡的
+        // 底线 → 仲裁拒绝该提案、**重新生成**。这一级是「事前预防」（第 2 级注解权是事中、
+        // 第 3 级 if 线是事后），事前拦住的 OOC 越多，事后申诉越少（T1 门槛：申诉 <10%/阶段）。
+        //
+        // **分层**：判「拦不拦」在规则层（`arbiter::screen_bottom_lines` 纯函数，确定性、零新增
+        // 模型调用、可 replay）；做「怎么改」在模型层（带底线回执重跑 `role_decide`，有次数上限），
+        // 改完再过同一个确定性闸复检。判定绝不交给模型——那会让提交内容挂在模型输出上，replay 破裂。
+        //
+        // **降级序列（对齐 VALIDATION §5「宁可停拍，不让失败输出成为永久公共事实」）**：
+        //   ① 重新生成 ≤ MAX_BOTTOM_LINE_REGEN 次（把被违反的底线原文回注为硬约束 —— 对应
+        //      §5 的「缩短上下文重仲裁」：不是换模型碰运气，是把约束写死再来一次）；
+        //   ② 仍违规 → 该提案判 `Invalid`（`rule:bottom_line`）：不落状态、不发事件、不推里程碑、
+        //      不进关系演化，写作被显式告知「并未发生」—— 对应 §5 的「延后此拍」，
+        //      延后的是**该角色这一拍**，世界其余部分照常推进（不卡死）；
+        //   ③ 本拍**全部**提案都被拦下 → 整拍 `blocked`、零提交 —— 对应 §5 的「暂停世界并说明原因」，
+        //      由上层（server 的连续 blocked 计数 / stall_hint）接「人工复核队列」。
+        //   （§5 的「过审过渡事件」需要一个过审事件库，属宿主侧资产，引擎不自造。）
+        //
+        // 确定性：`collect_bottom_lines`/`screen_bottom_lines` 全序纯函数；重生成按命中的定序
+        // **串行**发起（不并发，避免任何完成序影响）；重生成次数只由输入决定，同输入恒同调用次数。
+        let bottom_lines = arbiter::collect_bottom_lines(&input.active_cards);
+        // 无任何卡声明底线 → 整段短路：不筛查、不调用、不改预算，行为与接线前逐字节一致。
+        let mut bottom_line_rejects: Vec<ArbiterOutcome> = Vec::new();
+        let mut regen_calls: u64 = 0;
+        if !bottom_lines.is_empty() {
+            let mut hits = arbiter::screen_bottom_lines(&bottom_lines, &decisions);
+            let mut attempt = 0usize;
+            while !hits.is_empty() && attempt < MAX_BOTTOM_LINE_REGEN {
+                attempt += 1;
+                for hit in &hits {
+                    cancel.check()?;
+                    let cid = hit.character_id.as_str();
+                    let Some(idx) = decisions.iter().position(|d| d.character_id == cid) else {
+                        continue;
+                    };
+                    let dctx = &decide_ctx[cid];
+                    let base = decide::assemble_visible_context(
+                        &current,
+                        cid,
+                        &input.active_cards[cid],
+                        &dctx.brief,
+                        &dctx.situation,
+                        input.fragments.get(cid).unwrap_or(&empty_frags),
+                        input.whispers.get(cid).map(|s| s.as_str()),
+                        input.self_identities.get(cid).map(|s| s.as_str()),
+                    )?;
+                    let ctx = decide::append_bottom_line_rejection(
+                        &base,
+                        &hit.line,
+                        &decisions[idx].action,
+                    )?;
+                    regen_calls += 1;
+                    match decide::role_decide(
+                        host,
+                        decide_stage,
+                        &decide_prompts,
+                        input.temperature_decide,
+                        input.max_output_tokens,
+                        &run_id,
+                        input.now_hint,
+                        cid,
+                        &ctx,
+                        &dctx.members,
+                        cancel,
+                    )
+                    .await
+                    {
+                        // decision_id 由 run_id/now_hint/cid 确定性派生 → 重生成后 id 不变，
+                        // 原地替换不打乱 `decisions` 的既有定序。
+                        Ok(nd) => decisions[idx] = nd,
+                        Err(EngineError::Cancelled) => return Err(EngineError::Cancelled),
+                        // 重生成本身失败（模型类错误）：保留原提案交下方 ② 拦截——
+                        // 宁可这一拍这个角色不动，也不放行违背底线的行动。
+                        Err(e @ (EngineError::ModelOutput(_) | EngineError::Model { .. })) => {
+                            host.events.emit(EngineEvent::ModelCall(ModelCallLog {
+                                run_id: run_id.clone(),
+                                agent: "roleDecide".to_string(),
+                                prompt_version: prompts.prompt_version.clone(),
+                                model_id: decide_stage.model.clone(),
+                                input_tokens: None,
+                                output_tokens: None,
+                                latency_ms: 0,
+                                retries: 0,
+                                error: Some(format!("bottom_line_regen_failed:{cid}:{}", e.code())),
+                            }));
+                        }
+                        // 非模型类错误（引擎内部缺陷）：fail-hard 上抛，不掩盖。
+                        Err(e) => return Err(e),
+                    }
+                }
+                hits = arbiter::screen_bottom_lines(&bottom_lines, &decisions);
+            }
+            // ② 重试上限后仍违规 → 拦截该提案（发观测事件供告警面板 / 人工复核队列取数）。
+            for hit in &hits {
+                host.events.emit(EngineEvent::ModelCall(ModelCallLog {
+                    run_id: run_id.clone(),
+                    agent: "arbiter".to_string(),
+                    prompt_version: prompts.prompt_version.clone(),
+                    model_id: decide_stage.model.clone(),
+                    input_tokens: None,
+                    output_tokens: None,
+                    latency_ms: 0,
+                    retries: attempt as u32,
+                    error: Some(format!(
+                        "bottom_line_rejected:{}:{}",
+                        hit.character_id, hit.matched
+                    )),
+                }));
+                bottom_line_rejects.push(arbiter::bottom_line_outcome(hit));
+            }
+        }
+
+        // ③ 全部提案都被底线拦下 → 整拍延后、零提交（不写作、不审校，也不空转出一场
+        //    「所有人都临阵收手」的公共事实）。上层据连续 blocked 暂停世界并入人工复核队列。
+        if !decisions.is_empty() && bottom_line_rejects.len() == decisions.len() {
+            let reason = format!(
+                "底线硬约束：本拍全部 {} 条提案均违反角色自己卡上的底线（已重新生成 {} 次仍未通过），\
+整拍延后，不提交任何状态",
+                bottom_line_rejects.len(),
+                MAX_BOTTOM_LINE_REGEN
+            );
+            let scene = stub_scene(tick, &situation, &decisions, &bottom_line_rejects, now);
+            return Ok(RoundOutcome {
+                scene,
+                new_state: current,
+                critic: continuity::CriticReport::default(),
+                budget,
+                blocked: Some(reason),
+            });
+        }
+
         // 3) 逐组仲裁（Phase 2）：每组独立规则层（R2 同组在场 + R6 移动连通/准入），
         //    pending 汇总后全局一次 model_arbitrate（仲裁模型调用仍 ≤1）。
+        // 已被底线拦下的提案**不再进 R1–R6**：提案已死，不必再判资源/冲突，也绝不占用模型层
+        // pending 名额（拦截不得抬高成本）。它们仍留在 `decisions` 里（战报可见「他提了什么、
+        // 为什么被自己的底线否掉」，I2 的 source_decision_ids ⊆ 本回合决策也照旧成立）。
+        let rejected_ids: BTreeSet<String> =
+            bottom_line_rejects.iter().map(|o| o.decision_id.clone()).collect();
         let dmap_by_cid: BTreeMap<&str, &RoleDecision> =
             decisions.iter().map(|d| (d.character_id.as_str(), d)).collect();
-        let mut outcomes: Vec<ArbiterOutcome> = Vec::new();
+        let mut outcomes: Vec<ArbiterOutcome> = bottom_line_rejects;
         let mut pending: Vec<RoleDecision> = Vec::new();
         for members in groups.values() {
             let group_decisions: Vec<RoleDecision> = members
                 .iter()
                 .filter_map(|m| dmap_by_cid.get(m.as_str()).map(|d| (*d).clone()))
+                .filter(|d| !rejected_ids.contains(&d.decision_id))
                 .collect();
             let (mut res, mut pend) =
                 arbiter::rule_arbitrate(&current, &group_decisions, members, &input.locations);
@@ -616,7 +765,16 @@ impl NarrativeEngine {
                 .emit(EngineEvent::Narrative { run_id: run_id.clone(), payload: serde_json::to_value(ev)? });
         }
 
-        budget.spent_tokens = budget.spent_tokens.saturating_add(scene_cost).min(budget.max_total_tokens);
+        // 底线重生成的额外决策调用据实计费（§17 成本工程：拦截不许悄悄花钱）。
+        // 未发生重生成时 `regen_calls == 0`，本行与接线前逐字节等价。
+        // 注：它发生在预算硬停之后，故只可能小幅超出上限 —— 由 `.min()` 夹住，
+        // 且上限本身是 `MAX_BOTTOM_LINE_REGEN × 活跃角色数`，有界。
+        let regen_cost = regen_calls.saturating_mul(input.max_output_tokens as u64);
+        budget.spent_tokens = budget
+            .spent_tokens
+            .saturating_add(scene_cost)
+            .saturating_add(regen_cost)
+            .min(budget.max_total_tokens);
         budget.max_scenes = budget.max_scenes.saturating_sub(1);
 
         Ok(RoundOutcome { scene, new_state, critic, budget, blocked: None })
@@ -3732,5 +3890,408 @@ mod tests {
         apply_lethality(std::slice::from_mut(&mut o), std::slice::from_ref(&d), Lethality::Sanctuary);
         assert!(rules.is_lethal(&o, &d));
         assert!(rules.classify(&o, &d, Lethality::Sanctuary).is_none());
+    }
+
+    // ========================================================================
+    // 人设保险 第 1 级 · 事前 · 底线硬约束（总规格 §7）—— run_round 端到端
+    // ========================================================================
+
+    fn card_with_bottom_lines(name: &str, lines: &[&str]) -> CharacterCardV2 {
+        let mut c = minimal_card(name);
+        c.dramatic_core.bottom_lines = lines.iter().map(|s| s.to_string()).collect();
+        c
+    }
+
+    /// 在 `round_input` 基础上替换活跃卡（只动底线声明，其余入参一律默认档）。
+    fn input_with_bottom_lines(
+        run_id: &str,
+        li_lines: &[&str],
+        wang_lines: &[&str],
+    ) -> RoundInput {
+        let mut input = round_input(run_id, big_budget());
+        input.active_cards = [
+            ("li".to_string(), card_with_bottom_lines("李", li_lines)),
+            ("wang".to_string(), card_with_bottom_lines("王", wang_lines)),
+        ]
+        .into_iter()
+        .collect();
+        input
+    }
+
+    /// 违反「不做伪证」的提案（字面重述禁止行为）。
+    fn forging_decision() -> String {
+        r#"{"intent":"保住他","action":"在堂上做伪证，一口咬定他当夜不在场","speak":{"willSpeak":true,"purpose":"作证"},"targets":[],"acceptableCosts":[],"predictions":[]}"#.to_string()
+    }
+
+    fn director() -> Result<String, EngineError> {
+        Ok(r#"{"situation":"堂前灯火通明，众人各自落座"}"#.to_string())
+    }
+    fn writer() -> Result<String, EngineError> {
+        Ok(r#"{"prose":"堂中礼数周全，暗流未起。"}"#.to_string())
+    }
+    fn critic() -> Result<String, EngineError> {
+        Ok(r#"{"characterConsistencyIssues":[],"causalIssues":[],"revisionSuggestions":[]}"#.to_string())
+    }
+
+    fn outcome_of_cid<'a>(out: &'a RoundOutcome, cid: &str) -> &'a ArbiterOutcome {
+        out.scene.outcomes.iter().find(|o| o.character_id == cid).expect("该角色应有裁决")
+    }
+
+    /// 🔴 回归保护（最重要）：卡上没声明底线 → 整段短路，调用序列与产物与接线前完全一致。
+    /// 并且——声明了底线但**没违反**时，产物与「压根没声明」逐字节相同：
+    /// 底线不带任何数值/结果影响（§0.1 平权：底线是「不会做什么」，不是「更强」）。
+    #[tokio::test]
+    async fn bottom_lines_absent_or_unviolated_are_byte_identical() {
+        let run = |cards: Option<BTreeMap<String, CharacterCardV2>>| async move {
+            let model = Arc::new(CapturingModel::new(two_char_script()));
+            let host = host_capturing(model.clone());
+            init_run(host.as_ref(), "run-1", true);
+            let engine = NarrativeEngine::new(host.clone());
+            let mut input = round_input("run-1", big_budget());
+            if let Some(c) = cards {
+                input.active_cards = c;
+            }
+            let out =
+                engine.run_round(&routes(), &prompts(), input, &CancelFlag::new()).await.unwrap();
+            (serde_json::to_string(&out.scene).unwrap(), model.decide_prompts().len(), out)
+        };
+
+        // ① 无底线声明：调用序列 = director + 决策×2 + writer + critic（无重生成）。
+        let (plain_scene, plain_decides, plain) = run(None).await;
+        assert_eq!(plain_decides, 2, "无底线 → 不得多出任何决策调用");
+        assert!(plain.blocked.is_none());
+        assert_eq!(plain.new_state.revision, 1);
+
+        // ② 声明底线但未违反：逐字节相同 —— 底线不改变任何结果。
+        let lines: &[&str] = &["不做伪证", "不篡改记录"];
+        let (declared_scene, declared_decides, declared) = run(Some(
+            [
+                ("li".to_string(), card_with_bottom_lines("李", lines)),
+                ("wang".to_string(), card_with_bottom_lines("王", lines)),
+            ]
+            .into_iter()
+            .collect(),
+        ))
+        .await;
+        assert_eq!(declared_decides, 2, "未违反 → 不得触发重生成");
+        assert_eq!(declared_scene, plain_scene, "声明底线但没违反 → 产物必须逐字节一致");
+        assert_eq!(declared.budget.spent_tokens, plain.budget.spent_tokens, "也不得多花一个 token");
+    }
+
+    /// 规格主路径：违反自己卡的底线 → **拒绝该提案、重新生成**；重生成合规后照常落定。
+    #[tokio::test]
+    async fn bottom_line_violation_is_regenerated_then_committed() {
+        // 调用序列：director → decide(li 违规) → decide(wang) → 【重生成 li】→ writer → critic。
+        let model = Arc::new(CapturingModel::new(vec![
+            director(),
+            Ok(forging_decision()),
+            Ok(benign_decision()),
+            Ok(benign_decision()), // 重生成：换了一个不违背底线的行动
+            writer(),
+            critic(),
+        ]));
+        let host = host_capturing(model.clone());
+        init_run(host.as_ref(), "run-1", true);
+        let engine = NarrativeEngine::new(host.clone());
+
+        let out = engine
+            .run_round(
+                &routes(),
+                &prompts(),
+                input_with_bottom_lines("run-1", &["不做伪证"], &[]),
+                &CancelFlag::new(),
+            )
+            .await
+            .unwrap();
+
+        // 重生成确实发生了一次（且只有违规的那个角色被重问）。
+        let decide_prompts = model.decide_prompts();
+        assert_eq!(decide_prompts.len(), 3, "只应多出违规角色的那一次重生成");
+        let regen = &decide_prompts[2];
+        assert!(regen.starts_with("以下是【仅你（li）可见】"), "重问的必须是违规的 li");
+        assert!(regen.contains("bottomLineRejection"), "重生成上下文须带底线拦截回执");
+        assert!(regen.contains("不做伪证"), "回执须带被违反的底线原文");
+        assert!(regen.contains("在堂上做伪证"), "回执须带被拒的提案原文");
+        // 其余两次（首轮决策）不得出现回执字段。
+        assert!(!decide_prompts[0].contains("bottomLineRejection"));
+        assert!(!decide_prompts[1].contains("bottomLineRejection"));
+
+        // 重生成后的提案合规 → 正常落定、正常提交，战报里不留底线拦截痕迹。
+        assert!(out.blocked.is_none());
+        assert_eq!(out.new_state.revision, 1);
+        assert_eq!(outcome_of_cid(&out, "li").result, ArbiterResult::Success);
+        assert!(!out
+            .scene
+            .outcomes
+            .iter()
+            .any(|o| o.rule_refs.iter().any(|r| r == arbiter::BOTTOM_LINE_RULE_REF)));
+        // 落定的是重生成后的行动，违规原文不进公共事实。
+        assert_eq!(out.scene.decisions[0].action, "上前拱手行礼");
+        assert!(!serde_json::to_string(&out.scene).unwrap().contains("做伪证"));
+        // 重生成据实计费（§17）：场景基线 N+组数*2+2 = 6 次调用，外加 1 次重生成 = 7。
+        assert_eq!(out.budget.spent_tokens, 7 * 100);
+    }
+
+    /// 降级序列 ②：重试上限用尽仍违规 → 该提案判 `Invalid`(`rule:bottom_line`)，
+    /// 不落状态、不发事件、不进节拍记录；**世界照常推进**（只延后这个角色这一拍）。
+    #[tokio::test]
+    async fn bottom_line_rejected_after_regen_limit_and_world_keeps_running() {
+        let model = Arc::new(CapturingModel::new(vec![
+            director(),
+            Ok(forging_decision()),
+            Ok(benign_decision()),
+            Ok(forging_decision()), // 重生成后依旧违规
+            writer(),
+            critic(),
+        ]));
+        let host = host_capturing(model.clone());
+        init_run(host.as_ref(), "run-1", true);
+        let engine = NarrativeEngine::new(host.clone());
+
+        let out = engine
+            .run_round(
+                &routes(),
+                &prompts(),
+                input_with_bottom_lines("run-1", &["不做伪证"], &[]),
+                &CancelFlag::new(),
+            )
+            .await
+            .unwrap();
+
+        // 重试上限生效：只重生成 MAX_BOTTOM_LINE_REGEN 次，不无限重试。
+        assert_eq!(model.decide_prompts().len(), 2 + MAX_BOTTOM_LINE_REGEN);
+
+        let li = outcome_of_cid(&out, "li");
+        assert_eq!(li.result, ArbiterResult::Invalid, "拦截 = 拒绝提案");
+        assert_eq!(li.rule_refs, vec![arbiter::BOTTOM_LINE_RULE_REF.to_string()]);
+        assert!(li.consequence.contains("并未发生"), "写作须被告知它没发生：{}", li.consequence);
+
+        // 世界没有卡死：整拍照常提交，别人照常行动。
+        assert!(out.blocked.is_none(), "单个角色违规不得阻断整个世界");
+        assert_eq!(out.new_state.revision, 1);
+        assert_eq!(outcome_of_cid(&out, "wang").result, ArbiterResult::Success);
+
+        // 被拦提案在下游完全惰性：无 ActionResolved、无节拍记录、无状态操作。
+        assert!(action_resolved_of(&out, "li").is_none(), "Invalid 不得产生 ActionResolved");
+        assert!(
+            !out.new_state.narrative.pacing_notes.iter().any(|n| n.contains("做伪证")),
+            "被拦行动不得进节拍记录（那是公共事实）：{:?}",
+            out.new_state.narrative.pacing_notes
+        );
+        assert!(
+            !out.scene
+                .state_patch
+                .operations
+                .iter()
+                .any(|op| serde_json::to_string(op).unwrap().contains("做伪证")),
+            "被拦行动不得进 StatePatch"
+        );
+        // 提案本身仍留在战报里（透明：看得见他提了什么、被自己的哪条底线否掉）。
+        assert!(out.scene.decisions.iter().any(|d| d.action.contains("做伪证")));
+        // I2 不变量仍成立：patch 的来源决策 ⊆ 本回合决策。
+        assert_eq!(out.scene.state_patch.source_decision_ids.len(), 2);
+    }
+
+    /// 🔴 红线（§0.1 平权）：拦截**只能拒绝提案，不能改判成功率**。
+    /// 对照组 = 同一份剧本、同一个违规行动，但 li 没声明底线。
+    /// 断言：拦截既不给 li 更好的结果，也不改动 wang 的任何裁决。
+    #[tokio::test]
+    async fn bottom_line_rejection_never_improves_any_outcome() {
+        let script = || {
+            vec![
+                director(),
+                Ok(forging_decision()),
+                Ok(benign_decision()),
+                Ok(forging_decision()),
+                writer(),
+                critic(),
+            ]
+        };
+        // 对照组：无底线 → 同样的行动被判 Success（规则层 rule:clear）。
+        let (h0, _) = host_with(script());
+        init_run(h0.as_ref(), "run-1", true);
+        let control = NarrativeEngine::new(h0.clone())
+            .run_round(
+                &routes(),
+                &prompts(),
+                input_with_bottom_lines("run-1", &[], &[]),
+                &CancelFlag::new(),
+            )
+            .await
+            .unwrap();
+        // 实验组：声明底线 → 同样的行动被拦。
+        let (h1, _) = host_with(script());
+        init_run(h1.as_ref(), "run-1", true);
+        let guarded = NarrativeEngine::new(h1.clone())
+            .run_round(
+                &routes(),
+                &prompts(),
+                input_with_bottom_lines("run-1", &["不做伪证"], &[]),
+                &CancelFlag::new(),
+            )
+            .await
+            .unwrap();
+
+        // ① 声明底线的角色只可能变差（Success → Invalid），绝不可能变好。
+        assert_eq!(outcome_of_cid(&control, "li").result, ArbiterResult::Success);
+        assert_eq!(outcome_of_cid(&guarded, "li").result, ArbiterResult::Invalid);
+        // ② 拦截不产生任何新的成功：实验组的成功数严格少于对照组。
+        let count_ok = |o: &RoundOutcome| {
+            o.scene
+                .outcomes
+                .iter()
+                .filter(|x| {
+                    matches!(x.result, ArbiterResult::Success | ArbiterResult::PartialSuccess)
+                })
+                .count()
+        };
+        assert_eq!(count_ok(&control), 2);
+        assert_eq!(count_ok(&guarded), 1, "拦截只减不增，绝不改判成功率");
+        // ③ 旁人不受影响：wang 的裁决逐字节一致（底线不外溢成任何优势或惩罚）。
+        assert_eq!(
+            serde_json::to_string(outcome_of_cid(&control, "wang")).unwrap(),
+            serde_json::to_string(outcome_of_cid(&guarded, "wang")).unwrap()
+        );
+        // ④ 被拦者不得因此少付代价或多拿东西：状态里没有任何属于 li 的新操作
+        //    （对照组有 li 的节拍记录，实验组必须一条都没有）。
+        let li_ops = |o: &RoundOutcome| {
+            o.scene
+                .state_patch
+                .operations
+                .iter()
+                .filter(|op| {
+                    op.path.starts_with("characters.li")
+                        || op
+                            .value
+                            .as_ref()
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.starts_with("li｜"))
+                            .unwrap_or(false)
+                })
+                .count()
+        };
+        assert_eq!(li_ops(&control), 1, "对照组里 li 的行动会留下节拍记录");
+        assert_eq!(li_ops(&guarded), 0, "被拦者不得在状态里留下任何操作");
+    }
+
+    /// 降级序列 ③：本拍**全部**提案都被底线拦下 → 整拍 `blocked`、零提交
+    /// （VALIDATION §5「宁可停拍，不让失败输出成为永久公共事实」；上层据此暂停世界 + 人工复核）。
+    #[tokio::test]
+    async fn bottom_line_all_proposals_rejected_blocks_the_tick() {
+        let (host, _ev) = host_with(vec![
+            director(),
+            Ok(forging_decision()),
+            Ok(forging_decision()),
+            Ok(forging_decision()), // 重生成 li：仍违规
+            Ok(forging_decision()), // 重生成 wang：仍违规
+            // 后面不该再有任何调用（不写作、不审校）——脚本到此为止。
+        ]);
+        init_run(host.as_ref(), "run-1", true);
+        let out = NarrativeEngine::new(host.clone())
+            .run_round(
+                &routes(),
+                &prompts(),
+                input_with_bottom_lines("run-1", &["不做伪证"], &["不做伪证"]),
+                &CancelFlag::new(),
+            )
+            .await
+            .unwrap();
+
+        let reason = out.blocked.expect("全员违规必须整拍延后");
+        assert!(reason.contains("底线"), "阻断原因须说明白：{reason}");
+        // 零提交：状态一个字节都没动，场景没落盘。
+        assert_eq!(out.new_state.revision, 0);
+        assert!(out.scene.events.is_empty());
+        assert!(out.scene.state_patch.operations.is_empty());
+        assert!(out.scene.prose.is_empty());
+        assert!(NarrativeStore::new(host.fs.clone()).list_scene_ids("run-1").unwrap().is_empty());
+        // critic 报告为默认空（阻断路径不调用模型）。
+        assert!(out.critic.character_consistency_issues.is_empty());
+    }
+
+    /// 误伤控制：底线写得极宽（"绝不伤害任何人"）也不会让世界卡死 ——
+    /// 过宽条目不进规则层，普通行动照常落定，且不触发任何重生成。
+    #[tokio::test]
+    async fn overbroad_bottom_lines_never_stall_the_world() {
+        let model = Arc::new(CapturingModel::new(two_char_script()));
+        let host = host_capturing(model.clone());
+        init_run(host.as_ref(), "run-1", true);
+
+        let wide: &[&str] = &["绝不伤害任何人", "不做任何事", "不逃", "答应过的路一定走完"];
+        let out = NarrativeEngine::new(host.clone())
+            .run_round(
+                &routes(),
+                &prompts(),
+                input_with_bottom_lines("run-1", wide, wide),
+                &CancelFlag::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(out.blocked.is_none(), "过宽底线不得阻断世界");
+        assert_eq!(out.new_state.revision, 1);
+        assert_eq!(model.decide_prompts().len(), 2, "过宽底线不得触发重生成（否则拍拍烧钱）");
+        assert_eq!(outcome_of_cid(&out, "li").result, ArbiterResult::Success);
+    }
+
+    /// 确定性：含重生成与拦截的回合，同一份脚本重跑两次，产物逐字节相同（replay 契约）。
+    #[tokio::test]
+    async fn bottom_line_round_is_replay_deterministic() {
+        let once = || async {
+            let (host, _ev) = host_with(vec![
+                director(),
+                Ok(forging_decision()),
+                Ok(benign_decision()),
+                Ok(forging_decision()),
+                writer(),
+                critic(),
+            ]);
+            init_run(host.as_ref(), "run-1", true);
+            let out = NarrativeEngine::new(host.clone())
+                .run_round(
+                    &routes(),
+                    &prompts(),
+                    input_with_bottom_lines("run-1", &["不做伪证"], &[]),
+                    &CancelFlag::new(),
+                )
+                .await
+                .unwrap();
+            (
+                serde_json::to_string(&out.scene).unwrap(),
+                serde_json::to_string(&out.new_state).unwrap(),
+            )
+        };
+        let a = once().await;
+        let b = once().await;
+        assert_eq!(a.0, b.0, "scene 必须逐字节可复现");
+        assert_eq!(a.1, b.1, "state 必须逐字节可复现");
+    }
+
+    /// critic 的既有产出口径不被破坏（它已落库为 SLO「状态-文本矛盾率」的数据源）：
+    /// 拦截发生的回合里，critic 照常被调用一次、三个字段照常解析回填。
+    #[tokio::test]
+    async fn bottom_line_keeps_critic_contract_intact() {
+        let (host, _ev) = host_with(vec![
+            director(),
+            Ok(forging_decision()),
+            Ok(benign_decision()),
+            Ok(forging_decision()),
+            writer(),
+            Ok(r#"{"characterConsistencyIssues":["李四行为偏离价值排序"],"causalIssues":["因果链缺一环"],"revisionSuggestions":["补一处动机铺垫"]}"#.to_string()),
+        ]);
+        init_run(host.as_ref(), "run-1", true);
+        let out = NarrativeEngine::new(host.clone())
+            .run_round(
+                &routes(),
+                &prompts(),
+                input_with_bottom_lines("run-1", &["不做伪证"], &[]),
+                &CancelFlag::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(out.critic.character_consistency_issues, vec!["李四行为偏离价值排序".to_string()]);
+        assert_eq!(out.critic.causal_issues, vec!["因果链缺一环".to_string()]);
+        assert_eq!(out.critic.revision_suggestions, vec!["补一处动机铺垫".to_string()]);
     }
 }

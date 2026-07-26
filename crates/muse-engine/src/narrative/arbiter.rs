@@ -10,6 +10,7 @@ use regex::Regex;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::character::types::CharacterCardV2;
 use crate::host::{CancelFlag, EngineHost};
 use crate::model::{json_call, ModelCallSpec, ModelProfile};
 use crate::EngineError;
@@ -231,6 +232,282 @@ pub fn rule_arbitrate(
     }
 
     (resolved, pending)
+}
+
+// ============================================================================
+// R7 底线硬约束（总规格 §7「人设保险」三级出口第 1 级 · 事前预防）
+// ============================================================================
+//
+// 规格原文：卡的 `bottomLines` / `refusalRules` / `immutableCore` 升级为仲裁硬约束——
+// 角色行为违反自己卡的底线 → 仲裁拒绝该提案、重新生成。
+//
+// **为什么检测放在规则层而不是模型层**：拦不拦得住必须**可 replay**（同一份脚本重跑两次
+// 逐字节相同）。把「是否违反底线」交给模型判，等于把一个会改变提交内容的分支挂在模型输出上，
+// replay 契约当场破裂；而「重新生成」本身才是模型该干的活（在底线硬约束下重出提案），
+// 它的结果又会被同一个确定性闸重新校验一遍。故分工是：
+//   **规则层判「拦不拦」（确定性、零新增成本）→ 模型层做「怎么改」（重新生成，有上限）**。
+//
+// **为什么不做成 `rule_arbitrate` 的第七条 if**：`rule_arbitrate` 的入参里没有角色卡
+// （它只吃 `NarrativeState`），加参数会让全部既有调用点与用例被迫改签名，违反
+// 「卡没声明底线时行为与用例一个字都不变」。故独立成纯函数，由 `run_round` 在仲裁步骤起手调用，
+// 命中者直接落 `Invalid` 并**不再进入** R1–R6（提案已死，不必再判资源/冲突，也不进模型层 pending）。
+//
+// **误伤控制**（底线是玩家写的自由文本，可能写得极宽）三道闸，见各常量注释：
+//   ①过宽护栏（含「任何/所有/一切…」的条目不进规则层）②最短片段门槛 ③否定回看窗口。
+// 三闸的共同取向与 R1/R3 一致——**宁可漏判，绝不误伤**：漏掉的交模型重新生成时的底线回执、
+// 交 critic 事后建议（第 2/3 级出口），而误伤会让角色什么都做不了、世界卡死。
+
+/// 底线拦截写入 `ArbiterOutcome.rule_refs` 的规则标记（透明战报可见「为什么这一步没发生」）。
+pub const BOTTOM_LINE_RULE_REF: &str = "rule:bottom_line";
+
+/// 规则层可判定的「禁止行为」最短片段（Unicode 字符数）。**误伤控制闸②**：
+/// 低于此长度的底线（「不逃」→「逃」、「不杀人」→「杀人」）字面匹配会大面积误伤
+/// （「逃出火场」也算「逃」），一律不进规则层。**参数化集中点**（VALIDATION §0.2）。
+const MIN_FORBIDDEN_CHARS: usize = 3;
+
+/// 单角色进入规则层的底线条目上限。**参数化集中点**：防有人往卡里堆几千条底线拖垮每拍筛查
+/// （成本工程 §17），也防「底线堆量 = 拦得更多 = 变相优势」。超出部分按声明序截断（确定性）。
+const MAX_BOTTOM_LINES_PER_CHARACTER: usize = 32;
+
+/// 否定回看窗口（Unicode 字符数）。**误伤控制闸③**：命中片段之前这么多个字里若出现否定字，
+/// 视为「角色正在**拒绝**做这件事」（"我不会做伪证"/"拒绝做伪证"），不算违反底线——
+/// 恰恰相反，那是底线在起作用。**参数化集中点**。
+const NEGATION_WINDOW_CHARS: usize = 3;
+
+/// 底线里引出「被禁止行为」的否定标记（按长度降序匹配，取最长）。
+/// 只有以否定式书写的底线才进规则层：正向承诺式（「答应过的路一定走完」）无法确定性判定
+/// 「违反」，一律交模型层与 critic。
+/// 注：刻意不收「不做」「不肯」这类会把动词一并吃掉的组合（「不做伪证」→ 片段应是「做伪证」
+/// 而不是「伪证」），只收纯否定成分。
+const NEGATION_MARKERS: &[&str] = &[
+    "绝对不能",
+    "绝对不会",
+    "绝对不",
+    "永远不会",
+    "永远不",
+    "从来不会",
+    "从来不",
+    "无论如何不",
+    "绝不会",
+    "绝不能",
+    "决不会",
+    "决不能",
+    "不可以",
+    "再也不",
+    "绝不",
+    "决不",
+    "永不",
+    "从不",
+    "不得",
+    "不能",
+    "不会",
+    "不可",
+    "不许",
+    "不准",
+    "不该",
+    "不应",
+    "不再",
+    "拒绝",
+    "禁止",
+    "不",
+];
+
+/// 行动文本里表示「没有做/拒绝做」的否定字（用于否定回看窗口）。
+/// 刻意不收「非」（"非要做…" 是坚持要做，收了会漏判）。
+const NEGATION_CHARS: &[char] = &['不', '没', '未', '别', '莫', '勿', '拒', '绝', '甭', '无'];
+
+/// 过宽限定词。**误伤控制闸①**：含这些词的底线（"绝不伤害任何人"）覆盖面等于全世界，
+/// 一旦按字面拦截，角色将什么都做不了、世界卡死。这类条目**不进规则层**——
+/// 它仍然会作为角色自己卡上的内容进决策上下文（角色自己会照着演），也仍然被 critic 事后审校，
+/// 只是不作为确定性硬拦截的依据。**参数化集中点**。
+const OVERBROAD_MARKERS: &[&str] =
+    &["任何", "所有", "一切", "全部", "任谁", "谁都", "什么都", "凡是", "无论"];
+
+/// 可剥离的前置虚词（单字）：把「在背后出刀」收窄为「背后出刀」，令「从背后出刀」也能命中。
+/// 只剥一个字、且剥完仍须满足 `MIN_FORBIDDEN_CHARS`，不改变行为语义。
+const STRIPPABLE_LEADING: &[char] = &[
+    '在', '从', '对', '向', '跟', '同', '与', '把', '将', '往', '朝', '给', '替', '为', '去', '要',
+    '会', '能', '肯', '愿', '再', '被', '让',
+];
+
+/// 一条被违反的底线（事前筛查产物）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BottomLineHit {
+    pub character_id: String,
+    pub decision_id: String,
+    /// 被违反的底线**原文**（回注给角色重新决策，也进战报）。
+    pub line: String,
+    /// 命中的禁止行为片段（诊断用，便于运营看误伤）。
+    pub matched: String,
+}
+
+/// 取一张卡声明的全部底线（规格 §7 的三处合一）：
+/// `dramaticCore.bottomLines` → `agency.refusalRules` → `growthArc.immutableCore`。
+/// 顺序固定（字段序 → 各字段内声明序），去重保留首次出现，截断到 `MAX_BOTTOM_LINES_PER_CHARACTER`。
+/// 纯函数、全序可复现。
+pub fn card_bottom_lines(card: &CharacterCardV2) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in card
+        .dramatic_core
+        .bottom_lines
+        .iter()
+        .chain(card.agency.refusal_rules.iter())
+        .chain(card.growth_arc.immutable_core.iter())
+    {
+        let line = raw.trim();
+        if line.is_empty() || out.iter().any(|x| x == line) {
+            continue;
+        }
+        out.push(line.to_string());
+        if out.len() >= MAX_BOTTOM_LINES_PER_CHARACTER {
+            break;
+        }
+    }
+    out
+}
+
+/// 活跃卡集合 → 底线表（`character_id → 底线原文`，BTreeMap 键有序）。
+/// **没有任何一张卡声明底线 → 返回空表**，`run_round` 据此整段短路，默认路径零开销、零行为变化。
+pub fn collect_bottom_lines(
+    cards: &BTreeMap<String, CharacterCardV2>,
+) -> BTreeMap<String, Vec<String>> {
+    cards
+        .iter()
+        .filter_map(|(cid, card)| {
+            let lines = card_bottom_lines(card);
+            if lines.is_empty() {
+                None
+            } else {
+                Some((cid.clone(), lines))
+            }
+        })
+        .collect()
+}
+
+/// 在 `line` 中定位第一个否定标记，返回 `(字节起点, 标记)`；同一位置取最长匹配。
+fn first_negation(line: &str) -> Option<(usize, &'static str)> {
+    for (idx, _) in line.char_indices() {
+        // NEGATION_MARKERS 已按长度降序书写：同一位置命中的第一条即最长匹配。
+        if let Some(m) = NEGATION_MARKERS.iter().find(|m| line[idx..].starts_with(**m)) {
+            return Some((idx, m));
+        }
+    }
+    None
+}
+
+/// 由一条底线原文解析出可供字面匹配的「禁止行为」片段（可能为空 = 该条不进规则层）。
+/// 纯函数：过宽护栏 → 定位否定标记 → 取其后的行为片段 → 生成 ≤2 个片段（原片段 + 剥前置虚词）。
+fn forbidden_needles(line: &str) -> Vec<String> {
+    // 闸①：过宽条目不进规则层。
+    if OVERBROAD_MARKERS.iter().any(|m| line.contains(m)) {
+        return Vec::new();
+    }
+    // 只认否定式书写；正向承诺式无法确定性判定「违反」。
+    let Some((idx, marker)) = first_negation(line) else {
+        return Vec::new();
+    };
+    let pred = line[idx + marker.len()..].trim();
+    let mut needles: Vec<String> = Vec::new();
+    let mut push = |s: &str| {
+        // 闸②：最短片段门槛。
+        if s.chars().count() >= MIN_FORBIDDEN_CHARS && !needles.iter().any(|x| x == s) {
+            needles.push(s.to_string());
+        }
+    };
+    push(pred);
+    let mut chars = pred.chars();
+    if let Some(first) = chars.next() {
+        if STRIPPABLE_LEADING.contains(&first) {
+            push(chars.as_str());
+        }
+    }
+    needles
+}
+
+/// 命中片段之前 `NEGATION_WINDOW_CHARS` 个字内是否出现否定字（闸③）。
+fn negated_before(action: &str, pos: usize) -> bool {
+    action[..pos].chars().rev().take(NEGATION_WINDOW_CHARS).any(|c| NEGATION_CHARS.contains(&c))
+}
+
+/// `action` 是否**明白无误地重述**了某个被禁止的行为：命中片段且该处未被否定。
+/// 返回命中的片段。确定性：片段按固定顺序遍历，出现位置从左到右。
+fn action_restates(action: &str, needles: &[String]) -> Option<String> {
+    for needle in needles {
+        let mut from = 0usize;
+        while let Some(rel) = action[from..].find(needle.as_str()) {
+            let pos = from + rel;
+            if !negated_before(action, pos) {
+                return Some(needle.clone());
+            }
+            from = pos + needle.len();
+        }
+    }
+    None
+}
+
+/// 事前底线筛查（纯函数，确定性，无模型调用）。
+///
+/// 只看 `action`（规格说的是「角色**行为**违反自己卡的底线」）——不看 `intent`：
+/// 内心动过念头不等于做了，按念头拦会把「挣扎」这种最好的戏也拦掉。
+///
+/// 每条决策至多产 1 条命中（取该角色**首条**被违反的底线，按 `card_bottom_lines` 的固定序），
+/// 输出按 `(character_id, decision_id)` 定序（§12.5.3）。
+pub fn screen_bottom_lines(
+    bottom_lines: &BTreeMap<String, Vec<String>>,
+    decisions: &[RoleDecision],
+) -> Vec<BottomLineHit> {
+    let mut hits: Vec<BottomLineHit> = Vec::new();
+    for d in decisions {
+        let Some(lines) = bottom_lines.get(&d.character_id) else {
+            continue;
+        };
+        for line in lines {
+            let needles = forbidden_needles(line);
+            if needles.is_empty() {
+                continue;
+            }
+            if let Some(matched) = action_restates(&d.action, &needles) {
+                hits.push(BottomLineHit {
+                    character_id: d.character_id.clone(),
+                    decision_id: d.decision_id.clone(),
+                    line: line.clone(),
+                    matched,
+                });
+                break;
+            }
+        }
+    }
+    hits.sort_by(|a, b| a.character_id.cmp(&b.character_id).then(a.decision_id.cmp(&b.decision_id)));
+    hits
+}
+
+/// 底线拦截后的 `consequence` 文案（**参数化集中点**，与 `SANCTUARY_DOWNGRADE_CONSEQUENCE` 同规格）。
+///
+/// 该文本同时是**给写作环节的指令**——`call_writer` 把 `consequence` 原样喂给写手，若不显式否定，
+/// 写手会顺着决策原文把违背底线的行为写成已发生；而正文即公共事实，一旦写出就不可回滚（§0.3）。
+/// 它还会随 `SceneRecord.outcomes` 进战报供玩家直读（但**不**进 `pacingNotes`／`DomainEvent`——
+/// `Invalid` 在 `build_patch`/`build_events` 里被整条跳过，被拦的行动不留任何公共事实），
+/// 故写成可直读的中文陈述句，不夹排版记号。
+///
+/// 🔴 平权（§0.1）：末句显式声明「底线不是优势」——拦截只否决提案，绝不改判成功率。
+fn bottom_line_consequence(line: &str) -> String {
+    format!(
+        "此行动触到该角色自己的底线「{line}」，因而并未发生：他在做下去之前收住了。\
+正文不得把该行动写成已经发生，只可写他临到跟前又停下\
+（底线说的是这个角色不会做什么，不是他更强、更容易成功或能少付代价）"
+    )
+}
+
+/// 命中 → 仲裁拒绝裁决。`Invalid` 在下游是**完全惰性**的：不产 `ActionResolved`、不进 `StatePatch`、
+/// 不推关系、不计里程碑强度、不进生死降级与同意门控——正好等于「拒绝该提案」，且**不改判成功率**。
+pub fn bottom_line_outcome(hit: &BottomLineHit) -> ArbiterOutcome {
+    ArbiterOutcome {
+        decision_id: hit.decision_id.clone(),
+        character_id: hit.character_id.clone(),
+        result: ArbiterResult::Invalid,
+        rule_refs: vec![BOTTOM_LINE_RULE_REF.to_string()],
+        consequence: bottom_line_consequence(&hit.line),
+    }
 }
 
 /// 模型层输出（宽松解析：result 缺省视为 success）。
@@ -654,6 +931,258 @@ mod tests {
         assert_eq!(out[1].decision_id, "d2");
         assert_eq!(out[1].result, ArbiterResult::Success); // 漏判回退
         assert!(out.iter().all(|o| o.decision_id != "ghost"));
+    }
+
+    // ===== R7 底线硬约束（人设保险第 1 级·事前，总规格 §7）=====
+
+    fn card_with(bottom: &[&str], refusal: &[&str], immutable: &[&str]) -> CharacterCardV2 {
+        use crate::character::types::{CardLifecycle, Identity};
+        let vs = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        CharacterCardV2 {
+            schema_version: 2,
+            id: "c".into(),
+            lifecycle: CardLifecycle::Draft,
+            identity: Identity::default(),
+            dramatic_core: crate::character::types::DramaticCore {
+                bottom_lines: vs(bottom),
+                ..Default::default()
+            },
+            decision_model: Default::default(),
+            perception: Default::default(),
+            emotion_dynamics: Default::default(),
+            relation_grammar: Default::default(),
+            expression_fingerprint: Default::default(),
+            agency: crate::character::types::Agency {
+                refusal_rules: vs(refusal),
+                ..Default::default()
+            },
+            growth_arc: crate::character::types::GrowthArc {
+                immutable_core: vs(immutable),
+                ..Default::default()
+            },
+            world_adaptation: Default::default(),
+            evidence_index: Default::default(),
+            revision: 0,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    fn lines_of(cid: &str, card: &CharacterCardV2) -> BTreeMap<String, Vec<String>> {
+        let cards: BTreeMap<String, CharacterCardV2> =
+            [(cid.to_string(), card.clone())].into_iter().collect();
+        collect_bottom_lines(&cards)
+    }
+
+    /// 🔴 回归护栏（最重要）：卡上一条底线都没声明 → 筛查恒空、底线表恒空，
+    /// `run_round` 据此整段短路，默认路径行为与接线前逐字节一致。
+    #[test]
+    fn bottom_line_absent_screens_nothing() {
+        let card = card_with(&[], &[], &[]);
+        let lines = lines_of("li", &card);
+        assert!(lines.is_empty(), "无声明 → 底线表必须为空（run_round 据此短路）");
+        let d = decision("d1", "li", "拔刀当场杀死对手", vec![]);
+        assert!(screen_bottom_lines(&lines, &[d]).is_empty());
+    }
+
+    /// 字面重述自己卡上的禁止行为 → 命中，并落成 `Invalid` + `rule:bottom_line`。
+    #[test]
+    fn bottom_line_literal_restatement_is_rejected() {
+        let card = card_with(&["不替人做伪证"], &[], &["不做伪证"]);
+        let lines = lines_of("li", &card);
+        let d = decision("d1", "li", "在堂上替裴照做伪证，一口咬定他当夜不在场", vec![]);
+        let hits = screen_bottom_lines(&lines, &[d]);
+        assert_eq!(hits.len(), 1, "应命中：{hits:?}");
+        assert_eq!(hits[0].character_id, "li");
+        assert_eq!(hits[0].line, "不做伪证", "命中的是 immutableCore 那一条（更短、更通用）");
+        assert_eq!(hits[0].matched, "做伪证");
+
+        let o = bottom_line_outcome(&hits[0]);
+        assert_eq!(o.result, ArbiterResult::Invalid, "拦截 = 拒绝提案");
+        assert_eq!(o.rule_refs, vec![BOTTOM_LINE_RULE_REF.to_string()]);
+        // consequence 同时是给写手的指令：必须显式否定「已发生」，否则正文会把 OOC 写成公共事实。
+        assert!(o.consequence.contains("并未发生"), "必须显式告诉写手它没发生：{}", o.consequence);
+        // 🔴 平权（§0.1）：文案必须否掉「底线 = 优势」的联想。
+        assert!(o.consequence.contains("不是他更强"), "文案须声明底线不是优势：{}", o.consequence);
+    }
+
+    /// 三处字段合一（规格 §7 明列三处），去重且顺序固定。
+    #[test]
+    fn bottom_line_merges_three_card_fields_in_fixed_order() {
+        let card = card_with(&["不牵连无辜", "不做伪证"], &["不做伪证", "不篡改记录"], &["不背后出刀"]);
+        let lines = lines_of("li", &card);
+        assert_eq!(
+            lines["li"],
+            vec![
+                "不牵连无辜".to_string(),
+                "不做伪证".to_string(),
+                "不篡改记录".to_string(),
+                "不背后出刀".to_string(),
+            ],
+            "bottomLines → refusalRules → immutableCore，重复项只留首次出现"
+        );
+        // refusalRules / immutableCore 单独也能拦（不是只认 bottomLines）。
+        let only_refusal = lines_of("li", &card_with(&[], &["不篡改记录"], &[]));
+        let d = decision("d1", "li", "连夜篡改记录，把那一行抹掉", vec![]);
+        assert_eq!(
+            screen_bottom_lines(&only_refusal, std::slice::from_ref(&d)).len(),
+            1,
+            "refusalRules 也是硬约束"
+        );
+        let only_immutable = lines_of("li", &card_with(&[], &[], &["不篡改记录"]));
+        assert_eq!(screen_bottom_lines(&only_immutable, &[d]).len(), 1, "immutableCore 也是硬约束");
+    }
+
+    /// 误伤控制闸③：角色**拒绝**做这件事 → 不算违反底线（那正是底线在起作用）。
+    #[test]
+    fn bottom_line_refusing_the_act_is_not_a_violation() {
+        let lines = lines_of("li", &card_with(&["不做伪证"], &[], &[]));
+        for action in [
+            "当堂拒绝做伪证，把笔推回去",
+            "他不肯做伪证，只是沉默",
+            "我不会做伪证",
+            "任凭如何相逼，也没有做伪证",
+        ] {
+            let d = decision("d1", "li", action, vec![]);
+            assert!(
+                screen_bottom_lines(&lines, &[d]).is_empty(),
+                "拒绝/否定语境不得判违规：{action}"
+            );
+        }
+    }
+
+    /// 误伤控制闸①：过宽底线（"绝不伤害任何人"）不进规则层——按字面拦会让角色什么都做不了。
+    #[test]
+    fn bottom_line_overbroad_declaration_is_not_enforced() {
+        let lines = lines_of("li", &card_with(&["绝不伤害任何人", "不做任何事"], &[], &[]));
+        assert_eq!(lines["li"].len(), 2, "条目仍原样留在卡上（角色自己看得见、critic 也照审）");
+        for action in ["出手伤害任何人挡路的", "做任何事都要先问过", "伤害任何人"] {
+            let d = decision("d1", "li", action, vec![]);
+            assert!(
+                screen_bottom_lines(&lines, &[d]).is_empty(),
+                "过宽条目不得作为确定性硬拦截依据：{action}"
+            );
+        }
+    }
+
+    /// 误伤控制闸②：过短底线（"不逃"/"不杀人"）不进规则层——字面匹配会大面积误伤。
+    #[test]
+    fn bottom_line_too_short_declaration_is_not_enforced() {
+        let lines = lines_of("li", &card_with(&["不逃", "不杀人"], &[], &[]));
+        for action in ["转身就逃出火场", "杀人偿命，他还是动了手"] {
+            let d = decision("d1", "li", action, vec![]);
+            assert!(screen_bottom_lines(&lines, &[d]).is_empty(), "过短条目不得进规则层：{action}");
+        }
+    }
+
+    /// 正向承诺式底线（无否定标记）不进规则层：无法确定性判定「违反」。
+    #[test]
+    fn bottom_line_positive_pledge_is_not_enforced() {
+        let lines = lines_of("li", &card_with(&["答应过的路一定走完", "认错时如实报数目"], &[], &[]));
+        let d = decision("d1", "li", "半路撇下同行的人，独自走了", vec![]);
+        assert!(screen_bottom_lines(&lines, &[d]).is_empty(), "正向承诺交模型层与 critic");
+    }
+
+    /// 前置虚词剥离：「不在背后出刀」也能拦住「从背后出刀」。
+    #[test]
+    fn bottom_line_strips_one_leading_function_word() {
+        let lines = lines_of("li", &card_with(&["不在背后出刀"], &[], &[]));
+        let d = decision("d1", "li", "趁其不备，从背后出刀", vec![]);
+        let hits = screen_bottom_lines(&lines, &[d]);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].matched, "背后出刀");
+    }
+
+    /// 确定性：乱序输入 → 输出按 (character_id, decision_id) 定序；连跑两次逐字节相同。
+    #[test]
+    fn bottom_line_screen_is_deterministic() {
+        let cards: BTreeMap<String, CharacterCardV2> = [
+            ("wang".to_string(), card_with(&["不做伪证"], &[], &[])),
+            ("li".to_string(), card_with(&["不篡改记录"], &[], &[])),
+        ]
+        .into_iter()
+        .collect();
+        let lines = collect_bottom_lines(&cards);
+        let ds = vec![
+            decision("d2", "wang", "替人做伪证", vec![]),
+            decision("d1", "li", "连夜篡改记录", vec![]),
+        ];
+        let a = screen_bottom_lines(&lines, &ds);
+        let b = screen_bottom_lines(&lines, &ds);
+        assert_eq!(a, b, "同输入必须同输出");
+        assert_eq!(a.iter().map(|h| h.character_id.as_str()).collect::<Vec<_>>(), vec!["li", "wang"]);
+    }
+
+    /// 每条决策至多一条命中（不因底线堆量而放大战报噪声），且条目数有上限。
+    #[test]
+    fn bottom_line_caps_lines_and_reports_first_hit_only() {
+        let many: Vec<String> = (0..100).map(|i| format!("不做第{i}号勾当")).collect();
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        let lines = lines_of("li", &card_with(&refs, &[], &[]));
+        assert_eq!(lines["li"].len(), MAX_BOTTOM_LINES_PER_CHARACTER, "条目数须截断到上限");
+
+        let two = lines_of("li", &card_with(&["不篡改记录", "不做伪证"], &[], &[]));
+        let d = decision("d1", "li", "先篡改记录，再做伪证", vec![]);
+        let hits = screen_bottom_lines(&two, &[d]);
+        assert_eq!(hits.len(), 1, "一条决策至多产一条命中");
+        assert_eq!(hits[0].line, "不篡改记录", "取卡上首条被违反的底线");
+    }
+
+    /// 🔴 黄金世界护栏：把 `server/src/runtime/golden/cards.json` 的底线文案与剧本 action
+    /// 原样抄进引擎单测 —— golden 是逐字节比对的回归基线，规则层一旦在它身上误伤，
+    /// 12 项 golden 会集体变红。这条用例让误伤在引擎层就炸，而不是等到 server 侧。
+    #[test]
+    fn bottom_line_never_false_positives_on_golden_world_cards() {
+        let cards: BTreeMap<String, CharacterCardV2> = [
+            (
+                "shenyan".to_string(),
+                card_with(
+                    &["不牵连不知情的下属", "不在酒席上说一句自己不认的话"],
+                    &["不供出不知情的人"],
+                    &["不牵连无辜"],
+                ),
+            ),
+            (
+                "peizhao".to_string(),
+                card_with(&["不动手无寸铁的人", "不在背后出刀"], &["不在背后出刀"], &["不背后出刀"]),
+            ),
+            (
+                "cuie".to_string(),
+                card_with(&["不替人做伪证", "不把旧信交出去"], &["不做伪证"], &["不做伪证"]),
+            ),
+            (
+                "lu".to_string(),
+                card_with(&["不多记一个字"], &["不替任何人隐去一句话"], &["不篡改记录"]),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let lines = collect_bottom_lines(&cards);
+        let script: &[(&str, &str)] = &[
+            ("shenyan", "举杯向裴照道谢，谢他当年那一次相助"),
+            ("shenyan", "抢先把话头引开，挡在裴照面前"),
+            ("shenyan", "把半枚鱼符赠与崔萼，托她保管"),
+            ("peizhao", "坐直身子，向沈砚举杯回礼"),
+            ("peizhao", "拔刀出鞘半寸，逼沈砚正面回话"),
+            ("peizhao", "收刀入鞘，长出一口气"),
+            ("cuie", "起身替满席斟酒，唱一支旧曲"),
+            ("cuie", "出言相助，替裴照解围"),
+            ("cuie", "出手相救，把裴照护在身后"),
+            ("lu", "在灯下把席间言语记下"),
+            ("lu", "在灯下把方才的争执记下"),
+            ("lu", "在灯下把这一段记下"),
+            // 致死剧情测试点 + 剧本兜底响应（同样不得误伤）。
+            ("shenyan", "拔剑当场杀死裴照"),
+            ("shenyan", "端起酒盏，不接话头"),
+            ("peizhao", "端起酒盏，不接话头"),
+            ("cuie", "端起酒盏，不接话头"),
+            ("lu", "端起酒盏，不接话头"),
+        ];
+        for (cid, action) in script {
+            let d = decision("d1", cid, action, vec![]);
+            let hits = screen_bottom_lines(&lines, &[d]);
+            assert!(hits.is_empty(), "黄金世界剧本被误伤：{cid} / {action} → {hits:?}");
+        }
     }
 
     #[tokio::test]

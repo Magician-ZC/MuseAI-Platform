@@ -152,6 +152,44 @@ pub fn assemble_visible_context(
     Ok(serde_json::to_string_pretty(&ctx)?)
 }
 
+/// 底线拦截回执（人设保险第 1 级·事前，总规格 §7）：把「上一条提案触到了你自己的哪条底线」
+/// 追加进**已组装好的**可见上下文，供该角色在硬约束下重新决策。
+///
+/// **为何做成后置追加而不是给 `assemble_visible_context` 加一个 `Option` 参数**：
+/// 默认路径（卡没声明底线 / 声明了但没违反）根本不会调到本函数——「默认行为零变化」由
+/// 「代码路径压根不经过」保证，而不是靠一个每次都要求值的 `None` 分支；
+/// `assemble_visible_context` 的签名、产物与既有用例因此一个字都不用动。
+///
+/// 信息边界：追加的内容只有**该角色自己卡上的底线原文**与**他自己上一条提案的 action**，
+/// 不含任何他人信息，不新开可见性通道（铁律不变）。
+///
+/// 🔴 平权（§0.1）：措辞显式声明「重出提案不提高成功率、不带任何优待」——
+/// 底线是「这个角色不会做什么」，不是「这个角色更强」。
+///
+/// 确定性：纯函数（解析 → 插一个固定键 → 重新序列化），无随机、不依赖任何迭代序；
+/// `serde_json::Map` 默认按键有序，故同输入恒得同一份字节。
+pub fn append_bottom_line_rejection(
+    visible_context: &str,
+    violated_line: &str,
+    rejected_action: &str,
+) -> Result<String, EngineError> {
+    let mut ctx: Value = serde_json::from_str(visible_context)?;
+    if let Some(obj) = ctx.as_object_mut() {
+        obj.insert(
+            "bottomLineRejection".to_string(),
+            json!({
+                "violatedBottomLine": violated_line,
+                "rejectedAction": rejected_action,
+                "note": "你上一条提案触到了你自己的底线（见上），仲裁已经拒收——这一条不会发生。\
+请重新给出一个【不违背该底线】的行动：可以换手段、换目标、换时机，也可以选择按兵不动。\
+重出提案不会提高你的成功率，也不给你任何优待、豁免或额外资源；\
+底线说的是「你不会做什么」，不是「你更强」。",
+            }),
+        );
+    }
+    Ok(serde_json::to_string_pretty(&ctx)?)
+}
+
 /// 决策用户提示：可见上下文 + 严格 JSON 输出契约。
 fn build_decide_user_prompt(character_id: &str, visible_context: &str) -> String {
     format!(
@@ -505,6 +543,52 @@ mod tests {
             assemble_visible_context(&s, "B", &card_b, &BTreeMap::new(), "场景", &[], None, None)
                 .unwrap();
         assert!(!plain.contains("yourIdentity"), "未传身份的角色不得被别人的身份污染");
+    }
+
+    // ===== 底线拦截回执（人设保险第 1 级·事前，总规格 §7）=====
+
+    /// 回执只带角色**自己**的东西：被违反的底线原文 + 他自己上一条提案；不新开任何可见性通道。
+    /// 🔴 平权：措辞必须显式否掉「重出提案更容易成功」的联想。
+    #[test]
+    fn bottom_line_rejection_carries_only_own_card_content() {
+        let s = state_with_secrets();
+        let card_b = minimal_card("B");
+        let brief: BTreeMap<String, String> =
+            [("A".to_string(), "A 是一名沉默寡言的侍卫。".to_string())].into_iter().collect();
+        let base =
+            assemble_visible_context(&s, "B", &card_b, &brief, "宫廷大厅", &[], None, None).unwrap();
+
+        let ctx = append_bottom_line_rejection(&base, "不替人做伪证", "替裴照做伪证").unwrap();
+        let v: Value = serde_json::from_str(&ctx).unwrap();
+        assert_eq!(v["bottomLineRejection"]["violatedBottomLine"], json!("不替人做伪证"));
+        assert_eq!(v["bottomLineRejection"]["rejectedAction"], json!("替裴照做伪证"));
+        let note = v["bottomLineRejection"]["note"].as_str().unwrap_or_default();
+        assert!(note.contains("不违背该底线"), "必须给出可执行的重出指令：{note}");
+        assert!(note.contains("不会提高你的成功率"), "必须显式声明零优待：{note}");
+
+        // 信息边界：回执没有把任何他人私密带进来（原上下文的隔离性不被破坏）。
+        assert!(!ctx.contains("私生子"));
+        assert!(!ctx.contains("暗杀公爵"));
+
+        // 除新增的这一个键外，其余键集与基线完全一致（不夹带任何别的东西）。
+        let base_v: Value = serde_json::from_str(&base).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.retain(|k| *k != "bottomLineRejection");
+        let base_keys: Vec<&str> = base_v.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, base_keys, "回执只许多出 bottomLineRejection 一个键");
+    }
+
+    /// 确定性：同输入连跑两次逐字节相同（重生成路径必须可 replay）。
+    #[test]
+    fn bottom_line_rejection_is_byte_deterministic() {
+        let s = state_with_secrets();
+        let card_b = minimal_card("B");
+        let base =
+            assemble_visible_context(&s, "B", &card_b, &BTreeMap::new(), "场景", &[], None, None)
+                .unwrap();
+        let a = append_bottom_line_rejection(&base, "不做伪证", "做伪证").unwrap();
+        let b = append_bottom_line_rejection(&base, "不做伪证", "做伪证").unwrap();
+        assert_eq!(a, b);
     }
 
     // ===== role_decide：补齐 id + targets 白名单 =====

@@ -373,6 +373,19 @@ async fn create_invitation(
         return Err(ApiError::Conflict(REFUSE_GENERIC.into()));
     }
 
+    // 🔴 拉黑前门（`social` 模块，总规格 §14 配套治理）：任一方向拉黑 → 发不出邀请。
+    //
+    // 为什么邀请也要看拉黑：拉黑的承诺是「对方无法向你发起社交动作」，而房间邀请就是
+    // 一条社交动作通道——只挡真人身份解锁、不挡邀请，等于给被拉黑者留了一条继续打扰的路。
+    //
+    // ⚠️ 刻意**不看** `MUSE_SOCIAL_IDENTITY_UNLOCK` 开关：拉黑是**保护态**，
+    // 社交功能被急停/灰度收窄时既有拉黑仍须生效（方向同 `MUSE_SAFETY_LEXICON` 的 fail-safe）。
+    // 开关关闭时 `social_blocks` 表为空，本判定恒为 false —— 行为逐字不变、零副作用。
+    // 拒绝文案同样是 REFUSE_GENERIC：不得让邀请人从错误码里读出「我被拉黑了」。
+    if crate::social::is_blocked_pair(&state.db, &user.user_id, &invitee_user_id).await? {
+        return Err(ApiError::Conflict(REFUSE_GENERIC.into()));
+    }
+
     // 防骚扰 ①：**拒绝即终局**。同一邀请人被同一角色拒过一次，就不能再把它请进同一个世界。
     // （换角色、换世界、换邀请人仍可——这条治理的是"被拒后反复纠缠"。）
     let declined_before: i64 = sqlx::query_scalar(

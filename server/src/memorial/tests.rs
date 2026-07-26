@@ -921,3 +921,88 @@ fn red_line_no_hidden_numbers() {
         assert!(!src.contains(banned), "传世卡模块出现 `{banned}`：故人印记是叙事印记，不是 buff");
     }
 }
+
+// ==================== 结算侧自动封卷（#29 接线层） ====================
+
+/// 终局结算时自动封卷本世界已死的卡，口径与玩家主动认领**完全一致**（两条证据缺一不可）。
+#[tokio::test]
+async fn auto_seal_at_settlement_matches_manual_claim_criteria() {
+    let state = test_state().await;
+    let _sw = MemorialSwitch::set(true);
+    // seed_landed_death 已造好：chA（u1，已死已落定）与 chB（u2，同世界但没死）。
+    seed_landed_death(&state).await;
+
+    let mut tx = state.db.begin().await.unwrap();
+    let sealed = super::auto_seal_dead_participants_tx(
+        &mut tx,
+        "w1",
+        &[("chA".into(), "u1".into()), ("chB".into(), "u2".into())],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    assert_eq!(sealed, 1, "只有确已死亡的卡被封卷");
+    assert_eq!(memorial_status_of(&state, "chA").await, "sealed");
+    assert_eq!(
+        memorial_status_of(&state, "chB").await,
+        "living",
+        "🔴 同一世界的活人绝不能被顺手封卷——结算名单包含全体参与者，逐个核验缺一不可"
+    );
+}
+
+/// **授权 ≠ 死亡** 在自动路径上同样成立：pending 未清空时不封卷（否则就是捏造死亡）。
+#[tokio::test]
+async fn auto_seal_respects_the_not_yet_landed_guard() {
+    let state = test_state().await;
+    let _sw = MemorialSwitch::set(true);
+    seed_landed_death(&state).await;
+    // 回退到「已授权但未落定」。
+    set_narrative_state(&state, "w1", narrative_with(json!([]), Some("chA"))).await;
+
+    let mut tx = state.db.begin().await.unwrap();
+    let sealed = super::auto_seal_dead_participants_tx(&mut tx, "w1", &[("chA".into(), "u1".into())])
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    assert_eq!(sealed, 0, "同意已获批但引擎尚未落定 → 不得自动封卷");
+    assert_eq!(memorial_status_of(&state, "chA").await, "living");
+}
+
+/// 幂等：世界重复结算、或玩家已主动认领过，都不会重复封卷。
+#[tokio::test]
+async fn auto_seal_is_idempotent_across_repeated_settlements() {
+    let state = test_state().await;
+    let _sw = MemorialSwitch::set(true);
+    seed_landed_death(&state).await;
+
+    let run = |db: sqlx::AnyPool| async move {
+        let mut tx = db.begin().await.unwrap();
+        let n = super::auto_seal_dead_participants_tx(&mut tx, "w1", &[("chA".into(), "u1".into())])
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        n
+    };
+    assert_eq!(run(state.db.clone()).await, 1, "首次封卷");
+    assert_eq!(run(state.db.clone()).await, 0, "重复结算不得二次封卷（CAS 短路）");
+    assert_eq!(memorial_status_of(&state, "chA").await, "sealed");
+}
+
+/// 开关关闭时整段短路：一张卡都不封，状态一点没动。
+#[tokio::test]
+async fn auto_seal_is_disabled_with_the_switch_off() {
+    let state = test_state().await;
+    seed_landed_death(&state).await;
+    let _sw = MemorialSwitch::set(false);
+
+    let mut tx = state.db.begin().await.unwrap();
+    let sealed = super::auto_seal_dead_participants_tx(&mut tx, "w1", &[("chA".into(), "u1".into())])
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    assert_eq!(sealed, 0);
+    assert_eq!(memorial_status_of(&state, "chA").await, "living");
+}

@@ -2057,6 +2057,197 @@ async fn cost_meter_per_player_equal_split_and_no_divide_by_zero() {
     assert_eq!(m["tokenCostByWorld"][0]["tokens"], 2_000_000);
 }
 
+// ---------------- R3 错峰调度可观测面（migration 0038 → cost.offPeak） ----------------
+
+/// 带错峰标记的 tick（显式写迁移 0038 的三列；不写时走各自 DEFAULT = 中性值）。
+#[allow(clippy::too_many_arguments)]
+async fn ins_tick_offpeak(
+    state: &AppState,
+    id: &str,
+    world: &str,
+    tick_no: i64,
+    tokens: i64,
+    created_at: i64,
+    off_peak: i64,
+    price_ratio_pct: i64,
+    defer_ms: i64,
+) {
+    sqlx::query(
+        "INSERT INTO world_ticks (id, world_id, tick_no, base_revision, status, cost_tokens, \
+         created_at, off_peak, price_ratio_pct, defer_ms) \
+         VALUES (?, ?, ?, 0, 'done', ?, ?, ?, ?, ?)",
+    )
+    .bind(id)
+    .bind(world)
+    .bind(tick_no)
+    .bind(tokens)
+    .bind(created_at)
+    .bind(off_peak)
+    .bind(price_ratio_pct)
+    .bind(defer_ms)
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+fn close_to(a: f64, b: f64) -> bool {
+    (a - b).abs() < 1e-9
+}
+
+/// 🔴 **单位口径锁**：`price_ratio_pct` 是百分数整数（100=原价、40=4 折），
+/// 而对外一切**比率**字段是 0..1 小数（同 successRate/usageRatio）——两者最容易混。
+/// 本用例同时钉住：档位的两种形态、三个比率的取值域、以及折让金额的精确公式。
+#[tokio::test]
+async fn cost_offpeak_meter_keeps_pct_and_zero_to_one_ratios_apart() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+
+    let now = now_ms();
+    // 4 折两拍（各 100k token，分别被压 10min / 20min）、5 折一拍（200k）、原价一拍（600k）。
+    ins_tick_offpeak(&state, "op1", "w_op", 0, 100_000, now, 1, 40, 600_000).await;
+    ins_tick_offpeak(&state, "op2", "w_op", 1, 100_000, now, 1, 40, 1_200_000).await;
+    ins_tick_offpeak(&state, "op3", "w_op", 2, 200_000, now, 1, 50, 0).await;
+    ins_tick_offpeak(&state, "op4", "w_op", 3, 600_000, now, 0, 100, 0).await;
+
+    let (st, m) = get(&app, "/api/admin/metrics/overview", Some(&admin)).await;
+    assert_eq!(st, StatusCode::OK, "{m}");
+    let price = m["cost"]["centsPer1kTokens"].as_i64().unwrap();
+    let op = &m["cost"]["offPeak"];
+
+    // 计数与 token：错峰 3 拍 / 400k，全窗 4 拍 / 1M。
+    assert_eq!(op["windowDays"], 7, "窗口沿用 cost.trend 的 costDays");
+    assert_eq!(op["ticks"], 4);
+    assert_eq!(op["tokens"], 1_000_000);
+    assert_eq!(op["offPeakTicks"], 3);
+    assert_eq!(op["offPeakTokens"], 400_000);
+
+    // 🔴 比率一律 0..1 小数，绝不是 75 / 40 这类百分数。
+    let tick_ratio = op["tickRatio"].as_f64().unwrap();
+    let token_ratio = op["tokenRatio"].as_f64().unwrap();
+    assert!(close_to(tick_ratio, 0.75), "3/4 应为 0.75，实际 {tick_ratio}");
+    assert!(close_to(token_ratio, 0.4), "400k/1M 应为 0.4，实际 {token_ratio}");
+    for key in ["tickRatio", "tokenRatio", "savedRatio"] {
+        let v = op[key].as_f64().unwrap();
+        assert!((0.0..=1.0).contains(&v), "{key} 必须落在 0..1（禁止下发百分数），实际 {v}");
+    }
+
+    // 折让金额：按档位汇总 token 再换算，逐档地板。
+    let full = |tokens: i64| tokens * price / 1000;
+    let saved_40 = full(200_000) * 60 / 100; // 4 折 → 省 6 成
+    let saved_50 = full(200_000) * 50 / 100; // 5 折 → 省 5 成
+    let saved = saved_40 + saved_50;
+    let nominal = full(1_000_000);
+    assert_eq!(op["nominalCents"], nominal, "原价口径不变（cost.today/trend 同源）");
+    assert_eq!(op["savedCents"], saved);
+    assert_eq!(op["savedCny"].as_f64().unwrap(), saved as f64 / 100.0);
+    assert_eq!(op["effectiveCents"], nominal - saved);
+    assert!(close_to(op["savedRatio"].as_f64().unwrap(), saved as f64 / nominal as f64));
+    // 折让是金额，绝不是把档位数字当分数抄下来。
+    assert_ne!(op["savedCents"], 40, "savedCents 不得是 price_ratio_pct 本身");
+
+    // 档位分布：BTreeMap 升序 40 → 50 → 100；两种形态各守各的口径。
+    let by_ratio = op["byRatio"].as_array().unwrap();
+    assert_eq!(by_ratio.len(), 3, "三个档位各一桶: {op}");
+    assert_eq!(by_ratio[0]["priceRatioPct"], 40, "档位保留百分数整数原形");
+    assert!(close_to(by_ratio[0]["priceRatio"].as_f64().unwrap(), 0.4), "priceRatio 必须是 0.4 而不是 40");
+    assert_eq!(by_ratio[0]["ticks"], 2);
+    assert_eq!(by_ratio[0]["tokens"], 200_000);
+    assert_eq!(by_ratio[0]["savedCents"], saved_40);
+    assert_eq!(by_ratio[1]["priceRatioPct"], 50);
+    assert!(close_to(by_ratio[1]["priceRatio"].as_f64().unwrap(), 0.5));
+    assert_eq!(by_ratio[1]["savedCents"], saved_50);
+    assert_eq!(by_ratio[2]["priceRatioPct"], 100, "原价档同样入桶");
+    assert!(close_to(by_ratio[2]["priceRatio"].as_f64().unwrap(), 1.0));
+    assert_eq!(by_ratio[2]["savedCents"], 0, "原价档省 0");
+    let bucket_ticks: i64 = by_ratio.iter().map(|b| b["ticks"].as_i64().unwrap()).sum();
+    assert_eq!(bucket_ticks, 4, "档位分桶必须覆盖窗口内全部拍");
+
+    // 延后账：分母只含被延后过的拍（2 拍），不是全部 4 拍。
+    assert_eq!(op["deferredTicks"], 2);
+    assert_eq!(op["deferMsTotal"], 1_800_000);
+    assert_eq!(op["deferMsMax"], 1_200_000);
+    assert!(close_to(op["avgDeferMs"].as_f64().unwrap(), 900_000.0), "均值分母是 deferredTicks");
+}
+
+/// 错峰默认关闭（VALIDATION §0.1）时的看板形态：不报错、不缺键，
+/// **「窗口内没有拍」给 null（无数据）与「跑了拍但一拍没走错峰」给 0.0（真实的 0%）必须分得开**。
+#[tokio::test]
+async fn cost_offpeak_meter_degrades_to_empty_when_scheduler_disabled() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+
+    // ① 一拍都没有：各比率为 null（不得编 0.0），分桶为空。
+    let (st, m) = get(&app, "/api/admin/metrics/overview", Some(&admin)).await;
+    assert_eq!(st, StatusCode::OK, "{m}");
+    let op = &m["cost"]["offPeak"];
+    assert_eq!(op["ticks"], 0);
+    assert!(op["tickRatio"].is_null(), "无数据不得当 0% 读: {op}");
+    assert!(op["tokenRatio"].is_null());
+    assert!(op["savedRatio"].is_null());
+    assert!(op["avgDeferMs"].is_null());
+    assert_eq!(op["savedCents"], 0);
+    assert!(op["byRatio"].as_array().unwrap().is_empty());
+
+    // ② 跑了拍但错峰关闭：三列走 DEFAULT 中性值（0 / 100 / 0）→ 比率是真实的 0.0，折让为 0。
+    let now = now_ms();
+    ins_tick_st(&state, "np1", "w_np", 0, 500_000, "done", now).await;
+    ins_tick_st(&state, "np2", "w_np", 1, 500_000, "failed", now).await;
+
+    let (_, m) = get(&app, "/api/admin/metrics/overview", Some(&admin)).await;
+    let op = &m["cost"]["offPeak"];
+    assert_eq!(op["ticks"], 2);
+    assert_eq!(op["offPeakTicks"], 0);
+    assert!(close_to(op["tickRatio"].as_f64().unwrap(), 0.0), "有拍无错峰 = 真实的 0%");
+    assert!(close_to(op["tokenRatio"].as_f64().unwrap(), 0.0));
+    assert!(close_to(op["savedRatio"].as_f64().unwrap(), 0.0));
+    assert_eq!(op["savedCents"], 0, "关闭态不得虚报省钱");
+    assert_eq!(op["effectiveCents"], op["nominalCents"], "关闭态实付 = 原价");
+    assert_eq!(op["deferredTicks"], 0);
+    assert!(op["avgDeferMs"].is_null(), "无被延后拍 → null，不得除零");
+    let by_ratio = op["byRatio"].as_array().unwrap();
+    assert_eq!(by_ratio.len(), 1, "只有原价一桶: {op}");
+    assert_eq!(by_ratio[0]["priceRatioPct"], 100);
+    // 既有成本口径逐字不受影响（关闭态与 0038 之前完全一致）。
+    let price = m["cost"]["centsPer1kTokens"].as_i64().unwrap();
+    assert_eq!(m["cost"]["today"]["tokens"], 1_000_000);
+    assert_eq!(m["cost"]["today"]["cents"], 1_000_000 * price / 1000);
+}
+
+/// 趋势逐日拆出「其中走了折扣时段的 token」：与全量 tokens 是**包含**关系（不可相加），
+/// 空天两者同时补零；窗口内合计须与 offPeak.tokens 自洽。
+#[tokio::test]
+async fn cost_trend_splits_off_peak_tokens_per_day() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+
+    let now = now_ms();
+    let day_a = now - 2 * DAY_MS; // 前天；昨天故意留空验证补零
+    ins_tick_offpeak(&state, "tr1", "w_tr_op", 0, 300_000, day_a, 1, 50, 0).await;
+    ins_tick_offpeak(&state, "tr2", "w_tr_op", 1, 700_000, day_a, 0, 100, 0).await;
+    ins_tick_offpeak(&state, "tr3", "w_tr_op", 2, 400_000, now, 1, 50, 0).await;
+
+    let (st, m) = get(&app, "/api/admin/metrics/overview?costDays=3", Some(&admin)).await;
+    assert_eq!(st, StatusCode::OK, "{m}");
+    let trend = m["cost"]["trend"].as_array().unwrap();
+    assert_eq!(trend.len(), 3);
+    assert_eq!(trend[0]["day"], utc_day(day_a));
+    assert_eq!(trend[0]["tokens"], 1_000_000, "当日 tokens 仍是全量（含错峰那部分）");
+    assert_eq!(trend[0]["offPeakTokens"], 300_000);
+    assert_eq!(trend[1]["tokens"], 0);
+    assert_eq!(trend[1]["offPeakTokens"], 0, "空天两列同时补零");
+    assert_eq!(trend[2]["day"], utc_day(now));
+    assert_eq!(trend[2]["offPeakTokens"], 400_000);
+
+    let op = &m["cost"]["offPeak"];
+    assert_eq!(op["windowDays"], 3, "错峰窗口跟随 costDays");
+    let trend_tokens: i64 = trend.iter().map(|d| d["tokens"].as_i64().unwrap()).sum();
+    assert_eq!(op["tokens"].as_i64().unwrap(), trend_tokens, "窗口合计须与逐日和自洽");
+    assert_eq!(op["offPeakTokens"], 700_000);
+}
+
 /// 世界监控列表补充列：在场人数 / 成功率 / 今日成本；moderationLatency 无数据源故不下发。
 #[tokio::test]
 async fn worlds_list_participant_success_rate_and_today_cost() {

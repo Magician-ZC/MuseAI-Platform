@@ -1,0 +1,1143 @@
+//! 真人社交解锁测试（sqlite::memory + oneshot 真实路由）。总规格 §14【拍板 22】恨隔面具原则。覆盖：
+//!
+//! - **默认关闭**：11 个端点全 404，且**一行都不落库**（前门 + 状态侧双保险）；
+//! - 🔴 **青少年模式限真人社交是服务端拒绝**（红线）：未声明/未成年/无用户行三种账号调用
+//!   五个身份端点全 403，且**全库逐字节快照相等**（零副作用：不落幂等键、不发通知、不改任何表）；
+//! - 🔴 **对端未成年同样拒绝**，且拒绝文案与"被拉黑""不够格"**逐字相同**（不得成为年龄探测器）；
+//! - 🔴 **敌对线永久匿名**：达敌对判据即一票否决，「一起死过」也不豁免；
+//! - 🔴 **社交资产零数值影响**（红线）：走完全套流程后资产/进度/世界线九张表逐字节快照相等；
+//! - 🔴 **源码级红线**：本模块的写入目标只能是三张 social 表 + 风控/审计留痕表，
+//!   且源码里不出现任何资产/进度标识符；
+//! - **拉黑有服务端实效**：撤销已授予身份 → 身份读不出 → 对方发不出解锁请求 → 连房间邀请也发不出；
+//! - **双向自愿**：pending 期间双方都看不到对方真身；拒绝即终局，不能再问一次；
+//! - **举报进队列 + 阈值升级 + 运营处置留痕**；
+//! - **参数化**：阈值/配额/开关全部经 env 回落规则单测（纯函数，不摆布进程 env）。
+
+use axum::body::Body;
+use axum::http::{header, Request, StatusCode};
+use http_body_util::BodyExt;
+use serde_json::{json, Value};
+use sqlx::{Column, Row};
+use tower::ServiceExt;
+
+use super::*;
+use crate::safety::testkit::{seed_member, seed_user, seed_world, test_state, token};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 脚手架
+// ═══════════════════════════════════════════════════════════════════════════
+
+async fn send(
+    state: &AppState,
+    method: &str,
+    uri: &str,
+    tk: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let app = crate::app::build_router(state.clone());
+    let builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {tk}"));
+    let request = match body {
+        Some(b) => builder
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(b.to_string()))
+            .unwrap(),
+        None => builder.body(Body::empty()).unwrap(),
+    };
+    let resp = app.oneshot(request).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap_or(json!(null)))
+}
+
+/// `ApiError::Conflict(m)` 的线上渲染形状（`error.rs`：`"状态冲突: {m}"`）。
+/// 断言渲染后的整句而不是内层常量——**用户看到的是这一句**，它才是"无法区分原因"的载体。
+fn refuse_line() -> String {
+    format!("状态冲突: {REFUSE_GENERIC}")
+}
+
+fn admin_token(state: &AppState, role: &str) -> String {
+    crate::auth::issue_access(&state.config.jwt_secret, &format!("adm_{role}"), role, 3600).unwrap()
+}
+
+/// 🔴 开闸走 **`runtime_flags` DB 记录**而不是 env：env 是进程级的，本模块用例与其它模块同属
+/// 一个测试二进制、默认并发跑，改 env 必须共用全局锁才不串味。写一条 DB 记录只影响本用例
+/// 自己的内存库，天然无需加锁（范式抄 `annotations::tests::open_flag`）。
+async fn open_flag(state: &AppState, scope: &str, target: &str) {
+    sqlx::query(
+        "INSERT INTO runtime_flags (id, flag, scope, target_id, enabled, starts_at, ends_at, \
+         updated_by, updated_at, reason, created_at) \
+         VALUES (?, ?, ?, ?, 1, 0, 0, 'test', ?, '用例开闸', ?)",
+    )
+    .bind(new_id("rf"))
+    .bind(ENV_SOCIAL_IDENTITY_UNLOCK)
+    .bind(scope)
+    .bind(target)
+    .bind(now_ms())
+    .bind(now_ms())
+    .execute(&state.db)
+    .await
+    .unwrap();
+    crate::flags::invalidate(&state.db);
+}
+
+async fn seed_char(state: &AppState, id: &str, owner: &str, name: &str) {
+    sqlx::query(
+        "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, \
+         rights_declaration, moderation, withdrawn, created_at) \
+         VALUES (?, ?, 'loc', 1, ?, 'original', 'approved', 0, ?)",
+    )
+    .bind(id)
+    .bind(owner)
+    .bind(json!({ "identity": { "name": name } }).to_string())
+    .bind(now_ms())
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+/// 把一张卡封卷为传世卡（模拟 `memorial::seal_character_tx` 的落定结果）。
+async fn seal_char(state: &AppState, char_id: &str, world_id: &str) {
+    sqlx::query(
+        "UPDATE cloud_characters SET memorial_status = 'sealed', memorial_sealed_at = ?, \
+         memorial_world_id = ?, withdrawn = 1 WHERE id = ?",
+    )
+    .bind(now_ms())
+    .bind(world_id)
+    .bind(char_id)
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+/// 写世界的关系图（引擎 `relation_dynamics` 的产出形状）。
+async fn set_relations(state: &AppState, world_id: &str, relations: Value) {
+    sqlx::query("UPDATE worlds SET narrative_state_json = ? WHERE id = ?")
+        .bind(json!({ "relations": relations }).to_string())
+        .bind(world_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+}
+
+/// 改年龄声明（0 未声明 / 1 成年 / 2 未成年）。
+async fn set_age(state: &AppState, user_id: &str, age: i64) {
+    sqlx::query("UPDATE users SET age_declared = ? WHERE id = ?")
+        .bind(age)
+        .bind(user_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+}
+
+/// 两个成年用户 u1/u2，各一张卡 c1/c2，同在世界 w1。
+async fn base_world(state: &AppState) {
+    seed_user(&state.db, "u1").await;
+    seed_user(&state.db, "u2").await;
+    seed_world(&state.db, "w1", 1, "running").await;
+    seed_char(state, "c1", "u1", "青梧").await;
+    seed_char(state, "c2", "u2", "白露").await;
+    seed_member(&state.db, "m1", "w1", "u1", "c1", "active").await;
+    seed_member(&state.db, "m2", "w1", "u2", "c2", "active").await;
+}
+
+async fn dump_table(db: &AnyPool, table: &str) -> String {
+    let rows = sqlx::query(&format!("SELECT * FROM {table}")).fetch_all(db).await.unwrap();
+    let mut out: Vec<String> = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let mut cells: Vec<String> = Vec::new();
+        for (i, col) in r.columns().iter().enumerate() {
+            let name = col.name();
+            let cell = if let Ok(v) = r.try_get::<Option<String>, _>(i) {
+                format!("{name}=s{v:?}")
+            } else if let Ok(v) = r.try_get::<Option<i64>, _>(i) {
+                format!("{name}=i{v:?}")
+            } else if let Ok(v) = r.try_get::<Option<f64>, _>(i) {
+                format!("{name}=f{v:?}")
+            } else {
+                format!("{name}=<undecodable>")
+            };
+            cells.push(cell);
+        }
+        out.push(cells.join("|"));
+    }
+    out.sort();
+    out.join("\n")
+}
+
+async fn dump(db: &AnyPool, tables: &[&str]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for t in tables {
+        out.push(((*t).to_string(), dump_table(db, t).await));
+    }
+    out
+}
+
+/// 本模块**可能**写到的全部表 —— 「零副作用」断言扫的就是这一批（含幂等键与通知 outbox：
+/// 拒绝若发生在它们之后，快照就会不等，从而暴露"拒绝但已留下痕迹"）。
+const SIDE_EFFECT_TABLES: &[&str] = &[
+    "social_unlock_requests",
+    "social_blocks",
+    "social_reports",
+    "risk_events",
+    "audit_logs",
+    "idempotency_keys",
+    "notification_outbox",
+];
+
+/// 🔴 资产 / 进度 / 世界线表 —— 社交资产「我们的角色一起死过」绝不能碰的那一批。
+const ASSET_TABLES: &[&str] = &[
+    "cloud_characters",   // mileage / memorial_* / withdrawn
+    "backpacks",          // 道具
+    "users",              // card_slots
+    "world_contributions",// 三层结算 ③ 贡献账本
+    "subplot_cards",      // 副本卡
+    "worlds",             // narrative_state_json（引擎回灌面）
+    "world_events",       // 公共事实
+    "world_members",      // 足迹
+    "memorial_marks",     // 「故人」印记
+];
+
+/// 玩家面 + 运营面全部端点（method, uri, body, 是否 admin token）。
+fn all_endpoints() -> Vec<(&'static str, String, Option<Value>, bool)> {
+    vec![
+        ("GET", "/api/worlds/w1/social/bonds".into(), None, false),
+        (
+            "POST",
+            "/api/worlds/w1/social/unlock-requests".into(),
+            Some(json!({ "targetCharacterId": "c2" })),
+            false,
+        ),
+        ("GET", "/api/me/social/unlock-requests".into(), None, false),
+        (
+            "POST",
+            "/api/me/social/unlock-requests/sul_x/respond".into(),
+            Some(json!({ "accept": true })),
+            false,
+        ),
+        ("GET", "/api/me/social/identities".into(), None, false),
+        ("GET", "/api/me/social/blocks".into(), None, false),
+        ("POST", "/api/me/social/blocks".into(), Some(json!({ "characterId": "c2" })), false),
+        ("DELETE", "/api/me/social/blocks/sbk_x".into(), None, false),
+        (
+            "POST",
+            "/api/me/social/reports".into(),
+            Some(json!({ "subjectKind": "character", "subjectId": "c2", "category": "harassment" })),
+            false,
+        ),
+        ("GET", "/api/admin/social/reports".into(), None, true),
+        (
+            "POST",
+            "/api/admin/social/reports/srp_x/resolve".into(),
+            Some(json!({ "action": "dismissed", "reason": "测试" })),
+            true,
+        ),
+    ]
+}
+
+/// 身份相关端点（受青少年门约束的那一批；拉黑/举报**不在其中**，见模块头 ③）。
+fn identity_endpoints() -> Vec<(&'static str, String, Option<Value>)> {
+    vec![
+        ("GET", "/api/worlds/w1/social/bonds".into(), None),
+        (
+            "POST",
+            "/api/worlds/w1/social/unlock-requests".into(),
+            Some(json!({ "targetCharacterId": "c2" })),
+        ),
+        ("GET", "/api/me/social/unlock-requests".into(), None),
+        (
+            "POST",
+            "/api/me/social/unlock-requests/sul_x/respond".into(),
+            Some(json!({ "accept": true })),
+        ),
+        ("GET", "/api/me/social/identities".into(), None),
+    ]
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 🔴 红线①：未验证功能默认关闭
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn red_line_disabled_by_default_all_endpoints_404_and_no_side_effect() {
+    let state = test_state().await;
+    base_world(&state).await;
+    let tk = token(&state, "u1");
+    let atk = admin_token(&state, "admin");
+
+    let before = dump(&state.db, SIDE_EFFECT_TABLES).await;
+    for (method, uri, body, is_admin) in all_endpoints() {
+        let t = if is_admin { &atk } else { &tk };
+        let (status, _) = send(&state, method, &uri, t, body).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "🔴 VALIDATION §0.1：开关默认关闭时 {method} {uri} 必须 404（功能不存在）"
+        );
+    }
+    let after = dump(&state.db, SIDE_EFFECT_TABLES).await;
+    assert_eq!(before, after, "🔴 关闭态必须零副作用：一行都不落库");
+
+    // 登记表侧：默认值为关，且迁移不插种子数据。
+    assert!(!crate::flags::declared_default(ENV_SOCIAL_IDENTITY_UNLOCK));
+    assert!(!social_enabled(&state.db, Some("u1"), Some("w1")).await);
+}
+
+#[tokio::test]
+async fn flag_scope_world_opens_world_endpoints_only() {
+    // 文档化的运营须知（模块头）：只按 world 灰度时，玩家能在该世界发起，却读不到 /me 收件箱。
+    let state = test_state().await;
+    base_world(&state).await;
+    open_flag(&state, "world", "w1").await;
+    let tk = token(&state, "u1");
+
+    let (s1, _) = send(&state, "GET", "/api/worlds/w1/social/bonds", &tk, None).await;
+    assert_eq!(s1, StatusCode::OK, "world 作用域开闸后，世界维度端点可用");
+    let (s2, _) = send(&state, "GET", "/api/me/social/identities", &tk, None).await;
+    assert_eq!(s2, StatusCode::NOT_FOUND, "账户维度端点无 world 坐标 → 仍按全局解析（关）");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 🔴 红线②：青少年模式限真人社交 —— **服务端拒绝 + 零副作用**
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 三种非成年账号（未声明 0 / 未成年 2 / 用户行缺失）调用五个身份端点全部 403，
+/// 且**全库逐字节快照相等**——没有落幂等键、没有发通知、没有改任何一张表。
+#[tokio::test]
+async fn red_line_minor_rejected_by_server_with_zero_side_effect() {
+    for (label, age) in [("未声明", Some(0_i64)), ("未成年", Some(2)), ("无用户行", None)] {
+        let state = test_state().await;
+        base_world(&state).await;
+        open_flag(&state, "global", "").await;
+
+        let actor = match age {
+            Some(a) => {
+                set_age(&state, "u1", a).await;
+                "u1".to_string()
+            }
+            // 用户行缺失：签一个库里根本没有的 user 的 token（fail-closed 必须挡住它）。
+            None => "ghost".to_string(),
+        };
+        let tk = token(&state, &actor);
+
+        let before = dump(&state.db, SIDE_EFFECT_TABLES).await;
+        for (method, uri, body) in identity_endpoints() {
+            let (status, _) = send(&state, method, &uri, &tk, body).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "🔴 真红线 §0.4：{label}账号调用 {method} {uri} 必须被**服务端**拒绝（403）"
+            );
+        }
+        let after = dump(&state.db, SIDE_EFFECT_TABLES).await;
+        assert_eq!(before, after, "🔴 {label}账号被拒后必须零副作用（含幂等键与通知 outbox）");
+    }
+}
+
+/// ⚠️ 与上一条互补：拉黑 / 举报是**保护工具**，未成年同样可用。
+/// 把它们一并关掉是把"保护未成年"做成了"让未成年无法自保"。
+#[tokio::test]
+async fn minor_can_still_block_and_report() {
+    let state = test_state().await;
+    base_world(&state).await;
+    open_flag(&state, "global", "").await;
+    set_age(&state, "u1", 2).await; // 未成年
+    let tk = token(&state, "u1");
+
+    let (s1, _) = send(
+        &state,
+        "POST",
+        "/api/me/social/blocks",
+        &tk,
+        Some(json!({ "characterId": "c2", "reason": "对方一直私聊我" })),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::OK, "未成年必须能拉黑");
+
+    let (s2, _) = send(
+        &state,
+        "POST",
+        "/api/me/social/reports",
+        &tk,
+        Some(json!({ "subjectKind": "character", "subjectId": "c2", "category": "minor_risk" })),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK, "未成年必须能举报");
+
+    let (s3, _) = send(&state, "GET", "/api/me/social/blocks", &tk, None).await;
+    assert_eq!(s3, StatusCode::OK, "未成年必须能查看自己的黑名单");
+}
+
+/// 🔴 对端未成年同样拒绝，且拒绝文案与「被拉黑」「不够格」**逐字相同**——
+/// 否则解锁端点就成了「探测任意用户是否未成年」的接口。
+#[tokio::test]
+async fn red_line_minor_target_refused_with_indistinguishable_message() {
+    let state = test_state().await;
+    base_world(&state).await;
+    seed_user(&state.db, "u3").await;
+    seed_char(&state, "c3", "u3", "阿箬").await;
+    seed_member(&state.db, "m3", "w1", "u3", "c3", "active").await;
+    open_flag(&state, "global", "").await;
+    // c2/c3 都与 c1 一起死过（够格），差别只在年龄与拉黑。
+    seal_char(&state, "c2", "w1").await;
+    seal_char(&state, "c3", "w1").await;
+    set_age(&state, "u2", 2).await; // 对端未成年
+    let tk1 = token(&state, "u1");
+
+    // ① 对端未成年 → 拒绝。
+    let (s_minor, b_minor) = send(
+        &state,
+        "POST",
+        "/api/worlds/w1/social/unlock-requests",
+        &tk1,
+        Some(json!({ "targetCharacterId": "c2" })),
+    )
+    .await;
+    assert_eq!(s_minor, StatusCode::CONFLICT);
+    assert_eq!(b_minor["error"]["message"], refuse_line());
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM social_unlock_requests")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "🔴 对端未成年被拒时不得落任何解锁请求行");
+
+    // ② 对端成年但已互相拉黑 → 拒绝，文案必须**逐字相同**。
+    send(
+        &state,
+        "POST",
+        "/api/me/social/blocks",
+        &tk1,
+        Some(json!({ "characterId": "c3" })),
+    )
+    .await;
+    let (s_blocked, b_blocked) = send(
+        &state,
+        "POST",
+        "/api/worlds/w1/social/unlock-requests",
+        &tk1,
+        Some(json!({ "targetCharacterId": "c3" })),
+    )
+    .await;
+    assert_eq!(s_blocked, StatusCode::CONFLICT);
+    assert_eq!(
+        b_blocked["error"]["message"], b_minor["error"]["message"],
+        "🔴 未成年拒绝与拉黑拒绝的文案必须无法区分（否则端点即年龄探测器）"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 🔴 红线③：社交资产「我们的角色一起死过」零数值影响
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 走完**全套**社交流程（自查 → 发起 → 接受 → 读身份 → 拉黑 → 举报）之后，
+/// 资产 / 进度 / 世界线九张表**逐字节快照相等**。
+///
+/// 这条断言的强度在于它是运行时级而非源码级：即便将来有人在某条路径上偷偷加了一次
+/// `mileage + 1`，快照也会当场不等。
+#[tokio::test]
+async fn red_line_social_asset_has_zero_numeric_effect() {
+    let state = test_state().await;
+    base_world(&state).await;
+    open_flag(&state, "global", "").await;
+    // 造出「我们的角色一起死过」：c2 在 w1 封卷（c1 在场送别）。
+    seal_char(&state, "c2", "w1").await;
+    // 顺带造一条「故人」印记与一些资产，确保快照不是在空表上比较。
+    sqlx::query(
+        "INSERT INTO memorial_marks (id, character_id, owner_id, deceased_character_id, world_id, kind, granted_at) \
+         VALUES ('mm1', 'c1', 'u1', 'c2', 'w1', 'departed', ?)",
+    )
+    .bind(now_ms())
+    .execute(&state.db)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE cloud_characters SET mileage = 777 WHERE id = 'c1'")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    crate::safety::testkit::seed_backpack(&state.db, "bp1", "u1", "item1", "owned", None).await;
+
+    let tk1 = token(&state, "u1");
+    let tk2 = token(&state, "u2");
+
+    let before = dump(&state.db, ASSET_TABLES).await;
+
+    // ① 自查：凭证存在且够格。
+    let (s, body) = send(&state, "GET", "/api/worlds/w1/social/bonds", &tk1, None).await;
+    assert_eq!(s, StatusCode::OK);
+    let bond = &body["bonds"][0];
+    assert_eq!(bond["credential"]["present"], json!(true), "应派生出「我们的角色一起死过」");
+    assert_eq!(bond["credential"]["worlds"][0]["grade"], "they_fell");
+    assert_eq!(bond["paths"]["diedTogether"], json!(true));
+    assert_eq!(bond["paths"]["positiveBond"], json!(false), "没有关系记录 → 正向羁绊路径不成立");
+    assert_eq!(bond["eligible"], json!(true), "「一起死过」单独即构成合格的正向羁绊线");
+
+    // ② 发起 → ③ 接受。
+    let (s, req) = send(
+        &state,
+        "POST",
+        "/api/worlds/w1/social/unlock-requests",
+        &tk1,
+        Some(json!({ "targetCharacterId": "c2" })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{req:?}");
+    let rid = req["id"].as_str().unwrap().to_string();
+    let (s, _) = send(
+        &state,
+        "POST",
+        &format!("/api/me/social/unlock-requests/{rid}/respond"),
+        &tk2,
+        Some(json!({ "accept": true })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    // ④ 读真人身份 → ⑤ 拉黑 → ⑥ 举报。
+    send(&state, "GET", "/api/me/social/identities", &tk1, None).await;
+    send(&state, "POST", "/api/me/social/blocks", &tk2, Some(json!({ "characterId": "c1" }))).await;
+    send(
+        &state,
+        "POST",
+        "/api/me/social/reports",
+        &tk2,
+        Some(json!({ "subjectKind": "character", "subjectId": "c1", "category": "harassment" })),
+    )
+    .await;
+
+    let after = dump(&state.db, ASSET_TABLES).await;
+    assert_eq!(
+        before, after,
+        "🔴 平台红线①：「我们的角色一起死过」是关系凭证，对历练 / 卡位 / 背包 / 副本卡 / \
+         贡献账本 / 世界线**一律零影响**"
+    );
+}
+
+/// 🔴 源码级红线：本模块的写入目标只能是三张 social 表 + 风控/审计留痕表，
+/// 且源码里不出现任何资产 / 进度标识符。
+///
+/// 与上一条运行时快照互补：快照证明"这次流程没改"，源码扫描证明"没有任何一条路径能改"。
+#[test]
+fn red_line_module_writes_only_social_tables() {
+    let src = include_str!("mod.rs");
+    // 注释整行剔除（红线说明本身要能自由地写出这些词）。
+    let code: String = src
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    /// 允许写入的表。
+    const WRITE_ALLOWLIST: &[&str] = &[
+        "social_unlock_requests",
+        "social_blocks",
+        "social_reports",
+        // 举报累计升级 → 复用既有风控面；运营处置 → 审计留痕。两者都不是资产。
+        "risk_events",
+        "audit_logs",
+    ];
+
+    for verb in ["INSERT INTO ", "UPDATE ", "DELETE FROM "] {
+        let mut rest = code.as_str();
+        while let Some(pos) = rest.find(verb) {
+            rest = &rest[pos + verb.len()..];
+            let table: String =
+                rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            assert!(
+                WRITE_ALLOWLIST.contains(&table.as_str()),
+                "🔴 social 模块出现了对 `{table}` 的 {verb}写入 —— 只允许写 {WRITE_ALLOWLIST:?}"
+            );
+        }
+    }
+
+    // 资产 / 进度 / 引擎回灌面的标识符一个都不许出现在代码里（读也不行的那几个，
+    // 因为一旦读得到就迟早有人顺手写）。
+    for forbidden in [
+        "mileage",
+        "backpacks",
+        "card_slots",
+        "subplot_cards",
+        "world_contributions",
+        "grant_item_tx",
+        "grant_mileage_tx",
+        "billing_balances",
+        "ledger_postings",
+        "user_entitlements",
+    ] {
+        assert!(
+            !code.contains(forbidden),
+            "🔴 social 模块不得出现资产/进度标识符 `{forbidden}`（社交资产不是数值）"
+        );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 🔴 红线④：敌对线永久匿名
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn red_line_hostile_line_never_unlocks_even_after_dying_together() {
+    let state = test_state().await;
+    base_world(&state).await;
+    open_flag(&state, "global", "").await;
+    seal_char(&state, "c2", "w1").await; // 一起死过（最强的正向凭证）
+    // …但关系是宿敌。
+    set_relations(&state, "w1", json!([{ "from": "c1", "to": "c2", "trust": -0.9, "affinity": -0.8 }]))
+        .await;
+    let tk1 = token(&state, "u1");
+
+    let (_, body) = send(&state, "GET", "/api/worlds/w1/social/bonds", &tk1, None).await;
+    let bond = &body["bonds"][0];
+    assert_eq!(bond["hostile"], json!(true));
+    assert_eq!(bond["eligible"], json!(false), "🔴 §14：敌对线永久匿名，一票否决");
+    assert_eq!(bond["credential"]["present"], json!(true), "凭证仍如实展示（事实不改），但不解锁");
+    assert!(
+        bond["blockers"].as_array().unwrap().iter().any(|b| b == BLOCK_HOSTILE),
+        "拒绝原因应明示为敌对线"
+    );
+
+    let (s, b) = send(
+        &state,
+        "POST",
+        "/api/worlds/w1/social/unlock-requests",
+        &tk1,
+        Some(json!({ "targetCharacterId": "c2" })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    assert_eq!(b["error"]["message"], refuse_line());
+}
+
+/// 接受时**用当下数据重算**：发起后翻脸成敌对线 → 接受被拒，且状态仍留在 pending。
+#[tokio::test]
+async fn hostile_after_request_blocks_acceptance() {
+    let state = test_state().await;
+    base_world(&state).await;
+    open_flag(&state, "global", "").await;
+    set_relations(&state, "w1", json!([{ "from": "c1", "to": "c2", "trust": 0.9, "affinity": 0.9 }]))
+        .await;
+    let (tk1, tk2) = (token(&state, "u1"), token(&state, "u2"));
+
+    let (s, req) = send(
+        &state,
+        "POST",
+        "/api/worlds/w1/social/unlock-requests",
+        &tk1,
+        Some(json!({ "targetCharacterId": "c2" })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{req:?}");
+    let rid = req["id"].as_str().unwrap().to_string();
+
+    // 世界继续跑，关系翻脸。
+    set_relations(&state, "w1", json!([{ "from": "c1", "to": "c2", "trust": -0.9 }])).await;
+
+    let (s, _) = send(
+        &state,
+        "POST",
+        &format!("/api/me/social/unlock-requests/{rid}/respond"),
+        &tk2,
+        Some(json!({ "accept": true })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "🔴 接受时必须按当下关系重算，快照不作数");
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM social_unlock_requests WHERE id = ?")
+            .bind(&rid)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(status, UNLOCK_PENDING, "重算不通过不改状态（关系还可能回暖）");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 双向自愿 / 面具不泄露
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn identity_hidden_until_both_consent_then_declined_is_terminal() {
+    let state = test_state().await;
+    base_world(&state).await;
+    open_flag(&state, "global", "").await;
+    set_relations(&state, "w1", json!([{ "from": "c1", "to": "c2", "trust": 0.8 }])).await;
+    let (tk1, tk2) = (token(&state, "u1"), token(&state, "u2"));
+
+    let (_, req) = send(
+        &state,
+        "POST",
+        "/api/worlds/w1/social/unlock-requests",
+        &tk1,
+        Some(json!({ "targetCharacterId": "c2" })),
+    )
+    .await;
+    let rid = req["id"].as_str().unwrap().to_string();
+
+    // pending 期间：双方的身份面都是空的。
+    for tk in [&tk1, &tk2] {
+        let (_, ids) = send(&state, "GET", "/api/me/social/identities", tk, None).await;
+        assert_eq!(ids["identities"].as_array().unwrap().len(), 0, "🔴 未双向同意前不下发任何真人身份");
+    }
+    // 收件箱只有面具名，不含任何真人标识。
+    let (_, inbox) = send(&state, "GET", "/api/me/social/unlock-requests", &tk2, None).await;
+    let raw = inbox.to_string();
+    assert!(raw.contains("青梧"), "应展示发起人的角色面具名");
+    assert!(!raw.contains("u1"), "🔴 §14：收件箱不得出现发起人的真人 id");
+    assert!(inbox["requests"][0].get("fromUserId").is_none());
+
+    // 拒绝 → 终局，且不能再问一次。
+    let (s, b) = send(
+        &state,
+        "POST",
+        &format!("/api/me/social/unlock-requests/{rid}/respond"),
+        &tk2,
+        Some(json!({ "accept": false })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(b["status"], UNLOCK_DECLINED);
+
+    let (s, _) = send(
+        &state,
+        "POST",
+        "/api/worlds/w1/social/unlock-requests",
+        &tk1,
+        Some(json!({ "targetCharacterId": "c2" })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "🔴 拒绝即终局：真人身份只问一次，不给反复施压的空间");
+}
+
+#[tokio::test]
+async fn accepted_unlock_exposes_only_user_id_and_nickname() {
+    let state = test_state().await;
+    base_world(&state).await;
+    open_flag(&state, "global", "").await;
+    sqlx::query("UPDATE users SET nickname = '露露', phone = '13800000002' WHERE id = 'u2'")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    set_relations(&state, "w1", json!([{ "from": "c1", "to": "c2", "trust": 0.8 }])).await;
+    let (tk1, tk2) = (token(&state, "u1"), token(&state, "u2"));
+
+    let (_, req) = send(
+        &state,
+        "POST",
+        "/api/worlds/w1/social/unlock-requests",
+        &tk1,
+        Some(json!({ "targetCharacterId": "c2" })),
+    )
+    .await;
+    let rid = req["id"].as_str().unwrap().to_string();
+    send(
+        &state,
+        "POST",
+        &format!("/api/me/social/unlock-requests/{rid}/respond"),
+        &tk2,
+        Some(json!({ "accept": true })),
+    )
+    .await;
+
+    let (s, ids) = send(&state, "GET", "/api/me/social/identities", &tk1, None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(ids["identities"][0]["identity"]["userId"], "u2");
+    assert_eq!(ids["identities"][0]["identity"]["nickname"], "露露");
+    assert!(!ids.to_string().contains("13800000002"), "🔴 手机号等强 PII 绝不下发");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 拉黑的服务端实效
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn block_revokes_identity_and_stops_all_social_actions() {
+    let state = test_state().await;
+    base_world(&state).await;
+    open_flag(&state, "global", "").await;
+    set_relations(&state, "w1", json!([{ "from": "c1", "to": "c2", "trust": 0.8 }])).await;
+    let (tk1, tk2) = (token(&state, "u1"), token(&state, "u2"));
+
+    // 先达成解锁。
+    let (_, req) = send(
+        &state,
+        "POST",
+        "/api/worlds/w1/social/unlock-requests",
+        &tk1,
+        Some(json!({ "targetCharacterId": "c2" })),
+    )
+    .await;
+    let rid = req["id"].as_str().unwrap().to_string();
+    send(
+        &state,
+        "POST",
+        &format!("/api/me/social/unlock-requests/{rid}/respond"),
+        &tk2,
+        Some(json!({ "accept": true })),
+    )
+    .await;
+    let (_, ids) = send(&state, "GET", "/api/me/social/identities", &tk1, None).await;
+    assert_eq!(ids["identities"].as_array().unwrap().len(), 1, "前置：身份已互相可见");
+
+    // u2 拉黑 c1（面具寻址）。
+    let (s, blk) = send(
+        &state,
+        "POST",
+        "/api/me/social/blocks",
+        &tk2,
+        Some(json!({ "characterId": "c1", "reason": "不想再联系" })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(blk["revokedUnlocks"], json!(1), "拉黑必须撤销已达成的解锁");
+
+    // ① 身份可见性立即收回（双方都读不到）。
+    for tk in [&tk1, &tk2] {
+        let (_, ids) = send(&state, "GET", "/api/me/social/identities", tk, None).await;
+        assert_eq!(ids["identities"].as_array().unwrap().len(), 0, "🔴 拉黑后身份必须立刻读不出");
+    }
+    // ② 被拉黑者从社交面消失。
+    let (_, bonds) = send(&state, "GET", "/api/worlds/w1/social/bonds", &tk1, None).await;
+    assert_eq!(bonds["bonds"].as_array().unwrap().len(), 0, "拉黑双方互相不可见");
+    // ③ 被拉黑者发不出新的解锁请求。
+    let (s, b) = send(
+        &state,
+        "POST",
+        "/api/worlds/w1/social/unlock-requests",
+        &tk1,
+        Some(json!({ "targetCharacterId": "c2" })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    assert_eq!(b["error"]["message"], refuse_line());
+
+    // ④ 解除拉黑不恢复已撤销的解锁（revoked 是终局态）。
+    let bid = blk["id"].as_str().unwrap().to_string();
+    let (s, _) = send(&state, "DELETE", &format!("/api/me/social/blocks/{bid}"), &tk2, None).await;
+    assert_eq!(s, StatusCode::OK);
+    let (_, ids) = send(&state, "GET", "/api/me/social/identities", &tk1, None).await;
+    assert_eq!(ids["identities"].as_array().unwrap().len(), 0, "解除拉黑不等于恢复身份授予");
+}
+
+/// 拉黑的实效必须**跨通道**：房间邀请同样发不出。
+/// 且拉黑是保护态——即便社交开关被关掉，既有拉黑在邀请通道上仍然生效。
+#[tokio::test]
+async fn block_also_stops_room_invitations_even_when_social_flag_off() {
+    let state = test_state().await;
+    base_world(&state).await;
+    open_flag(&state, "global", "").await;
+    // u2 有一张不在 w2 里的卡 c9，用于接收邀请。
+    seed_char(&state, "c9", "u2", "白露·分身").await;
+    seed_world(&state.db, "w2", 1, "open").await;
+    seed_member(&state.db, "m9", "w2", "u1", "c1", "active").await;
+    let (tk1, tk2) = (token(&state, "u1"), token(&state, "u2"));
+
+    // u2 拉黑 c1。
+    let (s, _) = send(&state, "POST", "/api/me/social/blocks", &tk2, Some(json!({ "characterId": "c1" })))
+        .await;
+    assert_eq!(s, StatusCode::OK);
+
+    // 关掉社交开关（模拟运营急停），只留邀请开关。
+    sqlx::query("UPDATE runtime_flags SET enabled = 0 WHERE flag = ?")
+        .bind(ENV_SOCIAL_IDENTITY_UNLOCK)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    crate::flags::invalidate(&state.db);
+    let _inv = crate::invitations::InvitationSwitch::set(true);
+
+    let (s, b) = send(
+        &state,
+        "POST",
+        "/api/worlds/w2/invitations",
+        &tk1,
+        Some(json!({ "targetCharacterId": "c9" })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "🔴 拉黑必须跨通道生效：被拉黑者连房间邀请也发不出");
+    assert!(b["error"]["message"].as_str().unwrap().contains("不能被邀请"), "沿用邀请侧的统一拒绝文案");
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM room_invitations")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "被拉黑的邀请一行都不落库");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 举报队列
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn report_enters_queue_dedupes_escalates_and_is_resolvable() {
+    let state = test_state().await;
+    base_world(&state).await;
+    for (u, c) in [("u3", "c3"), ("u4", "c4"), ("u5", "c5")] {
+        seed_user(&state.db, u).await;
+        seed_char(&state, c, u, c).await;
+        seed_member(&state.db, &format!("m_{u}"), "w1", u, c, "active").await;
+    }
+    open_flag(&state, "global", "").await;
+
+    // ① 举报进队列，且响应不泄露被举报人的真人 id。
+    let (s, r1) = send(
+        &state,
+        "POST",
+        "/api/me/social/reports",
+        &token(&state, "u1"),
+        Some(json!({
+            "subjectKind": "character", "subjectId": "c2",
+            "category": "harassment", "detail": "反复发送骚扰内容"
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(r1["status"], REPORT_PENDING);
+    assert!(r1.get("subjectUserId").is_none(), "🔴 举报回执不得下发被举报人的真人 id");
+
+    // ② 冷却窗口内重复提交 → 幂等复用，不刷队列。
+    let (_, r2) = send(
+        &state,
+        "POST",
+        "/api/me/social/reports",
+        &token(&state, "u1"),
+        Some(json!({ "subjectKind": "character", "subjectId": "c2", "category": "harassment" })),
+    )
+    .await;
+    assert_eq!(r2["deduped"], json!(true));
+    assert_eq!(r2["id"], r1["id"]);
+
+    // ③ 累计到阈值（默认 3）→ 写一条 risk_events 升级。
+    for u in ["u3", "u4"] {
+        let (s, _) = send(
+            &state,
+            "POST",
+            "/api/me/social/reports",
+            &token(&state, u),
+            Some(json!({ "subjectKind": "character", "subjectId": "c2", "category": "harassment" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+    }
+    let escalations: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM risk_events WHERE kind = 'social_report_threshold' AND user_id = 'u2'",
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(escalations, 1, "恰好达阈值时升级一次（一次跨越只升级一次）");
+
+    // ④ 运营队列可见 + 处置 + 审计留痕。
+    let rtk = admin_token(&state, "reviewer");
+    let (s, list) = send(&state, "GET", "/api/admin/social/reports?status=pending", &rtk, None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(list["reports"].as_array().unwrap().len(), 3);
+    let rid = r1["id"].as_str().unwrap().to_string();
+    let (s, res) = send(
+        &state,
+        "POST",
+        &format!("/api/admin/social/reports/{rid}/resolve"),
+        &rtk,
+        Some(json!({ "action": "actioned", "reason": "已警告并限制其私信" })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(res["status"], REPORT_ACTIONED);
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_logs WHERE action = 'social.report_resolved' AND subject = ?",
+    )
+    .bind(&rid)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(audits, 1, "运营处置必须留痕（没有留痕就没有复盘）");
+
+    // ⑤ 重复处置 → 409（CAS，不覆盖别人的结论）。
+    let (s, _) = send(
+        &state,
+        "POST",
+        &format!("/api/admin/social/reports/{rid}/resolve"),
+        &rtk,
+        Some(json!({ "action": "dismissed", "reason": "改主意" })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn report_rejects_unknown_category_and_self_report() {
+    let state = test_state().await;
+    base_world(&state).await;
+    open_flag(&state, "global", "").await;
+    let tk = token(&state, "u1");
+
+    let (s, _) = send(
+        &state,
+        "POST",
+        "/api/me/social/reports",
+        &tk,
+        Some(json!({ "subjectKind": "character", "subjectId": "c2", "category": "我不喜欢他" })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "未知类别必须 400，绝不静默归到 other");
+
+    let (s, _) = send(
+        &state,
+        "POST",
+        "/api/me/social/reports",
+        &tk,
+        Some(json!({ "subjectKind": "character", "subjectId": "c1", "category": "other" })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "不能举报自己");
+}
+
+#[tokio::test]
+async fn admin_report_queue_enforces_role_matrix() {
+    let state = test_state().await;
+    base_world(&state).await;
+    open_flag(&state, "global", "").await;
+    for (role, expect) in [
+        ("admin", StatusCode::OK),
+        ("reviewer", StatusCode::OK),
+        ("support", StatusCode::OK),
+        ("operator", StatusCode::FORBIDDEN),
+        ("finance", StatusCode::FORBIDDEN),
+    ] {
+        let (s, _) =
+            send(&state, "GET", "/api/admin/social/reports", &admin_token(&state, role), None).await;
+        assert_eq!(s, expect, "{role} 的举报队列权限不符预期");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 「我们的角色一起死过」的派生口径
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn died_together_grades_derive_from_memorial_facts_only() {
+    let state = test_state().await;
+    base_world(&state).await;
+
+    // 都在世 → 无凭证。
+    assert!(!died_together(&state.db, "c1", "c2").await.unwrap().present());
+
+    // 对方倒下 → they_fell。
+    seal_char(&state, "c2", "w1").await;
+    let cred = died_together(&state.db, "c1", "c2").await.unwrap();
+    assert_eq!(cred.worlds[0]["grade"], "they_fell");
+    assert_eq!(cred.worlds[0]["markedAsDeparted"], json!(false), "还没打印记");
+
+    // 我也倒下 → both_fell；且从对方视角是同一段经历。
+    seal_char(&state, "c1", "w1").await;
+    assert_eq!(died_together(&state.db, "c1", "c2").await.unwrap().worlds[0]["grade"], "both_fell");
+    assert_eq!(died_together(&state.db, "c2", "c1").await.unwrap().worlds[0]["grade"], "both_fell");
+
+    // 没有共同世界 → 无凭证（哪怕两张卡都死了）。
+    seed_user(&state.db, "u9").await;
+    seed_char(&state, "c99", "u9", "路人").await;
+    seal_char(&state, "c99", "w_other").await;
+    assert!(!died_together(&state.db, "c1", "c99").await.unwrap().present());
+}
+
+/// 传世卡的 `withdrawn` 恒为 1 —— 社交资格判定绝不能拿它当门，否则这条独有社交资产整条被掐死。
+#[tokio::test]
+async fn sealed_character_is_still_a_valid_social_counterpart() {
+    let state = test_state().await;
+    base_world(&state).await;
+    open_flag(&state, "global", "").await;
+    seal_char(&state, "c2", "w1").await;
+    let withdrawn: i64 =
+        sqlx::query_scalar("SELECT withdrawn FROM cloud_characters WHERE id = 'c2'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(withdrawn, 1, "前置：封卷会把 withdrawn 置 1");
+
+    let (s, _) = send(
+        &state,
+        "POST",
+        "/api/worlds/w1/social/unlock-requests",
+        &token(&state, "u1"),
+        Some(json!({ "targetCharacterId": "c2" })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "🔴 死者仍是合法的社交对端（否则「一起死过」永远兑现不了）");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 纯函数：羁绊折算与参数回落
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn bond_requires_both_directions_and_detects_hostility() {
+    let two_way = json!({ "relations": [
+        { "from": "a", "to": "b", "trust": 0.9 },
+        { "from": "b", "to": "a", "trust": 0.1 },
+    ]})
+    .to_string();
+    let v = bond_between(&two_way, "a", "b", 0.3, 0.5);
+    assert_eq!(v.edges, 2);
+    assert!(!v.hostile);
+    assert!((v.positive - 0.1).abs() < 1e-9, "双向取较小者：一头热不构成羁绊线");
+
+    let one_way = json!({ "relations": [{ "from": "a", "to": "b", "affinity": 0.7 }]}).to_string();
+    assert!((bond_between(&one_way, "a", "b", 0.3, 0.5).positive - 0.7).abs() < 1e-9);
+
+    // 救命之恩（debt）计入正向线（§14「救命」）。
+    let debt = json!({ "relations": [{ "from": "a", "to": "b", "debt": 0.8 }]}).to_string();
+    assert!((bond_between(&debt, "a", "b", 0.3, 0.5).positive - 0.8).abs() < 1e-9);
+
+    // 敌对三判据，任一命中即敌对。
+    for rel in [
+        json!({ "from": "a", "to": "b", "trust": -0.3 }),
+        json!({ "from": "b", "to": "a", "affinity": -0.5 }),
+        json!({ "from": "a", "to": "b", "fear": 0.5 }),
+    ] {
+        let s = json!({ "relations": [rel] }).to_string();
+        assert!(bond_between(&s, "a", "b", 0.3, 0.5).hostile, "应判为敌对");
+    }
+
+    // 无关的边、损坏的状态、空状态 → 中性视图（解锁不了，但也不冤枉成敌对）。
+    for s in [
+        json!({ "relations": [{ "from": "a", "to": "z", "trust": -1.0 }]}).to_string(),
+        "{ not json".to_string(),
+        "{}".to_string(),
+    ] {
+        let v = bond_between(&s, "a", "b", 0.3, 0.5);
+        assert_eq!(v, BondView::default());
+    }
+}
+
+#[test]
+fn params_fall_back_and_reject_garbage() {
+    assert_eq!(parse_positive(None, 7), 7);
+    assert_eq!(parse_positive(Some("0"), 7), 7, "非正数回落默认");
+    assert_eq!(parse_positive(Some("-3"), 7), 7);
+    assert_eq!(parse_positive(Some("abc"), 7), 7);
+    assert_eq!(parse_positive(Some(" 12 "), 7), 12);
+
+    assert!((parse_non_negative_f64(None, 0.6) - 0.6).abs() < 1e-9);
+    assert!((parse_non_negative_f64(Some("-1"), 0.6) - 0.6).abs() < 1e-9, "负数回落默认");
+    assert!((parse_non_negative_f64(Some("nan"), 0.6) - 0.6).abs() < 1e-9);
+    assert!((parse_non_negative_f64(Some("0.25"), 0.6) - 0.25).abs() < 1e-9);
+
+    assert!(parse_bool(None, true));
+    assert!(!parse_bool(Some("off"), true));
+    assert!(parse_bool(Some("yes"), false));
+    assert!(parse_bool(Some("随便"), true), "配错不静默改变状态：回落默认");
+
+    // §0.2：每一条产品规则都必须是可配置的（这里断言默认值确实是"保守方向"）。
+    assert!(DEFAULT_UNLOCK_MIN_BOND > 0.0, "解锁阈值不得默认为 0（那等于人人可解锁）");
+    assert!(DEFAULT_UNLOCK_DAILY_LIMIT <= DEFAULT_REPORT_DAILY_LIMIT, "举报配额必须比解锁宽松");
+    assert!(!DEFAULT_SOCIAL_ENABLED);
+}
+
+#[test]
+fn refusal_message_is_single_and_generic() {
+    // 🔴 全模块只有一句"不能解锁"的话：多一句就多一条可被用来区分原因的信息。
+    let src = include_str!("mod.rs");
+    let occurrences = src.matches("REFUSE_GENERIC").count();
+    assert!(occurrences >= 5, "所有解锁类拒绝都应走同一个常量，实测引用 {occurrences} 次");
+    assert!(!REFUSE_GENERIC.contains("未成年"));
+    assert!(!REFUSE_GENERIC.contains("拉黑"));
+    assert!(!REFUSE_GENERIC.contains("敌对"));
+}

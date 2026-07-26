@@ -514,6 +514,21 @@ pub(crate) async fn settle_idle_world_ending_tx(
     // 崩塌 → 封卷出一份「BE 结局传记」（§9「坏结局也是内容，封卷收藏」）。与结算同事务：
     // 结算回滚则传记同滚，绝不出现"奖罚没落地但墓志铭已刻好"。正常终局不产出（有输才有痛）。
     seal_be_biography_tx(tx, world_id, collapsed, &ctx).await?;
+
+    // 自动封卷（§12【拍板 23】「死亡 = 传记封卷，不是资产清零」）：本世界里已死的卡转传世卡。
+    //
+    // 落在结算侧而非死亡落定处，是因为后者在 runtime::commit_tick 内，而平权红线要求
+    // runtime/mod.rs 对资产模块零引用（与 subplot 铸卡同一条理由：挂 progression 不挂 runtime）。
+    //
+    // 顺序在 ①③ 与 BE 传记**之后**：封卷会把 withdrawn 置 1，而 total_mileage 虽已按
+    // 「withdrawn=0 OR memorial_status='sealed'」统计（死者历练仍算数），但结算发放本身
+    // 只认 participants 名单、不重查库，放在后面可确保「先把这局该给的给完，再封卷」这个直觉次序。
+    //
+    // 幂等由 seal_character_tx 的 CAS 承担；开关关闭时整段短路。失败不阻断结算——
+    // 封卷是纪念不是账目，玩家还可随时用主动认领入口补上。
+    if let Err(e) = crate::memorial::auto_seal_dead_participants_tx(tx, world_id, participants).await {
+        tracing::warn!(world_id, error = %e, "自动封卷失败（结算照常落定，玩家可主动认领）");
+    }
     Ok(())
 }
 

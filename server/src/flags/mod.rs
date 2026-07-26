@@ -33,7 +33,7 @@
 //! 一次把 9 个开关全搬进来是一次巨大的行为变更：每个模块的「前门拒绝 + 读取侧降级」
 //! 语义各有细节（有的关掉是端点 404，有的是读取侧降级，有的是结算期跳过而非报错），
 //! 批量改必然出错。本批次只交付**基础设施 + 一条参考接线**（`MUSE_ONBOARDING`，
-//! 语义最简单：四个端点统一 404）。其余 8 个的迁移清单见本文件末尾的
+//! 语义最简单：四个端点统一 404）。其余未接线开关的迁移清单见本文件末尾的
 //! `MIGRATION_NOTES` 常量——它是代码内的待办清单，随迁移逐条划掉。
 //!
 //! ════════════════════════════════════════════════════════════════════════════
@@ -65,12 +65,12 @@
 //! **立即返回该开关声明的默认值，且不再继续回落到 env**。
 //!
 //! 「不再回落」是刻意的：若损坏记录被静默跳过，「配坏了」就变成了「按 env 开着」——
-//! 一个本该报警的状态被降级成了正常状态。宁可整个开关退回默认值（对 8 个未验证功能就是关），
+//! 一个本该报警的状态被降级成了正常状态。宁可整个开关退回默认值（对未验证功能就是关），
 //! 也不要让损坏数据决定用户能看到什么。
 //!
 //! ⚠️ **「安全」永远指向不扩大用户可见范围的那一侧，不是字面的 `false`**。
 //! `MUSE_SAFETY_LEXICON` 默认为**开**：它是审核链，关掉它等于放行敏感词。
-//! 因此 fail-safe 值统一取 `FlagDef::default_enabled`——对 8 个未验证功能是 `false`（关），
+//! 因此 fail-safe 值统一取 `FlagDef::default_enabled`——对未验证功能是 `false`（关），
 //! 对审核链是 `true`（继续过滤）。红线用例 `red_line_only_safety_chain_defaults_on` 锁死这一点。
 //!
 //! ════════════════════════════════════════════════════════════════════════════
@@ -209,6 +209,37 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
         wired: true,
     },
     FlagDef {
+        name: "MUSE_IFLINE_PARALLEL",
+        default_enabled: false,
+        owner: "ifline",
+        desc: "if 线付费副本（世界结束后以终局为分叉点开单人平行线；烧副本卡换内容）。总规格 §7 人设保险第 3 级；\
+               🔴 平行线不是改写——原世界线一个字节不动，且 if 线不产出任何可反哺原世界的资产",
+        // 🔵 与 `MUSE_OOC_ANNOTATIONS` 同理：R3 新建件，没有需要保留的历史 env 语义，直接接线。
+        wired: true,
+    },
+    FlagDef {
+        name: "MUSE_SOCIAL_IDENTITY_UNLOCK",
+        default_enabled: false,
+        owner: "social",
+        desc: "真人社交解锁（正向羁绊线达阈值后双向自愿互揭真身）+ 拉黑 / 举报队列。总规格 §14【拍板 22】恨隔面具原则；\
+               🔴 敌对线永久匿名 · 青少年模式服务端拒绝 · 独有社交资产「我们的角色一起死过」是关系凭证不是数值",
+        // 🔵 与 `MUSE_OOC_ANNOTATIONS` / `MUSE_IFLINE_PARALLEL` 同理：R3 新建件，
+        // 没有需要保留的历史 env 语义，从建成之日起就经本体系解析。
+        wired: true,
+    },
+    FlagDef {
+        name: "MUSE_OFFPEAK_SCHEDULING",
+        default_enabled: false,
+        owner: "runtime",
+        desc: "错峰调度（成本工程杠杆①）：连载/慢炖场的 tick 优先排进折扣时段，窗口内压缩间隔以保住每日拍数；\
+               🔴 直播场永不延后 · 🔴 防饿死兜底恒有限、首拍绝不延后",
+        // 🔵 与上面几条不同：本开关**有历史 env 语义**（登记前一直走 `env_bool` 兜底）。
+        // 登记后语义仍然连续——env 是解析链第 ④ 层，只是前面多了 user/world/global 三层，
+        // 于是错峰从「全局一刀切」变成可按世界灰度。`runtime/mod.rs` 的
+        // `offpeak::enabled_for_world` 早已写好「已登记走体系、未登记退 env」的分支，故那边一行不用改。
+        wired: true,
+    },
+    FlagDef {
         name: "MUSE_SAFETY_LEXICON",
         // 🔴 唯一默认为「开」的开关：审核链。关掉它 = 放行敏感词，
         // 所以对它而言「安全的那一侧」是开着，fail-closed 返回 true 才是 fail-**safe**。
@@ -263,7 +294,11 @@ pub const fn declared_default(name: &str) -> bool {
     false
 }
 
-/// 其余 8 个开关的迁移清单（代码内待办，随迁移逐条划掉；同步见 `docs/VALIDATION.md` §3.1）。
+/// 其余未接线开关的迁移清单（代码内待办，随迁移逐条划掉；同步见 `docs/VALIDATION.md` §3.1）。
+///
+/// ⚠️ 此处**刻意不写死开关个数**：数字散落在模块头、本注释、`flags/tests.rs` 与
+/// `docs/VALIDATION.md` 四处，历次加开关都漏改过其中几处。计数的唯一权威是
+/// `KNOWN_FLAGS.len()`（由 `red_line_only_safety_chain_defaults_on` 钉住），文字描述不复述它。
 ///
 /// 迁移一个开关的通用步骤：
 ///   1. 把模块内 `xxx_enabled()` 改成 `async fn xxx_enabled(db, ctx)`，内部调 `flags::is_enabled`；
@@ -727,9 +762,15 @@ pub struct SetFlag<'a> {
 
 /// upsert 一条记录（唯一键 = flag+scope+target_id，语义是**覆盖**）。返回记录 id。
 ///
-/// 🔴 不用 `ON CONFLICT`（方言不可移植，`db.rs` 约定禁用）：先 UPDATE，`rows_affected==0`
-/// 再 INSERT。并发下两个 INSERT 会有一个撞唯一索引，此时**重试一次 UPDATE** 即收敛为
-/// 「后写的赢」——与单线程下的覆盖语义一致。开关写入是低频运营动作，这点重试成本无关紧要。
+/// 实现是先 UPDATE、`rows_affected==0` 再 INSERT。并发下两个 INSERT 会有一个撞唯一索引，
+/// 此时**重试一次 UPDATE** 即收敛为「后写的赢」——与单线程下的覆盖语义一致。
+/// 开关写入是低频运营动作，这点重试成本无关紧要。
+///
+/// ⚠️ **此处原注释称「`ON CONFLICT` 方言不可移植、`db.rs` 约定禁用」——那是错的**，已订正：
+/// `db.rs` 禁的是方言特性（JSONB / serial / NOW()），`ON CONFLICT` 是 SQLite 3.24+ 与
+/// Postgres 都支持的标准 UPSERT，仓库里 `ledger` / `shop` / `consents` / `runtime` 等多处在用。
+/// 本函数的实现**本身没问题**（重试已覆盖竞态），保留即可；但别再把那句话当约定传下去——
+/// 它已经让人为绕开一条不存在的禁令而写出「先 SELECT 再 INSERT」的竞态代码。
 ///
 /// 调用方**必须**在成功后调 `invalidate(db)`（admin_api 已封在同一个 handler 里）。
 pub async fn set_flag(db: &AnyPool, p: SetFlag<'_>) -> Result<String, sqlx::Error> {

@@ -1,7 +1,9 @@
 # 平台后端 API 清单（server）
 
-> 全部端点 nest 在 `/api` 下（`server/src/app.rs`），共 **103 条路由声明 / 112 个方法-路径组合**
-> （0036 运行时开关 +3 条声明 / +4 个组合；口径以 §8 的 grep 为准）。
+> 全部端点 nest 在 `/api` 下（`server/src/app.rs`）。
+> ⚠️ **本文不复述路由总数**：这个数字被漏改过多次（一度停在 103，彼时实际已 129），
+> 且并行开发时任何一个批次落地都会让它当场过期——而一个「看起来精确却是错的」计数，
+> 比没有计数更糟。需要数字时以代码为准，口径见 §8 的 grep 命令。
 > 鉴权列语义：**JWT** = 需 `Authorization: Bearer <accessToken>`（`AuthUser` 提取器）；
 > **公开** = 无需 token；**admin+角色** = 需管理员 token 且 `require_role` 通过（`admin` 角色恒通过）。
 > 校验于 2026-07-26。**改路由必须同步改本文件**——与 `docs/VALIDATION.md` §3 台账同级纪律。
@@ -196,6 +198,7 @@
 | 优先级 | 折扣时段开启时，**被压得最久的世界先入队**（先入队 = 先被 worker 领走）。稳定排序，无人被延后时逐字保留原顺序 |
 | 时区口径 | 窗口字面量按 `MUSE_OFFPEAK_TZ_OFFSET_MIN`（供应商时区相对 UTC 的分钟偏移，默认 0）**在解析期一次性折算成 UTC**，之后判定/落库/聚合全是 UTC——与 `dashboards::utc_day_start_ms` / `runtime::day_string` / `reports::day_bounds` 同一套日界，**全仓不存在第二套时区口径**（用例 `offpeak_utc_day_offset_matches_dashboard_day_boundary` 钉住） |
 | 可观测 | `world_ticks` 新增 `off_peak`(0/1) · `price_ratio_pct`(名义档位，100=原价) · `defer_ms`(被压时长)。「省了多少」= `Σ cost_tokens × (100-price_ratio_pct)/100 × MUSE_TOKEN_CNY_CENTS_PER_1K`；「生效了多少」= `off_peak=1` 的拍数占比与 `Σ defer_ms` |
+| 读出口 | `GET /api/admin/metrics/overview` → `cost.offPeak`（**唯一**读出口，不另开路由；窗口同 `cost.trend`，即 `?costDays=`）。另在 `cost.trend[].offPeakTokens` 给出逐日拆分。字段与单位见下表 |
 | 失效方向 | 窗口一条都解析不出来 → **整个错峰退化为关闭**（配错的后果必须是「功能不生效」，不是「所有世界永远被延后」） |
 
 **参数**（全部 env，§0.2 参数化，不写死）：
@@ -223,7 +226,31 @@
 > `ModelClient` 增加 `submit_batch`/`poll_batch`，server 侧新增中间态表与批次协调器。
 > 完整可行性分析与改造路径见 `server/src/runtime/mod.rs` 的 `offpeak` 模块头。
 
-## 4. 玩家账户（me / backpack / progression / subplot / memorial / onboarding / annotations / reports / notifications）
+**成本看板读出口 `cost.offPeak`**（`GET /api/admin/metrics/overview`，operator/finance；窗口 = `?costDays=`，默认 7、clamp [1,60]、UTC 日界、末桶即今天）：
+
+| 字段 | 单位 | 含义 |
+|---|---|---|
+| `windowDays` | 天 | 观测窗口，恒等于 `cost.trendDays` |
+| `ticks` / `tokens` | 拍 / token | 窗口内**全部**拍数与 token（各类占比的分母） |
+| `offPeakTicks` / `offPeakTokens` | 拍 / token | 其中 `off_peak=1` 的部分 |
+| `tickRatio` · `tokenRatio` · `savedRatio` | **0..1 小数** | 错峰拍占比 / 错峰 token 占比 / 折让占原价比。🔴 与 `successRate`、`usageRatio`、`openRate` 同一套约定，**不是百分数**；窗口内一拍都没有 → `null`（无数据 ≠ 真实的 0%），前端显示 `—` |
+| `nominalCents` / `nominalCny` | 分 / 元 | 窗口内**按原价**估算的成本（与 `cost.trend[].cents` 同口径） |
+| `savedCents` / `savedCny` | 分 / 元 | 估算折让 = `Σ 按档位汇总 tokens × (100-priceRatioPct)/100 × 单价`。**先按档位汇总再换算**（不逐拍取整），避免地板误差累积 |
+| `effectiveCents` / `effectiveCny` | 分 / 元 | `nominal - saved`，恒 ≥ 0 |
+| `deferredTicks` · `deferMsTotal` · `deferMsMax` | 拍 / 毫秒 | 被延后过的拍数与被压总时长 / 峰值 |
+| `avgDeferMs` | 毫秒（浮点） | 平均延后时长，**分母只含 `deferredTicks`**；无被延后拍 → `null`，不除零 |
+| `byRatio[]` | — | 按名义档位分桶（升序，折扣最深在前，原价 `100` 在末），`Σ byRatio[].ticks == ticks`。每项含 `priceRatioPct`（**百分数整数**，100=原价）· `priceRatio`（同一个数的 **0..1** 形态）· `ticks` · `tokens` · `savedCents` / `savedCny` |
+| `notes[]` | — | 口径与局限自述（同 `cost.notes[]` 的范式） |
+
+> 🔴 **最易错的一处单位**：`priceRatioPct` 是**百分数整数**（`50` = 5 折），`priceRatio` / `tickRatio` /
+> `tokenRatio` / `savedRatio` 是 **0..1 小数**。把 `priceRatioPct` 当比率渲染会得到 5000%。
+> 用例 `cost_offpeak_meter_keeps_pct_and_zero_to_one_ratios_apart`（`server/src/admin_api/tests.rs`）钉住这条。
+>
+> `cost.today` / `cost.trend` / `cost.byWorld` / `cost.total` **一律按原价计**（口径不变，0038 之前的消费者逐字不受影响），
+> 错峰折让只在 `cost.offPeak` 体现，两处**不重复相减**。错峰默认关闭时三列恒为中性值 ⇒ `offPeakTicks=0`、
+> 各比率为真实的 `0.0`、`savedCents=0`，看板显示空态而非报错。
+
+## 4. 玩家账户（me / backpack / progression / subplot / memorial / onboarding / annotations / ifline / reports / notifications）
 
 | 方法 | 路径 | 鉴权 | 说明 |
 |---|---|---|---|
@@ -444,6 +471,128 @@
 > 由 `slo::tests::ooc_appeal_rate_never_reads_moderation_appeals` 与
 > `admin_api::tests::narrative_slo_marks_remaining_metrics_as_no_data_source` 双向锁死。
 
+### if 线付费副本（ifline，migration 0039 立项 + **0041 推进**；总规格 §7「人设保险（三级出口）」**第 3 级**）
+
+> 规格原文：**事后·if 线**：世界结束后花资源以某拍为分叉点开单人平行线副本（**不影响原世界线**）——
+> 把遗憾变成付费内容。
+
+三级出口至此完整：事前底线硬约束（engine/critic）· 事中注解权（0037）· **事后 if 线（本节）**。
+
+```text
+原世界线：他在城门口退了一步 → 城破 → 世界结束     ← worlds/world_events，永不改写
+if 线：   从终局那一拍岔出去的、只属于你的一条平行线   ← ifline_worlds，独立实例、有主人、不进结算
+```
+
+| 方法 | 路径 | 鉴权 | 说明 |
+|---|---|---|---|
+| GET | `/api/worlds/{id}/ifline-fork-points` | JWT | **可用分叉点 + 限制说明**（诚实面：客户端不必猜）。含 `eligible` / `supportedForkPoints` / `unsupportedForkPoints`（带证据与补齐路径）/ `cost` |
+| POST | `/api/worlds/{id}/iflines` | JWT | 开 if 线（**烧副本卡**）。**幂等**：同一 `(ownerId, originWorldId, characterId, forkPoint, forkTickNo)` 只开得出一条，重复提交回既有那条 + `created:false`。**开关默认关闭** |
+| GET | `/api/me/iflines?status=&limit=&offset=` | JWT | 我的 if 线列表。硬边界 `WHERE owner_id = 本人` |
+| GET | `/api/me/iflines/{id}` | JWT | 一条 if 线（含**冻结分叉快照**与剥离台账）。别人的一律 **404**（不是 403） |
+| POST | `/api/me/iflines/{id}/beats` | JWT | **推进一拍**（0041）。并发闸 = `(ifline_id, beat_no)` 唯一键：同一拍只跑一次，抢占失败 **409 且一个 token 都不花**。到拍数上限则**强制收尾**（不调模型）。别人的一律 **404** |
+| GET | `/api/me/iflines/{id}/beats?limit=&offset=` | JWT | 这条平行线的正文（按拍序）= **终局产物的全部形态**：可读的私人传记 + 结局名。恒带 `grantedAssets: []` |
+| GET | `/api/admin/iflines?status=&limit=&offset=` | **operator** | 运营只读列表（`status` ∈ `sealed`/`running`/`ended`，默认 `sealed`）。不下发 `ownerId`；含 `beatCount` / `costTokensTotal` / `endingReason` |
+| GET | `/api/admin/iflines/cost?since=&until=` | **operator** | 🔴 **if 线 token 开销读数**（0041）。时间窗 BIGINT 毫秒，缺省回看 30 天。响应的 `dashboardIntegration` **明写主看板尚未并入**及接入方式 |
+
+请求体（开 if 线）：
+
+```jsonc
+{
+  "characterId": "cc_1",        // 必须是本人在该世界的**在世**卡（传世卡 400，见下）
+  "forkPoint": "terminal",      // 可省；当前**只接受** terminal，其它值 400（绝不静默降级）
+  "tickNo": 12,                 // 可省；给了就必须**等于**终局拍，否则 400 并写明唯一可用的拍号
+  "premise": "如果他在城门口没有退那一步。",  // 可选 ≤1000 字，过机审
+  "cardIds": ["sc_1"]           // 数量须恰好 = MUSE_IFLINE_CARD_COST（默认 1）；由玩家显式点名
+}
+```
+
+#### 🔴 分叉点的状态从哪来，以及它的限制（本功能最容易做假的地方）
+
+规格写「以某拍为分叉点」，但**仓库里没有任何一拍的状态快照**。核实证据：
+
+| 候选数据源 | 实际内容 | 能否还原第 N 拍 |
+|---|---|---|
+| `world_ticks` | `base_revision` / `status` / `cost_tokens` / `attempts` / 错峰三列 | ❌ **没有一列存状态** |
+| `worlds.narrative_state_json` | 单行，每拍被 `commit_tick` 的 CAS **覆盖** | ❌ 只有最终态，历史版本不留存 |
+| `world_events` | 投影后的**展示文本**；引擎 `StatePatch` 在 `commit_tick` 里被丢弃、从不落库 | ❌ 事件流无法重放出中间态 |
+| 引擎 FS（`store.rs`） | DB 那一列的每拍物化 | ❌ 同样只有当前态 |
+
+因此本实现**只支持终局分叉**：`forkPoint='terminal'`，状态源 = 原世界 `narrative_state_json`
+（世界已 `ended`，那份 JSON 就是最后一拍提交后的状态），**逐字节复制**后按 §14 剥离他人角色。
+`forkTickNo` = `MAX(tick_no) WHERE status='done'`（**不是** `MAX(tick_no)`：没落定的拍不能当分叉点）。
+
+- 请求中间拍 → **400**，报文点名「无法从第 N 拍分叉」+ 唯一可用的终局拍号，且**一张卡都不烧**；
+- 请求 `forkPoint=tick` → **400**，不静默降级成 terminal；
+- 每次读取恒下发 `forkPoint.stateFidelity`（当前唯一取值 `origin_terminal_state`）与 `isApproximate:false`。
+
+> 🔴 **为什么不做「降级近似」**：用终局态冒充第 N 拍，会让玩家为一个假分叉付费。
+> 宁可功能弱一点，也不给「看起来是那一拍、其实不是」的东西。
+> 🔵 **补齐路径**：先加一张逐拍状态快照表（每拍多存一份完整 `NarrativeState`），再扩 `fork_point='tick'`。
+> 表结构已留位（`fork_point` / `fork_tick_no` / `state_fidelity` 三列），不必改表。
+> 用例佐证：`red_line_mid_tick_fork_is_rejected_without_touching_resources` ·
+> `red_line_unsupported_fork_point_kind_is_rejected` · `fork_points_endpoint_declares_the_limitation`。
+
+| 项 | 取值 |
+|---|---|
+| 运营开关 | `MUSE_IFLINE_PARALLEL`，**默认关闭**，经 `flags::is_enabled` 解析（解析链 user > world > global > env > 默认）。关闭时五个端点全 404 **且一行都不落库、一张卡都不烧**。⚠️ **推荐灰度作用域是 user 或 global**：只按 world 灰度时玩家能开 if 线但读不到 `/me/iflines`（那两个端点无 world 坐标）；运营列表走 `entry_ever_open`（入口曾对任何人开放过即可见），否则已烧掉玩家卡的 if 线运营查不到 |
+| 🔴 不影响原世界线（§0.3） | 开 if 线**不写** `worlds` · `world_events` · `world_ticks` · `world_members` · `world_contributions` · `consent_requests` · `interventions` · `backpacks` · `cloud_characters` · `world_biographies` · `arena_rewards` 中的任何一行。用例 `red_line_opening_ifline_leaves_worldline_byte_identical` 对这十一张表做**逐字节快照比对**，另有源码级 `red_line_never_writes_worldline` |
+| 🔴 **if 线不是一行 `worlds`** | 本批次最重要的结构决定。一行 `worlds` + `world_members` 会被 `runtime::commit_tick → end_world_tx → finalize_ending_tx` 自动带进 `progression::settle_idle_world_ending_tx`（发历练）/ `subplot::settle_subplot_card_tx`（铸卡）/ `arena_rewards`（荣誉）——历练是准入与卡位解锁的钥匙，于是「花钱开 if 线」立刻等于「花钱买数值」，踩穿 §0.1。放进独立表 `ifline_worlds` 后那条反哺路径**物理上不存在**（结算管线只认那两张表）。用例 `red_line_ifline_is_not_a_world_row` |
+| 🔴 产出不反哺（§0.1） | `ifline_worlds` **没有任何数值列**。开 if 线后历练 / 背包 / 贡献账本 / 荣誉全部零变化，副本卡**总行数不增**（本模块不 INSERT `subplot_cards`）。用例 `red_line_ifline_grants_nothing_back_to_origin` |
+| 🔴 读取面为何无法冒充世界线 | ① id 空间不同（`ifw_` 前缀）；② `owner_id NOT NULL` 而 `worlds` **没有 owner 列**——有主人的世界在形状上就不是「大家共处的那条世界线」；③ 读取管道分离（if 线只经 `/me/iflines**`，世界事实只经 `/worlds/{id}/events`）；④ 响应恒带 `layer="ifline"` / `isWorldFact=false` / `affectsOriginWorld=false` / `forkPoint.stateFidelity`；⑤ `runtime` 与 `crates/muse-engine` 对 `ifline_worlds` 零引用（grep 级断言） |
+| 🔴 单人平行线（§14 社交防火墙） | 冻结前**剥离他人玩家角色**：`characters` 条目 + 涉及它的 `relations` 边 + 剩余边里的 `knownTo` 引用，三处一并清除（少清一处就是引用悬空）。判定依据 `world_members`（NPC 不在其中，故 **NPC 保留**——NPC 是世界的，不是谁的）。剥离台账落 `redaction_json` 并**对玩家可见**：不能既剥离了又不说剥离了什么。将来「经他人同意带入」应走 `consents` 同意流程，不是在本模块加开关。用例 `red_line_foreign_player_characters_are_redacted_from_snapshot` |
+| 🔴 传世卡不得进 if 线（§12） | 主角卡须 `memorial_status='living'` 且 `withdrawn=0`。允许了就是**付费复活** = 付费改命，正是本项最该避免的形态。用例 `red_line_memorial_sealed_character_cannot_open_ifline` |
+| 「花资源」= 烧副本卡（§10） | **不新造货币**（§0.5 无提现下多一种货币就多一条 RMT 侧门）。消耗 `MUSE_IFLINE_CARD_COST`（默认 **1**、上限 10）张在手副本卡，走副本卡**既有状态机**：`status='owned' → 'consumed'` 的 CAS，`consumed_into` 指向 if 线 id（反向血缘，与 `cost.subplotCardIds` 互为对账）。🔴 本模块**不 INSERT `subplot_cards`**——铸卡的唯一写入路径仍是 `subplot::grant_card_tx`（§0.2）。副作用是 if 线成为副本卡的**第二个回收口**（第一个是合成升级），对经济体净收缩 |
+| 为何「烧」而非「占用」 | 「占用」需要一张绑定表，而 `subplot::synthesize` 的 CAS 只看 `status='owned'`，会把被占用的卡照熔不误 → 「卡熔了、if 线还开着」的白嫖漏洞，堵它必须改 `subplot/`。「烧」天然复用同一个状态机：卡一旦 `consumed`，合成端自动排除它，零跨模块接线 |
+| 幂等 | 三层：① `Idempotency-Key`（同一次点击的 HTTP 重试）；② **DB 唯一键** `(owner_id, fork_key)`，`fork_key = {worldId}:{characterId}:{forkPoint}:{forkTickNo}`——换 key 再点也只读回既有那条；③ 副本卡 `status='owned'` 的 **CAS**。抢不到卡 → **整笔回滚**（if 线不留、已烧的卡不留），`409` |
+| 审计 | `audit_logs` 落 `ifline.opened`，`subject = ifline:{id}`，reason 含 `origin\|forkPoint\|tick\|revision\|character\|cards\|redactedCharacters\|worldlineChanged=false`，**与建实例、烧卡同一事务** |
+| 机审 | 分叉前提走 `safety::moderate_and_queue`（Pending 自动进 `audit_queue` 人审），**在开事务之前**调用（事务内做网络调用会把单连接池锁死）。无论裁决都落库，读取面仅 `approved` 才给正文（否则 `premise:null` + `premiseWithheld:true`） |
+| **推进（跑拍，0041）** | 生命周期 `sealed`（已立项未推进）→ `running`（跑过拍）→ `ended`（已收尾）。**玩家拉动，不是调度器推动**：世界按调度器流逝，if 线由买它的人一拍一拍翻页——于是**没有任何调度器会碰 `ifline_worlds`**（`runtime::scheduler_loop` 只扫 `worlds`），付费内容也不会在他没看的时候自己烧完。一拍一行落 `ifline_beats`（**不是 `world_ticks`**），活态另存 `live_state_json` + `live_revision`（CAS 令牌） |
+| 🔴 **终局绝不进结算管线**（本批次头号红线） | `progression::settle_*` / `subplot::settle_subplot_card_tx` / `arena_rewards` **一条都不进**。那三条全挂在 `commit_tick → end_world_tx → finalize_ending_tx` 这一条自动链路上，而该链路入口只有一行 `worlds` + 若干 `world_members`——if 线两者都不是，路径在物理上够不着它。推进走 `ifline::runner::commit_beat`，与 `runtime::commit_tick` 零交叉。🔴 **接线时最容易走错的一步**是为复用 `process_tick_inner` 而把 if 线塞回 `worlds`/`world_ticks`：tick 管线与结算管线是**连体的**（CAS 成功即评估终局、终局即结算），没有「跑但不结算」的开关可拨。用例：运行时 `red_line_ifline_ending_grants_nothing`（跑到终局后 `SUM(mileage)` / `subplot_cards` 行数 / `backpacks` / `arena_rewards` / `world_contributions` / `world_ticks` 行数**全部零变化**）+ 源码级 `red_line_runner_never_enters_settlement` |
+| 🔴 终局产物 = **内容** | `ifline_beats.prose` 按拍序拼起来的私人传记 + `endingReason`/`endingLabel` 两个**字符串**。终局投影恒带 `isContentOnly:true` / `grantedAssets:[]`，审计 `audit_logs` 落 `ifline.ended`，reason 含 `grantedAssets=none\|settlementEntered=none\|worldlineChanged=false`。🔴 if 线里主角「死了」**不会封卷传世卡**（封卷是 `UPDATE cloud_characters`，属被禁写入）——既不能复活（0039 已挡传世卡入场），也不会杀死你在真实世界线的卡，两个方向都不通才叫平行线 |
+| 🔴 成本记在哪 | if 线跑拍烧 token，但**不能写 `world_ticks`**（写进去就等于接回上面那条自动链路）。故：`ifline_beats.cost_tokens`（逐拍实测，共用 `runtime::TokenMeter`，与 `world_ticks.cost_tokens` **口径逐字一致**故可比）+ `ifline_worlds.cost_tokens_total`（实例累计，同事务累加，两处互为对账）+ 运营端点 `GET /api/admin/iflines/cost`。⚠️ **现状**：`admin_api::dashboards` 的主成本看板**尚未并入 if 线开销**（它只 SUM `world_ticks.cost_tokens`）——本批次未动 `dashboards.rs`（并行批次在改）。接入是一句 SQL（索引 `idx_ifline_beats_created` 已建好）：`SELECT SUM(cost_tokens) FROM ifline_beats WHERE created_at >= ? AND created_at < ?`。这件事同时写在 `/api/admin/iflines/cost` 响应的 `dashboardIntegration` 里，不靠人记 |
+| 🔴 SLO 归属：**不并入世界线 SLO** | 五项 SLO 度量的是**多人世界线**。基尼（单人样本恒为满分 → **稀释真实的多人不公平，让指标失去报警能力**）/ 无戏份率（单人线结构上不可能有人没戏份）/ 二次入世率（if 线没有「入世」这件事）/ 收尾率（if 线常由拍数上限强制收尾，与「叙事弧完成」不是同一件事）——**四项全部排除**。仅「状态-文本矛盾」同质，故逐拍存 `ifline_beats.critic_json` 供将来做**独立**读数，不并进世界线池子。工程上本就默认排除（`slo/` 取数口径是 `world_ticks.status='done' AND cost_tokens>0`），本批次是把这个默认变成**有意的决定并写下来**。本批次不动 `slo/`。用例 `ifline_beats_never_enter_worldline_slo_input` |
+| 成本闸（§0.2 参数化） | `MUSE_IFLINE_MAX_BEATS`（默认 **12**、上限 60）：一张副本卡换一条 if 线，推进无上限则单条算力开销无界。到顶**强制收尾**（`endingReason='beat_cap'`，不调模型、不花 token），玩家拿到的是完整而非断掉的线。另有 `MUSE_IFLINE_BEAT_TOKENS`（单拍预算，默认 40000）、`MUSE_IFLINE_CAST_SIZE`（每拍上场人数，默认 4，clamp 2–5）。**这是成本闸，不是玩法数值，与胜负无关** |
+| 🔴 推进时的 §14（纵深防御） | ① 组阵容时剔除原世界 `world_members` 里他人的 `cloud_character_id`（挡「装配格式变化把玩家写进来」）；② 每拍跑前把活态再过一遍 `freeze_snapshot`（挡「`StatePatch` 往 `characters` 塞新键」）；③ 实际上场角色逐拍落 `ifline_beats.cast_json` 可审。NPC 保留。用例 `red_line_foreign_players_never_enter_beat_cast` |
+| 同意门为何不卡死 | NPC 走 `world_controlled` 自动放行；**主角走 `approved_consents`**——单人平行线里唯一可能被不可逆结果伤到的人就是主人自己，而**开这条线的动作本身就是同意**（烧卡 + 手写前提）。于是 if 线永不产 `ConsentRequested`，也就永不写 `consent_requests`（被禁写入表之一）。生死档沿用原世界**生效档** `worlds::effective_lethality`（分叉忠实于原世界契约） |
+| 🔴 冻结态永不被覆盖 | `snapshot_json` 是**分叉点证据**（「这条线确实从那一拍那份状态岔出去」），推进写的是另一列 `live_state_json`。覆盖了 `stateFidelity` 就变成一句无法证伪的话。用例 `snapshot_stays_frozen_while_live_state_advances` |
+| 确定性（推进） | 首次推进钉 `run_seed`（`fnv1a_64` 派生自不可变身份要素，十六进制文本落库，**此后永不改写**）；逐拍子流 `Rng(fnv1a_64(run_seed‖beat_no) ^ 0x5B)`（SplitMix64，域常量 `DOMAIN_IFLINE_CAST=0x5B`，已登记进 `assembly` 的域常量清单，**下一个可用是 0x5C**）；抽样对象**先排序成 Vec 再抽**（禁 map 迭代序驱动 RNG）。⇒ 同分叉态 + 同 `run_seed` + 同 `beat_no` → 同演员表。用例 `cast_selection_is_deterministic_and_seed_sensitive` · `run_seed_is_pinned_on_first_advance_and_never_changes` |
+| 终局判定 | 引擎导出的 `muse_engine::narrative::is_terminal`（**与世界线同一把尺**：if 线是一条真的叙事线，不是降级模拟）→ `mainline_done` / `time_cap` / `starved`；另加本模块成本闸 `beat_cap`。恒走 `run_round`（**不走 `run_event_step`**：DES 依赖 `timeline.next_time` 这类世界级调度元数据，而 if 线没有世界时钟在推它） |
+| ⚠️ 遗留 | 推进端点在**请求内同步调用模型**，长回合会是长连接请求。生产化应改为「入队 + 后台 worker + 轮询/推送」（`queue` 模块已具备）。本批次未做：if 线默认关闭、状态只标到 `Implemented`，加独立 worker 循环会显著放大改动面且需单独评审 |
+
+### 真人社交解锁（social，migration 0040；总规格 §14【拍板 22】「社交：恨隔面具原则」）
+
+| 方法 | 路径 | 鉴权 | 说明 |
+|---|---|---|---|
+| GET | `/worlds/{id}/social/bonds` | AuthUser | 我在该世界的社交对端（**面具视图**）+ 资格自查 + 「我们的角色一起死过」凭证 + 解锁状态 |
+| POST | `/worlds/{id}/social/unlock-requests` | AuthUser | 发起真人身份解锁 `{targetCharacterId}`；`Idempotency-Key` 可选 |
+| GET | `/me/social/unlock-requests?status=` | AuthUser | 我**收到**的解锁请求（默认 `pending`，`all` 出全部） |
+| POST | `/me/social/unlock-requests/{id}/respond` | AuthUser | 接受 / 拒绝 `{accept}`（幂等） |
+| GET | `/me/social/identities` | AuthUser | 🔴 **全平台唯一下发真人身份的读路径**（只给 `userId` + 昵称） |
+| GET/POST | `/me/social/blocks` | AuthUser | 我的黑名单 / 拉黑 `{characterId, worldId?, reason?}` |
+| DELETE | `/me/social/blocks/{id}` | AuthUser | 解除拉黑 |
+| POST | `/me/social/reports` | AuthUser | 举报 `{subjectKind, subjectId, category, detail?, worldId?}` |
+| GET | `/admin/social/reports?status=&cursor=` | AdminUser(reviewer/support) | 举报队列 |
+| POST | `/admin/social/reports/{id}/resolve` | AdminUser(reviewer/support) | 处置 `{action: actioned\|dismissed, reason}` |
+
+**运行时开关 `MUSE_SOCIAL_IDENTITY_UNLOCK`（默认关闭，经 `flags::is_enabled` 解析）。**
+关闭时上述 11 个端点**全部 404 且零副作用**（不落幂等键、不发通知、不改任何表），
+由 `social::tests::red_line_disabled_by_default_all_endpoints_404_and_no_side_effect` 锁死。
+
+| 项 | 取值 |
+|---|---|
+| 🔴 未成年保护 | **服务端拒绝**（`ensure_adult_social`，挂每个身份端点第一行、任何读写之前）：只有 `users.age_declared == 1` 放行，未声明(0)/未成年(2)/**用户行缺失**一律 403，口径与 `worlds::join_world` 生死状门逐字一致。**对端未成年同样拒绝**。⚠️ **拉黑/举报不设年龄门**——它们是保护工具，关掉等于让未成年无法自保 |
+| 🔴 敌对线永久匿名 | 任一方向 `trust`/`affinity ≤ -MUSE_SOCIAL_HOSTILE_MAX` 或 `fear ≥ MUSE_SOCIAL_HOSTILE_FEAR` → **一票否决**，在任何补偿路径之前，且「一起死过」也不豁免 |
+| 解锁门槛 | ①非敌对 ②共历世界数 ≥ `MUSE_SOCIAL_MIN_SHARED_WORLDS` ③两条正向路径任一成立：正向羁绊分 ≥ `MUSE_SOCIAL_UNLOCK_MIN_BOND`（`max(trust,affinity,debt)` 取非负，**两方向取较小者**——单方面好感不算羁绊线）／ 「我们的角色一起死过」（`MUSE_SOCIAL_DEATH_BOND_COUNTS`） |
+| 双向自愿 | 发起 → 对方接受。**接受时用当下数据重算资格**（世界线会继续跑，昨天的盟友今天可能已翻脸），发起时的 `eligibility_json` 只作审计、不参与判定 |
+| 🔴 「我们的角色一起死过」 | **关系凭证，不是数值**。由 `cloud_characters.memorial_status/memorial_world_id` + `world_members` **只读派生，无任何存储**；三档 `grade`：`both_fell`／`they_fell`／`i_fell`。对历练/卡位/背包/副本卡/贡献账本/结算/引擎决策**一律零影响**（运行时九表快照 + 源码级写入白名单双用例锁死） |
+| 拒绝文案 | 未成年 / 被拉黑 / 敌对 / 不够格**全部共用同一句** `REFUSE_GENERIC`——区分原因即把端点变成「探测对方是否未成年 / 是否拉黑了我」的接口 |
+| 拉黑实效 | **按 user 判定、按面具录入**（按角色判定会被换卡绕过）。落库同时**撤销**双方 `pending`/`accepted` 解锁 → `revoked`（已授予的身份可见性立即收回）；被拉黑者发不出解锁请求；🔴 **跨通道生效**——`invitations::create_invitation` 前门也调 `social::is_blocked_pair`，且**不看社交开关**（拉黑是保护态，急停不应让它失效，方向同 `MUSE_SAFETY_LEXICON` 的 fail-safe） |
+| 终局态 | `declined`/`expired`/`revoked` 均为**终局**，唯一索引 `(world_id, requester_character_id, target_character_id)` 使同一条线只有一行 → **拒绝后不能再问一次**（真人身份是最敏感的一次授予，不给反复施压的空间）。解除拉黑**不恢复**已撤销的解锁 |
+| 举报 | 进 `social_reports` 队列（`pending → actioned/dismissed`，CAS + 同事务 `audit_logs('social.report_resolved')`）。同一被举报人 pending 数**恰好**达 `MUSE_SOCIAL_REPORT_ESCALATE_AT` → 写一条 `risk_events(kind='social_report_threshold')` 升级到既有风控面。冷却窗口内重复提交幂等复用既有那条（**不建唯一索引**：唯一即"终身只能举报一次"，会让再犯无法被举报） |
+| 参数化（§0.2） | `MUSE_SOCIAL_UNLOCK_MIN_BOND`(0.6) / `_HOSTILE_MAX`(0.3) / `_HOSTILE_FEAR`(0.5) / `_MIN_SHARED_WORLDS`(1) / `_DEATH_BOND_COUNTS`(on) / `_UNLOCK_DAILY_LIMIT`(3) / `_UNLOCK_TTL_MS`(7d) / `_BLOCK_MAX`(500) / `_REPORT_DAILY_LIMIT`(20) / `_REPORT_COOLDOWN_MS`(24h) / `_REPORT_ESCALATE_AT`(3) / `_PAGE_SIZE`(20) |
+| 幂等 | 发起/回应支持 `Idempotency-Key`；DB 侧 `INSERT ... ON CONFLICT(...) DO NOTHING` + 回读权威行（解锁请求与拉黑均如此，杜绝「先查后插」的并发竞态） |
+| ⚠️ 运营须知 | 只按 `world` 作用域灰度时，玩家能在该世界发起解锁却读不到 `/me/social/**` 收件箱（后者无 world 坐标）。**推荐灰度作用域是 `user` 或 `global`**，`world` 只用于「临时关掉某个出问题世界的社交入口」这种收窄动作 |
+
 ## 5. 计费与商城（billing / shop）
 
 | 方法 | 路径 | 鉴权 | feature | 说明 |
@@ -493,7 +642,7 @@
 | POST | `/api/admin/world-templates/{id}/star` | operator | 星级 curation（**3-5★ 唯一晋升路径**） |
 | GET | `/api/admin/economy/overview` | finance | 经济只读聚合 |
 | GET | `/api/admin/ledger/reconcile` | finance | 全账复式恒等 SUM=0 + 物化余额对账（只读，无提现） |
-| GET | `/api/admin/metrics/overview?costDays=` | operator, finance | 数据看板。含 `cost` 对象：`today`（今日 token/分/元）、`trend[]`（近 N 日，默认 7，clamp [1,60]）、`byWorld[]`（每局 Top10 含 `tokensPerPlayer`）、`total`、`centsPer1kTokens`。**每玩家成本口径为人均等分**（`world_ticks` 是整拍口径、无 per-member 分解），局限见响应 `notes` |
+| GET | `/api/admin/metrics/overview?costDays=` | operator, finance | 数据看板。含 `cost` 对象：`today`（今日 token/分/元）、`trend[]`（近 N 日，默认 7，clamp [1,60]，每项另含 `offPeakTokens`）、`byWorld[]`（每局 Top10 含 `tokensPerPlayer`）、`total`、`centsPer1kTokens`、**`offPeak`**（错峰调度仪表：占比 / 估算折让 / 延后时长 / 档位分桶，字段与单位见 §3「错峰调度」小节）。**每玩家成本口径为人均等分**（`world_ticks` 是整拍口径、无 per-member 分解），局限见响应 `notes` |
 | GET | `/api/admin/metrics/trends` | operator, finance | 按天趋势（UTC 日界） |
 | GET | `/api/admin/prompts` | operator | Prompt 版本列表 |
 | POST | `/api/admin/prompts` | **admin 专属** | 建 Prompt 版本 |
@@ -550,7 +699,7 @@
 
 ```bash
 # 路由与方法
-grep -rhoE '\.route\("[^"]+"' server/src | wc -l           # 109 条 route 声明（0037 后）
+grep -rhoE '\.route\("[^"]+"' server/src | wc -l           # 114 条 route 声明（0039 后）
 # admin 角色矩阵
 grep -rn "require_role" server/src/admin_api/*.rs
 ```

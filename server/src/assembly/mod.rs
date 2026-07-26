@@ -587,7 +587,7 @@ fn one_usize() -> usize {
 // 变体分桶用「首见序 = 模板序」而非 map 序；跨版本一致性由 FNV/SplitMix 测试向量兜底。
 
 /// FNV-1a 64：种子 / 阵容指纹派生（显式常量，跨 Rust 版本稳定，不用 std SipHash/DefaultHasher）。
-fn fnv1a_64(bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a_64(bytes: &[u8]) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     for b in bytes {
         h ^= *b as u64;
@@ -597,9 +597,9 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
 }
 
 /// SplitMix64：确定性整数流（每维度独立子流从含 world_id 的全局 seed 派生，杜绝纯阵容维度可被观测反推）。
-struct Rng(u64);
+pub(crate) struct Rng(pub(crate) u64);
 impl Rng {
-    fn next_u64(&mut self) -> u64 {
+    pub(crate) fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -607,7 +607,7 @@ impl Rng {
         z ^ (z >> 31)
     }
     /// [0, n) 均匀整数（n=0 → 0）。
-    fn below(&mut self, n: usize) -> usize {
+    pub(crate) fn below(&mut self, n: usize) -> usize {
         if n == 0 {
             0
         } else {
@@ -642,6 +642,11 @@ const DOMAIN_ENDING: u64 = 0x54;
 const DOMAIN_NPC: u64 = 0x55;
 const DOMAIN_LOC: u64 = 0x56;
 const DOMAIN_IDENTITY: u64 = 0x57;
+// 0x58-0x5A：`runtime::simulation`（离线仿真试跑工装）的三条子流，登记在此以免与装配域撞号。
+// 它们与装配采样物理隔离（不同 seed、不同进程路径），登记只为让「域常量唯一」这条纪律有单一清单。
+// 0x5B：`ifline::runner`（if 线付费副本推进）的逐拍演员表抽样子流 `DOMAIN_IFLINE_CAST`。
+// 同样物理隔离（种子来自 `ifline_worlds.run_seed`，与实例装配 seed 无交集）。
+// **下一个可用域常量是 0x5C**；新增子流请在此续号并写明归属，不要跳号也不要复用。
 
 // ---------- 身份池分配权重（§5 拍板 4、5；纯叙事倾向常量，可调，禁止赋予任何数值含义） ----------
 

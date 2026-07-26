@@ -949,7 +949,13 @@ fn clamp_duration(d: i64) -> i64 {
 /// - 无任何角色 → `Starved`。
 ///
 /// **不以「全员 next_time 耗尽」为条件**：世界结束不等落在远未来的角色（规格 `terminal_not_wait_all`）。
-fn is_terminal(state: &NarrativeState) -> Option<Terminal> {
+///
+/// `pub`：**终局判定必须只有一把尺**。除 DES 调度器（`run_event_step`）之外，宿主还存在
+/// 「拿一份状态跑一回合、自己判要不要收尾」的形态（如平台侧的单人平行线副本）。
+/// 那类宿主若各自照着这段规则重写一遍，第一次改这里的阈值语义时就会出现「世界线收尾了、
+/// 平行线还在跑」的分叉——而这正是最难被测试发现的一类不一致。导出它，让所有线共用同一把尺。
+/// 🔴 只读、无副作用：它只看状态、不改状态、不产生任何结算动作。
+pub fn is_terminal(state: &NarrativeState) -> Option<Terminal> {
     // 里程碑 = 带 threshold 的节点；chapter/arena 的硬节点（threshold=None）不计入 → 旧硬节点零影响。
     let milestones: Vec<&OutlineNode> =
         state.narrative.outline_nodes.iter().filter(|n| n.threshold.is_some()).collect();

@@ -234,11 +234,24 @@ fn red_line_only_safety_chain_defaults_on() {
     }
     // 迁移 0036 不插种子数据 —— 登记表非空但数据表为空，是「有开关体系 ≠ 功能被打开」的形状。
     //
-    // 计数 9 → 10：R3 的 `MUSE_OOC_ANNOTATIONS`（OOC 注解权，总规格 §7 人设保险第 2 级）
+    // 计数 9 → 10 → 11 → 12：R3 的三条新建件 `MUSE_OOC_ANNOTATIONS`（OOC 注解权，§7 人设保险第 2 级）、
+    // `MUSE_IFLINE_PARALLEL`（if 线付费副本，§7 人设保险第 3 级）
+    // 与 `MUSE_SOCIAL_IDENTITY_UNLOCK`（真人社交解锁，§14【拍板 22】恨隔面具原则）
     // **从建成之日起就经本体系解析**（`wired: true`，无历史 env 语义要保留）。
-    // 这是登记表**新增了一个默认关闭的开关**，不是断言被放宽——上面那个循环仍逐条钉死
+    //
+    // 12 → 13：`MUSE_OFFPEAK_SCHEDULING`（错峰调度，§17【拍板 16】）。⚠️ 它与上面三条**性质不同**——
+    // 前三条是新建件，它是**第一个从纯 env 迁进体系的存量开关**，所以待迁移数同步 8 → 7。
+    // 语义连续（env 仍是解析链第 ④ 层兜底），变化只是前面多了 user/world/global 三层，
+    // 错峰从「全局一刀切」变成可按世界灰度。
+    //
+    // 这些都是登记表**新增了默认关闭的开关**，不是断言被放宽——上面那个循环仍逐条钉死
     // 「除审核链外默认值必须为 false」，新开关同样在其中。
-    assert_eq!(KNOWN_FLAGS.len(), 10, "登记表应覆盖 9 个存量 env 开关 + R3 新建的 MUSE_OOC_ANNOTATIONS");
+    assert_eq!(
+        KNOWN_FLAGS.len(),
+        13,
+        "登记表应覆盖 9 个存量 env 开关 + R3 新建的 MUSE_OOC_ANNOTATIONS / MUSE_IFLINE_PARALLEL / \
+         MUSE_SOCIAL_IDENTITY_UNLOCK，其中 MUSE_OFFPEAK_SCHEDULING 已由纯 env 迁入体系"
+    );
 }
 
 /// 迁移本身不得插入任何记录（种子数据 = 静默开闸）。
@@ -897,8 +910,13 @@ async fn list_endpoint_reports_effective_global_state() {
     // 已接线本体系的开关。清单只增不减，且**每加一个都要在这里显式登记**——
     // 它是「哪些开关的 DB 记录真的会生效」的唯一清单，漏登记 = 运营点了没反应。
     //   - `MUSE_ONBOARDING`：0036 批次的参考接线（存量 env 开关的迁移样板）；
-    //   - `MUSE_OOC_ANNOTATIONS`：R3 新建件，无历史 env 语义要保留，建成即接线。
-    // 其余 8 个存量开关仍是纯 env，迁移清单见 `flags::MIGRATION_NOTES`。
+    //   - `MUSE_OOC_ANNOTATIONS`：R3 新建件，无历史 env 语义要保留，建成即接线；
+    //   - `MUSE_IFLINE_PARALLEL`：同上（R3 if 线付费副本，§7 人设保险第 3 级）；
+    //   - `MUSE_SOCIAL_IDENTITY_UNLOCK`：同上（R3 真人社交解锁，§14【拍板 22】恨隔面具原则）。
+    //   - `MUSE_OFFPEAK_SCHEDULING`：⚠️ **不同性质**——第一个从纯 env 迁进体系的**存量**开关。
+    //     `runtime::offpeak::enabled_for_world` 早已写好「已登记走体系、未登记退 env」的分支，
+    //     所以登记这一步不需要改 runtime 一行代码，世界级灰度即刻可用。
+    // 其余 7 个存量开关仍是纯 env，迁移清单见 `flags::MIGRATION_NOTES`。
     let wired: Vec<&str> = arr
         .iter()
         .filter(|f| f["wired"] == json!(true))
@@ -906,8 +924,14 @@ async fn list_endpoint_reports_effective_global_state() {
         .collect();
     assert_eq!(
         wired,
-        vec![F, "MUSE_OOC_ANNOTATIONS"],
-        "已接线清单：0036 的参考接线 + R3 新建的 OOC 注解权"
+        vec![
+            F,
+            "MUSE_OOC_ANNOTATIONS",
+            "MUSE_IFLINE_PARALLEL",
+            "MUSE_SOCIAL_IDENTITY_UNLOCK",
+            "MUSE_OFFPEAK_SCHEDULING"
+        ],
+        "已接线清单：0036 的参考接线 + R3 新建的 OOC 注解权 / if 线 / 真人社交解锁 + 迁入体系的错峰调度"
     );
     assert!(b["records"].as_array().unwrap().is_empty());
 }

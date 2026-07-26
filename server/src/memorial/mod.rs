@@ -785,6 +785,96 @@ async fn my_marks(State(state): State<AppState>, user: AuthUser) -> Result<Json<
 // 对资产模块零引用（同 subplot 的处理：结算铸卡挂在 `progression::settle_worldline_tx`，
 // 不挂在 runtime）。故正确落点是**结算侧的薄接线层**，不是 runtime 本身。
 
+/// 结算侧自动封卷（**接线层**，由 `progression::settle_idle_world_ending_tx` 在终局事务内调用）。
+///
+/// 为什么落在结算侧而不是死亡落定处：死亡落定在 `runtime::commit_tick` 内，而平权红线要求
+/// `runtime/mod.rs` 对资产模块零引用（同 subplot：结算铸卡挂 `progression`，不挂 runtime）。
+///
+/// ⚠️ **已知的延迟窗口（如实记录，不要误以为已闭合）**：角色可能在世界跑到一半时死亡，
+/// 而本函数要等**世界终局**才封卷。这段窗口里那张卡的 `withdrawn` 仍是 0，
+/// 理论上能去 join 别的世界——与 §12「传世卡不可再入世界」有出入。
+/// 收窄它需要在死亡落定那一拍就封卷，那要么破平权红线、要么给 runtime 加一条不含资产语义的
+/// 出口回调，属独立的一件事。当前折中的依据：死者在原世界已不再行动，且玩家主动认领的
+/// 入口（`POST /me/characters/{id}/memorial`）随时可用、不必等终局。
+///
+/// 幂等由 `seal_character_tx` 的 `WHERE memorial_status='living'` CAS 承担：
+/// 世界重复结算、或玩家已主动认领过，都只会短路返回 `sealed:false`。
+pub(crate) async fn auto_seal_dead_participants_tx(
+    tx: &mut Transaction<'_, Any>,
+    world_id: &str,
+    participants: &[(String, String)],
+) -> Result<u64, ApiError> {
+    if !memorial_enabled() {
+        return Ok(0);
+    }
+    let mut sealed = 0u64;
+    for (character_id, owner_id) in participants {
+        // 两条证据同时成立才封卷，口径与玩家主动认领完全一致（find_death_evidence 的 doc 有详述）：
+        // (a) consent_requests 有 approved 的 death 且 subject 含本卡；
+        // (b) 该世界 narrative.pendingConsents 已不含本卡的 death 条目（引擎确已落定）。
+        // 任一不成立 → 跳过。**授权 ≠ 死亡**，只看 (a) 会把活角色误封卷（捏造死亡）。
+        if !death_evidence_holds_tx(tx, world_id, character_id).await? {
+            continue;
+        }
+        if seal_character_tx(tx, character_id, owner_id, world_id).await?.sealed {
+            sealed += 1;
+        }
+    }
+    Ok(sealed)
+}
+
+/// `find_death_evidence` + `death_has_landed` 的**事务内**版本，限定在单个世界。
+///
+/// 与池版本的差异只有取连接的方式与「已知世界」这一约束；判定口径逐条对齐，
+/// 任一侧改口径都必须同步改另一侧（两处都在本文件内，便于一起看）。
+async fn death_evidence_holds_tx(
+    tx: &mut Transaction<'_, Any>,
+    world_id: &str,
+    character_id: &str,
+) -> Result<bool, ApiError> {
+    // 证据 (a)：本世界有 approved 的 death 且 subject 精确含本卡。
+    let rows = sqlx::query(
+        "SELECT subject_character_ids FROM consent_requests \
+         WHERE world_id = ? AND event_kind = ? AND status = 'approved'",
+    )
+    .bind(world_id)
+    .bind(EVENT_KIND_DEATH)
+    .fetch_all(&mut **tx)
+    .await?;
+    let authorized = rows.iter().any(|r| {
+        r.try_get::<String, _>("subject_character_ids")
+            .ok()
+            .and_then(|j| serde_json::from_str::<Vec<String>>(&j).ok())
+            // 精确匹配数组元素，绝不用子串包含（`chA` 会命中 `chAB`）。
+            .map(|list| list.iter().any(|s| s == character_id))
+            .unwrap_or(false)
+    });
+    if !authorized {
+        return Ok(false);
+    }
+
+    // 证据 (b)：pendingConsents 已不含本卡的 death 条目。查不到/解析失败一律当"没落定"。
+    let state_json: Option<String> =
+        sqlx::query_scalar("SELECT narrative_state_json FROM worlds WHERE id = ?")
+            .bind(world_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let Some(state_json) = state_json else { return Ok(false) };
+    let Ok(state) = serde_json::from_str::<Value>(&state_json) else { return Ok(false) };
+    let Some(narrative) = state.get("narrative") else { return Ok(false) };
+    let still_pending = narrative
+        .get("pendingConsents")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+        .iter()
+        .any(|p| {
+            p.get("subject").and_then(Value::as_str) == Some(character_id)
+                && p.get("eventKind").and_then(Value::as_str) == Some(EVENT_KIND_DEATH)
+        });
+    Ok(!still_pending)
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/memorial/characters", get(memorial_hall))

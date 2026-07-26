@@ -179,6 +179,13 @@
 
 单价参数为 `MUSE_TOKEN_CNY_CENTS_PER_1K`（分/千 token），与 runtime 预算熔断同源；每玩家成本按 active 成员人均等分，戏份极不均的世界会低估重度玩家（口径自述见 `cost.allocation` / `cost.notes[]`）。
 
+**错峰调度成本仪表**（migration 0038）不在本监控页，落在**数据看板**（`admin/src/pages/Metrics.tsx`），读同一个 `GET /admin/metrics/overview` 的 `cost.offPeak`：错峰拍/ token 占比、估算折让、平均延后时长、名义档位分桶，以及逐日「折扣时段 / 原价时段」token 构成（来自 `cost.trend[].offPeakTokens`，与当日 `tokens` 是**包含**关系，不可相加）。单位口径照下述渲染，与本节其余成本字段同一套约定：
+
+- `tickRatio` / `tokenRatio` / `savedRatio` / `priceRatio` 均为 **0..1 小数**，走 `formatPercent`（内部 ×100）；窗口内无 tick → `null`，显示 `—`，**不得当 0% 读**。
+- 🔴 `priceRatioPct` 是**百分数整数**（`100` = 原价、`50` = 5 折），直接带 `%` 渲染，**绝不能喂进 `formatPercent`**（会渲染成 5000%）。
+- 金额账面为整数分（`*Cents`），`*Cny` 仅展示；折让是**估算**（名义档位 × 单价），不是供应商账单，界面须自述该局限。
+- 错峰调度默认关闭（`MUSE_OFFPEAK_SCHEDULING`，VALIDATION §0.1）：关闭时 `offPeakTicks = 0`、各比率为真实的 `0.0`，图表位显示「没有错峰拍 / 默认关闭」空态而非报错，四张指标卡照常显示真实的 0 值。
+
 `最新异常` 与 `事件时间线` 由 `diagnostics.ticks`（tick 状态、错误码、耗时、token）派生，跟随当前选中世界；延迟告警阈值、「需关注」预算比例与成功率告警分档目前是前端展示分档常量，服务端下发后应改读接口。
 
 ## 10. 实现映射

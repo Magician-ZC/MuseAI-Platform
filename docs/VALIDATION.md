@@ -9,7 +9,10 @@
 1. **未验证功能默认关闭**：经 feature flag / 运营开关 / 数据配置启用（现状抓手：cargo feature
    `billing`/`arena`、admin 建房控制、建房参数；**运行时开关体系基础设施已落地**——
    迁移 `0036` + `server/src/flags/`，按用户/世界/全局三作用域灰度 + 时间窗 + 审计留痕，
-   env 作为兜底层，详见 §3.1。现仅接线 `MUSE_ONBOARDING` 一条，其余 8 个待逐个迁移）。
+   env 作为兜底层，详见 §3.1。已接线 `MUSE_ONBOARDING`（参考接线）+ R3 三条新建件
+   （`MUSE_OOC_ANNOTATIONS` / `MUSE_IFLINE_PARALLEL` / `MUSE_SOCIAL_IDENTITY_UNLOCK`）
+   + 首个由纯 env 迁入的存量开关 `MUSE_OFFPEAK_SCHEDULING`，其余存量开关待逐个迁移。
+   ⚠️ 开关个数以 `flags::KNOWN_FLAGS` 为唯一权威，本文不复述计数——历次加开关都漏改过散落各处的数字）。
 2. **产品规则参数化**：托梦配额、死亡规则、奖励系数、成员规模、tick 节奏、历练阈值、
    崩塌惩罚系数等一律可配置，禁止写死。
 3. **状态语言七档**，文档与台账统一使用：
@@ -101,7 +104,8 @@
 | 生死契约（三档参数化） | Specified | T5 待测 | 关闭（默认庇护/同意制） |
 | 副本卡 + 自定义房装配 | Specified（R2） | T4 待测 | 关闭 |
 | 赛事直播 / 弹幕 | Implemented（观战）/ Specified（直播场） | T5 待测 | 关闭 |
-| 真人社交解锁 | Specified（R3） | T4+ 待测 | 关闭 |
+| 真人社交解锁 | **Implemented**（0040；解锁门槛 / 拉黑 / 举报队列 / 青少年服务端拒绝 / 「一起死过」凭证） | T4+ 待测 | 关闭（`MUSE_SOCIAL_IDENTITY_UNLOCK`） |
+| 人设保险三级出口（事前底线 / 事中注解权 / 事后 if 线） | 事前 engine Implemented · 事中 **Implemented**（0037）· 事后 **Implemented（开局 + 推进）**（0039/0041） | T1 起（注解权是 T1 门槛的测量手段）/ if 线 T3 待测 | 三级**全部默认关闭** |
 | 内容中台工业线 | Concept | — | — |
 
 ### 3.1 R1 批次台账（总规格 §19 地基批，**校验于 2026-07-26**）
@@ -121,8 +125,8 @@
 | 生死契约三档（join 签署 + 引擎分派） | **engine Implemented / server 未接线** | 引擎 `narrative/types.rs` `Lethality` + `mod.rs` `apply_lethality`（写作前降级，保证正文与事件同口径）+ `gate_consents` 生死状放行。**server 侧 `worlds.lethality` 列、join 签署、未成年门、runtime 回灌全部未做**，runtime 恒传默认档 | **关闭**（恒为同意制，生死状档不对任何世界生效） |
 | 身份池进采样域 | **Implemented（分配层）/ 叙事未接线** | `assembly/mod.rs` `IdentitySpec` + `DOMAIN_IDENTITY=0x57` + `assign_identities`，结果钉进 `assembled_json` 的 `/assembly/identityAssignments`。**runtime 尚未读回**，身份目前只存不用、叙事层无效果 | 未启用（模板不声明 identityPool 即零影响） |
 | 确定性产出表 + ③世界线层贡献归因 | 见本表下方补记 | 迁移 `0025`；贡献归因表独立于 `narrative_state_json`（回灌引擎会违反平权红线） | — |
-| 成本仪表 | **Implemented** | `admin_api/dashboards.rs` `cost.*`（今日/趋势/每局/每玩家）；`/admin/worlds` 补 `participantCount`·`successRate`·`todayCostCny`；diagnostics 补金额与用量比。**分摊口径为人均等分**（world_ticks 是整拍口径，无 per-member 分解），局限已写进接口 `notes`。**2026-07-26 补记（R3 成本工程杠杆①）**：迁移 `0038` 给 `world_ticks` 加 `off_peak`·`price_ratio_pct`·`defer_ms` 三列，由 `runtime/mod.rs` 的错峰调度器逐拍写入——成本从此可按「折扣时段 / 原价时段」拆桶，「省了多少」= `Σ cost_tokens × (100-price_ratio_pct)/100 × 单价`，「错峰生效了多少」= `off_peak=1` 占比与 `Σ defer_ms`。⚠️ **`dashboards.rs` 尚未接这三列**（仍只聚合 `cost_tokens`），拆桶目前要手写 SQL；把 `cost.*` 补出 `offPeakShare`/`estimatedSavingCny` 是下一步 | 恒开（只读聚合）；错峰写入侧**默认关闭** |
-| 错峰调度（成本工程杠杆①） | **Implemented** | 总规格 §17【拍板 16】。`runtime/mod.rs` 的 `offpeak` 模块 + `schedule_due_ticks` 接入：连载/慢炖场的 tick 优先排进折扣时段，窗口内按窗口占全天比例**压缩间隔以保住每日拍数**（不是节奏降档）；🔴 直播场（`room_type='arena'` ∨ `tick_per_day ≥ MUSE_OFFPEAK_LIVE_TICK_PER_DAY`）永不延后；🔴 防饿死兜底 `interval + min(interval×200%, 6h)` 恒有限、首拍绝不延后；折扣时段内按「被压最久」优先入队。时区口径与 `dashboards::utc_day_start_ms` 同源（UTC，窗口字面量解析期一次性折算）。参数与列口径见 `docs/API.md` §3「错峰调度」 | **关闭**（`MUSE_OFFPEAK_SCHEDULING` 默认 0；开关名已按 `flags/` 体系命名，登记进 `KNOWN_FLAGS` 即得 world 作用域灰度，未登记时退回 env 兜底） |
+| 成本仪表 | **Implemented** | `admin_api/dashboards.rs` `cost.*`（今日/趋势/每局/每玩家）；`/admin/worlds` 补 `participantCount`·`successRate`·`todayCostCny`；diagnostics 补金额与用量比。**分摊口径为人均等分**（world_ticks 是整拍口径，无 per-member 分解），局限已写进接口 `notes`。**2026-07-26 补记（R3 成本工程杠杆①）**：迁移 `0038` 给 `world_ticks` 加 `off_peak`·`price_ratio_pct`·`defer_ms` 三列，由 `runtime/mod.rs` 的错峰调度器逐拍写入——成本从此可按「折扣时段 / 原价时段」拆桶，「省了多少」= `Σ cost_tokens × (100-price_ratio_pct)/100 × 单价`，「错峰生效了多少」= `off_peak=1` 占比与 `Σ defer_ms`。**2026-07-26 再补记**：`dashboards.rs` **已接这三列**——`cost.offPeak`（拍/token 占比、估算折让、延后时长、按名义档位分桶）挂在成本趋势那条已有的窗口查询上，未新开路由、未新增迁移、未多发一次 SQL；`cost.trend[]` 逐日拆出 `offPeakTokens`。🔴 单位陷阱已锁进用例：`priceRatioPct` 是**百分数整数**（100=原价）、`priceRatio` 是 0..1 小数，两者同时下发且不得互串。⚠️ **if 线开销尚未并入**（`ifline_beats.cost_tokens` 走独立端点 `GET /api/admin/iflines/cost`，接入 SQL 与索引均已就绪） | 恒开（只读聚合）；错峰写入侧**默认关闭** |
+| 错峰调度（成本工程杠杆①） | **Implemented** | 总规格 §17【拍板 16】。`runtime/mod.rs` 的 `offpeak` 模块 + `schedule_due_ticks` 接入：连载/慢炖场的 tick 优先排进折扣时段，窗口内按窗口占全天比例**压缩间隔以保住每日拍数**（不是节奏降档）；🔴 直播场（`room_type='arena'` ∨ `tick_per_day ≥ MUSE_OFFPEAK_LIVE_TICK_PER_DAY`）永不延后；🔴 防饿死兜底 `interval + min(interval×200%, 6h)` 恒有限、首拍绝不延后；折扣时段内按「被压最久」优先入队。时区口径与 `dashboards::utc_day_start_ms` 同源（UTC，窗口字面量解析期一次性折算）。参数与列口径见 `docs/API.md` §3「错峰调度」 | **关闭**（`MUSE_OFFPEAK_SCHEDULING` 默认 0）。**2026-07-26 补记**：已登记进 `KNOWN_FLAGS`，成为**首个由纯 env 迁入开关体系的存量开关**——解析链升为 user > world > global > env > 默认，错峰从「全局一刀切」变为可按世界灰度。`runtime` 侧一行未改（`offpeak::enabled_for_world` 早已写好「已登记走体系、未登记退 env」的分支） |
 | Batch API（成本工程杠杆③） | **Specified（未实现）** | 约 5 折，但与现有同步 tick 管线结构性冲突：`run_round` 是**串行**五环节 + 同事务 `commit_tick`，而 Batch 是分钟~小时级异步；一拍需 5 次批往返、`CLAIM_STALE_MS=300000` 会把等批 worker 判成崩溃重排、中间态无持久化（批途中重启 = 半通管线，违反 §5「宁可停拍」）。改造路径：`crates/muse-engine` 把 `run_round` 改成可挂起/可恢复的分步状态机 + `ModelClient` 增 `submit_batch`/`poll_batch`（默认实现回落同步 `complete`，桌面轨零改动），server 侧加中间态表 + 批次协调器 + 降级回落。完整分析见 `server/src/runtime/mod.rs` 的 `offpeak` 模块头 | — （未实现，无开关） |
 | 运行时敏感词库 + 语义分类钩 | **第 2 层 Implemented / 第 3 层仅接口位** | `safety/lexicon.rs`（复用 `inject.rs` 归一化管线，零宽/同形/全角绕过均被拦）+ `runtime` commit 事务内闸 + `events`/`reports`/`clips`/`arena` 全部读取面过滤。**第 3 层语义分类未实装**（不能进事务，见 `safety/mod.rs` TODO） | 恒开（审核链） |
 | Saga 归组字段（saga_id + stage_no） | **Implemented** | 迁移 `0024`；`admin_api/worlds_ops.rs` 建模板成对校验 + `?sagaId=` 阶段列表（按 stage_no 升序、不分页） | 未启用（不填即独立模板） |
@@ -146,7 +150,7 @@
 >
 > 🔴 **fail-closed**：查库失败 / 记录损坏（作用域非法、`enabled` 非 0-1、时间窗反转/为负）→
 > 返回声明的默认值**且不再回落 env**（否则「配坏了」会被静默降级成「按 env 开着」）。
-> 「安全」指不扩大用户可见范围的那一侧：8 个未验证开关是**关**，`MUSE_SAFETY_LEXICON`
+> 「安全」指不扩大用户可见范围的那一侧：未验证开关一律是**关**，`MUSE_SAFETY_LEXICON`
 > （审核链，关掉 = 放行敏感词）是**开**。用例 `red_line_corrupt_records_fail_closed`
 > / `red_line_query_failure_fails_closed` / `red_line_safety_chain_fails_safe_to_on`。
 >
@@ -170,6 +174,89 @@
 **仍缺的接线（不在上表，单独跟踪）**：生死契约 server 侧全部 · 身份池叙事回灌 ·
 第 3 层语义分类 · 机审耗时打点（`moderationLatency` 全仓无数据源，后台该列恒为 `—`）·
 **其余 8 个 env 开关接入运行时开关体系**（清单与注意事项见上）。
+
+### 3.2 R3 批次台账 —— 人设保险三级出口（总规格 §7，**校验于 2026-07-26**）
+
+> 三级出口是同一句话的三种兑现方式：**公共事实不可回滚（§0.3）**，
+> 所以玩家买到的从来不是「改写」，而是事前的保护、事中的解释权、事后的**平行线**。
+
+| R3 项 | 开发状态 | 代码锚点 | 默认开关 |
+|---|---|---|---|
+| ① 事前 · 底线硬约束 | **engine Implemented** | 卡的 `bottomLines`/`refusalRules`/`immutableCore` 进 critic 底线拦截（`crates/muse-engine`）；server 侧无独立开关 | 随引擎恒开 |
+| ② 事中 · OOC 注解权 | **Implemented** | 迁移 `0037`；`server/src/annotations/`；SLO 消费端 `slo::ooc_appeal_block`。世界事实不改，私人传记加批注；复核确认模型错误 → 补偿托梦配额（**加数表**，`interventions` 的计数 SQL 一个字符不改）。兑现补偿**已接线**（`interventions/mod.rs` 配额校验处比较的是 `dream_quota_per_stage() + bonus`，计数 SQL 未动） | **关闭**（`MUSE_OOC_ANNOTATIONS`）⚠️ T1 开测前必须先打开，否则 `oocAppealRate` 返回 `entry_not_open` 而非 0% |
+| ③ 事后 · if 线付费副本 | **Implemented（立项与开局 + 推进）** | 迁移 `0039`（`ifline_worlds`）+ **`0041`（`ifline_beats` + 推进态列）**；`server/src/ifline/`（`mod.rs` 立项 · `runner.rs` 推进）；端点见 `docs/API.md` §4「if 线付费副本」。交付面 = 校验 → 烧副本卡 → **逐字节冻结分叉态** → 注册独立实例 → **一拍一拍推进（`sealed → running → ended`）** → 可读可审。终局产物 = 可读的私人传记 + 结局名，**不是资产** | **关闭**（`MUSE_IFLINE_PARALLEL`） |
+
+**③ 的三条结构性红线（都已锁进测试，改动需显式评审）**：
+
+1. 🔴 **if 线不是一行 `worlds`**。一行 `worlds` + `world_members` 会被
+   `runtime::commit_tick → end_world_tx → finalize_ending_tx` 自动带进
+   `progression::settle_idle_world_ending_tx`（发历练）/ `subplot::settle_subplot_card_tx`（铸卡）/
+   `arena_rewards`——历练是准入与卡位解锁的钥匙，于是「花钱开 if 线」立刻等于「花钱买数值」，
+   踩穿 §0.1「付费只买体验容量，永不买结果」。放进独立表后那条反哺路径**物理上不存在**。
+   用例：`red_line_ifline_is_not_a_world_row` · `red_line_ifline_grants_nothing_back_to_origin`。
+2. 🔴 **原世界逐字节不变**。开 if 线前后对 11 张世界线/资产表做逐字节快照比对
+   （`red_line_opening_ifline_leaves_worldline_byte_identical`），另有源码级
+   `red_line_never_writes_worldline`（本模块对世界线表只有 SELECT）。
+3. 🔴 **单人平行线（§14）**。冻结前剥离他人玩家角色（条目 + 关系边 + `knownTo` 引用三处一并清），
+   NPC 保留；剥离台账对玩家可见。传世卡不得进 if 线（§12「不可再入世界」，否则 = 付费复活）。
+   **推进时每拍再剥一次**（纵深防御三层：组阵容剔除 · 跑前过 `freeze_snapshot` · 逐拍台账落
+   `ifline_beats.cast_json`）。用例 `red_line_foreign_players_never_enter_beat_cast`。
+4. 🔴 **终局绝不进结算管线**（0041 接线时的头号红线）。`progression::settle_*` /
+   `subplot::settle_subplot_card_tx` / `arena_rewards` 一条都不进。推进走 `ifline::runner::commit_beat`，
+   与 `runtime::commit_tick` 零交叉；if 线的拍落 `ifline_beats`，**不是 `world_ticks`**。
+   用例：运行时 `red_line_ifline_ending_grants_nothing`（跑到终局后 `SUM(mileage)` /
+   `subplot_cards` 行数 / `backpacks` / `arena_rewards` / `world_contributions` / `world_ticks` 行数
+   **全部零变化**）+ 源码级 `red_line_runner_never_enters_settlement`。
+   🔴 **改动此处前先读**：接线时最容易走错的一步是为复用 `process_tick_inner` 而把 if 线塞回
+   `worlds`/`world_ticks`——tick 管线与结算管线是**连体的**（CAS 成功即评估终局、终局即结算），
+   没有「跑但不结算」的开关可拨。
+5. 🔴 **推进后原世界仍逐字节不变**。跑拍会产状态/事件/critic，一个字节都不许流回世界线。
+   用例 `red_line_advancing_leaves_worldline_byte_identical`（跑两拍后对 11 张表逐字节比对）。
+6. 🔴 **冻结的分叉态永不被推进覆盖**。`snapshot_json` 是分叉点证据，活态另存 `live_state_json`；
+   覆盖了 `stateFidelity` 就成了一句无法证伪的话。用例 `snapshot_stays_frozen_while_live_state_advances`。
+
+**⚠️ ③ 的诚实降级（必须写进台账，不能只留在代码注释里）**：规格写「以**某拍**为分叉点」，
+但仓库**不存逐拍状态快照**——`world_ticks` 无状态列、`worlds.narrative_state_json` 每拍被 CAS 覆盖、
+`world_events` 只是投影文本且引擎 `StatePatch` 从不落库（事件流无法重放中间态）、引擎 FS 只是当前态的物化。
+因此本实现**只支持终局分叉**（`fork_point='terminal'`，状态源 = 已 `ended` 世界的 `narrative_state_json`
+逐字节复制），**请求中间拍一律 400 并点名唯一可用的终局拍号**，绝不用终局态冒充第 N 拍——
+那是在为一个假分叉收费。补齐路径：先加逐拍状态快照表，再扩 `fork_point='tick'`（表结构已留位）。
+用例佐证：`red_line_mid_tick_fork_is_rejected_without_touching_resources` ·
+`red_line_unsupported_fork_point_kind_is_rejected` · `fork_points_endpoint_declares_the_limitation`。
+
+**③ 的推进（0041）—— 三个必须写进台账的判断**：
+
+- **成本记在哪**：if 线跑拍烧 token 但**不能写 `world_ticks`**（写进去就等于接回那条自动结算链路）。
+  故 `ifline_beats.cost_tokens`（逐拍实测，共用 `runtime::TokenMeter`，与 `world_ticks.cost_tokens`
+  口径逐字一致故可比）+ `ifline_worlds.cost_tokens_total`（实例累计，两处互为对账）+ 运营端点
+  `GET /api/admin/iflines/cost`。⚠️ **现状**：`admin_api::dashboards` 的主成本看板**尚未并入 if 线开销**
+  （只 SUM `world_ticks.cost_tokens`）——本批次未动 `dashboards.rs`（并行批次在改）。
+  接入是一句 SQL（索引 `idx_ifline_beats_created` 已建好）：
+  `SELECT SUM(cost_tokens) FROM ifline_beats WHERE created_at >= ? AND created_at < ?`。
+  这件事同时写在 `/api/admin/iflines/cost` 响应的 `dashboardIntegration` 字段里，不靠人记。
+- **SLO 归属：不并入世界线 SLO**。五项指标度量的是**多人世界线**：基尼（单人样本恒为满分 →
+  **稀释真实的多人不公平，让指标失去报警能力**）/ 无戏份率（单人线结构上不可能有人没戏份）/
+  二次入世率（if 线没有「入世」这件事）/ 收尾率（if 线常由拍数上限强制收尾，与「叙事弧完成」
+  不是同一件事）——**四项全部排除**。仅「状态-文本矛盾」同质，故逐拍存 `ifline_beats.critic_json`
+  供将来做**独立**读数，不并进世界线池子。工程上本就默认排除（`slo/` 取数口径是
+  `world_ticks.status='done' AND cost_tokens>0`），本批次是把这个默认变成**有意的决定并写下来**。
+  本批次不动 `slo/`。用例 `ifline_beats_never_enter_worldline_slo_input`。
+- **终局产物只能是内容**：`ifline_beats.prose` 按拍序拼成的私人传记 + `endingReason`/`endingLabel`
+  两个字符串。读取面恒带 `isContentOnly:true` / `grantedAssets:[]`；审计 `ifline.ended` 的 reason 里
+  明写 `grantedAssets=none|settlementEntered=none|worldlineChanged=false`。
+  🔴 if 线里主角「死了」**不会封卷传世卡**（封卷是 `UPDATE cloud_characters`，属被禁写入）——
+  既不能复活（0039 已挡传世卡入场），也不会杀死你在真实世界线的卡。
+
+**⚠️ ③ 的遗留（0041 未做，需在生产化前解决）**：
+
+1. **推进端点在请求内同步调用模型**，长回合 = 长连接请求。生产化应改为「入队 + 后台 worker +
+   轮询/推送」（`queue` 模块已具备该能力）。本批次未做的原因：if 线默认关闭、状态只标到
+   `Implemented`，加一条独立 worker 循环会显著放大改动面且需单独评审。
+2. **主成本看板未并入 if 线开销**（见上，接入方式与索引均已就绪）。
+3. **分叉点仍只支持终局**（0039 的诚实降级，未变；补齐路径见上）。
+
+if 线现在是「可开、可跑、可读、可审、可查成本」，但仍**不是「可上线」**——
+**状态语言按 §0.3：`Implemented`，不是 `Production-ready`，更不是 `Validated`**。
 
 > **纪律提醒**：本节存在的意义是 §4.3 那条"发布评审以台账为准，禁止口头'已完成'"。
 > 台账漏项 = 评审失去依据，与状态写错同等严重。改 R1 相关代码时同步改本表。
@@ -230,6 +317,66 @@
    > 还有一处同类浪费未处理：`ModelCallLog` 的分环节 token（agent/model_id/latency/retries）
    > 被 `TokenMeter` 求和成标量即丢弃，导致成本做不了「decide 换便宜模型省了多少」的分环节归因。
 3. **台账维护**：每次合并/发布更新 §3 表；发布评审以台账为准，禁止口头"已完成"。
+
+### 4.4 世界质量仿真回归（新增于 2026-07-26 · 状态 `Implemented`）
+
+总规格 §4「内容中台工业线」第四道工序「仿真试跑（自动化压测）」+ 增量投入项
+「仿真质检自动化（世界质量回归：完读率/阻断率/结局分布）」的第一版落地。
+
+**落点**（均不在生产路径上，无路由、无迁移、无 feature flag）：
+
+| 件 | 位置 | 性质 |
+|---|---|---|
+| 仿真试跑工装 | `server/src/runtime/simulation.rs` | `#[cfg(test)]`，自动进 `platform-test` CI job |
+| 三指标口径 | `server/src/slo/quality.rs` | 生产代码（`pub(crate)`，暂无路由消费方），与 §4.2 同源 |
+| 跨版本基线 | `server/src/runtime/simulation/baseline.json` | 随代码入库，`include_str!` 内联 |
+
+**与 §4.1 黄金世界回归的分工**：golden 抓「某条固定路径的产物字节变了」；本件抓
+「一整批世界的统计形状变了」。共用同一份 fixture（`golden/cards.json` + `golden/skeleton.json`）、
+同一条生产路径（`process_tick_with_model`）、同一套分类口径（`crate::slo`）——不另起一套。
+
+**三指标口径**（分子/分母的圈法是新增的，分类算法一律复用 §4.2）：
+
+| 指标 | 分子 | 分母 | 关键纪律 |
+|---|---|---|---|
+| **完读率** `completionRate` | 自然收尾（`mainline_complete`）且 `worlds.status='ended'` 的世界 | **纳入本批的全部世界，含未收尾** | 🔴 **完读率 ≠ 1 − 强制收尾率**。§4.2 `forcedConclusionRate` 的分母只含 `status='ended'`，「跑不完」的世界在它眼里根本不存在；90 个卡半路 + 10 个自然收尾 ⇒ 强制收尾率 0%（看着完美）、完读率 10%（真相）。两个数都输出以便对账，**不得混用** |
+| **阻断率** `blockedRate` | `world_ticks.error='blocked'`（引擎跑完整回合但拒绝提交） | **真正跑完整回合**的拍 = 提交 + 阻断 | 终局短路 / 前置门 / failed / 未终结拍**一律不进分母**（进去只会稀释），但**照样报出来**——排除不等于隐藏。内容安全扣留（`world_events.moderation<>'approved'`）是**独立第二通道**，分开报，合成一个数就再也分不清「世界卡住了」和「世界在说不该说的话」 |
+| **结局分布** `endingDistribution` | 按 `audit_logs('world.ended').reason` 的 `\|ending=` 后缀分桶 | — | 三态分得开：真实结局 / `(none)` 收尾无结局 / `(unfinished)` 未收尾，**均不丢弃**。集中度复用 `slo::gini_coefficient`（与叙事注意力基尼同一实现） |
+
+🔴 **诚实边界（不得省略转述）**：仿真跑的是**种子驱动的规则化假模型**，全程不调用任何真实模型。
+
+- 完读率在此测的是**主线推进 + 终局判定管线在各种决策组合下能否走到自然收尾**，**不是**内容好不好看。
+  跑出 100% 完读率只说明管线不卡死，**不得**表述为「内容质量已验证」。
+- 阻断率在此测的是**规则层（底线/硬节点/不变量）的触发频率**，不是模型输出是否合规。
+- 结局分布在此测的是**加权采样与终局判定的分布形状**，不是玩家会喜欢哪个结局。
+- 内容安全扣留率在桩下**恒为 0**：桩文本永不命中词库 —— 该通道**只是被计算了，并没有被测试**。
+
+这段话不只在文档里：`slo::quality::QualitySource::SimulatedStub` 让它作为 `honesty` 字段随每一份
+报告 JSON 一起走（**数会被复制进评审材料，文档不会**）。补齐内容质量成分的前置件仍是 §4.1 标注的
+record-and-replay `ModelClient`，**至今未建**。
+
+**当前基线**（`museai-sim-2026-07-26` 种子 · 4 场景 · 10 个世界 · 引擎 0.1.0）：
+完读 6 / 强制收尾 2（`time_limit`）/ 未收尾 2 ⇒ 完读率 60%；阻断 8 拍 / 引擎拍 57 ⇒ 阻断率 14%；
+结局落桶 `e_alliance` × 8 + `(unfinished)` × 2。四个场景刻意各压一个失败面
+（`cordial` 完读正样本 · `volatile` 高冲突 · `attrition` 强制收尾正样本 · `deadlock` 阻断正样本），
+以保证三个指标**都不会恒定**——一个恒为 100% 的完读率和恒为 0 的阻断率测不出任何回归。
+
+**基线更新纪律**：确认差异是预期的产品/引擎变化后，
+`MUSEAI_SIM_UPDATE_BASELINE=1 cargo test --manifest-path server/Cargo.toml simulation_` 重写基线，
+**必须与改动同一提交**，且提交信息写清「为什么这三个数应该变」——无解释就被刷新的基线等于没有基线。
+
+**本件首次运行即抓到一个生产缺陷**（已登记，未修）：**结局选择不进实例采样**。
+`assembly::weight_endings` 完全无 RNG（按权重过阈值筛，返回池声明序子集），
+`runtime::select_ending` 取 `enabledEndings` 的**第一个元素**、不掷点、不看 `instance_seed`。
+主线/隐藏池/NPC/地点/身份池各有一条 `Rng(seed ^ DOMAIN_*)` 子流，唯独结局这一维在
+`DOMAIN_ENDING` 之后只用于变体分组，选谁上场那一步把种子丢了 ⇒ 同模板同阵容下**所有实例落同一个结局**，
+总规格 §5「一个模板，千个平行世界」在结局维上不成立。本次刻意不修：会改变已有世界落到哪个结局、
+终局产出与黄金世界快照字节，属破坏性产品变更，须单独评审。已钉成
+`ending_selection_ignores_instance_seed_registered_finding`，修好后该用例会红（那是好消息）。
+
+**仍未做**：人工校准面（阶段切分/身份池/境界档的 admin 可视化与调参）。
+其中**境界档在 `Skeleton` 里没有任何字段落点**（`identity_pool` 有、`payout_table` 有、境界档没有），
+故校准面在补上 schema 之前无数据可展示——这是它的真前置件，不是 UI 工作量问题。
 
 ## 5. AI 失败安全降级（写入门槛，因公共事实不可回滚）
 

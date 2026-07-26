@@ -105,15 +105,20 @@ pub fn day_string(ms: i64) -> String {
 // ---------- token 计量宿主（B-1：把引擎每次 ModelCall 的实测 token 汇总，作为真实计费口径） ----------
 
 /// 收集 run_round 全过程各环节 ModelCall 的 input+output token 实测值。
+///
+/// `pub(crate)`：**成本口径必须全平台唯一**。任何在本进程里调用引擎的路径（世界线 tick 之外还有
+/// 付费副本的推进）都必须用这同一个计量器汇总 token，否则两条路径的成本数字不可比——
+/// 一边算 input+output、另一边只算 output 这类偏差，会让成本看板长出一个查不出来的系统性缺口。
+/// 复用一个结构体比「两处各写一遍、约定保持一致」可靠得多。
 #[derive(Default)]
-struct TokenMeter {
+pub(crate) struct TokenMeter {
     input: AtomicU64,
     output: AtomicU64,
     calls: AtomicU64,
 }
 
 impl TokenMeter {
-    fn total_tokens(&self) -> u64 {
+    pub(crate) fn total_tokens(&self) -> u64 {
         self.input.load(Ordering::Relaxed) + self.output.load(Ordering::Relaxed)
     }
 }
@@ -977,7 +982,11 @@ struct RoutesConfig {
 
 /// 解析世界钉住的 model_route_version → (ModelRoutes, max_output_tokens)；无匹配/缺 default profile →
 /// None（dev 跳过信号）。max_output_tokens 取配置值，缺省回退 `DEFAULT_MAX_OUTPUT_TOKENS`（>0 兜底）。
-async fn resolve_model_routes(
+///
+/// `pub(crate)`：模型路由是**运营配置的唯一解析口**（含"dev 无配置则跳过"这条 fail-closed 语义）。
+/// 本进程内其它调用引擎的路径必须走同一个解析器，否则会出现"运营把某版本路由停用了、
+/// 另一条路径还在照跑"的配置漂移。
+pub(crate) async fn resolve_model_routes(
     db: &AnyPool,
     version: &str,
 ) -> Result<Option<(ModelRoutes, u32)>, ApiError> {
@@ -1011,7 +1020,10 @@ async fn resolve_model_routes(
 }
 
 /// 解析世界钉住的 prompt_set_version（按 version 聚合各 scope 行）→ NarrativePrompts。
-async fn resolve_prompts(db: &AnyPool, version: &str) -> Result<NarrativePrompts, ApiError> {
+///
+/// `pub(crate)`：理由同 `resolve_model_routes`——提示词版本是运营可调的产品参数，
+/// 必须只有一个解析入口。
+pub(crate) async fn resolve_prompts(db: &AnyPool, version: &str) -> Result<NarrativePrompts, ApiError> {
     let rows = sqlx::query("SELECT scope, content FROM prompt_versions WHERE version = ?")
         .bind(version)
         .fetch_all(db)
@@ -2677,5 +2689,11 @@ pub fn spawn_workers(state: AppState) {
 /// 好处是自动进现有 `platform-test` CI job，CI 改动为零。
 #[cfg(test)]
 mod golden;
+/// 仿真试跑工装（总规格 §4 内容中台工业线「仿真试跑（自动化压测）」）：种子驱动的批量世界
+/// 生命周期驱动器 + 世界质量三指标（完读率/阻断率/结局分布，口径在 `crate::slo::quality`）。
+/// 与 `golden` 同源不同层——golden 抓"某条固定路径的字节变了"，它抓"一整批世界的统计形状变了"。
+/// 🔴 用的是种子驱动的**假模型**，三个指标**不度量内容质量**，见该文件头「诚实划界」。
+#[cfg(test)]
+mod simulation;
 #[cfg(test)]
 mod tests;

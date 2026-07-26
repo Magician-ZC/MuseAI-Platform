@@ -1,0 +1,102 @@
+{
+  "__doc": "世界质量回归基线（完读率/阻断率/结局分布）。由 `simulation_quality_matches_committed_baseline` 在 MUSEAI_SIM_UPDATE_BASELINE=1 时重写。🔴 只收整数计数，不收比率（浮点不可逐字节比对）。🔴 数据源是种子驱动的假模型，这三个数**不度量内容质量**，见 runtime/simulation.rs 文件头「诚实划界」。",
+  "baseline": {
+    "perScenario": [
+      {
+        "blockedTicks": 0,
+        "committedTicks": 8,
+        "conclusionReasons": {
+          "time_limit": 2
+        },
+        "eventsTotal": 22,
+        "replicas": 2,
+        "scenario": "attrition",
+        "stopReasons": {
+          "concluded": 2
+        }
+      },
+      {
+        "blockedTicks": 0,
+        "committedTicks": 18,
+        "conclusionReasons": {
+          "mainline_complete": 3
+        },
+        "eventsTotal": 62,
+        "replicas": 3,
+        "scenario": "cordial",
+        "stopReasons": {
+          "concluded": 3
+        }
+      },
+      {
+        "blockedTicks": 8,
+        "committedTicks": 0,
+        "conclusionReasons": {
+          "(unfinished)": 2
+        },
+        "eventsTotal": 0,
+        "replicas": 2,
+        "scenario": "deadlock",
+        "stopReasons": {
+          "drive_cap": 2
+        }
+      },
+      {
+        "blockedTicks": 0,
+        "committedTicks": 23,
+        "conclusionReasons": {
+          "mainline_complete": 3
+        },
+        "eventsTotal": 82,
+        "replicas": 3,
+        "scenario": "volatile",
+        "stopReasons": {
+          "concluded": 3
+        }
+      }
+    ],
+    "quality": {
+      "blocking": {
+        "blockedTicks": 8,
+        "engineTicks": 57,
+        "eventsTotal": 166,
+        "eventsWithheld": 0,
+        "failedTicks": 0,
+        "gatedTicks": 0,
+        "openTicks": 0,
+        "terminalTicks": 0,
+        "worldsWithBlock": 2
+      },
+      "completion": {
+        "collapsed": 0,
+        "forced": 2,
+        "natural": 6,
+        "unfinished": 2,
+        "unknownEnded": 0,
+        "worlds": 10
+      },
+      "endings": {
+        "byEnding": {
+          "(unfinished)": 2,
+          "e_alliance": 8
+        },
+        "byKind": {
+          "forced": 2,
+          "natural": 6
+        },
+        "byReason": {
+          "mainline_complete": 6,
+          "time_limit": 2
+        },
+        "distinctEndings": 1,
+        "worldsWithEnding": 8
+      }
+    },
+    "suiteSeed": "museai-sim-2026-07-26"
+  },
+  "meta": {
+    "engineVersion": "0.1.0",
+    "note": "meta 不参与比对，只供人读：引擎版本变了但三指标没变，是好消息，不该逼着刷基线。",
+    "suiteSeed": "museai-sim-2026-07-26"
+  }
+}

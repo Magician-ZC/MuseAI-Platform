@@ -75,7 +75,7 @@ const WORLD_DEATH: &str = "wld-golden-changan-death";
 const WORLD_WHISPER: &str = "wld-golden-changan-whisper";
 
 /// 玩家成员：(cloud_character_id, user_id)。数组下标即入场次序，落成**固定且互不相同**的 `joined_at`。
-const GOLDEN_MEMBERS: &[(&str, &str)] = &[("shenyan", "ushen"), ("peizhao", "upei"), ("cuie", "ucui")];
+pub(super) const GOLDEN_MEMBERS: &[(&str, &str)] = &[("shenyan", "ushen"), ("peizhao", "upei"), ("cuie", "ucui")];
 
 /// 固定入场时刻基准 + 步长：`joined_at = BASE + idx * STEP`。
 ///
@@ -84,25 +84,25 @@ const GOLDEN_MEMBERS: &[(&str, &str)] = &[("shenyan", "ushen"), ("peizhao", "upe
 /// （用 `now_ms()` 连续播种时必然如此），行序由数据库决定 ⇒ `perCharacterHooks` /
 /// `difficultyNotes` 的顺序在两次重放之间漂移 ⇒ 逐字节比对失败。
 /// 这条约束正是本回归第一次跑就抓到的问题，详见文件末尾「已知非确定性来源」。
-const GOLDEN_JOINED_AT_BASE: i64 = 1_700_000_000_000;
-const GOLDEN_JOINED_AT_STEP: i64 = 1_000;
+pub(super) const GOLDEN_JOINED_AT_BASE: i64 = 1_700_000_000_000;
+pub(super) const GOLDEN_JOINED_AT_STEP: i64 = 1_000;
 /// 世界固有角色（NPC）：参与决策与贡献归因，但**不是 world_member**——算基尼前必须被交集剔除。
-const GOLDEN_NPC: &str = "lugong";
+pub(super) const GOLDEN_NPC: &str = "lugong";
 
 // ============================================================================
 // §2 fixture：固定角色卡 + 固定世界骨架
 // ============================================================================
 
 const CARDS_JSON: &str = include_str!("golden/cards.json");
-const SKELETON_JSON: &str = include_str!("golden/skeleton.json");
+pub(super) const SKELETON_JSON: &str = include_str!("golden/skeleton.json");
 
 /// 取一张固定角色卡（原始 JSON 值）。`__doc` 等注释键不是卡，按 id 精确取用。
-fn golden_card_value(id: &str) -> Value {
+pub(super) fn golden_card_value(id: &str) -> Value {
     let all: BTreeMap<String, Value> = serde_json::from_str(CARDS_JSON).expect("cards.json 必须是合法 JSON");
     all.get(id).unwrap_or_else(|| panic!("cards.json 缺少角色卡 {id}")).clone()
 }
 
-fn golden_card_json(id: &str) -> String {
+pub(super) fn golden_card_json(id: &str) -> String {
     let v = golden_card_value(id);
     // 解析一次，确保 fixture 始终是引擎可读的合法 CharacterCardV2（fixture 写错要在这里就炸）。
     let card: CharacterCardV2 =
@@ -298,7 +298,7 @@ const AGENT_TOKENS: &[(&str, u32, u32)] = &[
     ("critic", 180, 20),
 ];
 
-fn agent_tokens(agent: &str) -> (u32, u32) {
+pub(super) fn agent_tokens(agent: &str) -> (u32, u32) {
     AGENT_TOKENS
         .iter()
         .find(|(a, _, _)| *a == agent)
@@ -374,7 +374,7 @@ impl ScriptedModel {
 
 /// 从 roleDecide 的 user prompt 头部解析角色 id（`build_decide_user_prompt` 的固定包裹：
 /// 「以下是【仅你（<cid>）可见】的信息…」）。非 roleDecide 环节返回空串。
-fn cid_of_decide_prompt(user: &str) -> String {
+pub(super) fn cid_of_decide_prompt(user: &str) -> String {
     let Some(head) = user.strip_prefix("以下是【仅你（") else {
         return String::new();
     };
@@ -398,7 +398,7 @@ impl ModelClient for ScriptedModel {
 }
 
 /// 构造一条合法的 roleDecide 响应（`decision_id`/`character_id` 由引擎代码补齐，不来自模型）。
-fn decision_json(
+pub(super) fn decision_json(
     intent: &str,
     action: &str,
     will_speak: bool,

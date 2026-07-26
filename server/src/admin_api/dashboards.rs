@@ -3,7 +3,7 @@
 //! `/admin/metrics/overview` 含三段：核心运营计数 · 成本仪表（§17【拍板 16】）·
 //! **叙事质量 SLO**（`narrativeSlo`，VALIDATION §4.2，口径与聚合在 `crate::slo`）。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use axum::extract::{Query, State};
 use axum::Json;
@@ -30,6 +30,15 @@ fn rate(numer: i64, denom: i64) -> f64 {
     } else {
         (numer as f64) / (denom as f64)
     }
+}
+
+/// `rate` 的诚实版：分母为 0 → `None`（渲染成 `—`），而不是编一个 0.0。
+///
+/// 用在错峰仪表上：「窗口内一拍都没有」与「窗口内跑了 100 拍、一拍都没走错峰」是两件事，
+/// 前者是**没有数据**、后者是**真实的 0%**。前端据此区分空态与真值（同 `/admin/worlds`
+/// 的 `successRate`：无已终结 tick → null，不得当 0% 读）。
+fn ratio_or_null(numer: i64, denom: i64) -> Option<f64> {
+    (denom > 0).then(|| (numer as f64) / (denom as f64))
 }
 
 // ---------------- 成本仪表口径（总规格 §17【拍板 16】） ----------------
@@ -82,6 +91,127 @@ fn per_player(value: i64, members: i64) -> Option<f64> {
     }
 }
 
+// ---------------- 错峰调度可观测面（迁移 0038；总规格 §17【拍板 16】成本杠杆①） ----------------
+
+/// 🔴 **单位陷阱**：`world_ticks.price_ratio_pct` 是**百分数整数**（100=原价、50=5 折、40=4 折），
+/// 而本接口对外的一切**比率**字段一律是 **0..1 小数**（与 `successRate` / `usageRatio` / `openRate`
+/// 同一套约定，见 docs/API.md）。两者必须显式换算，绝不能把 `50` 直接当成比率下发——
+/// 那会让前端把「5 折」渲染成「5000%」。
+///
+/// 故对外同时给两个字段、各自守住各自的口径：
+/// - `priceRatioPct`：原列值，百分数整数，**运营配置的名义档位**；
+/// - `priceRatio`：`pct/100`，0..1 小数，供前端按统一比率通道渲染。
+fn price_ratio(pct: i64) -> f64 {
+    pct as f64 / 100.0
+}
+
+/// 按名义档位估算「相对原价省下多少」（分）：`原价分 × (100 - pct) / 100`。
+///
+/// 口径与 docs/API.md「错峰调度」小节的公式逐字一致：
+/// `Σ cost_tokens × (100-price_ratio_pct)/100 × MUSE_TOKEN_CNY_CENTS_PER_1K`。
+/// 🔴 它是**估算折让**，不是供应商账单——`price_ratio_pct` 只是运营配置的名义档位（迁移 0038 口径声明），
+/// 不得当对账依据。
+///
+/// 先按档位把 token 汇总再换算（而不是逐拍取整再相加），避免逐拍地板误差累积成一个肉眼可见的低估。
+/// `pct` 越界（脏数据）时钳到 [0,100]：折让不会为负，也不会超过原价。
+fn saved_cents_at(tokens: i64, pct: i64) -> i64 {
+    let discount = 100 - pct.clamp(0, 100);
+    tokens_to_cents(tokens).saturating_mul(discount) / 100
+}
+
+/// 错峰仪表的窗口内累加器（与成本趋势共用**同一条**窗口查询，不额外发 SQL）。
+#[derive(Default)]
+struct OffPeakAgg {
+    /// 窗口内全部拍数（错峰与否都算，是各类占比的分母）。
+    ticks: i64,
+    /// 窗口内全部 token（应恒等于 `Σ trend[].tokens`）。
+    tokens: i64,
+    /// `off_peak = 1` 的拍数 / token（「错峰生效了多少」的直接度量）。
+    off_peak_ticks: i64,
+    off_peak_tokens: i64,
+    /// `defer_ms > 0` 的拍数与被压总时长/峰值（延后账是进程内存态，重启会低估，见迁移 0038）。
+    deferred_ticks: i64,
+    defer_ms_total: i64,
+    defer_ms_max: i64,
+    /// 名义档位 → (拍数, token)。BTreeMap 保证按档位升序（折扣最深的在前、原价 100 在末），
+    /// 输出顺序确定，前端不必再排。
+    by_pct: BTreeMap<i64, (i64, i64)>,
+}
+
+impl OffPeakAgg {
+    fn push(&mut self, tokens: i64, off_peak: bool, pct: i64, defer_ms: i64) {
+        self.ticks += 1;
+        self.tokens += tokens;
+        if off_peak {
+            self.off_peak_ticks += 1;
+            self.off_peak_tokens += tokens;
+        }
+        if defer_ms > 0 {
+            self.deferred_ticks += 1;
+            self.defer_ms_total += defer_ms;
+            self.defer_ms_max = self.defer_ms_max.max(defer_ms);
+        }
+        let slot = self.by_pct.entry(pct).or_insert((0, 0));
+        slot.0 += 1;
+        slot.1 += tokens;
+    }
+
+    /// 组装 `cost.offPeak`。窗口与成本趋势同一个（`?costDays=`），故不另立一套时间口径。
+    fn to_json(&self, window_days: i64) -> Value {
+        let nominal_cents = tokens_to_cents(self.tokens);
+        let mut saved_cents = 0i64;
+        let mut by_ratio = Vec::with_capacity(self.by_pct.len());
+        for (&pct, &(ticks, tokens)) in &self.by_pct {
+            let saved = saved_cents_at(tokens, pct);
+            saved_cents += saved;
+            by_ratio.push(json!({
+                "priceRatioPct": pct,              // 百分数整数（原列值，100=原价）
+                "priceRatio": price_ratio(pct),    // 0..1 小数（同 successRate 约定）
+                "ticks": ticks,
+                "tokens": tokens,
+                "savedCents": saved,
+                "savedCny": cents_to_cny(saved),
+            }));
+        }
+        // 逐档地板求和恒 ≤ 整体地板，故折让不会超过原价，effective 不会为负。
+        let effective_cents = (nominal_cents - saved_cents).max(0);
+        json!({
+            "windowDays": window_days,
+            "ticks": self.ticks,
+            "tokens": self.tokens,
+            "offPeakTicks": self.off_peak_ticks,
+            "offPeakTokens": self.off_peak_tokens,
+            // 三个比率一律 **0..1 小数**；窗口内一拍都没有 → null（没有数据 ≠ 真实的 0%）。
+            "tickRatio": ratio_or_null(self.off_peak_ticks, self.ticks),
+            "tokenRatio": ratio_or_null(self.off_peak_tokens, self.tokens),
+            "savedRatio": ratio_or_null(saved_cents, nominal_cents),
+            "nominalCents": nominal_cents,
+            "nominalCny": cents_to_cny(nominal_cents),
+            "savedCents": saved_cents,
+            "savedCny": cents_to_cny(saved_cents),
+            "effectiveCents": effective_cents,
+            "effectiveCny": cents_to_cny(effective_cents),
+            "deferredTicks": self.deferred_ticks,
+            "deferMsTotal": self.defer_ms_total,
+            "deferMsMax": self.defer_ms_max,
+            // 平均延后时长的分母是**被延后过的拍**（不是全部拍）；一拍都没被延后 → null。
+            "avgDeferMs": (self.deferred_ticks > 0)
+                .then(|| self.defer_ms_total as f64 / self.deferred_ticks as f64),
+            "byRatio": by_ratio,
+            "notes": [
+                "窗口与 cost.trend 同一个（?costDays=，默认 7、clamp [1,60]、UTC 日界、末桶即今天）。",
+                "🔴 priceRatioPct 是百分数整数（100=原价、50=5 折），priceRatio 是同一个数的 0..1 形态；tickRatio/tokenRatio/savedRatio 一律 0..1 小数。",
+                "savedCents = Σ 按档位汇总的 tokens × (100-priceRatioPct)/100 × MUSE_TOKEN_CNY_CENTS_PER_1K，是相对原价的**估算折让**，不是供应商账单，不得当对账依据（迁移 0038 口径声明）。",
+                "cost.today / cost.trend / cost.total 一律按**原价**计（口径不变），错峰折让只在本节体现，两者不重复相减。",
+                "错峰调度默认关闭（MUSE_OFFPEAK_SCHEDULING，VALIDATION §0.1），关闭时每拍落中性值 off_peak=0 / price_ratio_pct=100 / defer_ms=0，本节各项恒为 0/空——是「未开启」，不是「没省下钱」。",
+                "本节不下发开关状态：错峰是**按世界**生效的（登记进 flags::KNOWN_FLAGS 后走 world 作用域灰度，未登记时退回 env 兜底），没有一个诚实的平台级布尔可报；登记后可在 GET /admin/flags 查每档解析结果。",
+                "deferMs 由进程内存态计时，server 重启会让在途延后账清零（方向是低估错峰效果，不会虚报）。",
+                "avgDeferMs 的分母只含被延后过的拍（deferredTicks），无被延后拍时为 null。",
+            ],
+        })
+    }
+}
+
 /// 成本榜单长度（每局成本卡片只展示头部世界；平台合计仍按全量世界算）。
 const COST_TOP_N: usize = 10;
 
@@ -102,7 +232,8 @@ pub(super) struct OverviewQuery {
 
 /// GET /admin/metrics/overview：核心运营指标聚合。
 /// 注册数、日报打开率、tick 成功率、按世界 token 成本、审核积压、活跃/熔断世界、风控计数，
-/// 以及**成本仪表**（§17【拍板 16】）：今日成本 + 近 N 日趋势 + 每局成本 + 每玩家分摊。
+/// 以及**成本仪表**（§17【拍板 16】）：今日成本 + 近 N 日趋势 + 每局成本 + 每玩家分摊
+/// + **错峰调度**（`cost.offPeak`，迁移 0038 三列：占比 / 估算折让 / 延后时长）。
 pub(super) async fn metrics_overview(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -206,8 +337,18 @@ pub(super) async fn metrics_overview(
     let cost_start = today_start - (cost_days - 1) * DAY_MS;
     let cost_end = today_start + DAY_MS; // 右开区间，含今天整天
     let mut day_tokens = vec![0i64; cost_days as usize];
+    // 同一条窗口查询顺带喂错峰仪表（迁移 0038 三列）：**不新开查询、不新开端点**——
+    // 本端点是后台轮询调用的，"数据在写没人看"要补的是读出口，不是再加一次全表扫描。
+    // 三列均为 INTEGER/BIGINT，`CAST(... AS BIGINT)` 保证 SQLite/Postgres 解码一致
+    //（同 metrics_trends 对 gift_count 的处理）；别名与原列名错开，避免 PG 下的名字解析歧义。
+    let mut day_off_peak_tokens = vec![0i64; cost_days as usize];
+    let mut off_peak = OffPeakAgg::default();
     let rows = sqlx::query(
-        "SELECT cost_tokens, created_at FROM world_ticks WHERE created_at >= ? AND created_at < ?",
+        "SELECT cost_tokens, created_at, \
+         CAST(off_peak AS BIGINT) AS off_peak_flag, \
+         CAST(price_ratio_pct AS BIGINT) AS price_pct, \
+         CAST(defer_ms AS BIGINT) AS defer_millis \
+         FROM world_ticks WHERE created_at >= ? AND created_at < ?",
     )
     .bind(cost_start)
     .bind(cost_end)
@@ -217,7 +358,20 @@ pub(super) async fn metrics_overview(
         let ts: i64 = r.try_get("created_at")?;
         // 窗口起点即 UTC 0 点，(ts-start)/天宽 整除即天序号；SQL 已过滤，越界防御性跳过。
         if ts >= cost_start && ts < cost_end {
-            day_tokens[((ts - cost_start) / DAY_MS) as usize] += r.try_get::<i64, _>("cost_tokens")?;
+            let tokens: i64 = r.try_get("cost_tokens")?;
+            // 布尔按仓库约定存 INTEGER 0/1（db.rs 头注释），非 0 即真。
+            let is_off_peak = r.try_get::<i64, _>("off_peak_flag")? != 0;
+            let idx = ((ts - cost_start) / DAY_MS) as usize;
+            day_tokens[idx] += tokens;
+            if is_off_peak {
+                day_off_peak_tokens[idx] += tokens;
+            }
+            off_peak.push(
+                tokens,
+                is_off_peak,
+                r.try_get::<i64, _>("price_pct")?,
+                r.try_get::<i64, _>("defer_millis")?,
+            );
         }
     }
     let mut cost_trend = Vec::with_capacity(day_tokens.len());
@@ -228,6 +382,9 @@ pub(super) async fn metrics_overview(
             "tokens": tokens,
             "cents": cents,
             "cny": cents_to_cny(cents),
+            // 当日 token 里走了折扣时段的那部分（`tokens` 仍是当日全量，两者是**包含**关系，不可相加）。
+            // 错峰关闭 / 无错峰拍时恒为 0，既有折线逐字不受影响。
+            "offPeakTokens": day_off_peak_tokens[i],
         }));
     }
     let today_tokens = *day_tokens.last().unwrap_or(&0);
@@ -298,6 +455,8 @@ pub(super) async fn metrics_overview(
             "trendDays": cost_days,
             "trend": cost_trend,
             "byWorld": cost_by_world,
+            // 错峰调度可观测面（迁移 0038 三列的唯一读出口）。窗口同 trend；口径与局限见其 notes[]。
+            "offPeak": off_peak.to_json(cost_days),
             "total": {
                 "worlds": cost_rows.len() as i64,
                 "tokens": total_tokens,
@@ -315,6 +474,7 @@ pub(super) async fn metrics_overview(
                 "局限：等分假设玩家对成本贡献均等，戏份极不均的世界会低估重度玩家的真实成本。",
                 "平台合计的成员分母只含有 tick 记账的世界；无 active 成员的世界 perPlayer 为 null（不除零）。",
                 "日界为 UTC（与 metrics/trends、world_budgets.budget_day 同口径）；趋势末桶即今天。",
+                "本对象的 today/trend/byWorld/total 一律按**原价**估算（不扣错峰折让）；错峰省了多少见 offPeak.savedCents，两处不重复相减。",
             ],
         },
         // 叙事质量 SLO（VALIDATION §4.2）。只读观测，七项：四项算得出来、

@@ -1394,6 +1394,21 @@ fn build_events(
             fact["to"] = json!(dest);
         }
 
+        // 🔴 **这个 id 在世界之间会重名，不可当唯一键用。**
+        //
+        // `patch_id` 形如 `patch-{base_revision}`,于是本 id 形如 `patch-0-ev-0` ——
+        // 它只在**一条世界线内部**唯一,**不含任何世界维度**。两个不同世界在同一 revision 上
+        // 的第 N 个事件,id 逐字相同(任意两个新世界的第一拍都有 `patch-0-ev-0`)。
+        //
+        // 这是刻意的:引擎是宿主无关的,它不知道"世界 id"这回事,而确定性 id 又是黄金世界
+        // 回归能逐字节比对的前提。**问题不在这里,在使用方**——宿主侧若拿它当定位键写
+        // `WHERE domain_event_id = $1`,就会**跨世界误伤**:2026-07-27 查实,人审队列的
+        // world_event 回写路径正是这么写的,一次「通过」会把别的世界里正被拦下的同名事件
+        // 一并放行。修法是 server 侧按 `(world_id, domain_event_id)` 定位到主键再改
+        // (迁移 `0047` 给 `audit_queue` 补了 `subject_world_id`)。
+        //
+        // ⚠️ 这类缺陷**在单世界测试下永远不会暴露** —— 只有一个世界时不存在重名。
+        // 任何将来按本 id 定位的代码都会重新踩它,写之前先想清楚"同名的另一个世界在哪"。
         events.push(DomainEvent {
             schema_version: 1,
             id: format!("{patch_id}-ev-{seq}"),

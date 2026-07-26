@@ -965,14 +965,30 @@ async fn seal_be_biography_tx(
 
 // ---------------- 读侧辅助（卡位校验 / 进度查询共用） ----------------
 
-/// owner 的总历练 = 全部**未撤回**云端角色的 mileage 之和。
+/// owner 的总历练 = 全部**未撤回**云端角色 **＋ 已封卷的传世卡** 的 mileage 之和。
+///
+/// 🔴 为什么传世卡要算进来（总规格 §12【拍板 23】）：该节标题就是
+/// **「死亡 = 传记封卷，不是资产清零」**，并明写「卡的价值 = 累计人生（历练/羁绊/传记/足迹），
+/// 全是显性资产」。封卷时为了复用 join 那道门会把 `withdrawn` 置 1（见 `memorial` 模块），
+/// 若这里只按 `withdrawn = 0` 统计，角色一死玩家的**卡位解锁进度就会倒退**——
+/// 那正是「资产清零」，与该节的产品承诺直接冲突。
+///
+/// **主动撤回仍然不算**：那是玩家自己把卡收回、不再参与，与「死得其所」是两回事，
+/// 保持原口径（撤回可逆，封卷不可逆）。
+///
+/// 与 `count_active_cards` 的区别是刻意的：那个统计**卡位占用**，传世卡已不可再入世界、
+/// 不该继续占着容器位，所以那边必须保持 `withdrawn = 0`。
+/// 一句话：**传世卡不再占位，但它挣来的历练永远算数。**
+///
 /// 汇总在 Rust 侧完成（避免 SQL SUM 的双库类型差异，遵守 db.rs 可移植子集约定）。
 pub(crate) async fn total_mileage(db: &AnyPool, owner_id: &str) -> Result<i64, ApiError> {
-    let rows: Vec<(i64,)> =
-        sqlx::query_as("SELECT mileage FROM cloud_characters WHERE owner_id = ? AND withdrawn = 0")
-            .bind(owner_id)
-            .fetch_all(db)
-            .await?;
+    let rows: Vec<(i64,)> = sqlx::query_as(
+        "SELECT mileage FROM cloud_characters \
+         WHERE owner_id = ? AND (withdrawn = 0 OR memorial_status = 'sealed')",
+    )
+    .bind(owner_id)
+    .fetch_all(db)
+    .await?;
     Ok(rows.into_iter().map(|(m,)| m).sum())
 }
 

@@ -1080,3 +1080,47 @@ async fn be_biography_rolls_back_with_failed_settlement() {
     assert!(biography_rows(&state, &wid).await.is_empty(), "结算回滚后传记不得残留");
     assert_eq!(mileage_of(&state, "c_be1").await, 0, "结算回滚后历练不得残留");
 }
+
+/// 🔴 §12【拍板 23】「死亡 = 传记封卷，**不是资产清零**」：传世卡的历练必须继续算数。
+///
+/// 封卷会把 `withdrawn` 置 1（`memorial` 模块复用 join 那道门），若 `total_mileage` 只看
+/// `withdrawn = 0`，角色一死玩家的**卡位解锁进度就会倒退**——那正是该节明令禁止的资产清零。
+/// 本用例同时钉住与「主动撤回」的区别：撤回是玩家自己收回卡（可逆），不算；封卷不可逆，要算。
+#[tokio::test]
+async fn sealed_memorial_cards_keep_counting_toward_mileage() {
+    let state = test_state().await;
+    // 在世 300 + 封卷 500 + 主动撤回 700。
+    seed_char_with_mileage(&state, "c_living", "u1", 300, 0).await;
+    seed_char_with_mileage(&state, "c_sealed", "u1", 500, 1).await;
+    seed_char_with_mileage(&state, "c_withdrawn", "u1", 700, 1).await;
+    sqlx::query("UPDATE cloud_characters SET memorial_status = 'sealed' WHERE id = 'c_sealed'")
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    let total = super::total_mileage(&state.db, "u1").await.unwrap();
+    assert_eq!(
+        total, 800,
+        "在世 300 + 传世 500 = 800；主动撤回的 700 不算。\n\
+         若得 300 说明传世卡被漏掉了——角色一死就把玩家的卡位进度打回去，违反 §12；\n\
+         若得 1500 说明主动撤回也被算进来了，那是另一个方向的错。"
+    );
+}
+
+/// 与上一条互为边界：传世卡**不再占卡位**。
+///
+/// 两个统计口径刻意不同——`total_mileage` 算历练（传世卡算），`count_active_cards` 算容器占用
+/// （传世卡不算，它已不可再入世界）。一句话：**不再占位，但挣来的历练永远算数。**
+#[tokio::test]
+async fn sealed_memorial_cards_no_longer_occupy_a_card_slot() {
+    let state = test_state().await;
+    seed_char_with_mileage(&state, "c_alive", "u2", 0, 0).await;
+    seed_char_with_mileage(&state, "c_gone", "u2", 0, 1).await;
+    sqlx::query("UPDATE cloud_characters SET memorial_status = 'sealed' WHERE id = 'c_gone'")
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    let n = super::count_active_cards(&state.db, "u2").await.unwrap();
+    assert_eq!(n, 1, "传世卡不可再入世界，不该继续占着卡位——这里必须保持 withdrawn = 0 口径");
+}

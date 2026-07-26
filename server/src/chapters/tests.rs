@@ -42,7 +42,7 @@ fn token(state: &AppState, user_id: &str) -> String {
 }
 
 async fn seed_user(state: &AppState, id: &str) {
-    sqlx::query("INSERT INTO users (id, nickname, age_declared, status, created_at, updated_at) VALUES (?, '', 1, 'active', ?, ?)")
+    sqlx::query("INSERT INTO users (id, nickname, age_declared, status, created_at, updated_at) VALUES ($1, '', 1, 'active', $2, $3)")
         .bind(id)
         .bind(now_ms())
         .bind(now_ms())
@@ -94,7 +94,7 @@ fn make_card(id: &str, name: &str, fear: &str, seeds: &[&str], source: Option<(&
 async fn seed_char(state: &AppState, id: &str, owner: &str, card_json: &str) {
     sqlx::query(
         "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, rights_declaration, moderation, withdrawn, created_at) \
-         VALUES (?, ?, 'local', 1, ?, 'original', 'approved', 0, ?)",
+         VALUES ($1, $2, 'local', 1, $3, 'original', 'approved', 0, $4)",
     )
     .bind(id)
     .bind(owner)
@@ -108,7 +108,7 @@ async fn seed_char(state: &AppState, id: &str, owner: &str, card_json: &str) {
 async fn seed_template(state: &AppState, id: &str, room_type: &str, skeleton_json: &str, admission_json: &str) {
     sqlx::query(
         "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, official, version, moderation, created_at) \
-         VALUES (?, '测试模板', ?, ?, ?, 1, 1, 'approved', ?)",
+         VALUES ($1, '测试模板', $2, $3, $4, 1, 1, 'approved', $5)",
     )
     .bind(id)
     .bind(room_type)
@@ -123,7 +123,7 @@ async fn seed_template(state: &AppState, id: &str, room_type: &str, skeleton_jso
 async fn seed_member(state: &AppState, world_id: &str, user_id: &str, char_id: &str) {
     sqlx::query(
         "INSERT INTO world_members (id, world_id, user_id, cloud_character_id, boundary_json, status, joined_at) \
-         VALUES (?, ?, ?, ?, '{}', 'active', ?)",
+         VALUES ($1, $2, $3, $4, '{}', 'active', $5)",
     )
     .bind(new_id("wm"))
     .bind(world_id)
@@ -206,7 +206,7 @@ async fn count(db: &sqlx::AnyPool, sql: &str) -> i64 {
 }
 
 async fn backpack_row(db: &sqlx::AnyPool, user: &str, item: &str) -> (String, Option<String>) {
-    let row = sqlx::query("SELECT status, carried_world_id FROM backpacks WHERE user_id=? AND item_id=?")
+    let row = sqlx::query("SELECT status, carried_world_id FROM backpacks WHERE user_id=$1 AND item_id=$2")
         .bind(user)
         .bind(item)
         .fetch_one(db)
@@ -252,7 +252,7 @@ async fn assemble_binds_hidden_content_to_obsession_and_weights_endings() {
     assert_eq!(ha.fated_nodes, vec!["n1".to_string()], "宿命硬节点应为标 fated 的主线节点");
 
     // 装配结果写入 worlds.assembled_json 并钉住（含派生 templateVersion）。
-    let raw: String = sqlx::query("SELECT assembled_json FROM worlds WHERE id = ?")
+    let raw: String = sqlx::query("SELECT assembled_json FROM worlds WHERE id = $1")
         .bind(&wid)
         .fetch_one(&state.db)
         .await
@@ -362,7 +362,7 @@ async fn world_characters_assemble_into_entries_and_pin() {
     assert!(!assembled.per_character_hooks.iter().any(|h| h.character_id == "npc_villain"));
 
     // 钉入 assembled_json（随实例持久化，runtime 每 tick 读回注入）。
-    let raw: String = sqlx::query("SELECT assembled_json FROM worlds WHERE id = ?")
+    let raw: String = sqlx::query("SELECT assembled_json FROM worlds WHERE id = $1")
         .bind(&wid)
         .fetch_one(&state.db)
         .await
@@ -406,7 +406,7 @@ async fn locations_assemble_into_location_graph_and_pin() {
     assert_eq!(gate.max_power_tier, Some(3));
 
     // 钉入 assembled_json（随实例持久化，runtime 每 tick 读回）。
-    let raw: String = sqlx::query("SELECT assembled_json FROM worlds WHERE id = ?")
+    let raw: String = sqlx::query("SELECT assembled_json FROM worlds WHERE id = $1")
         .bind(&wid)
         .fetch_one(&state.db)
         .await
@@ -461,7 +461,7 @@ async fn resident_items_distribute_from_world_items_catalog() {
     assert_eq!(secret.gate.as_ref().unwrap().required_item_ids, vec!["wi_orb".to_string()]);
 
     // 钉入 assembled_json（随实例持久化）。
-    let raw: String = sqlx::query("SELECT assembled_json FROM worlds WHERE id = ?")
+    let raw: String = sqlx::query("SELECT assembled_json FROM worlds WHERE id = $1")
         .bind(&wid)
         .fetch_one(&state.db)
         .await
@@ -531,7 +531,7 @@ async fn assembly_snapshots_star_and_culls_over_tier_hooks() {
     }
 
     // assembled_json：starRating 快照 + 剔除清单钉进 sampling 审计段。
-    let raw: String = sqlx::query("SELECT assembled_json FROM worlds WHERE id = ?")
+    let raw: String = sqlx::query("SELECT assembled_json FROM worlds WHERE id = $1")
         .bind(&wid)
         .fetch_one(&state.db)
         .await
@@ -699,7 +699,7 @@ async fn chapter_start_assembles_and_finish_grants_reward_and_offline() {
     assert_eq!(body["hookCount"], json!(1));
     assert!(body["enabledEndings"].as_array().unwrap().iter().any(|e| e == "ending_smart"));
     // 世界已转 running（会话驱动）。
-    let wstatus: String = sqlx::query("SELECT status FROM worlds WHERE id=?")
+    let wstatus: String = sqlx::query("SELECT status FROM worlds WHERE id=$1")
         .bind(&wid)
         .fetch_one(&state.db)
         .await
@@ -901,7 +901,7 @@ async fn duplicate_assembly_preserves_chapter_state() {
     // 已装配则复用，不覆盖 → chapterState（currentNode/grantedHookIds）完好。
     let _ = assemble_instance(&state, &wid).await.unwrap();
 
-    let raw: String = sqlx::query("SELECT assembled_json FROM worlds WHERE id=?")
+    let raw: String = sqlx::query("SELECT assembled_json FROM worlds WHERE id=$1")
         .bind(&wid).fetch_one(&state.db).await.unwrap().try_get("assembled_json").unwrap();
     let v: Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(v["chapterState"]["currentNode"], json!(1), "重复装配不得重置章节推进");
@@ -936,7 +936,7 @@ async fn concurrent_assemble_instance_writes_single_consistent_assembly() {
     assert_eq!(a1.per_character_hooks[0].pool_item_id, a2.per_character_hooks[0].pool_item_id, "并发装配应返回一致实例");
 
     // DB 内恰好一份 assembly，且 chapterState 为初值（未被并发覆盖损坏）。
-    let raw: String = sqlx::query("SELECT assembled_json FROM worlds WHERE id=?")
+    let raw: String = sqlx::query("SELECT assembled_json FROM worlds WHERE id=$1")
         .bind(&wid).fetch_one(&state.db).await.unwrap().try_get("assembled_json").unwrap();
     let v: Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(v["assembly"]["perCharacterHooks"].as_array().unwrap().len(), 1);
@@ -1057,7 +1057,7 @@ async fn superset_instance_pins_sampling_and_narrows_pools() {
     assert!(s.selected_hidden.len() <= 1, "隐藏内容采样 ≤ 1: {:?}", s.selected_hidden);
 
     // 钉入 assembled_json /assembly/sampling（服务端审计，随实例钉住）。
-    let raw: String = sqlx::query("SELECT assembled_json FROM worlds WHERE id = ?")
+    let raw: String = sqlx::query("SELECT assembled_json FROM worlds WHERE id = $1")
         .bind(&wid).fetch_one(&state.db).await.unwrap().try_get("assembled_json").unwrap();
     let v: Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(v["assembly"]["sampling"]["seed"], json!(s.seed));
@@ -1164,7 +1164,7 @@ async fn chapter_settlement_grants_mileage_with_items_and_only_once() {
     let mileage = |cid: &'static str| {
         let db = state.db.clone();
         async move {
-            sqlx::query_scalar::<_, i64>("SELECT mileage FROM cloud_characters WHERE id = ?")
+            sqlx::query_scalar::<_, i64>("SELECT mileage FROM cloud_characters WHERE id = $1")
                 .bind(cid)
                 .fetch_one(&db)
                 .await
@@ -1224,7 +1224,7 @@ const NO_PAYOUT_CHAPTER_SKELETON: &str = r#"{
 }"#;
 
 async fn set_template_star(state: &AppState, template_id: &str, star: i64) {
-    sqlx::query("UPDATE world_templates SET star_rating = ? WHERE id = ?")
+    sqlx::query("UPDATE world_templates SET star_rating = $1 WHERE id = $2")
         .bind(star)
         .bind(template_id)
         .execute(&state.db)
@@ -1237,7 +1237,7 @@ async fn seed_contribution(state: &AppState, world_id: &str, cid: &str, mileston
     sqlx::query(
         "INSERT INTO world_contributions \
          (world_id, character_id, score_milli, milestone_score_milli, settled_at, updated_at) \
-         VALUES (?, ?, ?, ?, 0, ?)",
+         VALUES ($1, $2, $3, $4, 0, $5)",
     )
     .bind(world_id)
     .bind(cid)
@@ -1250,7 +1250,7 @@ async fn seed_contribution(state: &AppState, world_id: &str, cid: &str, mileston
 }
 
 async fn mileage_of(state: &AppState, cid: &str) -> i64 {
-    sqlx::query_scalar::<_, i64>("SELECT mileage FROM cloud_characters WHERE id = ?")
+    sqlx::query_scalar::<_, i64>("SELECT mileage FROM cloud_characters WHERE id = $1")
         .bind(cid)
         .fetch_one(&state.db)
         .await
@@ -1258,7 +1258,7 @@ async fn mileage_of(state: &AppState, cid: &str) -> i64 {
 }
 
 async fn hook_grants(state: &AppState, user: &str, hook_key: &str) -> i64 {
-    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM backpacks WHERE user_id=? AND reward_hook_key=?")
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM backpacks WHERE user_id=$1 AND reward_hook_key=$2")
         .bind(user)
         .bind(hook_key)
         .fetch_one(&state.db)
@@ -1355,7 +1355,7 @@ async fn chapter_worldline_settlement_is_off_without_payout_table() {
     assert_eq!(hook_grants(&state, "usrW3", &format!("{wid}:chW3:worldline")).await, 0);
     // 未结算 → settled_at 保持 0（表被打开后仍可正常结算，不因关闭期跑过一次就作废）。
     let settled: i64 = sqlx::query_scalar(
-        "SELECT settled_at FROM world_contributions WHERE world_id=? AND character_id='chW3'",
+        "SELECT settled_at FROM world_contributions WHERE world_id=$1 AND character_id='chW3'",
     )
     .bind(&wid)
     .fetch_one(&state.db)

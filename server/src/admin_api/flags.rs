@@ -263,7 +263,7 @@ pub(super) async fn set_flag(
     // 把灰度删了），那是另一回事，坚决不做。残留行由运营在列表页自行清理。
     match req.scope.as_str() {
         flags::SCOPE_USER => {
-            let ok = sqlx::query_scalar::<_, i64>("SELECT 1 FROM users WHERE id = ?")
+            let ok = sqlx::query_scalar::<_, i64>("SELECT 1 FROM users WHERE id = $1")
                 .bind(&target_id)
                 .fetch_optional(&state.db)
                 .await?
@@ -273,7 +273,7 @@ pub(super) async fn set_flag(
             }
         }
         flags::SCOPE_WORLD => {
-            let ok = sqlx::query_scalar::<_, i64>("SELECT 1 FROM worlds WHERE id = ?")
+            let ok = sqlx::query_scalar::<_, i64>("SELECT 1 FROM worlds WHERE id = $1")
                 .bind(&target_id)
                 .fetch_optional(&state.db)
                 .await?

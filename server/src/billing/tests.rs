@@ -37,7 +37,7 @@ fn token(state: &AppState, user_id: &str) -> String {
 
 /// 造用户，可控声明年龄（0 未声明 / 1 成年 / 2 未成年）。
 async fn seed_user(state: &AppState, id: &str, age_declared: i64) {
-    sqlx::query("INSERT INTO users (id, nickname, age_declared, status, created_at, updated_at) VALUES (?, '', ?, 'active', ?, ?)")
+    sqlx::query("INSERT INTO users (id, nickname, age_declared, status, created_at, updated_at) VALUES ($1, '', $2, 'active', $3, $4)")
         .bind(id)
         .bind(age_declared)
         .bind(now_ms())
@@ -81,21 +81,21 @@ async fn count(db: &sqlx::AnyPool, sql: &str, uid: &str) -> i64 {
 }
 
 async fn orders_count(db: &sqlx::AnyPool, uid: &str) -> i64 {
-    count(db, "SELECT COUNT(*) FROM orders WHERE user_id = ?", uid).await
+    count(db, "SELECT COUNT(*) FROM orders WHERE user_id = $1", uid).await
 }
 
 async fn ledger_count(db: &sqlx::AnyPool, uid: &str) -> i64 {
-    count(db, "SELECT COUNT(*) FROM ledger_entries WHERE user_id = ?", uid).await
+    count(db, "SELECT COUNT(*) FROM ledger_entries WHERE user_id = $1", uid).await
 }
 
 /// 账本聚合：SUM(ledger.delta_cents)，供恒等式断言。
 async fn ledger_sum(db: &sqlx::AnyPool, uid: &str) -> i64 {
-    count(db, "SELECT COALESCE(SUM(delta_cents), 0) FROM ledger_entries WHERE user_id = ?", uid).await
+    count(db, "SELECT COALESCE(SUM(delta_cents), 0) FROM ledger_entries WHERE user_id = $1", uid).await
 }
 
 /// 权威余额（直读表，无行视为 0）。
 async fn balance_row(db: &sqlx::AnyPool, uid: &str) -> i64 {
-    let row: Option<(i64,)> = sqlx::query_as("SELECT balance_cents FROM billing_balances WHERE user_id = ?")
+    let row: Option<(i64,)> = sqlx::query_as("SELECT balance_cents FROM billing_balances WHERE user_id = $1")
         .bind(uid)
         .fetch_optional(db)
         .await
@@ -104,7 +104,7 @@ async fn balance_row(db: &sqlx::AnyPool, uid: &str) -> i64 {
 }
 
 async fn order_status(db: &sqlx::AnyPool, order_id: &str) -> String {
-    let row: (String,) = sqlx::query_as("SELECT status FROM orders WHERE id = ?")
+    let row: (String,) = sqlx::query_as("SELECT status FROM orders WHERE id = $1")
         .bind(order_id)
         .fetch_one(db)
         .await
@@ -203,14 +203,14 @@ async fn refund_reverses_and_enforces_state_machine() {
 
     // 非 fulfilled 订单拒退：直插一条 paid 订单 → 409
     let paid_oid = new_id("order");
-    sqlx::query("INSERT INTO orders (id, user_id, kind, amount_cents, status, created_at, updated_at) VALUES (?, 'u3', 'recharge', 3000, 'paid', ?, ?)")
+    sqlx::query("INSERT INTO orders (id, user_id, kind, amount_cents, status, created_at, updated_at) VALUES ($1, 'u3', 'recharge', 3000, 'paid', $2, $3)")
         .bind(&paid_oid).bind(now_ms()).bind(now_ms()).execute(&state.db).await.unwrap();
     let (st3, _) = post(&app, "/api/billing/refunds", &tk, Some("r-f3"), json!({"orderId": paid_oid})).await;
     assert_eq!(st3, StatusCode::CONFLICT);
 
     // 越权退他人订单 → 403（先给 other 造一张 fulfilled 单）
     let other_oid = new_id("order");
-    sqlx::query("INSERT INTO orders (id, user_id, kind, amount_cents, status, created_at, updated_at) VALUES (?, 'other', 'recharge', 1000, 'fulfilled', ?, ?)")
+    sqlx::query("INSERT INTO orders (id, user_id, kind, amount_cents, status, created_at, updated_at) VALUES ($1, 'other', 'recharge', 1000, 'fulfilled', $2, $3)")
         .bind(&other_oid).bind(now_ms()).bind(now_ms()).execute(&state.db).await.unwrap();
     let (st4, _) = post(&app, "/api/billing/refunds", &tk, Some("r-f4"), json!({"orderId": other_oid})).await;
     assert_eq!(st4, StatusCode::FORBIDDEN);
@@ -233,7 +233,7 @@ async fn minor_recharge_forbidden() {
     // 无订单 / 无账本 / 无余额行
     assert_eq!(orders_count(&state.db, "kid").await, 0);
     assert_eq!(ledger_count(&state.db, "kid").await, 0);
-    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM billing_balances WHERE user_id = ?", "kid").await, 0);
+    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM billing_balances WHERE user_id = $1", "kid").await, 0);
 }
 
 /// 保守拒充：未声明年龄（age_declared==0，注册默认）→ 403，零账务副作用。
@@ -250,7 +250,7 @@ async fn undeclared_recharge_forbidden() {
     // 无订单 / 无账本 / 无余额行
     assert_eq!(orders_count(&state.db, "u0").await, 0);
     assert_eq!(ledger_count(&state.db, "u0").await, 0);
-    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM billing_balances WHERE user_id = ?", "u0").await, 0);
+    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM billing_balances WHERE user_id = $1", "u0").await, 0);
 }
 
 /// 端到端：未声明 → 拒充；经 /auth/age-declaration 声明成年（age_declared=1）后 → 可充。
@@ -312,7 +312,7 @@ async fn balance_zero_when_no_row_and_requires_auth() {
     let (st, body) = get(&app, "/api/billing/balance", Some(&tk)).await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(body["balanceCents"], 0);
-    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM billing_balances WHERE user_id = ?", "u5").await, 0);
+    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM billing_balances WHERE user_id = $1", "u5").await, 0);
 
     // 无 token → 401
     let (st_noauth, _) = get(&app, "/api/billing/balance", None).await;
@@ -339,7 +339,7 @@ async fn no_withdraw_or_transfer_endpoints() {
 
 /// 复式账户余额（无行视为 0）。
 async fn acct_balance(db: &sqlx::AnyPool, id: &str) -> i64 {
-    let row: Option<(i64,)> = sqlx::query_as("SELECT balance_cents FROM ledger_accounts WHERE id = ?")
+    let row: Option<(i64,)> = sqlx::query_as("SELECT balance_cents FROM ledger_accounts WHERE id = $1")
         .bind(id)
         .fetch_optional(db)
         .await

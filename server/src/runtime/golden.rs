@@ -188,7 +188,7 @@ async fn seed_golden_template(db: &AnyPool, params: &GoldenParams) {
     sqlx::query(
         "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, official, \
          version, moderation, star_rating, created_at) \
-         VALUES (?, '长安夜宴（黄金世界）', 'idle', ?, '{\"mode\":\"open\"}', 1, ?, 'approved', ?, ?)",
+         VALUES ($1, '长安夜宴（黄金世界）', 'idle', $2, '{\"mode\":\"open\"}', 1, $3, 'approved', $4, $5)",
     )
     .bind(GOLDEN_TEMPLATE_ID)
     .bind(golden_skeleton(params))
@@ -204,7 +204,7 @@ async fn seed_golden_char(db: &AnyPool, cid: &str, owner: &str) {
     sqlx::query(
         "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, \
          rights_declaration, moderation, withdrawn, created_at) \
-         VALUES (?, ?, 'local', 1, ?, 'original', 'approved', 0, ?)",
+         VALUES ($1, $2, 'local', 1, $3, 'original', 'approved', 0, $4)",
     )
     .bind(cid)
     .bind(owner)
@@ -235,8 +235,8 @@ async fn seed_golden_world(state: &AppState, world_id: &str, params: &GoldenPara
          model_route_version, room_type, title, status, visibility, host_user_id, member_limit, \
          tick_per_day, timeline_mode, lethality, assembled_json, state_revision, narrative_state_json, \
          created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, 'idle', '长安夜宴', 'running', 'official', NULL, 10, 3, 'event', \
-         'consent', NULL, 0, '{}', ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6, 'idle', '长安夜宴', 'running', 'official', NULL, 10, 3, 'event', \
+         'consent', NULL, 0, '{}', $7, $8)",
     )
     .bind(world_id)
     .bind(GOLDEN_TEMPLATE_ID)
@@ -252,7 +252,7 @@ async fn seed_golden_world(state: &AppState, world_id: &str, params: &GoldenPara
 
     sqlx::query(
         "INSERT INTO world_budgets (world_id, daily_token_budget, daily_cny_budget_cents, \
-         spent_tokens_today, budget_day, fused, updated_at) VALUES (?, 10000000, 0, 0, '', 0, ?)",
+         spent_tokens_today, budget_day, fused, updated_at) VALUES ($1, 10000000, 0, 0, '', 0, $2)",
     )
     .bind(world_id)
     .bind(now)
@@ -264,7 +264,7 @@ async fn seed_golden_world(state: &AppState, world_id: &str, params: &GoldenPara
     for (idx, (cid, uid)) in GOLDEN_MEMBERS.iter().enumerate() {
         sqlx::query(
             "INSERT INTO world_members (id, world_id, user_id, cloud_character_id, boundary_json, status, joined_at) \
-             VALUES (?, ?, ?, ?, '{}', 'active', ?)",
+             VALUES ($1, $2, $3, $4, '{}', 'active', $5)",
         )
         .bind(format!("wm-golden-{idx}"))
         .bind(world_id)
@@ -597,7 +597,7 @@ async fn golden_snapshot(db: &AnyPool, world_id: &str) -> String {
 
     let ticks: Vec<Value> = sqlx::query(
         "SELECT tick_no, status, cost_tokens, COALESCE(error, '') AS error FROM world_ticks \
-         WHERE world_id = ? ORDER BY tick_no ASC",
+         WHERE world_id = $1 ORDER BY tick_no ASC",
     )
     .bind(world_id)
     .fetch_all(db)
@@ -618,7 +618,7 @@ async fn golden_snapshot(db: &AnyPool, world_id: &str) -> String {
         "SELECT tick_no, sequence, domain_event_id, event_type, actors_json, visibility, \
          COALESCE(audience_json, '') AS audience, COALESCE(public_projection_json, '') AS pub_proj, \
          COALESCE(private_projections_json, '') AS priv_proj, moderation, ai_label \
-         FROM world_events WHERE world_id = ? ORDER BY sequence ASC",
+         FROM world_events WHERE world_id = $1 ORDER BY sequence ASC",
     )
     .bind(world_id)
     .fetch_all(db)
@@ -644,7 +644,7 @@ async fn golden_snapshot(db: &AnyPool, world_id: &str) -> String {
 
     let contributions: Vec<Value> = sqlx::query(
         "SELECT character_id, score_milli, milestone_score_milli, settled_at FROM world_contributions \
-         WHERE world_id = ? ORDER BY character_id ASC",
+         WHERE world_id = $1 ORDER BY character_id ASC",
     )
     .bind(world_id)
     .fetch_all(db)
@@ -663,7 +663,7 @@ async fn golden_snapshot(db: &AnyPool, world_id: &str) -> String {
     .collect();
 
     let interventions: Vec<Value> = sqlx::query(
-        "SELECT id, character_id, kind, status FROM interventions WHERE world_id = ? ORDER BY id ASC",
+        "SELECT id, character_id, kind, status FROM interventions WHERE world_id = $1 ORDER BY id ASC",
     )
     .bind(world_id)
     .fetch_all(db)
@@ -681,7 +681,7 @@ async fn golden_snapshot(db: &AnyPool, world_id: &str) -> String {
     .collect();
 
     let consents: Vec<Value> = sqlx::query(
-        "SELECT event_kind, subject_character_ids, status FROM consent_requests WHERE world_id = ? \
+        "SELECT event_kind, subject_character_ids, status FROM consent_requests WHERE world_id = $1 \
          ORDER BY event_kind ASC, subject_character_ids ASC",
     )
     .bind(world_id)
@@ -702,7 +702,7 @@ async fn golden_snapshot(db: &AnyPool, world_id: &str) -> String {
     for (cid, _) in GOLDEN_MEMBERS {
         mileage.push(json!({
             "characterId": cid,
-            "mileage": i64_one(db, "SELECT mileage FROM cloud_characters WHERE id = ?", cid).await,
+            "mileage": i64_one(db, "SELECT mileage FROM cloud_characters WHERE id = $1", cid).await,
         }));
     }
 
@@ -723,7 +723,7 @@ async fn golden_snapshot(db: &AnyPool, world_id: &str) -> String {
     .collect();
 
     let rewards: Vec<Value> = sqlx::query(
-        "SELECT character_id, kind, label FROM arena_rewards WHERE world_id = ? \
+        "SELECT character_id, kind, label FROM arena_rewards WHERE world_id = $1 \
          ORDER BY character_id ASC, kind ASC",
     )
     .bind(world_id)
@@ -850,7 +850,7 @@ async fn golden_world_reaches_natural_ending_and_settles() {
     );
 
     // 世界停机 + 收尾类型 = 自然。
-    assert_eq!(text_one(&state.db, "SELECT status FROM worlds WHERE id = ?", WORLD_MAIN).await, "ended");
+    assert_eq!(text_one(&state.db, "SELECT status FROM worlds WHERE id = $1", WORLD_MAIN).await, "ended");
     let (reason, ending) = conclusion_of(&state.db, WORLD_MAIN).await;
     assert_eq!(reason, "mainline_complete", "主线走完 = 自然收尾");
     assert!(!is_forced_conclusion(&reason), "自然收尾不计入强制收尾率");
@@ -894,13 +894,13 @@ async fn golden_world_reaches_natural_ending_and_settles() {
     // 3★ 实例不触封顶）；① 出席保底 60 ⇒ 每张卡 140。
     for (cid, uid) in GOLDEN_MEMBERS {
         assert_eq!(
-            i64_one(&state.db, "SELECT mileage FROM cloud_characters WHERE id = ?", cid).await,
+            i64_one(&state.db, "SELECT mileage FROM cloud_characters WHERE id = $1", cid).await,
             140,
             "{cid} 应得 ① 出席 60 + ③ 推动档 80"
         );
         let hook = format!("{WORLD_MAIN}:{cid}:worldline");
         let granted: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM backpacks WHERE user_id = ? AND reward_hook_key = ?")
+            sqlx::query_scalar("SELECT COUNT(*) FROM backpacks WHERE user_id = $1 AND reward_hook_key = $2")
                 .bind(uid)
                 .bind(&hook)
                 .fetch_one(&state.db)
@@ -910,7 +910,7 @@ async fn golden_world_reaches_natural_ending_and_settles() {
     }
 
     // 🔴 平权红线：贡献分/产出绝不写进会回灌引擎的 narrative_state_json。
-    let raw = text_one(&state.db, "SELECT narrative_state_json FROM worlds WHERE id = ?", WORLD_MAIN).await;
+    let raw = text_one(&state.db, "SELECT narrative_state_json FROM worlds WHERE id = $1", WORLD_MAIN).await;
     assert!(
         !raw.contains("contribution") && !raw.contains("payout") && !raw.contains("mileage"),
         "结算侧数值绝不能进入引擎状态（VALIDATION §0.1 平权红线）"
@@ -937,7 +937,7 @@ async fn golden_world_collapse_is_forced_and_zeroes_worldline() {
     assert_eq!(drive_tick(&state, &model, WORLD_COLLAPSE, 0).await, TickStatus::Done);
     for (cid, _) in GOLDEN_MEMBERS {
         let s: i64 = sqlx::query_scalar(
-            "SELECT score_milli FROM world_contributions WHERE world_id = ? AND character_id = ?",
+            "SELECT score_milli FROM world_contributions WHERE world_id = $1 AND character_id = $2",
         )
         .bind(WORLD_COLLAPSE)
         .bind(cid)
@@ -948,7 +948,7 @@ async fn golden_world_collapse_is_forced_and_zeroes_worldline() {
     }
 
     // 关键角色永久退场 → 世界线崩塌。
-    sqlx::query("UPDATE world_members SET status = 'left' WHERE world_id = ? AND cloud_character_id = ?")
+    sqlx::query("UPDATE world_members SET status = 'left' WHERE world_id = $1 AND cloud_character_id = $2")
         .bind(WORLD_COLLAPSE)
         .bind("cuie")
         .execute(&state.db)
@@ -957,7 +957,7 @@ async fn golden_world_collapse_is_forced_and_zeroes_worldline() {
 
     // 拍 1：关键角色退场门在跑回合之前命中 → 直接停机（不白跑一回合）。
     assert_eq!(drive_tick(&state, &model, WORLD_COLLAPSE, 1).await, TickStatus::Concluded);
-    assert_eq!(text_one(&state.db, "SELECT status FROM worlds WHERE id = ?", WORLD_COLLAPSE).await, "ended");
+    assert_eq!(text_one(&state.db, "SELECT status FROM worlds WHERE id = $1", WORLD_COLLAPSE).await, "ended");
 
     let (reason, _) = conclusion_of(&state.db, WORLD_COLLAPSE).await;
     assert_eq!(reason, "key_character_exit");
@@ -967,12 +967,12 @@ async fn golden_world_collapse_is_forced_and_zeroes_worldline() {
     // ① 减半：出席 60 → 30；③ 归零：不发任何世界线产出，但幂等标记照落。
     for cid in ["shenyan", "peizhao"] {
         assert_eq!(
-            i64_one(&state.db, "SELECT mileage FROM cloud_characters WHERE id = ?", cid).await,
+            i64_one(&state.db, "SELECT mileage FROM cloud_characters WHERE id = $1", cid).await,
             30,
             "{cid} 崩塌 → ① 保底减半（60×0.5）且 ③ 归零"
         );
         let settled: i64 = sqlx::query_scalar(
-            "SELECT settled_at FROM world_contributions WHERE world_id = ? AND character_id = ?",
+            "SELECT settled_at FROM world_contributions WHERE world_id = $1 AND character_id = $2",
         )
         .bind(WORLD_COLLAPSE)
         .bind(cid)
@@ -982,7 +982,7 @@ async fn golden_world_collapse_is_forced_and_zeroes_worldline() {
         assert!(settled > 0, "{cid} 崩塌也要打幂等结算标记");
     }
     let worldline_items: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM backpacks WHERE reward_hook_key LIKE ?",
+        "SELECT COUNT(*) FROM backpacks WHERE reward_hook_key LIKE $1",
     )
     .bind(format!("{WORLD_COLLAPSE}:%"))
     .fetch_one(&state.db)
@@ -992,7 +992,7 @@ async fn golden_world_collapse_is_forced_and_zeroes_worldline() {
     assert_eq!(
         i64_one(
             &state.db,
-            "SELECT COUNT(*) FROM audit_logs WHERE action = 'world.worldline_settled' AND subject = ?",
+            "SELECT COUNT(*) FROM audit_logs WHERE action = 'world.worldline_settled' AND subject = $1",
             WORLD_COLLAPSE
         )
         .await,
@@ -1036,7 +1036,7 @@ async fn golden_world_death_requires_consent_then_lands() {
     assert_eq!(
         i64_one(
             &state.db,
-            "SELECT COUNT(*) FROM consent_requests WHERE world_id = ? AND status = 'pending'",
+            "SELECT COUNT(*) FROM consent_requests WHERE world_id = $1 AND status = 'pending'",
             WORLD_DEATH
         )
         .await,
@@ -1045,14 +1045,14 @@ async fn golden_world_death_requires_consent_then_lands() {
     );
     let kind = text_one(
         &state.db,
-        "SELECT event_kind FROM consent_requests WHERE world_id = ? AND status = 'pending'",
+        "SELECT event_kind FROM consent_requests WHERE world_id = $1 AND status = 'pending'",
         WORLD_DEATH,
     )
     .await;
     assert_eq!(kind, "death");
     let subjects = text_one(
         &state.db,
-        "SELECT subject_character_ids FROM consent_requests WHERE world_id = ? AND status = 'pending'",
+        "SELECT subject_character_ids FROM consent_requests WHERE world_id = $1 AND status = 'pending'",
         WORLD_DEATH,
     )
     .await;
@@ -1060,7 +1060,7 @@ async fn golden_world_death_requires_consent_then_lands() {
     assert!(
         i64_one(
             &state.db,
-            "SELECT COUNT(*) FROM notification_outbox WHERE kind = 'consent_request' AND user_id = ?",
+            "SELECT COUNT(*) FROM notification_outbox WHERE kind = 'consent_request' AND user_id = $1",
             "upei"
         )
         .await
@@ -1086,7 +1086,7 @@ async fn golden_world_death_requires_consent_then_lands() {
     );
 
     // ---- 当事人授权（等价于 respond 落定；respond 端点在 consents/tests.rs 另有覆盖）----
-    sqlx::query("UPDATE consent_requests SET status = 'approved', resolved_at = ? WHERE world_id = ?")
+    sqlx::query("UPDATE consent_requests SET status = 'approved', resolved_at = $1 WHERE world_id = $2")
         .bind(now_ms())
         .bind(WORLD_DEATH)
         .execute(&state.db)
@@ -1103,7 +1103,7 @@ async fn golden_world_death_requires_consent_then_lands() {
     assert_eq!(
         i64_one(
             &state.db,
-            "SELECT COUNT(*) FROM consent_requests WHERE world_id = ? AND status = 'pending'",
+            "SELECT COUNT(*) FROM consent_requests WHERE world_id = $1 AND status = 'pending'",
             WORLD_DEATH
         )
         .await,
@@ -1152,9 +1152,9 @@ async fn golden_world_whisper_is_fed_into_decision_context_and_consumed() {
     assert!(shen_prompt.contains("\"whisper\""), "托梦应以 whisper 字段挂进可见上下文");
 
     // Q-3：只消费本拍真正喂入的干预。
-    assert_eq!(text_one(&state.db, "SELECT status FROM interventions WHERE id = ?", "iv-fed").await, "applied");
+    assert_eq!(text_one(&state.db, "SELECT status FROM interventions WHERE id = $1", "iv-fed").await, "applied");
     assert_eq!(
-        text_one(&state.db, "SELECT status FROM interventions WHERE id = ?", "iv-unfed").await,
+        text_one(&state.db, "SELECT status FROM interventions WHERE id = $1", "iv-unfed").await,
         "accepted",
         "非在场角色的托梦不得被 blanket 标 applied"
     );
@@ -1236,7 +1236,7 @@ async fn golden_world_metrics_and_cost_baseline() {
 
     // ---- 成本基线（逐拍精确）----
     let costs: Vec<(i64, i64)> = sqlx::query(
-        "SELECT tick_no, cost_tokens FROM world_ticks WHERE world_id = ? ORDER BY tick_no ASC",
+        "SELECT tick_no, cost_tokens FROM world_ticks WHERE world_id = $1 ORDER BY tick_no ASC",
     )
     .bind(WORLD_MAIN)
     .fetch_all(&state.db)
@@ -1252,7 +1252,7 @@ async fn golden_world_metrics_and_cost_baseline() {
          交锋拍（R4 冲突升级模型仲裁）多 200"
     );
     assert_eq!(
-        i64_one(&state.db, "SELECT spent_tokens_today FROM world_budgets WHERE world_id = ?", WORLD_MAIN)
+        i64_one(&state.db, "SELECT spent_tokens_today FROM world_budgets WHERE world_id = $1", WORLD_MAIN)
             .await,
         COST_MAIN_TOTAL,
         "预算累计应等于各拍实测 token 之和"
@@ -1266,7 +1266,7 @@ async fn golden_world_metrics_and_cost_baseline() {
 
     // 🔴 NPC 陷阱：世界固有角色**也入 world_contributions**，不取交集就会污染公平度。
     let npc_score: i64 = sqlx::query_scalar(
-        "SELECT score_milli FROM world_contributions WHERE world_id = ? AND character_id = ?",
+        "SELECT score_milli FROM world_contributions WHERE world_id = $1 AND character_id = $2",
     )
     .bind(WORLD_MAIN)
     .bind(GOLDEN_NPC)
@@ -1275,7 +1275,7 @@ async fn golden_world_metrics_and_cost_baseline() {
     .unwrap();
     assert!(npc_score > 0, "NPC 确实在账本里（这正是必须取交集的原因）");
     let npc_is_member: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM world_members WHERE world_id = ? AND cloud_character_id = ?",
+        "SELECT COUNT(*) FROM world_members WHERE world_id = $1 AND cloud_character_id = $2",
     )
     .bind(WORLD_MAIN)
     .bind(GOLDEN_NPC)

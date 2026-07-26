@@ -28,7 +28,7 @@ async fn seed_char_with_mileage(
     sqlx::query(
         "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, \
          rights_declaration, moderation, withdrawn, created_at, mileage) \
-         VALUES (?, ?, 'local', 1, '{}', 'original', 'approved', ?, ?, ?)",
+         VALUES ($1, $2, 'local', 1, '{}', 'original', 'approved', $3, $4, $5)",
     )
     .bind(id)
     .bind(owner)
@@ -41,7 +41,7 @@ async fn seed_char_with_mileage(
 }
 
 async fn mileage_of(state: &AppState, char_id: &str) -> i64 {
-    sqlx::query_scalar::<_, i64>("SELECT mileage FROM cloud_characters WHERE id = ?")
+    sqlx::query_scalar::<_, i64>("SELECT mileage FROM cloud_characters WHERE id = $1")
         .bind(char_id)
         .fetch_one(&state.db)
         .await
@@ -587,7 +587,7 @@ async fn seed_be_template(state: &AppState, id: &str) {
     sqlx::query(
         "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, official, \
          version, moderation, star_rating, created_at) \
-         VALUES (?, '黑角域篇', 'idle', '{}', '{}', 1, 3, 'approved', 4, ?)",
+         VALUES ($1, '黑角域篇', 'idle', '{}', '{}', 1, 3, 'approved', 4, $2)",
     )
     .bind(id)
     .bind(now_ms())
@@ -601,7 +601,7 @@ async fn seed_named_char(state: &AppState, id: &str, owner: &str, name: &str) {
     sqlx::query(
         "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, \
          rights_declaration, moderation, withdrawn, created_at, mileage) \
-         VALUES (?, ?, 'local', 1, ?, 'original', 'approved', 0, ?, 0)",
+         VALUES ($1, $2, 'local', 1, $3, 'original', 'approved', 0, $4, 0)",
     )
     .bind(id)
     .bind(owner)
@@ -633,7 +633,7 @@ async fn seed_played_world(state: &AppState) -> String {
     ] {
         sqlx::query(
             "INSERT INTO world_members (id, world_id, user_id, cloud_character_id, boundary_json, \
-             status, joined_at, left_at) VALUES (?, ?, ?, ?, '{}', ?, ?, ?)",
+             status, joined_at, left_at) VALUES ($1, $2, $3, $4, '{}', $5, $6, $7)",
         )
         .bind(mid)
         .bind(&wid)
@@ -649,7 +649,7 @@ async fn seed_played_world(state: &AppState) -> String {
     for (cid, score, milestone) in [("c_be1", 4_500i64, 3_000i64), ("c_be2", 1_500i64, 0i64)] {
         sqlx::query(
             "INSERT INTO world_contributions (world_id, character_id, score_milli, \
-             milestone_score_milli, settled_at, updated_at) VALUES (?, ?, ?, ?, 0, ?)",
+             milestone_score_milli, settled_at, updated_at) VALUES ($1, $2, $3, $4, 0, $5)",
         )
         .bind(&wid)
         .bind(cid)
@@ -663,7 +663,7 @@ async fn seed_played_world(state: &AppState) -> String {
     for (tid, no, status) in [("tk1", 1i64, "done"), ("tk2", 2i64, "done"), ("tk3", 3i64, "failed")] {
         sqlx::query(
             "INSERT INTO world_ticks (id, world_id, tick_no, base_revision, status, cost_tokens, created_at) \
-             VALUES (?, ?, ?, 0, ?, 10, ?)",
+             VALUES ($1, $2, $3, 0, $4, 10, $5)",
         )
         .bind(tid)
         .bind(&wid)
@@ -677,7 +677,7 @@ async fn seed_played_world(state: &AppState) -> String {
     for (eid, seq, kind) in [("ev1", 1i64, "dialogue"), ("ev2", 2i64, "dialogue"), ("ev3", 3i64, "action")] {
         sqlx::query(
             "INSERT INTO world_events (id, world_id, tick_no, sequence, domain_event_id, event_type, \
-             actors_json, visibility, occurred_at) VALUES (?, ?, 1, ?, ?, ?, '[]', 'public', ?)",
+             actors_json, visibility, occurred_at) VALUES ($1, $2, 1, $3, $4, $5, '[]', 'public', $6)",
         )
         .bind(eid)
         .bind(&wid)
@@ -696,7 +696,7 @@ async fn seed_played_world(state: &AppState) -> String {
 async fn seed_world_ended_audit(state: &AppState, world_id: &str, reason: &str, ending: &str) {
     sqlx::query(
         "INSERT INTO audit_logs (id, actor_id, actor_role, action, subject, reason, created_at) \
-         VALUES (?, 'system', 'system', 'world.ended', ?, ?, ?)",
+         VALUES ($1, 'system', 'system', 'world.ended', $2, $3, $4)",
     )
     .bind(crate::db::new_id("aud"))
     .bind(world_id)
@@ -716,7 +716,7 @@ async fn seal(state: &AppState, world_id: &str, collapsed: bool) {
 }
 
 async fn biography_rows(state: &AppState, world_id: &str) -> Vec<(String, String, String, String, i64)> {
-    sqlx::query_as("SELECT kind, terminal_reason, ending_id, summary_json, sealed_at FROM world_biographies WHERE world_id = ?")
+    sqlx::query_as("SELECT kind, terminal_reason, ending_id, summary_json, sealed_at FROM world_biographies WHERE world_id = $1")
         .bind(world_id)
         .fetch_all(&state.db)
         .await
@@ -733,7 +733,7 @@ async fn biography_summary(state: &AppState, world_id: &str) -> Value {
 async fn worldline_snapshot(state: &AppState, world_id: &str) -> String {
     let world: Vec<(i64, String, String, Option<String>, String, i64)> = sqlx::query_as(
         "SELECT state_revision, status, narrative_state_json, assembled_json, title, updated_at \
-         FROM worlds WHERE id = ?",
+         FROM worlds WHERE id = $1",
     )
     .bind(world_id)
     .fetch_all(&state.db)
@@ -741,14 +741,14 @@ async fn worldline_snapshot(state: &AppState, world_id: &str) -> String {
     .unwrap();
     let events: Vec<(String, String, String, String, i64)> = sqlx::query_as(
         "SELECT id, event_type, visibility, moderation, occurred_at FROM world_events \
-         WHERE world_id = ? ORDER BY id ASC",
+         WHERE world_id = $1 ORDER BY id ASC",
     )
     .bind(world_id)
     .fetch_all(&state.db)
     .await
     .unwrap();
     let ticks: Vec<(String, i64, String, i64)> = sqlx::query_as(
-        "SELECT id, tick_no, status, cost_tokens FROM world_ticks WHERE world_id = ? ORDER BY id ASC",
+        "SELECT id, tick_no, status, cost_tokens FROM world_ticks WHERE world_id = $1 ORDER BY id ASC",
     )
     .bind(world_id)
     .fetch_all(&state.db)
@@ -756,7 +756,7 @@ async fn worldline_snapshot(state: &AppState, world_id: &str) -> String {
     .unwrap();
     let contributions: Vec<(String, i64, i64, i64)> = sqlx::query_as(
         "SELECT character_id, score_milli, milestone_score_milli, settled_at FROM world_contributions \
-         WHERE world_id = ? ORDER BY character_id ASC",
+         WHERE world_id = $1 ORDER BY character_id ASC",
     )
     .bind(world_id)
     .fetch_all(&state.db)
@@ -764,7 +764,7 @@ async fn worldline_snapshot(state: &AppState, world_id: &str) -> String {
     .unwrap();
     let members: Vec<(String, String, String, i64, Option<i64>)> = sqlx::query_as(
         "SELECT id, cloud_character_id, status, joined_at, left_at FROM world_members \
-         WHERE world_id = ? ORDER BY id ASC",
+         WHERE world_id = $1 ORDER BY id ASC",
     )
     .bind(world_id)
     .fetch_all(&state.db)
@@ -835,7 +835,7 @@ async fn be_biography_sealed_on_collapse() {
     assert_eq!(s["settlement"]["worldlineFactor"], json!(COLLAPSE_WORLDLINE_FACTOR));
     // 封卷本身留痕（§0.2 全链审计）
     let audited: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM audit_logs WHERE action = 'world.be_biography_sealed' AND subject = ?",
+        "SELECT COUNT(*) FROM audit_logs WHERE action = 'world.be_biography_sealed' AND subject = $1",
     )
     .bind(&wid)
     .fetch_one(&state.db)
@@ -919,7 +919,7 @@ async fn be_biography_content_is_deterministic_and_blame_free() {
     );
 
     // 重算一次：删掉封卷行再封一次，摘要必须逐字节相同。
-    sqlx::query("DELETE FROM world_biographies WHERE world_id = ?")
+    sqlx::query("DELETE FROM world_biographies WHERE world_id = $1")
         .bind(&wid)
         .execute(&state.db)
         .await
@@ -946,7 +946,7 @@ async fn be_biography_is_idempotent() {
     assert_eq!(first[0].4, again[0].4, "封卷时刻不得被后续调用改写");
     assert_eq!(first[0].3, again[0].3, "封卷内容不得被后续调用改写");
     let audited: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM audit_logs WHERE action = 'world.be_biography_sealed' AND subject = ?",
+        "SELECT COUNT(*) FROM audit_logs WHERE action = 'world.be_biography_sealed' AND subject = $1",
     )
     .bind(&wid)
     .fetch_one(&state.db)

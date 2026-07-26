@@ -10,7 +10,7 @@ use sqlx::{AnyPool, Row};
 
 use crate::app::AppState;
 use crate::auth::{AdminUser, AuthUser};
-use crate::db::{new_id, now_ms};
+use crate::db::{new_id, now_ms, Placeholders};
 use crate::error::ApiError;
 use crate::worlds::{
     create_world as create_world_inner, deathmatch_enabled, enroll_series, is_valid_lethality,
@@ -37,7 +37,8 @@ async fn active_member_counts(db: &AnyPool, ids: &[String]) -> Result<HashMap<St
     if ids.is_empty() {
         return Ok(out);
     }
-    let placeholders = vec!["?"; ids.len()].join(",");
+    // 整条语句只有这一串参数，故从 $1 起顺序发号，与下面 bind 的循环顺序一致。
+    let placeholders = Placeholders::new().list(ids.len());
     let sql = format!(
         "SELECT world_id, COUNT(*) AS n FROM world_members \
          WHERE status = 'active' AND world_id IN ({placeholders}) GROUP BY world_id"
@@ -68,10 +69,13 @@ async fn tick_stats_by_world(
     if ids.is_empty() {
         return Ok(out);
     }
-    let placeholders = vec!["?"; ids.len()].join(",");
+    // 发号顺序 = 下面 bind 的顺序：先日界两端，再整串 ids。
+    let mut ph = Placeholders::new();
+    let (day_from, day_to) = (ph.take(), ph.take());
+    let placeholders = ph.list(ids.len());
     let sql = format!(
         "SELECT world_id, \
-         CAST(COALESCE(SUM(CASE WHEN created_at >= ? AND created_at < ? THEN cost_tokens ELSE 0 END), 0) AS BIGINT) AS today_tokens, \
+         CAST(COALESCE(SUM(CASE WHEN created_at >= {day_from} AND created_at < {day_to} THEN cost_tokens ELSE 0 END), 0) AS BIGINT) AS today_tokens, \
          CAST(COALESCE(SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END), 0) AS BIGINT) AS done_n, \
          CAST(COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS BIGINT) AS failed_n \
          FROM world_ticks WHERE world_id IN ({placeholders}) GROUP BY world_id"
@@ -119,14 +123,21 @@ pub(super) async fn list_worlds(
          COALESCE(b.fused, 0) AS fused \
          FROM worlds w LEFT JOIN world_budgets b ON b.world_id = w.id WHERE 1=1",
     );
+    // 发号顺序 = 下面 bind 的顺序；status/cursor 段出不出现要到运行时才知道。
+    let mut ph = Placeholders::new();
     if q.status.is_some() {
-        sql.push_str(" AND w.status = ?");
+        sql.push_str(&format!(" AND w.status = {}", ph.take()));
     }
     let cursor = q.cursor.as_deref().and_then(parse_cursor);
     if cursor.is_some() {
-        sql.push_str(" AND (w.created_at < ? OR (w.created_at = ? AND w.id < ?))");
+        sql.push_str(&format!(
+            " AND (w.created_at < {} OR (w.created_at = {} AND w.id < {}))",
+            ph.take(),
+            ph.take(),
+            ph.take()
+        ));
     }
-    sql.push_str(" ORDER BY w.created_at DESC, w.id DESC LIMIT ?");
+    sql.push_str(&format!(" ORDER BY w.created_at DESC, w.id DESC LIMIT {}", ph.take()));
 
     let mut query = sqlx::query(&sql);
     if let Some(s) = &q.status {
@@ -231,7 +242,7 @@ pub(super) async fn diagnostics(
     // 最近 10 个 tick 的元数据（含错误码），不含叙事产物。
     let tick_rows = sqlx::query(
         "SELECT tick_no, status, error, cost_tokens, started_at, finished_at, created_at \
-         FROM world_ticks WHERE world_id = ? ORDER BY tick_no DESC LIMIT 10",
+         FROM world_ticks WHERE world_id = $1 ORDER BY tick_no DESC LIMIT 10",
     )
     .bind(&id)
     .fetch_all(&state.db)
@@ -253,7 +264,7 @@ pub(super) async fn diagnostics(
     // 换算单价与公式与 runtime 熔断同源（dashboards::tokens_to_cents ← MUSE_TOKEN_CNY_CENTS_PER_1K）。
     let budget = sqlx::query(
         "SELECT daily_token_budget, daily_cny_budget_cents, spent_tokens_today, budget_day, fused \
-         FROM world_budgets WHERE world_id = ?",
+         FROM world_budgets WHERE world_id = $1",
     )
     .bind(&id)
     .fetch_optional(&state.db)
@@ -303,7 +314,7 @@ pub(super) async fn diagnostics(
 
     // 规则命中：本世界风控事件按 kind 聚合计数（不出 detail_json 内容）。
     let risk_rows = sqlx::query(
-        "SELECT kind, COUNT(*) AS n FROM risk_events WHERE world_id = ? GROUP BY kind",
+        "SELECT kind, COUNT(*) AS n FROM risk_events WHERE world_id = $1 GROUP BY kind",
     )
     .bind(&id)
     .fetch_all(&state.db)
@@ -318,7 +329,7 @@ pub(super) async fn diagnostics(
 
     // 事件审核态计数（仅数量，不含投影内容）。
     let ev_rows = sqlx::query(
-        "SELECT moderation, COUNT(*) AS n FROM world_events WHERE world_id = ? GROUP BY moderation",
+        "SELECT moderation, COUNT(*) AS n FROM world_events WHERE world_id = $1 GROUP BY moderation",
     )
     .bind(&id)
     .fetch_all(&state.db)
@@ -342,7 +353,7 @@ pub(super) async fn diagnostics(
     // BE 结局传记（§9）：崩塌世界的封卷是否已产出。只回**元信息**，正文另走玩家读取面
     // `GET /worlds/{id}/biography`——诊断视图是脱敏面，不在这里塞叙事汇总。
     let biography_json = match sqlx::query(
-        "SELECT kind, terminal_reason, ending_id, sealed_at FROM world_biographies WHERE world_id = ?",
+        "SELECT kind, terminal_reason, ending_id, sealed_at FROM world_biographies WHERE world_id = $1",
     )
     .bind(&id)
     .fetch_optional(&state.db)
@@ -425,7 +436,7 @@ async fn set_world_status(
     action: &str,
     reason: &str,
 ) -> Result<Json<Value>, ApiError> {
-    sqlx::query("UPDATE worlds SET status = ?, updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE worlds SET status = $1, updated_at = $2 WHERE id = $3")
         .bind(status)
         .bind(now_ms())
         .bind(id)
@@ -563,7 +574,7 @@ pub(super) async fn create_world(
         if h.is_empty() {
             return Err(ApiError::BadRequest("hostUserId 不能为空".into()));
         }
-        let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id = ?")
+        let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id = $1")
             .bind(&h)
             .fetch_one(&state.db)
             .await?;
@@ -713,21 +724,29 @@ pub(super) async fn list_templates(
          moderation, star_rating, star_source, saga_id, stage_no, created_at \
          FROM world_templates WHERE 1=1",
     );
+    // 发号顺序 = 下面 bind 的顺序；moderation/saga/cursor 三段各自可有可无，
+    // 且 ORDER BY 二选一——编号只能在运行时随分支长出来。
+    let mut ph = Placeholders::new();
     if q.moderation.is_some() {
-        sql.push_str(" AND moderation = ?");
+        sql.push_str(&format!(" AND moderation = {}", ph.take()));
     }
     if saga_filter.is_some() {
-        sql.push_str(" AND saga_id = ?");
+        sql.push_str(&format!(" AND saga_id = {}", ph.take()));
     }
     // 阶段列表按剧情顺序；普通列表沿用既有游标分页（created_at DESC + id DESC）。
     let cursor = q.cursor.as_deref().and_then(parse_cursor);
     if saga_filter.is_none() && cursor.is_some() {
-        sql.push_str(" AND (created_at < ? OR (created_at = ? AND id < ?))");
+        sql.push_str(&format!(
+            " AND (created_at < {} OR (created_at = {} AND id < {}))",
+            ph.take(),
+            ph.take(),
+            ph.take()
+        ));
     }
     if saga_filter.is_some() {
-        sql.push_str(" ORDER BY stage_no ASC, id ASC LIMIT ?");
+        sql.push_str(&format!(" ORDER BY stage_no ASC, id ASC LIMIT {}", ph.take()));
     } else {
-        sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ?");
+        sql.push_str(&format!(" ORDER BY created_at DESC, id DESC LIMIT {}", ph.take()));
     }
 
     let mut query = sqlx::query(&sql);
@@ -817,7 +836,7 @@ pub(super) async fn set_template_star(
             "reason 非法：定档理由须为 1-{STAR_REASON_MAX_CHARS} 字符"
         )));
     }
-    let res = sqlx::query("UPDATE world_templates SET star_rating = ?, star_source = 'curated' WHERE id = ?")
+    let res = sqlx::query("UPDATE world_templates SET star_rating = $1, star_source = 'curated' WHERE id = $2")
         .bind(req.star)
         .bind(&id)
         .execute(&state.db)
@@ -894,7 +913,7 @@ pub(super) async fn create_template(
     sqlx::query(
         "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, \
          official, version, moderation, saga_id, stage_no, created_at) \
-         VALUES (?, ?, ?, ?, ?, 1, 1, 'pending', ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, 1, 1, 'pending', $6, $7, $8)",
     )
     .bind(&id)
     .bind(req.title.trim())
@@ -910,7 +929,7 @@ pub(super) async fn create_template(
     // 登记到审核队列，供审核工作台 approve/reject（回写 world_templates.moderation）。
     sqlx::query(
         "INSERT INTO audit_queue (id, subject_kind, subject_id, machine_verdict, machine_hits, \
-         status, created_at) VALUES (?, 'template', ?, 'pending', '[]', 'open', ?)",
+         status, created_at) VALUES ($1, 'template', $2, 'pending', '[]', 'open', $3)",
     )
     .bind(new_id("aq"))
     .bind(&id)

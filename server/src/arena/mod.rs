@@ -59,7 +59,7 @@ pub fn router() -> Router<AppState> {
 
 /// 世界最新 tick（无 tick 则 0）：赛事系统事件挂到当前回合，便于回放/战报按拍归位。
 async fn latest_tick_no(db: &AnyPool, world_id: &str) -> i64 {
-    sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(tick_no) FROM world_ticks WHERE world_id = ?")
+    sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(tick_no) FROM world_ticks WHERE world_id = $1")
         .bind(world_id)
         .fetch_one(db)
         .await
@@ -104,7 +104,7 @@ async fn require_host(db: &AnyPool, world_id: &str, user_id: &str) -> Result<(),
 
 /// 确保该世界有一场赛事（首次控制台操作时冷创建，phase=lobby）。并发下唯一索引兜底。
 async fn ensure_match(db: &AnyPool, world_id: &str) -> Result<(), ApiError> {
-    let exists = sqlx::query("SELECT 1 AS x FROM arena_matches WHERE world_id = ?")
+    let exists = sqlx::query("SELECT 1 AS x FROM arena_matches WHERE world_id = $1")
         .bind(world_id)
         .fetch_optional(db)
         .await?
@@ -115,7 +115,7 @@ async fn ensure_match(db: &AnyPool, world_id: &str) -> Result<(), ApiError> {
     let now = now_ms();
     match sqlx::query(
         "INSERT INTO arena_matches (id, world_id, phase, alliances_json, eliminations_json, winner_char_id, updated_at, created_at) \
-         VALUES (?, ?, 'lobby', '[]', '[]', NULL, ?, ?)",
+         VALUES ($1, $2, 'lobby', '[]', '[]', NULL, $3, $4)",
     )
     .bind(new_id("am"))
     .bind(world_id)
@@ -140,7 +140,7 @@ struct MatchView {
 
 async fn load_match(db: &AnyPool, world_id: &str) -> Result<MatchView, ApiError> {
     let row = sqlx::query(
-        "SELECT phase, alliances_json, eliminations_json, winner_char_id FROM arena_matches WHERE world_id = ?",
+        "SELECT phase, alliances_json, eliminations_json, winner_char_id FROM arena_matches WHERE world_id = $1",
     )
     .bind(world_id)
     .fetch_optional(db)
@@ -166,7 +166,7 @@ fn parse_json_array(s: &str) -> Value {
 }
 
 async fn eliminations_of(db: &AnyPool, world_id: &str) -> Result<Vec<String>, ApiError> {
-    let row = sqlx::query("SELECT eliminations_json FROM arena_matches WHERE world_id = ?")
+    let row = sqlx::query("SELECT eliminations_json FROM arena_matches WHERE world_id = $1")
         .bind(world_id)
         .fetch_optional(db)
         .await?;
@@ -197,7 +197,7 @@ async fn host_tick(
 
     ensure_match(&state.db, &world_id).await?;
     // lobby → running：主播开赛第一击。
-    sqlx::query("UPDATE arena_matches SET phase='running', updated_at=? WHERE world_id=? AND phase='lobby'")
+    sqlx::query("UPDATE arena_matches SET phase='running', updated_at=$1 WHERE world_id=$2 AND phase='lobby'")
         .bind(now_ms())
         .bind(&world_id)
         .execute(&state.db)
@@ -236,7 +236,7 @@ async fn get_report(
     // moderation 过滤见 §15 第 2 层——被拦事件仍落库留痕，但不进任何对外读取面）。
     let rows = sqlx::query(
         "SELECT tick_no, sequence, event_type, actors_json, public_projection_json, arbiter_note \
-         FROM world_events WHERE world_id = ? AND visibility = 'public' \
+         FROM world_events WHERE world_id = $1 AND visibility = 'public' \
          AND moderation = 'approved' ORDER BY sequence ASC LIMIT 1000",
     )
     .bind(&world_id)
@@ -267,7 +267,7 @@ async fn get_report(
     // 环境事件（礼物 boon / 环境）——进战报，标注是否已应用到某回合。
     let env_rows = sqlx::query(
         "SELECT applied_tick, kind, payload_json, aggregated_count FROM arena_env_events \
-         WHERE world_id = ? ORDER BY created_at ASC LIMIT 1000",
+         WHERE world_id = $1 ORDER BY created_at ASC LIMIT 1000",
     )
     .bind(&world_id)
     .fetch_all(&state.db)
@@ -363,8 +363,8 @@ async fn get_replay(
     // 回放同样只出 public + 过审事件（§15 第 2 层，与透明战报同口径）。
     let rows = sqlx::query(
         "SELECT id, tick_no, sequence, event_type, actors_json, public_projection_json, arbiter_note, occurred_at \
-         FROM world_events WHERE world_id = ? AND visibility = 'public' \
-         AND moderation = 'approved' AND sequence > ? ORDER BY sequence ASC LIMIT ?",
+         FROM world_events WHERE world_id = $1 AND visibility = 'public' \
+         AND moderation = 'approved' AND sequence > $2 ORDER BY sequence ASC LIMIT $3",
     )
     .bind(&world_id)
     .bind(cursor)
@@ -443,7 +443,7 @@ struct ReviveReq {
 async fn revive_price_cents(db: &AnyPool, world_id: &str) -> Result<i64, ApiError> {
     let row: Option<(i64,)> = sqlx::query_as(
         "SELECT COALESCE(t.revive_price_cents, 0) FROM worlds w \
-         JOIN world_templates t ON w.template_id = t.id WHERE w.id = ?",
+         JOIN world_templates t ON w.template_id = t.id WHERE w.id = $1",
     )
     .bind(world_id)
     .fetch_optional(db)
@@ -470,7 +470,7 @@ async fn revive_match(
     }
 
     // 目标角色须为该世界参赛角色（成员），避免对任意角色写资格。
-    let is_member = sqlx::query("SELECT 1 AS x FROM world_members WHERE world_id=? AND cloud_character_id=? LIMIT 1")
+    let is_member = sqlx::query("SELECT 1 AS x FROM world_members WHERE world_id=$1 AND cloud_character_id=$2 LIMIT 1")
         .bind(&world_id)
         .bind(&body.cloud_character_id)
         .fetch_optional(&state.db)
@@ -491,7 +491,7 @@ async fn revive_match(
     crate::ledger::charge(&mut tx, &user.user_id, price, "revive", "revive_grant", &grant_id, None).await?;
     sqlx::query(
         "INSERT INTO arena_revive_grants (id, world_id, character_id, user_id, status, created_at) \
-         VALUES (?, ?, ?, ?, 'eligible', ?)",
+         VALUES ($1, $2, $3, $4, 'eligible', $5)",
     )
     .bind(&grant_id)
     .bind(&world_id)
@@ -551,7 +551,7 @@ async fn eliminate(
 async fn propose_elimination(state: &AppState, world_id: &str, character_id: &str) -> Result<Value, ApiError> {
     // 参赛角色（成员）校验：淘汰对象须是该世界的角色。
     let owner: Option<(String,)> =
-        sqlx::query_as("SELECT user_id FROM world_members WHERE world_id=? AND cloud_character_id=? LIMIT 1")
+        sqlx::query_as("SELECT user_id FROM world_members WHERE world_id=$1 AND cloud_character_id=$2 LIMIT 1")
             .bind(world_id)
             .bind(character_id)
             .fetch_optional(&state.db)
@@ -561,7 +561,7 @@ async fn propose_elimination(state: &AppState, world_id: &str, character_id: &st
     }
 
     // 已在台账 → 幂等返回当前状态（不重复建同意）。
-    if let Some(row) = sqlx::query("SELECT status, consent_id FROM arena_eliminations WHERE world_id=? AND character_id=?")
+    if let Some(row) = sqlx::query("SELECT status, consent_id FROM arena_eliminations WHERE world_id=$1 AND character_id=$2")
         .bind(world_id)
         .bind(character_id)
         .fetch_optional(&state.db)
@@ -587,7 +587,7 @@ async fn propose_elimination(state: &AppState, world_id: &str, character_id: &st
     let now = now_ms();
     sqlx::query(
         "INSERT INTO arena_eliminations (id, world_id, character_id, consent_id, status, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, 'pending_consent', ?, ?)",
+         VALUES ($1, $2, $3, $4, 'pending_consent', $5, $6)",
     )
     .bind(new_id("ae"))
     .bind(world_id)
@@ -629,7 +629,7 @@ async fn settle_consented_eliminations(state: &AppState, world_id: &str) -> Resu
     let _ = crate::consents::expire_stale_consents(&state.db).await;
 
     let pending = sqlx::query(
-        "SELECT character_id, consent_id FROM arena_eliminations WHERE world_id=? AND status='pending_consent'",
+        "SELECT character_id, consent_id FROM arena_eliminations WHERE world_id=$1 AND status='pending_consent'",
     )
     .bind(world_id)
     .fetch_all(&state.db)
@@ -640,7 +640,7 @@ async fn settle_consented_eliminations(state: &AppState, world_id: &str) -> Resu
         let consent_id: Option<String> = row.try_get("consent_id")?;
         let Some(consent_id) = consent_id else { continue };
         let cstatus: Option<(String,)> =
-            sqlx::query_as("SELECT status FROM consent_requests WHERE id=?").bind(&consent_id).fetch_optional(&state.db).await?;
+            sqlx::query_as("SELECT status FROM consent_requests WHERE id=$1").bind(&consent_id).fetch_optional(&state.db).await?;
         let Some((cstatus,)) = cstatus else { continue };
         match cstatus.as_str() {
             // 仅当事人同意，淘汰才落定（不可逆行动的同意门控）。
@@ -677,7 +677,7 @@ async fn add_elimination(db: &AnyPool, world_id: &str, character_id: &str) -> Re
     if !elim.iter().any(|c| c == character_id) {
         elim.push(character_id.to_string());
     }
-    sqlx::query("UPDATE arena_matches SET eliminations_json=?, updated_at=? WHERE world_id=?")
+    sqlx::query("UPDATE arena_matches SET eliminations_json=$1, updated_at=$2 WHERE world_id=$3")
         .bind(serde_json::to_string(&elim).unwrap_or_else(|_| "[]".into()))
         .bind(now_ms())
         .bind(world_id)
@@ -687,7 +687,7 @@ async fn add_elimination(db: &AnyPool, world_id: &str, character_id: &str) -> Re
 }
 
 async fn mark_elim(db: &AnyPool, world_id: &str, character_id: &str, status: &str) -> Result<(), ApiError> {
-    sqlx::query("UPDATE arena_eliminations SET status=?, updated_at=? WHERE world_id=? AND character_id=?")
+    sqlx::query("UPDATE arena_eliminations SET status=$1, updated_at=$2 WHERE world_id=$3 AND character_id=$4")
         .bind(status)
         .bind(now_ms())
         .bind(world_id)
@@ -705,7 +705,7 @@ async fn mark_elim(db: &AnyPool, world_id: &str, character_id: &str, status: &st
 /// （历练是累加量，不能靠 ON CONFLICT 幂等，必须靠转变沿只发一次）。
 async fn recompute_winner(state: &AppState, world_id: &str) -> Result<(), ApiError> {
     let roster: Vec<(String,)> =
-        sqlx::query_as("SELECT cloud_character_id FROM world_members WHERE world_id=? AND status='active'")
+        sqlx::query_as("SELECT cloud_character_id FROM world_members WHERE world_id=$1 AND status='active'")
             .bind(world_id)
             .fetch_all(&state.db)
             .await?;
@@ -721,8 +721,8 @@ async fn recompute_winner(state: &AppState, world_id: &str) -> Result<(), ApiErr
         let mut tx = state.db.begin().await?;
         // CAS：仅首次收敛（phase 尚非 concluded）才落定并发奖；重复/并发 settle 0 行命中 → 回滚跳过。
         let cas = sqlx::query(
-            "UPDATE arena_matches SET winner_char_id=?, phase='concluded', updated_at=? \
-             WHERE world_id=? AND phase != 'concluded'",
+            "UPDATE arena_matches SET winner_char_id=$1, phase='concluded', updated_at=$2 \
+             WHERE world_id=$3 AND phase != 'concluded'",
         )
         .bind(winner)
         .bind(now_ms())
@@ -778,7 +778,7 @@ async fn grant_champion_reward_tx(
 ) -> Result<(), ApiError> {
     sqlx::query(
         "INSERT INTO arena_rewards (id, world_id, character_id, kind, label, season, created_at) \
-         VALUES (?, ?, ?, 'title', '赛事冠军', NULL, ?) \
+         VALUES ($1, $2, $3, 'title', '赛事冠军', NULL, $4) \
          ON CONFLICT(world_id, character_id, kind) DO NOTHING",
     )
     .bind(new_id("rw"))

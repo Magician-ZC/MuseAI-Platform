@@ -53,7 +53,7 @@ async fn seed_char(state: &AppState, id: &str, owner: &str) {
     sqlx::query(
         "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, \
          rights_declaration, moderation, withdrawn, created_at, mileage) \
-         VALUES (?, ?, 'local', 1, '{}', 'original', 'approved', 0, ?, 0)",
+         VALUES ($1, $2, 'local', 1, '{}', 'original', 'approved', 0, $3, 0)",
     )
     .bind(id)
     .bind(owner)
@@ -65,7 +65,7 @@ async fn seed_char(state: &AppState, id: &str, owner: &str) {
 
 /// 把公示产出表钉进实例（结算侧的唯一数据源，与真实装配同一字段）。
 async fn set_assembled(state: &AppState, world_id: &str, wrapper: Value) {
-    sqlx::query("UPDATE worlds SET assembled_json = ? WHERE id = ?")
+    sqlx::query("UPDATE worlds SET assembled_json = $1 WHERE id = $2")
         .bind(wrapper.to_string())
         .bind(world_id)
         .execute(&state.db)
@@ -77,7 +77,7 @@ async fn seed_contribution(state: &AppState, world_id: &str, cid: &str, mileston
     sqlx::query(
         "INSERT INTO world_contributions \
          (world_id, character_id, score_milli, milestone_score_milli, settled_at, updated_at) \
-         VALUES (?, ?, ?, ?, 0, ?)",
+         VALUES ($1, $2, $3, $4, 0, $5)",
     )
     .bind(world_id)
     .bind(cid)
@@ -126,7 +126,7 @@ async fn seed_card(state: &AppState, owner: &str, star: i64, key: &str, label: &
 /// (id, star, label, status) 全量回读，按 id 升序（断言用，顺序稳定）。
 async fn cards_of(state: &AppState, owner: &str) -> Vec<(String, i64, String, String)> {
     sqlx::query_as::<_, (String, i64, String, String)>(
-        "SELECT id, star_rating, label, status FROM subplot_cards WHERE owner_id = ? ORDER BY id ASC",
+        "SELECT id, star_rating, label, status FROM subplot_cards WHERE owner_id = $1 ORDER BY id ASC",
     )
     .bind(owner)
     .fetch_all(&state.db)
@@ -495,7 +495,7 @@ async fn synthesis_consumes_sources_and_mints_next_star() {
 
     // 审计留痕（§0.2 全链审计）。
     let n: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM audit_logs WHERE action = 'subplot.card_synthesized' AND subject = ?",
+        "SELECT COUNT(*) FROM audit_logs WHERE action = 'subplot.card_synthesized' AND subject = $1",
     )
     .bind(&new_id)
     .fetch_one(&state.db)
@@ -592,7 +592,7 @@ async fn synthesis_writes_roll_back_as_one_unit() {
     .await
     .unwrap()
     .unwrap();
-    sqlx::query("UPDATE subplot_cards SET status='consumed', consumed_at=?, consumed_into=? WHERE id=?")
+    sqlx::query("UPDATE subplot_cards SET status='consumed', consumed_at=$1, consumed_into=$2 WHERE id=$3")
         .bind(now_ms())
         .bind(&minted)
         .bind(&a)

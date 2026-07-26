@@ -345,7 +345,7 @@ pub(crate) async fn grant_card_tx(
         "INSERT INTO subplot_cards (id, owner_id, star_rating, label, origin_kind, grant_key, \
          source_world_id, source_template_id, source_template_version, synthesized_from_json, \
          status, consumed_into, acquired_at, consumed_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'owned', NULL, ?, NULL)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'owned', NULL, $11, NULL)",
     )
     .bind(&card_id)
     .bind(card.owner_id)
@@ -460,7 +460,7 @@ async fn world_template_ref_tx(
     tx: &mut Transaction<'_, Any>,
     world_id: &str,
 ) -> Result<(Option<String>, Option<i64>), ApiError> {
-    let row = sqlx::query("SELECT template_id, template_version FROM worlds WHERE id = ?")
+    let row = sqlx::query("SELECT template_id, template_version FROM worlds WHERE id = $1")
         .bind(world_id)
         .fetch_optional(&mut **tx)
         .await?;
@@ -517,7 +517,7 @@ async fn my_subplot_cards(
     let rows = sqlx::query(
         "SELECT id, star_rating, label, origin_kind, status, source_world_id, source_template_id, \
          source_template_version, synthesized_from_json, consumed_into, acquired_at, consumed_at \
-         FROM subplot_cards WHERE owner_id = ? AND (? = 'all' OR status = ?) \
+         FROM subplot_cards WHERE owner_id = $1 AND ($2 = 'all' OR status = $3) \
          ORDER BY star_rating DESC, acquired_at DESC, id ASC",
     )
     .bind(&user.user_id)
@@ -607,7 +607,7 @@ async fn synthesize(
     for id in &ordered {
         let row = sqlx::query(
             "SELECT id, star_rating, label, status, source_world_id, source_template_id, \
-             source_template_version FROM subplot_cards WHERE id = ? AND owner_id = ?",
+             source_template_version FROM subplot_cards WHERE id = $1 AND owner_id = $2",
         )
         .bind(id)
         .bind(&user.user_id)
@@ -662,8 +662,8 @@ async fn synthesize(
     // ---- 销毁源卡（CAS：只熔仍在手的卡；抢不到即整笔回滚，新卡随之消失） ----
     for c in &sources {
         let res = sqlx::query(
-            "UPDATE subplot_cards SET status = ?, consumed_at = ?, consumed_into = ? \
-             WHERE id = ? AND owner_id = ? AND status = ?",
+            "UPDATE subplot_cards SET status = $1, consumed_at = $2, consumed_into = $3 \
+             WHERE id = $4 AND owner_id = $5 AND status = $6",
         )
         .bind(STATUS_CONSUMED)
         .bind(now)
@@ -682,7 +682,7 @@ async fn synthesize(
     // 全链审计（§0.2）：回收口的每一次销毁都留痕。
     sqlx::query(
         "INSERT INTO audit_logs (id, actor_id, actor_role, action, subject, reason, created_at) \
-         VALUES (?, ?, 'user', 'subplot.card_synthesized', ?, ?, ?)",
+         VALUES ($1, $2, 'user', 'subplot.card_synthesized', $3, $4, $5)",
     )
     .bind(new_id("aud"))
     .bind(&user.user_id)

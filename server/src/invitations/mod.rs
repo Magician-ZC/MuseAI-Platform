@@ -217,8 +217,8 @@ struct StatusQuery {
 async fn expire_stale_invitations(db: &AnyPool) -> Result<u64, ApiError> {
     let now = now_ms();
     let res = sqlx::query(
-        "UPDATE room_invitations SET status = ?, responded_at = ? \
-         WHERE status = 'pending' AND expires_at <= ?",
+        "UPDATE room_invitations SET status = $1, responded_at = $2 \
+         WHERE status = 'pending' AND expires_at <= $3",
     )
     .bind(STATUS_EXPIRED)
     .bind(now)
@@ -234,7 +234,7 @@ async fn character_name(db: &AnyPool, character_id: &str) -> String {
     if character_id.trim().is_empty() {
         return "房主".to_string();
     }
-    let card: Option<String> = sqlx::query_scalar("SELECT card_json FROM cloud_characters WHERE id = ?")
+    let card: Option<String> = sqlx::query_scalar("SELECT card_json FROM cloud_characters WHERE id = $1")
         .bind(character_id)
         .fetch_optional(db)
         .await
@@ -257,7 +257,7 @@ struct WorldBrief {
 
 async fn load_world_brief(db: &AnyPool, world_id: &str) -> Result<WorldBrief, ApiError> {
     let row: Option<(String, Option<String>, String, String)> =
-        sqlx::query_as("SELECT status, host_user_id, lethality, title FROM worlds WHERE id = ?")
+        sqlx::query_as("SELECT status, host_user_id, lethality, title FROM worlds WHERE id = $1")
             .bind(world_id)
             .fetch_optional(db)
             .await?;
@@ -283,7 +283,7 @@ async fn deathmatch_age_gate_ok(
     if effective_lethality(&world.lethality) != Lethality::Deathmatch {
         return Ok(true);
     }
-    let age: Option<(i64,)> = sqlx::query_as("SELECT age_declared FROM users WHERE id = ?")
+    let age: Option<(i64,)> = sqlx::query_as("SELECT age_declared FROM users WHERE id = $1")
         .bind(user_id)
         .fetch_optional(db)
         .await?;
@@ -328,7 +328,7 @@ async fn create_invitation(
     // 邀请人资格：必须是该世界的 active 成员，或世界房主。路人不能拿别人的房当骚扰通道。
     let my_membership: Option<(String,)> = sqlx::query_as(
         "SELECT cloud_character_id FROM world_members \
-         WHERE world_id = ? AND user_id = ? AND status = 'active'",
+         WHERE world_id = $1 AND user_id = $2 AND status = 'active'",
     )
     .bind(&world_id)
     .bind(&user.user_id)
@@ -343,7 +343,7 @@ async fn create_invitation(
 
     // 目标角色（面具寻址）→ 服务端内部解析收件人。
     let target: Option<(String, String, i64)> =
-        sqlx::query_as("SELECT owner_id, moderation, withdrawn FROM cloud_characters WHERE id = ?")
+        sqlx::query_as("SELECT owner_id, moderation, withdrawn FROM cloud_characters WHERE id = $1")
             .bind(&target_id)
             .fetch_optional(&state.db)
             .await?;
@@ -357,7 +357,7 @@ async fn create_invitation(
 
     // 已在场 → 无须邀请（阵容对本世界成员本就可见，此处不构成新的信息泄露）。
     let already_in: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM world_members WHERE world_id = ? AND user_id = ? AND status = 'active'",
+        "SELECT COUNT(*) FROM world_members WHERE world_id = $1 AND user_id = $2 AND status = 'active'",
     )
     .bind(&world_id)
     .bind(&invitee_user_id)
@@ -390,7 +390,7 @@ async fn create_invitation(
     // （换角色、换世界、换邀请人仍可——这条治理的是"被拒后反复纠缠"。）
     let declined_before: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM room_invitations \
-         WHERE world_id = ? AND inviter_user_id = ? AND invitee_character_id = ? AND status = 'declined'",
+         WHERE world_id = $1 AND inviter_user_id = $2 AND invitee_character_id = $3 AND status = 'declined'",
     )
     .bind(&world_id)
     .bind(&user.user_id)
@@ -405,7 +405,7 @@ async fn create_invitation(
     // 不刷新有效期、不再发一次通知，也就无法靠反复调用制造通知轰炸。
     let existing: Option<(String, i64, i64)> = sqlx::query_as(
         "SELECT id, expires_at, created_at FROM room_invitations \
-         WHERE world_id = ? AND inviter_user_id = ? AND invitee_character_id = ? AND status = 'pending'",
+         WHERE world_id = $1 AND inviter_user_id = $2 AND invitee_character_id = $3 AND status = 'pending'",
     )
     .bind(&world_id)
     .bind(&user.user_id)
@@ -430,7 +430,7 @@ async fn create_invitation(
     // 防骚扰 ③：每人每日（滚动 24h）发出总量上限，**跨世界合计**。
     let now = now_ms();
     let sent_today: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM room_invitations WHERE inviter_user_id = ? AND created_at >= ?",
+        "SELECT COUNT(*) FROM room_invitations WHERE inviter_user_id = $1 AND created_at >= $2",
     )
     .bind(&user.user_id)
     .bind(now - INVITE_QUOTA_WINDOW_MS)
@@ -446,7 +446,7 @@ async fn create_invitation(
         "INSERT INTO room_invitations \
          (id, world_id, inviter_user_id, inviter_character_id, invitee_user_id, invitee_character_id, \
           status, expires_at, responded_at, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, 0, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, 0, $8)",
     )
     .bind(&id)
     .bind(&world_id)
@@ -507,7 +507,7 @@ async fn list_sent(
     let filter = q.status.unwrap_or_else(|| STATUS_PENDING.to_string());
     let rows: Vec<(String, String, String, i64, i64)> = sqlx::query_as(
         "SELECT id, invitee_character_id, status, expires_at, created_at FROM room_invitations \
-         WHERE world_id = ? AND inviter_user_id = ? AND (? = 'all' OR status = ?) \
+         WHERE world_id = $1 AND inviter_user_id = $2 AND ($3 = 'all' OR status = $4) \
          ORDER BY created_at DESC LIMIT 100",
     )
     .bind(&world_id)
@@ -549,7 +549,7 @@ async fn list_received(
         "SELECT i.id, i.world_id, w.title, i.inviter_character_id, i.invitee_character_id, \
                 i.expires_at, i.created_at \
          FROM room_invitations i JOIN worlds w ON w.id = i.world_id \
-         WHERE i.invitee_user_id = ? AND (? = 'all' OR i.status = ?) \
+         WHERE i.invitee_user_id = $1 AND ($2 = 'all' OR i.status = $3) \
          ORDER BY i.created_at DESC LIMIT 100",
     )
     .bind(&user.user_id)
@@ -610,7 +610,7 @@ async fn respond(
     expire_stale_invitations(&state.db).await?;
 
     let row: Option<(String, String, String, String)> = sqlx::query_as(
-        "SELECT world_id, invitee_user_id, invitee_character_id, status FROM room_invitations WHERE id = ?",
+        "SELECT world_id, invitee_user_id, invitee_character_id, status FROM room_invitations WHERE id = $1",
     )
     .bind(&invitation_id)
     .fetch_optional(&state.db)
@@ -645,7 +645,7 @@ async fn respond(
     let now = now_ms();
     // 条件 UPDATE（CAS）：并发下只有一次能把 pending 推进，避免读改写丢更新。
     let res = sqlx::query(
-        "UPDATE room_invitations SET status = ?, responded_at = ? WHERE id = ? AND status = 'pending'",
+        "UPDATE room_invitations SET status = $1, responded_at = $2 WHERE id = $3 AND status = 'pending'",
     )
     .bind(new_status)
     .bind(now)
@@ -655,7 +655,7 @@ async fn respond(
     if res.rows_affected() == 0 {
         // 被并发抢先解决 → 回读权威状态，幂等返回。
         let cur: String =
-            sqlx::query_scalar("SELECT status FROM room_invitations WHERE id = ?")
+            sqlx::query_scalar("SELECT status FROM room_invitations WHERE id = $1")
                 .bind(&invitation_id)
                 .fetch_one(&state.db)
                 .await?;

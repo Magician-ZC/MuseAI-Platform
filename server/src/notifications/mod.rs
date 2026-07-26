@@ -51,7 +51,7 @@ pub async fn enqueue_notification(
     let id = crate::db::new_id("ntf");
     let res = sqlx::query(
         "INSERT INTO notification_outbox (id, user_id, kind, payload_json, status, attempts, dedupe_key, due_at, created_at) \
-         VALUES (?, ?, ?, ?, 'pending', 0, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, 'pending', 0, $5, $6, $7)",
     )
     .bind(&id)
     .bind(user_id)
@@ -76,7 +76,7 @@ pub async fn enqueue_notification(
 /// 消费一条 outbox（worker 单步）。幂等：已非 pending → Skipped。
 pub async fn deliver(state: &AppState, outbox_id: &str) -> Result<DeliveryOutcome, ApiError> {
     let row: Option<(String, String, String, i64)> =
-        sqlx::query_as("SELECT user_id, kind, status, attempts FROM notification_outbox WHERE id = ?")
+        sqlx::query_as("SELECT user_id, kind, status, attempts FROM notification_outbox WHERE id = $1")
             .bind(outbox_id)
             .fetch_optional(&state.db)
             .await?;
@@ -90,13 +90,13 @@ pub async fn deliver(state: &AppState, outbox_id: &str) -> Result<DeliveryOutcom
     // 偏好：退订 / 静默时段。N-2：事务/安全类（不可逆事件同意请求）豁免退订与静默，始终尽快送达。
     let essential = is_essential_kind(&kind);
     let pref: Option<(i64, String)> =
-        sqlx::query_as("SELECT unsubscribed, quiet_hours FROM notification_preferences WHERE user_id = ?")
+        sqlx::query_as("SELECT unsubscribed, quiet_hours FROM notification_preferences WHERE user_id = $1")
             .bind(&user_id)
             .fetch_optional(&state.db)
             .await?;
     if let Some((unsub, quiet)) = pref {
         if unsub != 0 && !essential {
-            sqlx::query("UPDATE notification_outbox SET status = 'suppressed' WHERE id = ?")
+            sqlx::query("UPDATE notification_outbox SET status = 'suppressed' WHERE id = $1")
                 .bind(outbox_id)
                 .execute(&state.db)
                 .await?;
@@ -106,7 +106,7 @@ pub async fn deliver(state: &AppState, outbox_id: &str) -> Result<DeliveryOutcom
         // 静默时段仅延后非事务类；事务类不延后，避免同意通知被推迟到 TTL 之外造成保守失效。
         if !essential {
             if let Some(resume_at) = quiet_resume_ms(&quiet, crate::db::now_ms()) {
-                sqlx::query("UPDATE notification_outbox SET due_at = ? WHERE id = ?")
+                sqlx::query("UPDATE notification_outbox SET due_at = $1 WHERE id = $2")
                     .bind(resume_at)
                     .bind(outbox_id)
                     .execute(&state.db)
@@ -121,7 +121,7 @@ pub async fn deliver(state: &AppState, outbox_id: &str) -> Result<DeliveryOutcom
     // dev "发送"：写日志即视为送达。真实渠道 = provider 接入位。
     let send_ok = dev_send(&user_id, outbox_id).await;
     if send_ok {
-        sqlx::query("UPDATE notification_outbox SET status = 'sent', sent_at = ?, attempts = attempts + 1 WHERE id = ?")
+        sqlx::query("UPDATE notification_outbox SET status = 'sent', sent_at = $1, attempts = attempts + 1 WHERE id = $2")
             .bind(crate::db::now_ms())
             .bind(outbox_id)
             .execute(&state.db)
@@ -132,7 +132,7 @@ pub async fn deliver(state: &AppState, outbox_id: &str) -> Result<DeliveryOutcom
         if next < MAX_ATTEMPTS {
             // due_at 同步推到退避点：rescan 以 due_at 为准，避免退避窗口内被重扫提前重推。
             let backoff = crate::db::now_ms() + 60_000 * next;
-            sqlx::query("UPDATE notification_outbox SET attempts = ?, due_at = ? WHERE id = ?")
+            sqlx::query("UPDATE notification_outbox SET attempts = $1, due_at = $2 WHERE id = $3")
                 .bind(next)
                 .bind(backoff)
                 .bind(outbox_id)
@@ -141,7 +141,7 @@ pub async fn deliver(state: &AppState, outbox_id: &str) -> Result<DeliveryOutcom
             crate::queue::push_json(state.queue.as_ref(), NOTIFY_TOPIC, &NotifyJob { outbox_id: outbox_id.to_string() }, backoff).await;
             Ok(DeliveryOutcome::Retried)
         } else {
-            sqlx::query("UPDATE notification_outbox SET status = 'failed', attempts = ? WHERE id = ?")
+            sqlx::query("UPDATE notification_outbox SET status = 'failed', attempts = $1 WHERE id = $2")
                 .bind(next)
                 .bind(outbox_id)
                 .execute(&state.db)
@@ -172,7 +172,7 @@ fn is_essential_kind(kind: &str) -> bool {
 pub async fn rescan_pending(state: &AppState) -> Result<u64, ApiError> {
     let now = crate::db::now_ms();
     let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT id FROM notification_outbox WHERE status = 'pending' AND due_at <= ? ORDER BY due_at ASC LIMIT 500",
+        "SELECT id FROM notification_outbox WHERE status = 'pending' AND due_at <= $1 ORDER BY due_at ASC LIMIT 500",
     )
     .bind(now)
     .fetch_all(&state.db)
@@ -243,7 +243,7 @@ struct PrefReq {
 
 async fn get_prefs(State(state): State<AppState>, user: AuthUser) -> Result<Json<serde_json::Value>, ApiError> {
     let row: Option<(String, String, i64)> =
-        sqlx::query_as("SELECT channels_json, quiet_hours, unsubscribed FROM notification_preferences WHERE user_id = ?")
+        sqlx::query_as("SELECT channels_json, quiet_hours, unsubscribed FROM notification_preferences WHERE user_id = $1")
             .bind(&user.user_id)
             .fetch_optional(&state.db)
             .await?;
@@ -263,7 +263,7 @@ async fn put_prefs(
     let channels = if req.channels.is_null() { json!({}) } else { req.channels };
     sqlx::query(
         "INSERT INTO notification_preferences (user_id, channels_json, quiet_hours, unsubscribed, updated_at) \
-         VALUES (?, ?, ?, ?, ?) \
+         VALUES ($1, $2, $3, $4, $5) \
          ON CONFLICT(user_id) DO UPDATE SET channels_json = excluded.channels_json, quiet_hours = excluded.quiet_hours, \
          unsubscribed = excluded.unsubscribed, updated_at = excluded.updated_at",
     )
@@ -290,7 +290,7 @@ async fn list_notifications(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let rows: Vec<(String, String, String, String, i64)> = sqlx::query_as(
         "SELECT id, kind, payload_json, status, created_at FROM notification_outbox \
-         WHERE user_id = ? AND (? IS NULL OR created_at < ?) ORDER BY created_at DESC LIMIT 30",
+         WHERE user_id = $1 AND ($2 IS NULL OR created_at < $3) ORDER BY created_at DESC LIMIT 30",
     )
     .bind(&user.user_id)
     .bind(q.cursor)
@@ -402,7 +402,7 @@ mod tests {
         seed_user(&state.db, "u1").await;
         sqlx::query(
             "INSERT INTO notification_preferences (user_id, channels_json, quiet_hours, unsubscribed, updated_at) \
-             VALUES ('u1', '{}', '', 1, ?)",
+             VALUES ('u1', '{}', '', 1, $1)",
         )
         .bind(crate::db::now_ms())
         .execute(&state.db)
@@ -480,7 +480,7 @@ mod tests {
         let ins = |id: &'static str| {
             sqlx::query(
                 "INSERT INTO notification_outbox (id, user_id, kind, payload_json, status, attempts, dedupe_key, due_at, created_at) \
-                 VALUES (?, 'u1', 'daily_report', '{}', 'pending', 0, 'dk-x', ?, ?)",
+                 VALUES ($1, 'u1', 'daily_report', '{}', 'pending', 0, 'dk-x', $2, $3)",
             )
             .bind(id)
             .bind(now)
@@ -511,7 +511,7 @@ mod tests {
         seed_user(&state.db, "u1").await;
         sqlx::query(
             "INSERT INTO notification_preferences (user_id, channels_json, quiet_hours, unsubscribed, updated_at) \
-             VALUES ('u1', '{}', '', 1, ?)",
+             VALUES ('u1', '{}', '', 1, $1)",
         )
         .bind(crate::db::now_ms())
         .execute(&state.db)
@@ -548,7 +548,7 @@ mod tests {
         // 孤儿：直接插 pending 行，不入队（模拟 deliver 出错留下 / MemQueue 重启丢失）。
         sqlx::query(
             "INSERT INTO notification_outbox (id, user_id, kind, payload_json, status, attempts, due_at, created_at) \
-             VALUES ('orphan1', 'u1', 'daily_report', '{}', 'pending', 0, ?, ?)",
+             VALUES ('orphan1', 'u1', 'daily_report', '{}', 'pending', 0, $1, $2)",
         )
         .bind(now - 1)
         .bind(now)
@@ -579,7 +579,7 @@ mod tests {
         // 未到期（静默延后 / 退避中）的 pending 行 due_at 在未来，不应被提前重推。
         sqlx::query(
             "INSERT INTO notification_outbox (id, user_id, kind, payload_json, status, attempts, due_at, created_at) \
-             VALUES ('future1', 'u1', 'daily_report', '{}', 'pending', 0, ?, ?)",
+             VALUES ('future1', 'u1', 'daily_report', '{}', 'pending', 0, $1, $2)",
         )
         .bind(now + 3_600_000)
         .bind(now)

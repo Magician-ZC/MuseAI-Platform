@@ -266,8 +266,8 @@ pub(crate) async fn seal_character_tx(
     //    （`worlds::join_world` 读 withdrawn，读不到 memorial_status——见模块头 ①）。
     let res = sqlx::query(
         "UPDATE cloud_characters \
-         SET memorial_status = ?, memorial_sealed_at = ?, memorial_world_id = ?, withdrawn = 1 \
-         WHERE id = ? AND owner_id = ? AND memorial_status = ?",
+         SET memorial_status = $1, memorial_sealed_at = $2, memorial_world_id = $3, withdrawn = 1 \
+         WHERE id = $4 AND owner_id = $5 AND memorial_status = $6",
     )
     .bind(STATUS_SEALED)
     .bind(sealed_at)
@@ -289,7 +289,7 @@ pub(crate) async fn seal_character_tx(
         "UPDATE backpacks \
          SET status = 'owned', carried_world_id = NULL, power_tier_override = NULL, \
              effect_tags_override = NULL \
-         WHERE user_id = ? AND carried_world_id = ? AND status IN ('carried', 'sealed')",
+         WHERE user_id = $1 AND carried_world_id = $2 AND status IN ('carried', 'sealed')",
     )
     .bind(owner_id)
     .bind(world_id)
@@ -331,7 +331,7 @@ async fn grant_departed_marks_tx(
     granted_at: i64,
 ) -> Result<u64, ApiError> {
     let state_json: Option<String> =
-        sqlx::query_scalar("SELECT narrative_state_json FROM worlds WHERE id = ?")
+        sqlx::query_scalar("SELECT narrative_state_json FROM worlds WHERE id = $1")
             .bind(world_id)
             .fetch_optional(&mut **tx)
             .await?;
@@ -370,7 +370,7 @@ async fn grant_departed_marks_tx(
     for other in counterparts {
         // 对端必须是**在世**的云端角色卡（NPC 无此行 → 天然跳过；传世卡只读 → 不再接收印记）。
         let row = sqlx::query(
-            "SELECT owner_id FROM cloud_characters WHERE id = ? AND memorial_status = ?",
+            "SELECT owner_id FROM cloud_characters WHERE id = $1 AND memorial_status = $2",
         )
         .bind(&other)
         .bind(STATUS_LIVING)
@@ -382,7 +382,7 @@ async fn grant_departed_marks_tx(
         let res = sqlx::query(
             "INSERT INTO memorial_marks \
              (id, character_id, owner_id, deceased_character_id, world_id, kind, granted_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(new_id("mm"))
         .bind(&other)
@@ -434,7 +434,7 @@ async fn find_death_evidence(
 ) -> Result<Option<DeathEvidence>, ApiError> {
     let rows = sqlx::query(
         "SELECT world_id, subject_character_ids FROM consent_requests \
-         WHERE event_kind = ? AND status = 'approved' \
+         WHERE event_kind = $1 AND status = 'approved' \
          ORDER BY resolved_at ASC, id ASC",
     )
     .bind(EVENT_KIND_DEATH)
@@ -464,7 +464,7 @@ async fn find_death_evidence(
 /// 宁可拒绝封卷也不凭空判人死亡）。
 async fn death_has_landed(db: &AnyPool, world_id: &str, character_id: &str) -> Result<bool, ApiError> {
     let state_json: Option<String> =
-        sqlx::query_scalar("SELECT narrative_state_json FROM worlds WHERE id = ?")
+        sqlx::query_scalar("SELECT narrative_state_json FROM worlds WHERE id = $1")
             .bind(world_id)
             .fetch_optional(db)
             .await?;
@@ -511,7 +511,7 @@ async fn seal_memorial(
     }
 
     // 归属校验（§9.6 服务端权威）：只有卡的主人能为它封卷。
-    let row = sqlx::query("SELECT owner_id, memorial_status FROM cloud_characters WHERE id = ?")
+    let row = sqlx::query("SELECT owner_id, memorial_status FROM cloud_characters WHERE id = $1")
         .bind(&character_id)
         .fetch_optional(&state.db)
         .await?
@@ -595,7 +595,7 @@ async fn memorial_hall(
     let offset = q.offset.unwrap_or(0).max(0);
 
     let total: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM cloud_characters WHERE memorial_status = ?")
+        sqlx::query_scalar("SELECT COUNT(*) FROM cloud_characters WHERE memorial_status = $1")
             .bind(STATUS_SEALED)
             .fetch_one(&state.db)
             .await?;
@@ -606,8 +606,8 @@ async fn memorial_hall(
                 cc.avatar_url AS avatar_url, cc.memorial_sealed_at AS sealed_at, \
                 cc.memorial_world_id AS world_id, w.title AS world_title \
          FROM cloud_characters cc LEFT JOIN worlds w ON w.id = cc.memorial_world_id \
-         WHERE cc.memorial_status = ? \
-         ORDER BY cc.memorial_sealed_at DESC, cc.id ASC LIMIT ? OFFSET ?",
+         WHERE cc.memorial_status = $1 \
+         ORDER BY cc.memorial_sealed_at DESC, cc.id ASC LIMIT $2 OFFSET $3",
     )
     .bind(STATUS_SEALED)
     .bind(limit)
@@ -659,7 +659,7 @@ async fn memorial_detail(
                 cc.memorial_sealed_at AS sealed_at, cc.memorial_world_id AS world_id, \
                 w.title AS world_title \
          FROM cloud_characters cc LEFT JOIN worlds w ON w.id = cc.memorial_world_id \
-         WHERE cc.id = ? AND cc.memorial_status = ?",
+         WHERE cc.id = $1 AND cc.memorial_status = $2",
     )
     .bind(&character_id)
     .bind(STATUS_SEALED)
@@ -673,7 +673,7 @@ async fn memorial_detail(
         "SELECT wm.world_id AS world_id, wm.status AS status, wm.joined_at AS joined_at, \
                 wm.left_at AS left_at, w.title AS title \
          FROM world_members wm LEFT JOIN worlds w ON w.id = wm.world_id \
-         WHERE wm.cloud_character_id = ? ORDER BY wm.joined_at ASC, wm.world_id ASC",
+         WHERE wm.cloud_character_id = $1 ORDER BY wm.joined_at ASC, wm.world_id ASC",
     )
     .bind(&character_id)
     .fetch_all(&state.db)
@@ -694,7 +694,7 @@ async fn memorial_detail(
         "SELECT mm.character_id AS character_id, mm.world_id AS world_id, \
                 mm.granted_at AS granted_at, cc.card_json AS card_json \
          FROM memorial_marks mm LEFT JOIN cloud_characters cc ON cc.id = mm.character_id \
-         WHERE mm.deceased_character_id = ? ORDER BY mm.granted_at ASC, mm.character_id ASC",
+         WHERE mm.deceased_character_id = $1 ORDER BY mm.granted_at ASC, mm.character_id ASC",
     )
     .bind(&character_id)
     .fetch_all(&state.db)
@@ -744,7 +744,7 @@ async fn my_marks(State(state): State<AppState>, user: AuthUser) -> Result<Json<
          LEFT JOIN cloud_characters mine ON mine.id = mm.character_id \
          LEFT JOIN cloud_characters gone ON gone.id = mm.deceased_character_id \
          LEFT JOIN worlds w ON w.id = mm.world_id \
-         WHERE mm.owner_id = ? ORDER BY mm.granted_at DESC, mm.character_id ASC",
+         WHERE mm.owner_id = $1 ORDER BY mm.granted_at DESC, mm.character_id ASC",
     )
     .bind(&user.user_id)
     .fetch_all(&state.db)
@@ -835,7 +835,7 @@ async fn death_evidence_holds_tx(
     // 证据 (a)：本世界有 approved 的 death 且 subject 精确含本卡。
     let rows = sqlx::query(
         "SELECT subject_character_ids FROM consent_requests \
-         WHERE world_id = ? AND event_kind = ? AND status = 'approved'",
+         WHERE world_id = $1 AND event_kind = $2 AND status = 'approved'",
     )
     .bind(world_id)
     .bind(EVENT_KIND_DEATH)
@@ -855,7 +855,7 @@ async fn death_evidence_holds_tx(
 
     // 证据 (b)：pendingConsents 已不含本卡的 death 条目。查不到/解析失败一律当"没落定"。
     let state_json: Option<String> =
-        sqlx::query_scalar("SELECT narrative_state_json FROM worlds WHERE id = ?")
+        sqlx::query_scalar("SELECT narrative_state_json FROM worlds WHERE id = $1")
             .bind(world_id)
             .fetch_optional(&mut **tx)
             .await?;

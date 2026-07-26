@@ -70,6 +70,171 @@ pub fn build_router(state: AppState) -> Router {
 
     Router::new()
         .nest("/api", api)
+        .layer(cors_layer())
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// 本地开发默认放行的来源。**三个前端都与 server 不同源**：
+/// 玩家端 Vite `:1420`、运营后台 Vite `:1430`、Tauri webview（各平台 origin 不同）。
+const DEFAULT_DEV_ORIGINS: &str = "http://localhost:1420,http://127.0.0.1:1420,\
+                                   http://localhost:1430,http://127.0.0.1:1430,\
+                                   tauri://localhost,https://tauri.localhost";
+
+/// 跨源白名单。
+///
+/// 🔴 **为什么必须有这一层**：在此之前 `build_router` 只挂了 `TraceLayer`，而
+/// `admin/vite.config` 与根 `vite.config.ts` **都没有配 proxy**，两个前端都直连
+/// `http://127.0.0.1:8787`。结果是浏览器同源策略拦掉每一个请求——**运营后台与玩家端
+/// 在真实浏览器里一个接口都调不通**。这件事长期没被发现，是因为前端一律只验证到
+/// `npm run build` 通过：构建通过和浏览器里能用，中间隔着一条同源策略。
+/// （`Cargo.toml` 的 `tower-http` 早就开着 `cors` feature，只是从未使用。）
+///
+/// 🔴 **不用 `AllowOrigin::any()`**：这些接口虽有 JWT 鉴权，放开任意源仍是无谓攻击面——
+/// 任何网站都能在受害者浏览器里向本服务发请求。故一律走白名单。
+///
+/// 生产部署用 `MUSE_CORS_ORIGINS` 显式指定（逗号分隔）；不设时只放行本地开发来源。
+/// 解析失败的条目**跳过并告警**，全部失败则退化为「不放行任何跨源」——
+/// fail-closed 方向：配错了宁可前端连不上（立刻可见），也不要静默放行成通配。
+///
+/// ⚠️ 不开 `allow_credentials`：两个前端都用 `Authorization: Bearer`
+/// （admin 存 sessionStorage、玩家端存 localStorage），没有 cookie 要带。
+/// 开了它反而会把「白名单必须精确」的约束变成安全关键项。
+fn cors_layer() -> tower_http::cors::CorsLayer {
+    use axum::http::{header, Method};
+
+    let raw = std::env::var("MUSE_CORS_ORIGINS")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_DEV_ORIGINS.to_string());
+    let origins = parse_origins(&raw);
+    if origins.is_empty() {
+        tracing::warn!("CORS 白名单为空——所有跨源请求都将被拒绝（前端将无法连接）");
+    }
+
+    tower_http::cors::CorsLayer::new()
+        .allow_origin(tower_http::cors::AllowOrigin::list(origins))
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+}
+
+/// 逗号分隔的来源串 → 白名单。非法条目跳过并告警，**不** panic：
+/// 一个打错的字符不该让整个服务起不来，但也不该被静默扩大成通配。
+fn parse_origins(raw: &str) -> Vec<axum::http::HeaderValue> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|item| match item.parse::<axum::http::HeaderValue>() {
+            Ok(v) => Some(v),
+            Err(_) => {
+                tracing::warn!(origin = item, "MUSE_CORS_ORIGINS 中有无法解析的来源，已跳过");
+                None
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod cors_tests {
+    use super::*;
+    use axum::http::{header, HeaderValue, Method, StatusCode};
+
+    /// 默认白名单必须覆盖**全部三个前端**。少一个就是那个前端在浏览器里连不上。
+    #[test]
+    fn default_whitelist_covers_every_frontend() {
+        let got = parse_origins(DEFAULT_DEV_ORIGINS);
+        for must in [
+            "http://localhost:1420",   // 玩家端 Vite
+            "http://127.0.0.1:1420",
+            "http://localhost:1430",   // 运营后台 Vite
+            "http://127.0.0.1:1430",
+            "tauri://localhost",       // Tauri webview（macOS / Linux）
+            "https://tauri.localhost", // Tauri webview（Windows）
+        ] {
+            assert!(
+                got.iter().any(|v| v == must),
+                "默认白名单缺少 {must}——该前端在浏览器里会被同源策略全拦"
+            );
+        }
+    }
+
+    /// 🔴 非法条目**跳过**而不是让整串作废，也不是 panic。
+    #[test]
+    fn malformed_entries_are_skipped_not_fatal() {
+        // `\n` 无法进 HeaderValue；空条目与多余空格应被吃掉。
+        let got = parse_origins(" http://a.example , \n , , http://b.example ");
+        assert_eq!(got, vec!["http://a.example", "http://b.example"]);
+        assert!(parse_origins("").is_empty());
+        assert!(parse_origins(" , , ").is_empty());
+    }
+
+    fn state() -> AppState {
+        AppState::new(
+            sqlx::any::AnyPoolOptions::new()
+                .max_connections(1)
+                .connect_lazy("sqlite::memory:")
+                .unwrap(),
+            ServerConfig {
+                database_url: "sqlite::memory:".into(),
+                bind_addr: "127.0.0.1:0".into(),
+                jwt_secret: "test-secret".into(),
+                access_ttl_secs: 3600,
+                refresh_ttl_secs: 100_000,
+                dev_mode: true,
+                object_store_dir: std::env::temp_dir().to_string_lossy().into_owned(),
+            },
+        )
+    }
+
+    async fn preflight(origin: &str) -> (StatusCode, Option<HeaderValue>) {
+        use tower::ServiceExt;
+        let resp = build_router(state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/api/auth/login")
+                    .header(header::ORIGIN, origin)
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                    .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "authorization,content-type")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let allow = resp.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).cloned();
+        (resp.status(), allow)
+    }
+
+    /// 白名单内的来源：预检必须回 `Access-Control-Allow-Origin`。
+    ///
+    /// ⚠️ 本用例不设 `MUSE_CORS_ORIGINS`（env 是进程级的，设了会与并发用例互踩），
+    /// 因此测的是**默认白名单**这条真实的开发路径——恰好也是此前完全走不通的那条。
+    #[tokio::test]
+    async fn preflight_from_admin_origin_is_allowed() {
+        let (status, allow) = preflight("http://127.0.0.1:1430").await;
+        assert!(status.is_success(), "预检应被 CorsLayer 直接放行，实际 {status}");
+        assert_eq!(
+            allow.as_ref().map(|v| v.to_str().unwrap()),
+            Some("http://127.0.0.1:1430"),
+            "🔴 缺 Access-Control-Allow-Origin —— 浏览器会拦掉后续所有请求"
+        );
+    }
+
+    /// 🔴 白名单外的来源**不得**拿到放行头。这条是 `allow_origin(Any)` 与白名单的分水岭：
+    /// 若哪天有人图省事换成 `Any`，本用例立刻红。
+    #[tokio::test]
+    async fn preflight_from_unknown_origin_is_not_allowed() {
+        let (_, allow) = preflight("https://evil.example").await;
+        assert!(
+            allow.is_none(),
+            "🔴 未登记来源拿到了放行头：任何网站都能拿受害者浏览器里的 token 发请求"
+        );
+    }
 }

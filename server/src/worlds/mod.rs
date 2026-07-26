@@ -32,7 +32,7 @@ use sqlx::{Any, AnyPool, Row, Transaction};
 
 use crate::app::AppState;
 use crate::auth::AuthUser;
-use crate::db::{new_id, now_ms};
+use crate::db::{new_id, now_ms, Placeholders};
 use crate::error::ApiError;
 use crate::idempotency;
 use crate::providers::ModerationVerdict;
@@ -313,7 +313,7 @@ fn map_world(row: &sqlx::any::AnyRow) -> Result<WorldRow, ApiError> {
 
 /// 读取世界（不存在 → NotFound）。runtime 与 handler 共用。
 pub async fn load_world(db: &AnyPool, id: &str) -> Result<WorldRow, ApiError> {
-    let row = sqlx::query("SELECT * FROM worlds WHERE id = ?")
+    let row = sqlx::query("SELECT * FROM worlds WHERE id = $1")
         .bind(id)
         .fetch_optional(db)
         .await?
@@ -447,17 +447,25 @@ async fn list_worlds_new(
          FROM worlds \
          WHERE status IN ('open','running') AND visibility IN ('official','public')",
     );
+    // 编号在运行时随分支长出来（走没走 room_type/q/cursor 编译期不知道），
+    // 故用发号器；下面 bind 的顺序必须与这里 take() 的顺序逐一对应。
+    let mut ph = Placeholders::new();
     if params.room_type.is_some() {
-        sql.push_str(" AND room_type = ?");
+        sql.push_str(&format!(" AND room_type = {}", ph.take()));
     }
     if like.is_some() {
-        sql.push_str(" AND LOWER(title) LIKE LOWER(?) ESCAPE '\\'");
+        sql.push_str(&format!(" AND LOWER(title) LIKE LOWER({}) ESCAPE '\\'", ph.take()));
     }
     let cursor = params.cursor.as_deref().and_then(parse_cursor);
     if cursor.is_some() {
-        sql.push_str(" AND (created_at < ? OR (created_at = ? AND id < ?))");
+        sql.push_str(&format!(
+            " AND (created_at < {} OR (created_at = {} AND id < {}))",
+            ph.take(),
+            ph.take(),
+            ph.take()
+        ));
     }
-    sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ?");
+    sql.push_str(&format!(" ORDER BY created_at DESC, id DESC LIMIT {}", ph.take()));
 
     let mut q = sqlx::query(&sql);
     if let Some(rt) = &params.room_type {
@@ -505,26 +513,30 @@ async fn list_worlds_hot(
 
     // SUM 可移植性：CAST(COALESCE(SUM(x),0) AS BIGINT)（先例 admin_api/reconcile.rs）；
     // 整体分再 CAST 一次，保证双库返回 BIGINT。gift_events 表恒存在（迁移不随 feature 门控）。
+    // 整条语句的编号统一由发号器发（含固定段的两个），发号顺序 = 下面 bind 的顺序；
+    // 尾部条件段是否出现要到运行时才知道，不能把编号写死在字面量里。
+    let mut ph = Placeholders::new();
+    let (events_ph, gifts_ph) = (ph.take(), ph.take());
     let mut sql = format!(
         "SELECT id, room_type, title, status, visibility, member_limit, tick_per_day, created_at, lethality, \
          {COVER_AND_TICK_COLUMNS}, \
          (SELECT COUNT(*) FROM world_members m WHERE m.world_id = worlds.id AND m.status='active') AS member_count, \
          {STAR_RATING_SUBQUERY}, \
          CAST( \
-           (SELECT COUNT(*) FROM world_events e WHERE e.world_id = worlds.id AND e.occurred_at >= ?) \
-           + (SELECT CAST(COALESCE(SUM(g.gift_count),0) AS BIGINT) FROM gift_events g WHERE g.world_id = worlds.id AND g.created_at >= ?) * 5 \
+           (SELECT COUNT(*) FROM world_events e WHERE e.world_id = worlds.id AND e.occurred_at >= {events_ph}) \
+           + (SELECT CAST(COALESCE(SUM(g.gift_count),0) AS BIGINT) FROM gift_events g WHERE g.world_id = worlds.id AND g.created_at >= {gifts_ph}) * 5 \
            + (SELECT COUNT(*) FROM world_members m2 WHERE m2.world_id = worlds.id AND m2.status='active') * 2 \
          AS BIGINT) AS hot_score \
          FROM worlds \
          WHERE status IN ('open','running') AND visibility IN ('official','public')",
     );
     if params.room_type.is_some() {
-        sql.push_str(" AND room_type = ?");
+        sql.push_str(&format!(" AND room_type = {}", ph.take()));
     }
     if like.is_some() {
-        sql.push_str(" AND LOWER(title) LIKE LOWER(?) ESCAPE '\\'");
+        sql.push_str(&format!(" AND LOWER(title) LIKE LOWER({}) ESCAPE '\\'", ph.take()));
     }
-    sql.push_str(" ORDER BY hot_score DESC, created_at DESC, id DESC LIMIT ?");
+    sql.push_str(&format!(" ORDER BY hot_score DESC, created_at DESC, id DESC LIMIT {}", ph.take()));
 
     let mut q = sqlx::query(&sql).bind(events_since).bind(gifts_since);
     if let Some(rt) = &params.room_type {
@@ -560,7 +572,7 @@ async fn ensure_world_readable(
     }
     let is_host = world.host_user_id.as_deref() == Some(user.user_id.as_str());
     let is_member = sqlx::query(
-        "SELECT 1 AS x FROM world_members WHERE world_id = ? AND user_id = ? AND status='active' LIMIT 1",
+        "SELECT 1 AS x FROM world_members WHERE world_id = $1 AND user_id = $2 AND status='active' LIMIT 1",
     )
     .bind(&world.id)
     .bind(&user.user_id)
@@ -590,7 +602,7 @@ async fn world_detail(
         "SELECT wm.cloud_character_id AS cid, cc.card_json AS card, \
          cc.avatar_url AS avatar_url, cc.avatar_moderation AS avatar_moderation \
          FROM world_members wm JOIN cloud_characters cc ON cc.id = wm.cloud_character_id \
-         WHERE wm.world_id = ? AND wm.status='active' \
+         WHERE wm.world_id = $1 AND wm.status='active' \
          ORDER BY wm.joined_at ASC, wm.cloud_character_id ASC",
     )
     .bind(&id)
@@ -617,7 +629,7 @@ async fn world_detail(
     }
 
     // 星级投影（波次 3）：从模板读当前 star_rating；模板行缺失（历史数据）兜底 1★。
-    let star_rating: i64 = sqlx::query_scalar("SELECT star_rating FROM world_templates WHERE id = ?")
+    let star_rating: i64 = sqlx::query_scalar("SELECT star_rating FROM world_templates WHERE id = $1")
         .bind(&world.template_id)
         .fetch_optional(&state.db)
         .await?
@@ -625,7 +637,7 @@ async fn world_detail(
 
     // 下一拍估算：末拍入队时刻 + 排拍间隔（仅 running 的 interval 世界可算，详见 next_tick_estimated_at）。
     let last_tick_at: Option<i64> =
-        sqlx::query_scalar("SELECT MAX(created_at) FROM world_ticks WHERE world_id = ?")
+        sqlx::query_scalar("SELECT MAX(created_at) FROM world_ticks WHERE world_id = $1")
             .bind(&id)
             .fetch_one(&state.db)
             .await?;
@@ -776,7 +788,7 @@ pub(crate) async fn upload_cover(
     let cover_url = format!("/api/assets/objects/{object_key}");
 
     sqlx::query(
-        "UPDATE worlds SET cover_object_key = ?, cover_url = ?, cover_moderation = ?, updated_at = ? WHERE id = ?",
+        "UPDATE worlds SET cover_object_key = $1, cover_url = $2, cover_moderation = $3, updated_at = $4 WHERE id = $5",
     )
     .bind(&object_key)
     .bind(&cover_url)
@@ -819,7 +831,7 @@ fn star_mileage_gate(star: i64) -> Option<i64> {
 /// 取不到名字（卡结构异常/无名）时兜底为「该角色」，文案仍可读，绝不因取名失败改变判定。
 async fn character_display_name(db: &AnyPool, character_id: &str) -> String {
     let card: Option<String> =
-        sqlx::query_scalar("SELECT card_json FROM cloud_characters WHERE id = ?")
+        sqlx::query_scalar("SELECT card_json FROM cloud_characters WHERE id = $1")
             .bind(character_id)
             .fetch_optional(db)
             .await
@@ -870,7 +882,7 @@ async fn join_world(
     // 角色服务端权威校验：属本人 + approved + 未撤回（mileage 供下方星级历练准入，
     // source_fingerprint/pristine 供下方同源唯一校验——同一次查询读出，不新增数据库往返）。
     let ch = sqlx::query(
-        "SELECT owner_id, moderation, withdrawn, mileage, source_fingerprint, pristine FROM cloud_characters WHERE id = ?",
+        "SELECT owner_id, moderation, withdrawn, mileage, source_fingerprint, pristine FROM cloud_characters WHERE id = $1",
     )
     .bind(&body.cloud_character_id)
     .fetch_optional(&state.db)
@@ -904,7 +916,7 @@ async fn join_world(
         // 用 403（而非本端点资格类拒绝惯用的 409）：这是永久禁入而非可解冲突，重试不可能通过；
         // 语义与既有红线先例（billing 拒充）逐字一致。前端已从世界详情拿到 deathContractRequired，
         // 可在投放前就把「未成年不可进入生死状世界」讲清楚，不必依赖本响应体文案。
-        let age: Option<(i64,)> = sqlx::query_as("SELECT age_declared FROM users WHERE id = ?")
+        let age: Option<(i64,)> = sqlx::query_as("SELECT age_declared FROM users WHERE id = $1")
             .bind(&user.user_id)
             .fetch_optional(&state.db)
             .await?;
@@ -924,7 +936,7 @@ async fn join_world(
     // 历练准入（波次 3 星级门槛，与防自刷同为投放资格校验）：模板 star≥3 时要求**本次投放的卡**
     // 历练达标（1-2★ 无门槛）。模板行缺失（测试/历史数据）按 1★ 兜底 → 无门槛，与老行为一致。
     // 409（Conflict）对齐本端点既有资格类拒绝（character_not_approved / 防自刷）的错误风格。
-    let star: i64 = sqlx::query_scalar("SELECT star_rating FROM world_templates WHERE id = ?")
+    let star: i64 = sqlx::query_scalar("SELECT star_rating FROM world_templates WHERE id = $1")
         .bind(&world.template_id)
         .fetch_optional(&state.db)
         .await?
@@ -957,9 +969,9 @@ async fn join_world(
             let same_source: i64 = sqlx::query(
                 "SELECT COUNT(*) AS n FROM world_members wm \
                  JOIN cloud_characters cc ON cc.id = wm.cloud_character_id \
-                 WHERE wm.world_id = ? AND wm.status = 'active' \
-                 AND cc.source_fingerprint = ? AND cc.pristine = 1 \
-                 AND wm.cloud_character_id != ?",
+                 WHERE wm.world_id = $1 AND wm.status = 'active' \
+                 AND cc.source_fingerprint = $2 AND cc.pristine = 1 \
+                 AND wm.cloud_character_id != $3",
             )
             .bind(&id)
             .bind(fingerprint)
@@ -988,7 +1000,7 @@ async fn join_world(
     // 不按成员行数计，多出的行不影响结算、可事后治理，收益不抵迁移与回填成本。
     let other_active: i64 = sqlx::query(
         "SELECT COUNT(*) AS n FROM world_members \
-         WHERE world_id = ? AND user_id = ? AND status = 'active' AND cloud_character_id != ?",
+         WHERE world_id = $1 AND user_id = $2 AND status = 'active' AND cloud_character_id != $3",
     )
     .bind(&id)
     .bind(&user.user_id)
@@ -1002,7 +1014,7 @@ async fn join_world(
 
     // 已有成员记录（唯一键 world+character）：active 直接幂等返回；left/retired 复活。
     let existing = sqlx::query(
-        "SELECT id, status FROM world_members WHERE world_id = ? AND cloud_character_id = ?",
+        "SELECT id, status FROM world_members WHERE world_id = $1 AND cloud_character_id = $2",
     )
     .bind(&id)
     .bind(&body.cloud_character_id)
@@ -1026,9 +1038,9 @@ async fn join_world(
             //（world_events / 账本 / 结算），world_members 是可变的成员状态行（status/user_id/joined_at
             // 本来就随复活重写）。
             let res = sqlx::query(
-                "UPDATE world_members SET status='active', user_id=?, boundary_json=?, joined_at=?, left_at=NULL \
-                 WHERE id=? AND status != 'active' \
-                 AND (SELECT COUNT(*) FROM world_members WHERE world_id=? AND status='active') < ?",
+                "UPDATE world_members SET status='active', user_id=$1, boundary_json=$2, joined_at=$3, left_at=NULL \
+                 WHERE id=$4 AND status != 'active' \
+                 AND (SELECT COUNT(*) FROM world_members WHERE world_id=$5 AND status='active') < $6",
             )
             .bind(&user.user_id)
             .bind(body.boundary.to_string())
@@ -1052,8 +1064,8 @@ async fn join_world(
         // 条件插入：仅当活跃人数 < 上限时落一行（SELECT 常量 + WHERE 子查询守卫）。
         let res = sqlx::query(
             "INSERT INTO world_members (id, world_id, user_id, cloud_character_id, boundary_json, status, joined_at) \
-             SELECT ?, ?, ?, ?, ?, 'active', ? \
-             WHERE (SELECT COUNT(*) FROM world_members WHERE world_id=? AND status='active') < ?",
+             SELECT $1, $2, $3, $4, $5, 'active', $6 \
+             WHERE (SELECT COUNT(*) FROM world_members WHERE world_id=$7 AND status='active') < $8",
         )
         .bind(&mid)
         .bind(&id)
@@ -1085,7 +1097,7 @@ async fn join_world(
     if lethality == Lethality::Deathmatch && entered_now {
         sqlx::query(
             "INSERT INTO audit_logs (id, actor_id, actor_role, action, subject, reason, created_at) \
-             VALUES (?, ?, 'user', 'world.death_contract_signed', ?, ?, ?)",
+             VALUES ($1, $2, 'user', 'world.death_contract_signed', $3, $4, $5)",
         )
         .bind(new_id("aud"))
         .bind(&user.user_id)
@@ -1135,8 +1147,8 @@ async fn leave_world(
     Json(body): Json<LeaveRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let res = sqlx::query(
-        "UPDATE world_members SET status='left', left_at=? \
-         WHERE world_id=? AND cloud_character_id=? AND user_id=? AND status='active'",
+        "UPDATE world_members SET status='left', left_at=$1 \
+         WHERE world_id=$2 AND cloud_character_id=$3 AND user_id=$4 AND status='active'",
     )
     .bind(now_ms())
     .bind(&id)
@@ -1262,7 +1274,7 @@ pub async fn create_world_tx(tx: &mut Transaction<'_, Any>, p: CreateWorldParams
         "INSERT INTO worlds (id, template_id, template_version, engine_version, prompt_set_version, \
          model_route_version, room_type, title, status, visibility, host_user_id, member_limit, \
          tick_per_day, timeline_mode, lethality, assembled_json, state_revision, narrative_state_json, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 0, $17, $18, $19)",
     )
     .bind(&id)
     .bind(&p.template_id)
@@ -1288,7 +1300,7 @@ pub async fn create_world_tx(tx: &mut Transaction<'_, Any>, p: CreateWorldParams
 
     sqlx::query(
         "INSERT INTO world_budgets (world_id, daily_token_budget, daily_cny_budget_cents, \
-         spent_tokens_today, budget_day, fused, updated_at) VALUES (?, ?, ?, 0, '', 0, ?)",
+         spent_tokens_today, budget_day, fused, updated_at) VALUES ($1, $2, $3, 0, '', 0, $4)",
     )
     .bind(&id)
     .bind(p.daily_token_budget)
@@ -1461,7 +1473,7 @@ pub(crate) async fn enroll_series(
     let mut tx = db.begin().await?;
     sqlx::query(
         "INSERT INTO world_series (id, origin_world_id, template_id, max_instances, status, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(&series_id)
     .bind(world_id)
@@ -1473,7 +1485,7 @@ pub(crate) async fn enroll_series(
     .execute(&mut *tx)
     .await?;
     sqlx::query(
-        "INSERT INTO world_series_instances (series_id, instance_no, world_id, created_at) VALUES (?, 1, ?, ?)",
+        "INSERT INTO world_series_instances (series_id, instance_no, world_id, created_at) VALUES ($1, 1, $2, $3)",
     )
     .bind(&series_id)
     .bind(world_id)
@@ -1492,7 +1504,7 @@ pub(crate) async fn load_series_of_world(
     let row = sqlx::query(
         "SELECT s.id AS sid, s.origin_world_id, s.max_instances, s.status, i.instance_no \
          FROM world_series_instances i JOIN world_series s ON s.id = i.series_id \
-         WHERE i.world_id = ?",
+         WHERE i.world_id = $1",
     )
     .bind(world_id)
     .fetch_optional(db)
@@ -1525,7 +1537,7 @@ async fn find_open_instance(
         "SELECT i.instance_no, w.id AS wid, w.member_limit, \
          (SELECT COUNT(*) FROM world_members m WHERE m.world_id = w.id AND m.status='active') AS member_count \
          FROM world_series_instances i JOIN worlds w ON w.id = i.world_id \
-         WHERE i.series_id = ? AND w.status IN ('open','running') \
+         WHERE i.series_id = $1 AND w.status IN ('open','running') \
          ORDER BY i.instance_no ASC",
     )
     .bind(series_id)
@@ -1548,7 +1560,7 @@ async fn find_open_instance(
 /// 系列当前最大号数（空系列 → 0）。
 async fn max_instance_no(db: &AnyPool, series_id: &str) -> Result<i64, ApiError> {
     let n: Option<i64> = sqlx::query_scalar(
-        "SELECT instance_no FROM world_series_instances WHERE series_id = ? ORDER BY instance_no DESC LIMIT 1",
+        "SELECT instance_no FROM world_series_instances WHERE series_id = $1 ORDER BY instance_no DESC LIMIT 1",
     )
     .bind(series_id)
     .fetch_optional(db)
@@ -1586,7 +1598,7 @@ async fn spawn_next_instance(
     // 预算两列不在 worlds 表里，单独读一次（缺行 → 用 official() 的保守默认，绝不落 0：
     // daily_token_budget=0 会被 runtime 当作"无上限"，那是成本失控）。
     let budget = sqlx::query(
-        "SELECT daily_token_budget, daily_cny_budget_cents FROM world_budgets WHERE world_id = ?",
+        "SELECT daily_token_budget, daily_cny_budget_cents FROM world_budgets WHERE world_id = $1",
     )
     .bind(&series.origin_world_id)
     .fetch_optional(db)
@@ -1629,7 +1641,7 @@ async fn spawn_next_instance(
     let mut tx = db.begin().await?;
     let new_world_id = create_world_tx(&mut tx, params).await?;
     let res = sqlx::query(
-        "INSERT INTO world_series_instances (series_id, instance_no, world_id, created_at) VALUES (?, ?, ?, ?)",
+        "INSERT INTO world_series_instances (series_id, instance_no, world_id, created_at) VALUES ($1, $2, $3, $4)",
     )
     .bind(&series.id)
     .bind(next_no)
@@ -1652,7 +1664,7 @@ async fn spawn_next_instance(
     // 这是系统按规则开的房，不是某个运营点的按钮，责任链指向系列登记那次运营动作。
     sqlx::query(
         "INSERT INTO audit_logs (id, actor_id, actor_role, action, subject, reason, created_at) \
-         VALUES (?, 'system', 'system', 'world.series_expanded', ?, ?, ?)",
+         VALUES ($1, 'system', 'system', 'world.series_expanded', $2, $3, $4)",
     )
     .bind(new_id("aud"))
     .bind(&new_world_id)
@@ -1809,7 +1821,7 @@ async fn world_biography(
     ensure_world_readable(&state.db, &world, &user).await?;
 
     let row = sqlx::query(
-        "SELECT kind, terminal_reason, ending_id, summary_json, sealed_at FROM world_biographies WHERE world_id = ?",
+        "SELECT kind, terminal_reason, ending_id, summary_json, sealed_at FROM world_biographies WHERE world_id = $1",
     )
     .bind(&id)
     .fetch_optional(&state.db)
@@ -1889,7 +1901,7 @@ async fn create_room(
     // 模板校验（读只在 pool 上，先于 tx；释放连接后再 begin，单连接池不自锁）。
     let tpl = sqlx::query(
         "SELECT title, room_type, version, moderation, COALESCE(withdrawn, 0) AS withdrawn, \
-         COALESCE(room_open_price_cents, 0) AS price FROM world_templates WHERE id = ?",
+         COALESCE(room_open_price_cents, 0) AS price FROM world_templates WHERE id = $1",
     )
     .bind(&body.template_id)
     .fetch_optional(&state.db)

@@ -204,7 +204,7 @@ pub(crate) async fn world_attention_gini(
     let rows = sqlx::query(
         "SELECT wc.score_milli AS s FROM world_contributions wc \
          JOIN world_members wm ON wm.world_id = wc.world_id AND wm.cloud_character_id = wc.character_id \
-         WHERE wc.world_id = ? ORDER BY wc.character_id ASC",
+         WHERE wc.world_id = $1 ORDER BY wc.character_id ASC",
     )
     .bind(world_id)
     .fetch_all(db)
@@ -227,7 +227,7 @@ pub(crate) async fn world_silent_streaks(
     world_id: &str,
 ) -> Result<BTreeMap<String, i64>, ApiError> {
     let rows = sqlx::query(
-        "SELECT cloud_character_id AS c FROM world_members WHERE world_id = ? \
+        "SELECT cloud_character_id AS c FROM world_members WHERE world_id = $1 \
          ORDER BY cloud_character_id ASC",
     )
     .bind(world_id)
@@ -239,7 +239,7 @@ pub(crate) async fn world_silent_streaks(
     }
 
     let sql = format!(
-        "SELECT wt.tick_no AS tick_no FROM world_ticks wt WHERE wt.world_id = ? AND {TICK_DOMAIN} \
+        "SELECT wt.tick_no AS tick_no FROM world_ticks wt WHERE wt.world_id = $1 AND {TICK_DOMAIN} \
          ORDER BY wt.tick_no ASC"
     );
     let rows = sqlx::query(&sql).bind(world_id).fetch_all(db).await?;
@@ -249,7 +249,7 @@ pub(crate) async fn world_silent_streaks(
     }
 
     let rows = sqlx::query(
-        "SELECT tick_no, event_type, actors_json FROM world_events WHERE world_id = ? \
+        "SELECT tick_no, event_type, actors_json FROM world_events WHERE world_id = $1 \
          ORDER BY sequence ASC",
     )
     .bind(world_id)
@@ -282,7 +282,7 @@ pub(crate) async fn world_conclusion(
     world_id: &str,
 ) -> Result<(String, String), ApiError> {
     let Some(row) = sqlx::query(
-        "SELECT reason FROM audit_logs WHERE action = 'world.ended' AND subject = ? LIMIT 1",
+        "SELECT reason FROM audit_logs WHERE action = 'world.ended' AND subject = $1 LIMIT 1",
     )
     .bind(world_id)
     .fetch_optional(db)
@@ -429,7 +429,7 @@ async fn attention_gini_block(db: &AnyPool, cfg: &SloConfig) -> Result<Value, Ap
          FROM world_contributions wc \
          JOIN world_members wm ON wm.world_id = wc.world_id AND wm.cloud_character_id = wc.character_id \
          WHERE wc.world_id IN ( \
-             SELECT world_id FROM world_contributions WHERE updated_at >= ? AND updated_at < ? \
+             SELECT world_id FROM world_contributions WHERE updated_at >= $1 AND updated_at < $2 \
          ) \
          ORDER BY wc.world_id ASC, wc.character_id ASC LIMIT {}",
         cfg.scan_row_cap + 1
@@ -541,7 +541,7 @@ async fn silent_streak_block(db: &AnyPool, cfg: &SloConfig) -> Result<Value, Api
     // ① 拍域。
     let sql = format!(
         "SELECT wt.world_id AS world_id, wt.tick_no AS tick_no FROM world_ticks wt \
-         WHERE {TICK_DOMAIN} AND wt.created_at >= ? AND wt.created_at < ? \
+         WHERE {TICK_DOMAIN} AND wt.created_at >= $1 AND wt.created_at < $2 \
          ORDER BY wt.world_id ASC, wt.tick_no ASC LIMIT {}",
         cap + 1
     );
@@ -562,7 +562,7 @@ async fn silent_streak_block(db: &AnyPool, cfg: &SloConfig) -> Result<Value, Api
     let sql = format!(
         "SELECT world_id, cloud_character_id FROM world_members WHERE world_id IN ( \
              SELECT wt.world_id FROM world_ticks wt \
-             WHERE {TICK_DOMAIN} AND wt.created_at >= ? AND wt.created_at < ? \
+             WHERE {TICK_DOMAIN} AND wt.created_at >= $1 AND wt.created_at < $2 \
          ) ORDER BY world_id ASC, cloud_character_id ASC LIMIT {}",
         cap + 1
     );
@@ -583,7 +583,7 @@ async fn silent_streak_block(db: &AnyPool, cfg: &SloConfig) -> Result<Value, Api
     let types = NARRATIVE_EVENT_TYPES.iter().map(|t| format!("'{t}'")).collect::<Vec<_>>().join(", ");
     let sql = format!(
         "SELECT world_id, tick_no, actors_json FROM world_events \
-         WHERE event_type IN ({types}) AND occurred_at >= ? AND occurred_at < ? LIMIT {}",
+         WHERE event_type IN ({types}) AND occurred_at >= $1 AND occurred_at < $2 LIMIT {}",
         cap + 1
     );
     let event_rows =
@@ -801,7 +801,7 @@ async fn contradiction_block(db: &AnyPool, cfg: &SloConfig) -> Result<Value, Api
          CAST(SUM(CASE WHEN consistency_issue_count > 0 OR causal_issue_count > 0 THEN 1 ELSE 0 END) AS BIGINT) AS flagged, \
          CAST(COALESCE(SUM(consistency_issue_count), 0) AS BIGINT) AS consistency, \
          CAST(COALESCE(SUM(causal_issue_count), 0) AS BIGINT) AS causal \
-         FROM world_tick_critic WHERE created_at >= ? AND created_at < ?",
+         FROM world_tick_critic WHERE created_at >= $1 AND created_at < $2",
     )
     .bind(cfg.window_start)
     .bind(cfg.window_end)
@@ -912,7 +912,7 @@ async fn ooc_appeal_block(db: &AnyPool, cfg: &SloConfig) -> Result<Value, ApiErr
          WHERE EXISTS ( \
              SELECT 1 FROM world_ticks wt WHERE wt.world_id = wm.world_id \
                AND {TICK_DOMAIN} \
-               AND wt.created_at >= ? AND wt.created_at < ? \
+               AND wt.created_at >= $1 AND wt.created_at < $2 \
          )"
     );
     let member_stages: i64 = sqlx::query(&sql)
@@ -926,7 +926,7 @@ async fn ooc_appeal_block(db: &AnyPool, cfg: &SloConfig) -> Result<Value, ApiErr
     let sql = format!(
         "SELECT CAST(COUNT(*) AS BIGINT) AS n FROM ( \
              SELECT a.world_id, a.character_id FROM ooc_appeals a \
-             WHERE a.created_at >= ? AND a.created_at < ? \
+             WHERE a.created_at >= $1 AND a.created_at < $2 \
                AND EXISTS ( \
                    SELECT 1 FROM world_members wm WHERE wm.world_id = a.world_id \
                      AND wm.cloud_character_id = a.character_id \
@@ -934,7 +934,7 @@ async fn ooc_appeal_block(db: &AnyPool, cfg: &SloConfig) -> Result<Value, ApiErr
                AND EXISTS ( \
                    SELECT 1 FROM world_ticks wt WHERE wt.world_id = a.world_id \
                      AND {TICK_DOMAIN} \
-                     AND wt.created_at >= ? AND wt.created_at < ? \
+                     AND wt.created_at >= $3 AND wt.created_at < $4 \
                ) \
              GROUP BY a.world_id, a.character_id \
          ) t"
@@ -953,7 +953,7 @@ async fn ooc_appeal_block(db: &AnyPool, cfg: &SloConfig) -> Result<Value, ApiErr
     let mut appeals_total: i64 = 0;
     for r in sqlx::query(
         "SELECT status, CAST(COUNT(*) AS BIGINT) AS n FROM ooc_appeals \
-         WHERE created_at >= ? AND created_at < ? GROUP BY status",
+         WHERE created_at >= $1 AND created_at < $2 GROUP BY status",
     )
     .bind(cfg.window_start)
     .bind(cfg.window_end)
@@ -969,7 +969,7 @@ async fn ooc_appeal_block(db: &AnyPool, cfg: &SloConfig) -> Result<Value, ApiErr
     let mut by_reason: BTreeMap<String, i64> = BTreeMap::new();
     for r in sqlx::query(
         "SELECT reason_code, CAST(COUNT(*) AS BIGINT) AS n FROM ooc_appeals \
-         WHERE created_at >= ? AND created_at < ? GROUP BY reason_code",
+         WHERE created_at >= $1 AND created_at < $2 GROUP BY reason_code",
     )
     .bind(cfg.window_start)
     .bind(cfg.window_end)
@@ -982,7 +982,7 @@ async fn ooc_appeal_block(db: &AnyPool, cfg: &SloConfig) -> Result<Value, ApiErr
     // 补偿发放量（复核确认模型错误的产物；不是资产，只是「说话的机会」）。
     let comp = sqlx::query(
         "SELECT CAST(COUNT(*) AS BIGINT) AS rows_n, CAST(COALESCE(SUM(grants), 0) AS BIGINT) AS grants_n \
-         FROM dream_quota_compensations WHERE created_at >= ? AND created_at < ?",
+         FROM dream_quota_compensations WHERE created_at >= $1 AND created_at < $2",
     )
     .bind(cfg.window_start)
     .bind(cfg.window_end)

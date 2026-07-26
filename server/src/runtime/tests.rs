@@ -98,7 +98,7 @@ fn sample_card_json(id: &str, name: &str) -> String {
 pub(super) async fn seed_user(db: &AnyPool, id: &str) {
     sqlx::query(
         "INSERT INTO users (id, nickname, age_declared, status, created_at, updated_at) \
-         VALUES (?, '', 0, 'active', ?, ?)",
+         VALUES ($1, '', 0, 'active', $2, $3)",
     )
     .bind(id)
     .bind(now_ms())
@@ -112,7 +112,7 @@ async fn seed_char(db: &AnyPool, id: &str, owner: &str, name: &str) {
     sqlx::query(
         "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, \
          rights_declaration, moderation, withdrawn, created_at) \
-         VALUES (?, ?, 'local', 1, ?, 'original', 'approved', 0, ?)",
+         VALUES ($1, $2, 'local', 1, $3, 'original', 'approved', 0, $4)",
     )
     .bind(id)
     .bind(owner)
@@ -126,7 +126,7 @@ async fn seed_char(db: &AnyPool, id: &str, owner: &str, name: &str) {
 async fn seed_member(db: &AnyPool, world_id: &str, user_id: &str, cid: &str) {
     sqlx::query(
         "INSERT INTO world_members (id, world_id, user_id, cloud_character_id, boundary_json, status, joined_at) \
-         VALUES (?, ?, ?, ?, '{}', 'active', ?)",
+         VALUES ($1, $2, $3, $4, '{}', 'active', $5)",
     )
     .bind(new_id("wm"))
     .bind(world_id)
@@ -148,7 +148,7 @@ async fn seed_template(db: &AnyPool, id: &str) {
     });
     sqlx::query(
         "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, official, version, moderation, created_at) \
-         VALUES (?, '联编模板', 'idle', ?, '{\"mode\":\"open\"}', 1, 1, 'approved', ?)",
+         VALUES ($1, '联编模板', 'idle', $2, '{\"mode\":\"open\"}', 1, 1, 'approved', $3)",
     )
     .bind(id)
     .bind(skeleton.to_string())
@@ -163,7 +163,7 @@ pub(super) async fn seed_model_routes(db: &AnyPool, version: &str) {
     let routes = json!({
         "default": { "interface": "OpenAI-compatible", "baseUrl": "http://mock", "apiKey": "k", "model": "mock-model" }
     });
-    sqlx::query("INSERT INTO model_routes (id, version, routes_json, active, created_at) VALUES (?, ?, ?, 1, ?)")
+    sqlx::query("INSERT INTO model_routes (id, version, routes_json, active, created_at) VALUES ($1, $2, $3, 1, $4)")
         .bind(new_id("mr"))
         .bind(version)
         .bind(routes.to_string())
@@ -176,7 +176,7 @@ pub(super) async fn seed_model_routes(db: &AnyPool, version: &str) {
 pub(super) async fn seed_whisper(db: &AnyPool, id: &str, world_id: &str, user_id: &str, cid: &str, text: &str) {
     sqlx::query(
         "INSERT INTO interventions (id, world_id, user_id, character_id, kind, payload_json, expected_revision, status, created_at) \
-         VALUES (?, ?, ?, ?, 'whisper', ?, 0, 'accepted', ?)",
+         VALUES ($1, $2, $3, $4, 'whisper', $5, 0, 'accepted', $6)",
     )
     .bind(id)
     .bind(world_id)
@@ -259,14 +259,14 @@ async fn tick_runs_full_round_accumulates_state_events_and_metered_budget() {
     assert!(st1.characters.contains_key("chA") && st1.characters.contains_key("chB"));
 
     // 事件落库：tick 0 有 world_events 行。
-    let ev0 = i64_one(&state.db, "SELECT COUNT(*) FROM world_events WHERE world_id=? AND tick_no=0", &wid).await;
+    let ev0 = i64_one(&state.db, "SELECT COUNT(*) FROM world_events WHERE world_id=$1 AND tick_no=0", &wid).await;
     assert!(ev0 > 0, "tick 0 应落库 world_events（2 ActionResolved + 2 DialogueSpoken）");
 
     // 预算实测计费（B-1）：director+decide×2+writer+critic = 5 次调用 ×(10+20) = 150。
-    let spent0 = i64_one(&state.db, "SELECT spent_tokens_today FROM world_budgets WHERE world_id=?", &wid).await;
+    let spent0 = i64_one(&state.db, "SELECT spent_tokens_today FROM world_budgets WHERE world_id=$1", &wid).await;
     assert_eq!(spent0, 150, "预算应按 ModelClient 实测 token 累计（5 调用 ×30）");
     let cost0 =
-        sqlx::query_scalar::<_, i64>("SELECT cost_tokens FROM world_ticks WHERE world_id=? AND tick_no=0")
+        sqlx::query_scalar::<_, i64>("SELECT cost_tokens FROM world_ticks WHERE world_id=$1 AND tick_no=0")
             .bind(&wid)
             .fetch_one(&state.db)
             .await
@@ -274,9 +274,9 @@ async fn tick_runs_full_round_accumulates_state_events_and_metered_budget() {
     assert_eq!(cost0, 150, "tick 成本记录应为实测 token");
 
     // Q-3：只消费本 tick 实际喂入的 whisper。
-    assert_eq!(text_one(&state.db, "SELECT status FROM interventions WHERE id=?", "iv-fed").await, "applied");
+    assert_eq!(text_one(&state.db, "SELECT status FROM interventions WHERE id=$1", "iv-fed").await, "applied");
     assert_eq!(
-        text_one(&state.db, "SELECT status FROM interventions WHERE id=?", "iv-unfed").await,
+        text_one(&state.db, "SELECT status FROM interventions WHERE id=$1", "iv-unfed").await,
         "accepted",
         "非在场角色的 whisper 不应被 blanket 标 applied"
     );
@@ -299,11 +299,11 @@ async fn tick_runs_full_round_accumulates_state_events_and_metered_budget() {
     assert_eq!(applied(&st2), 2, "tick 1 在 tick 0 状态之上应用 patch-1（引擎 FS 状态跨 tick 累积）");
 
     // 事件序号继续增长。
-    let ev_total = i64_one(&state.db, "SELECT COUNT(*) FROM world_events WHERE world_id=?", &wid).await;
+    let ev_total = i64_one(&state.db, "SELECT COUNT(*) FROM world_events WHERE world_id=$1", &wid).await;
     assert!(ev_total > ev0, "第二 tick 应追加事件");
 
     // 预算继续累积。
-    let spent1 = i64_one(&state.db, "SELECT spent_tokens_today FROM world_budgets WHERE world_id=?", &wid).await;
+    let spent1 = i64_one(&state.db, "SELECT spent_tokens_today FROM world_budgets WHERE world_id=$1", &wid).await;
     assert_eq!(spent1, 300, "两 tick 累计 = 300");
 }
 
@@ -318,12 +318,12 @@ async fn concurrent_claim_and_stale_tick_are_terminalized() {
     // 认领幂等（C-1）：tick 0 处理完成后再次处理 → already_done，不重复跑、不重复计费。
     insert_tick(&state.db, &wid, 0, 0).await.unwrap();
     assert_eq!(process_tick_with_model(&state, &wid, 0, model.clone()).await.unwrap(), TickStatus::Done);
-    let spent_after_first = i64_one(&state.db, "SELECT spent_tokens_today FROM world_budgets WHERE world_id=?", &wid).await;
+    let spent_after_first = i64_one(&state.db, "SELECT spent_tokens_today FROM world_budgets WHERE world_id=$1", &wid).await;
     assert_eq!(
         process_tick_with_model(&state, &wid, 0, model.clone()).await.unwrap(),
         TickStatus::Skipped("already_done")
     );
-    let spent_after_second = i64_one(&state.db, "SELECT spent_tokens_today FROM world_budgets WHERE world_id=?", &wid).await;
+    let spent_after_second = i64_one(&state.db, "SELECT spent_tokens_today FROM world_budgets WHERE world_id=$1", &wid).await;
     assert_eq!(spent_after_first, spent_after_second, "重复处理不得二次计费");
 
     // 陈旧 tick（C-2）：world 已推进到 revision 1，但补投一个 base_revision=0 的 tick_no=1 → 终态跳过，
@@ -331,7 +331,7 @@ async fn concurrent_claim_and_stale_tick_are_terminalized() {
     insert_tick(&state.db, &wid, 1, 0).await.unwrap();
     let stale = process_tick_with_model(&state, &wid, 1, model.clone()).await.unwrap();
     assert_eq!(stale, TickStatus::Skipped("superseded"));
-    let t1_status = text_one(&state.db, "SELECT status FROM world_ticks WHERE world_id=? AND tick_no=1", &wid).await;
+    let t1_status = text_one(&state.db, "SELECT status FROM world_ticks WHERE world_id=$1 AND tick_no=1", &wid).await;
     assert_eq!(t1_status, "done", "陈旧 tick 应终态化（done），不再 pending");
 }
 
@@ -395,21 +395,21 @@ async fn irreversible_action_gates_consent_then_approve_lands() {
     // runtime 消费本回合 ConsentRequested → 恰好建 1 条 pending 同意（多个同 subject 事件被幂等去重）。
     let n_pending = i64_one(
         &state.db,
-        "SELECT COUNT(*) FROM consent_requests WHERE world_id=? AND status='pending'",
+        "SELECT COUNT(*) FROM consent_requests WHERE world_id=$1 AND status='pending'",
         &wid,
     )
     .await;
     assert_eq!(n_pending, 1, "不可逆行动应触发恰好一条 pending 同意请求");
     let ck = text_one(
         &state.db,
-        "SELECT event_kind FROM consent_requests WHERE world_id=? AND status='pending'",
+        "SELECT event_kind FROM consent_requests WHERE world_id=$1 AND status='pending'",
         &wid,
     )
     .await;
     assert_eq!(ck, "death", "同意事件类别应为 death");
     let subjects = text_one(
         &state.db,
-        "SELECT subject_character_ids FROM consent_requests WHERE world_id=? AND status='pending'",
+        "SELECT subject_character_ids FROM consent_requests WHERE world_id=$1 AND status='pending'",
         &wid,
     )
     .await;
@@ -417,7 +417,7 @@ async fn irreversible_action_gates_consent_then_approve_lands() {
     // 通知已投递给当事角色主人 uB（同意触发源接通）。
     let n_notif = i64_one(
         &state.db,
-        "SELECT COUNT(*) FROM notification_outbox WHERE kind='consent_request' AND user_id=?",
+        "SELECT COUNT(*) FROM notification_outbox WHERE kind='consent_request' AND user_id=$1",
         "uB",
     )
     .await;
@@ -435,7 +435,7 @@ async fn irreversible_action_gates_consent_then_approve_lands() {
     let _ = process_tick_with_model(&state, &wid, 0, model.clone()).await.unwrap();
     let n_pending_again = i64_one(
         &state.db,
-        "SELECT COUNT(*) FROM consent_requests WHERE world_id=? AND status='pending'",
+        "SELECT COUNT(*) FROM consent_requests WHERE world_id=$1 AND status='pending'",
         &wid,
     )
     .await;
@@ -444,11 +444,11 @@ async fn irreversible_action_gates_consent_then_approve_lands() {
     // ===== 当事人 approve（等价 respond 落定；respond 端点在 consents/tests.rs 另有覆盖） =====
     let cid = text_one(
         &state.db,
-        "SELECT id FROM consent_requests WHERE world_id=? AND status='pending'",
+        "SELECT id FROM consent_requests WHERE world_id=$1 AND status='pending'",
         &wid,
     )
     .await;
-    sqlx::query("UPDATE consent_requests SET status='approved', resolved_at=? WHERE id=?")
+    sqlx::query("UPDATE consent_requests SET status='approved', resolved_at=$1 WHERE id=$2")
         .bind(now_ms())
         .bind(&cid)
         .execute(&state.db)
@@ -470,7 +470,7 @@ async fn irreversible_action_gates_consent_then_approve_lands() {
     // 落定回合不产 ConsentRequested → 不新建、也无残留 pending 同意。
     let n_pending_after = i64_one(
         &state.db,
-        "SELECT COUNT(*) FROM consent_requests WHERE world_id=? AND status='pending'",
+        "SELECT COUNT(*) FROM consent_requests WHERE world_id=$1 AND status='pending'",
         &wid,
     )
     .await;
@@ -489,7 +489,7 @@ async fn pin_world_characters(db: &AnyPool, world_id: &str, npcs: &[(&str, &str)
         })
         .collect();
     let assembled = json!({ "assembly": { "worldCharacterEntries": entries } });
-    sqlx::query("UPDATE worlds SET assembled_json=? WHERE id=?")
+    sqlx::query("UPDATE worlds SET assembled_json=$1 WHERE id=$2")
         .bind(assembled.to_string())
         .bind(world_id)
         .execute(db)
@@ -512,7 +512,7 @@ async fn world_character_injected_participates_and_is_not_a_member() {
     // NPC 参与决策 → 其行动落库为 world_event（actor 含 npc1，Public 广播）。
     let npc_events = i64_one(
         &state.db,
-        "SELECT COUNT(*) FROM world_events WHERE world_id=? AND actors_json LIKE '%npc1%'",
+        "SELECT COUNT(*) FROM world_events WHERE world_id=$1 AND actors_json LIKE '%npc1%'",
         &wid,
     )
     .await;
@@ -521,7 +521,7 @@ async fn world_character_injected_participates_and_is_not_a_member() {
     // NPC 无 owner，不是 world_member（故不进 members_projection、无日报投影）。
     let npc_member_rows = i64_one(
         &state.db,
-        "SELECT COUNT(*) FROM world_members WHERE world_id=? AND cloud_character_id='npc1'",
+        "SELECT COUNT(*) FROM world_members WHERE world_id=$1 AND cloud_character_id='npc1'",
         &wid,
     )
     .await;
@@ -529,7 +529,7 @@ async fn world_character_injected_participates_and_is_not_a_member() {
 
     // 预算实测：3 活跃角色（chA/chB/npc1）→ director + decide×3 + writer + critic = 6 调用 ×30 = 180
     //（对照纯 2 成员基线 150：NPC 计入活跃多一次 decide）。
-    let spent = i64_one(&state.db, "SELECT spent_tokens_today FROM world_budgets WHERE world_id=?", &wid).await;
+    let spent = i64_one(&state.db, "SELECT spent_tokens_today FROM world_budgets WHERE world_id=$1", &wid).await;
     assert_eq!(spent, 180, "NPC 计入活跃 → 多一次 decide 调用（6 调用 ×30）");
 }
 
@@ -550,7 +550,7 @@ async fn pin_locations_and_remote_npc(db: &AnyPool, world_id: &str) {
             ]
         }
     });
-    sqlx::query("UPDATE worlds SET assembled_json=? WHERE id=?")
+    sqlx::query("UPDATE worlds SET assembled_json=$1 WHERE id=$2")
         .bind(assembled.to_string())
         .bind(world_id)
         .execute(db)
@@ -579,7 +579,7 @@ async fn locations_seed_initial_positions_and_split_groups() {
 
     // 2 组（hall:{chA,chB}、north:{npc1}）→ 导演2 + 决策3 + 写作2 + 审校1 = 8 调用 ×30 = 240。
     // （对照单组 3 活跃基线 180：多一个地点组 → 多一次导演 + 一次写作。）
-    let spent = i64_one(&state.db, "SELECT spent_tokens_today FROM world_budgets WHERE world_id=?", &wid).await;
+    let spent = i64_one(&state.db, "SELECT spent_tokens_today FROM world_budgets WHERE world_id=$1", &wid).await;
     assert_eq!(spent, 240, "地点分组 → 导演/写作按组放大（8 调用 ×30）");
 }
 
@@ -589,7 +589,7 @@ async fn locations_seed_initial_positions_and_split_groups() {
 async fn seed_item(db: &AnyPool, id: &str, effect_tags: &[&str], cosmology: &[&str], tier: i64) {
     sqlx::query(
         "INSERT INTO items (id, narrative, effect_tags, origin_world_template_id, cosmology_json, power_tier, created_at) \
-         VALUES (?, '测试道具', ?, 'tpl-x', ?, ?, ?)",
+         VALUES ($1, '测试道具', $2, 'tpl-x', $3, $4, $5)",
     )
     .bind(id)
     .bind(serde_json::to_string(effect_tags).unwrap())
@@ -605,7 +605,7 @@ async fn seed_item(db: &AnyPool, id: &str, effect_tags: &[&str], cosmology: &[&s
 async fn seed_carried(db: &AnyPool, user: &str, item_id: &str, world_id: &str) {
     sqlx::query(
         "INSERT INTO backpacks (id, user_id, item_id, acquired_world_id, status, carried_world_id, acquired_at) \
-         VALUES (?, ?, ?, ?, 'carried', ?, ?)",
+         VALUES ($1, $2, $3, $4, 'carried', $5, $6)",
     )
     .bind(new_id("bp"))
     .bind(user)
@@ -630,7 +630,7 @@ async fn pin_npc_with_carried(db: &AnyPool, world_id: &str, npc_id: &str, name: 
             { "characterId": npc_id, "card": card, "location": "", "carriedItems": carried }
         ] }
     });
-    sqlx::query("UPDATE worlds SET assembled_json=? WHERE id=?")
+    sqlx::query("UPDATE worlds SET assembled_json=$1 WHERE id=$2")
         .bind(assembled.to_string())
         .bind(world_id)
         .execute(db)
@@ -714,7 +714,7 @@ async fn pin_secret_realm(db: &AnyPool, world_id: &str) {
               "gate": { "requiredItemIds": ["jade_key"] } }
         ] }
     });
-    sqlx::query("UPDATE worlds SET assembled_json=? WHERE id=?")
+    sqlx::query("UPDATE worlds SET assembled_json=$1 WHERE id=$2")
         .bind(assembled.to_string())
         .bind(world_id)
         .execute(db)
@@ -754,7 +754,7 @@ async fn seed_template_soft(db: &AnyPool, id: &str) {
     });
     sqlx::query(
         "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, official, version, moderation, created_at) \
-         VALUES (?, '软节点模板', 'idle', ?, '{\"mode\":\"open\"}', 1, 1, 'approved', ?)",
+         VALUES ($1, '软节点模板', 'idle', $2, '{\"mode\":\"open\"}', 1, 1, 'approved', $3)",
     )
     .bind(id)
     .bind(skeleton.to_string())
@@ -791,7 +791,7 @@ async fn running_soft_world(state: &AppState, tag: &str, mode: &str) -> String {
     seed_member(&state.db, &wid, &ub, &cb).await;
 
     if mode != "interval" {
-        sqlx::query("UPDATE worlds SET timeline_mode=? WHERE id=?")
+        sqlx::query("UPDATE worlds SET timeline_mode=$1 WHERE id=$2")
             .bind(mode)
             .bind(&wid)
             .execute(&state.db)
@@ -813,7 +813,7 @@ async fn game_time_written_back() {
     // event 世界 tick 0：首步激活时刻 T=0（全体缺席 next_time 视为 now=0）→ game_time 回写 0，与状态一致。
     insert_tick(&state.db, &ev, 0, 0).await.unwrap();
     assert_eq!(process_tick_with_model(&state, &ev, 0, model.clone()).await.unwrap(), TickStatus::Done);
-    let gt0 = i64_one(&state.db, "SELECT game_time FROM worlds WHERE id=?", &ev).await;
+    let gt0 = i64_one(&state.db, "SELECT game_time FROM worlds WHERE id=$1", &ev).await;
     let st0: NarrativeState =
         serde_json::from_str(&load_world(&state.db, &ev).await.unwrap().narrative_state_json).unwrap();
     assert_eq!(gt0, st0.timeline.now, "game_time 应等于 timeline.now");
@@ -824,7 +824,7 @@ async fn game_time_written_back() {
     // event 世界 tick 1：最小 next_time = 60 → T=60 → game_time 回写 60（游戏时钟随事件步前进）。
     insert_tick(&state.db, &ev, 1, 1).await.unwrap();
     assert_eq!(process_tick_with_model(&state, &ev, 1, model.clone()).await.unwrap(), TickStatus::Done);
-    let gt1 = i64_one(&state.db, "SELECT game_time FROM worlds WHERE id=?", &ev).await;
+    let gt1 = i64_one(&state.db, "SELECT game_time FROM worlds WHERE id=$1", &ev).await;
     let st1: NarrativeState =
         serde_json::from_str(&load_world(&state.db, &ev).await.unwrap().narrative_state_json).unwrap();
     assert_eq!(gt1, st1.timeline.now, "game_time 应持续等于 timeline.now");
@@ -834,7 +834,7 @@ async fn game_time_written_back() {
     // interval 世界：走原 run_round，timeline 不被触碰 → game_time 恒为 0。
     insert_tick(&state.db, &iv, 0, 0).await.unwrap();
     assert_eq!(process_tick_with_model(&state, &iv, 0, model.clone()).await.unwrap(), TickStatus::Done);
-    let gt_iv = i64_one(&state.db, "SELECT game_time FROM worlds WHERE id=?", &iv).await;
+    let gt_iv = i64_one(&state.db, "SELECT game_time FROM worlds WHERE id=$1", &iv).await;
     assert_eq!(gt_iv, 0, "interval 世界不推进游戏时钟，game_time 恒为 0");
 }
 
@@ -860,14 +860,14 @@ async fn timeline_mode_event_back_to_back() {
 
     let ev_max = i64_one(
         &state.db,
-        "SELECT COALESCE(MAX(tick_no), -1) FROM world_ticks WHERE world_id=?",
+        "SELECT COALESCE(MAX(tick_no), -1) FROM world_ticks WHERE world_id=$1",
         &ev,
     )
     .await;
     assert_eq!(ev_max, 1, "event 世界上一 tick done → 应背靠背立即排出 tick 1");
     let ev_pending = i64_one(
         &state.db,
-        "SELECT COUNT(*) FROM world_ticks WHERE world_id=? AND tick_no=1 AND status='pending'",
+        "SELECT COUNT(*) FROM world_ticks WHERE world_id=$1 AND tick_no=1 AND status='pending'",
         &ev,
     )
     .await;
@@ -875,7 +875,7 @@ async fn timeline_mode_event_back_to_back() {
 
     let iv_max = i64_one(
         &state.db,
-        "SELECT COALESCE(MAX(tick_no), -1) FROM world_ticks WHERE world_id=?",
+        "SELECT COALESCE(MAX(tick_no), -1) FROM world_ticks WHERE world_id=$1",
         &iv,
     )
     .await;
@@ -883,14 +883,14 @@ async fn timeline_mode_event_back_to_back() {
 
     // 背靠背排出的 tick 1 可继续处理 → game_time 随之推进（证明 event 世界持续推进）。
     assert_eq!(process_tick_with_model(&state, &ev, 1, model.clone()).await.unwrap(), TickStatus::Done);
-    let gt = i64_one(&state.db, "SELECT game_time FROM worlds WHERE id=?", &ev).await;
+    let gt = i64_one(&state.db, "SELECT game_time FROM worlds WHERE id=$1", &ev).await;
     assert_eq!(gt, 60, "背靠背处理的第二 tick 应把 game_time 推进到 60");
 
     // 再轮询一次：tick 1 已 done → 继续背靠背排出 tick 2。
     super::schedule_due_ticks(&state).await.unwrap();
     let ev_max2 = i64_one(
         &state.db,
-        "SELECT COALESCE(MAX(tick_no), -1) FROM world_ticks WHERE world_id=?",
+        "SELECT COALESCE(MAX(tick_no), -1) FROM world_ticks WHERE world_id=$1",
         &ev,
     )
     .await;
@@ -942,7 +942,7 @@ async fn seed_template_with_endgame(
     });
     sqlx::query(
         "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, official, version, moderation, created_at) \
-         VALUES (?, '终局模板', ?, ?, '{\"mode\":\"open\"}', 1, 1, 'approved', ?)",
+         VALUES ($1, '终局模板', $2, $3, '{\"mode\":\"open\"}', 1, 1, 'approved', $4)",
     )
     .bind(id)
     .bind(room_type)
@@ -985,7 +985,7 @@ async fn running_world_for_endgame(
     seed_member(&state.db, &wid, &ub, &cb).await;
 
     if mode != "interval" {
-        sqlx::query("UPDATE worlds SET timeline_mode=? WHERE id=?")
+        sqlx::query("UPDATE worlds SET timeline_mode=$1 WHERE id=$2")
             .bind(mode)
             .bind(&wid)
             .execute(&state.db)
@@ -996,7 +996,7 @@ async fn running_world_for_endgame(
 }
 
 async fn world_status(db: &AnyPool, wid: &str) -> String {
-    text_one(db, "SELECT status FROM worlds WHERE id=?", wid).await
+    text_one(db, "SELECT status FROM worlds WHERE id=$1", wid).await
 }
 
 /// 终局条件(2) 世界时间上限：idle event 房到 max_world_ticks → end_world（status=ended）+ Concluded。
@@ -1032,7 +1032,7 @@ async fn idle_world_concludes_at_max_world_ticks() {
     );
     assert_eq!(world_status(&state.db, &wid).await, "ended", "到时间上限世界应 status=ended 停机");
     // 终局与状态 CAS 同事务：本 tick 的状态推进（revision 2→3）与停机同时落库。
-    let rev = i64_one(&state.db, "SELECT state_revision FROM worlds WHERE id=?", &wid).await;
+    let rev = i64_one(&state.db, "SELECT state_revision FROM worlds WHERE id=$1", &wid).await;
     assert_eq!(rev, 3, "终局 tick 的状态 CAS 与 end_world 同事务提交（revision 仍推进到 3）");
 }
 
@@ -1150,7 +1150,7 @@ async fn ended_world_is_not_rescheduled() {
     super::schedule_due_ticks(&state).await.unwrap();
     let max_tick = i64_one(
         &state.db,
-        "SELECT COALESCE(MAX(tick_no), -1) FROM world_ticks WHERE world_id=?",
+        "SELECT COALESCE(MAX(tick_no), -1) FROM world_ticks WHERE world_id=$1",
         &wid,
     )
     .await;
@@ -1227,7 +1227,7 @@ async fn set_enabled_endings(db: &AnyPool, wid: &str, endings: &[&str]) {
         "assembly": { "enabledEndings": endings },
         "chapterState": {},
     });
-    sqlx::query("UPDATE worlds SET assembled_json=? WHERE id=?")
+    sqlx::query("UPDATE worlds SET assembled_json=$1 WHERE id=$2")
         .bind(assembled.to_string())
         .bind(wid)
         .execute(db)
@@ -1242,7 +1242,7 @@ async fn set_pinned_ending(db: &AnyPool, wid: &str, selected: &str, enabled: &[&
         "assembly": { "enabledEndings": enabled, "selectedEnding": selected },
         "chapterState": {},
     });
-    sqlx::query("UPDATE worlds SET assembled_json=? WHERE id=?")
+    sqlx::query("UPDATE worlds SET assembled_json=$1 WHERE id=$2")
         .bind(assembled.to_string())
         .bind(wid)
         .execute(db)
@@ -1295,7 +1295,7 @@ async fn idle_world_concludes_on_key_character_exit() {
     assert_eq!(world_status(&state.db, &wid).await, "running");
 
     // 关键角色 A 永久退场（成员表 left）——同时使在场活跃成员跌破 2。
-    sqlx::query("UPDATE world_members SET status='left' WHERE world_id=? AND cloud_character_id=?")
+    sqlx::query("UPDATE world_members SET status='left' WHERE world_id=$1 AND cloud_character_id=$2")
         .bind(&wid)
         .bind("ckeyA")
         .execute(&state.db)
@@ -1312,7 +1312,7 @@ async fn idle_world_concludes_on_key_character_exit() {
     assert_eq!(world_status(&state.db, &wid).await, "ended", "关键角色退场 → status=ended");
     // 终局审计留痕（reason=key_character_exit）。
     let audits =
-        i64_one(&state.db, "SELECT COUNT(*) FROM audit_logs WHERE action='world.ended' AND subject=?", &wid)
+        i64_one(&state.db, "SELECT COUNT(*) FROM audit_logs WHERE action='world.ended' AND subject=$1", &wid)
             .await;
     assert_eq!(audits, 1, "关键角色退场终局写一条审计");
 }
@@ -1364,18 +1364,18 @@ async fn idle_world_concludes_on_full_mainline_with_ending_report() {
     );
 
     // 终局日报：commit_tick 报告循环生成（每成员一份，幂等 per world+char+day）。
-    let reports = i64_one(&state.db, "SELECT COUNT(*) FROM daily_reports WHERE world_id=?", &wid).await;
+    let reports = i64_one(&state.db, "SELECT COUNT(*) FROM daily_reports WHERE world_id=$1", &wid).await;
     assert!(reports >= 1, "全里程碑 Done 的终局 tick 应产出终局日报");
 
     // 终局产出：审计留痕 + select_ending 落成每成员一枚荣誉。本例 assembled_json 无 selectedEnding
     //（老实例形态）→ 走回退口径取名单首个（golden_reunion）；定盘口径另见 ending_reward_uses_pinned_selected_ending。
     let audits =
-        i64_one(&state.db, "SELECT COUNT(*) FROM audit_logs WHERE action='world.ended' AND subject=?", &wid)
+        i64_one(&state.db, "SELECT COUNT(*) FROM audit_logs WHERE action='world.ended' AND subject=$1", &wid)
             .await;
     assert_eq!(audits, 1, "终局审计一条");
     let ending_rewards = i64_one(
         &state.db,
-        "SELECT COUNT(*) FROM arena_rewards WHERE kind='ending' AND label='golden_reunion' AND world_id=?",
+        "SELECT COUNT(*) FROM arena_rewards WHERE kind='ending' AND label='golden_reunion' AND world_id=$1",
         &wid,
     )
     .await;
@@ -1410,7 +1410,7 @@ async fn ending_reward_respects_arena_redline() {
     // 红线①：终局奖励只入 arena_rewards（荣誉），kind='ending'、label=选定结局；arena_rewards schema 无
     //        任何强度/属性列 → 结构性保证「荣誉非战力」。
     let rows: Vec<(String, String)> =
-        sqlx::query_as("SELECT kind, label FROM arena_rewards WHERE world_id=?")
+        sqlx::query_as("SELECT kind, label FROM arena_rewards WHERE world_id=$1")
             .bind(&wid)
             .fetch_all(&state.db)
             .await
@@ -1434,7 +1434,7 @@ async fn ending_reward_respects_arena_redline() {
         process_tick_with_model(&state, &wid, 2, model.clone()).await.unwrap(),
         TickStatus::Skipped("world_not_running")
     );
-    let after = i64_one(&state.db, "SELECT COUNT(*) FROM arena_rewards WHERE world_id=?", &wid).await;
+    let after = i64_one(&state.db, "SELECT COUNT(*) FROM arena_rewards WHERE world_id=$1", &wid).await;
     assert_eq!(after, 2, "遗留 tick 不重复发奖（幂等）");
 }
 
@@ -1461,7 +1461,7 @@ async fn ending_reward_uses_pinned_selected_ending() {
     insert_tick(&state.db, &wid, 1, 1).await.unwrap();
     assert_eq!(process_tick_with_model(&state, &wid, 1, model.clone()).await.unwrap(), TickStatus::Concluded);
 
-    let labels: Vec<(String,)> = sqlx::query_as("SELECT label FROM arena_rewards WHERE world_id=?")
+    let labels: Vec<(String,)> = sqlx::query_as("SELECT label FROM arena_rewards WHERE world_id=$1")
         .bind(&wid)
         .fetch_all(&state.db)
         .await
@@ -1474,7 +1474,7 @@ async fn ending_reward_uses_pinned_selected_ending() {
     // 终局审计的 reason 串里也带定盘结局（运营侧看到的同样是定盘那个）。
     let reason = text_one(
         &state.db,
-        "SELECT reason FROM audit_logs WHERE action='world.ended' AND subject=?",
+        "SELECT reason FROM audit_logs WHERE action='world.ended' AND subject=$1",
         &wid,
     )
     .await;
@@ -1531,7 +1531,7 @@ async fn seed_narrative_layer_filters_outline_to_selected_mainline() {
     });
     sqlx::query(
         "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, official, version, moderation, created_at) \
-         VALUES ('tpl-sample', '采样模板', 'idle', ?, '{\"mode\":\"open\"}', 1, 1, 'approved', ?)",
+         VALUES ('tpl-sample', '采样模板', 'idle', $1, '{\"mode\":\"open\"}', 1, 1, 'approved', $2)",
     )
     .bind(skeleton.to_string())
     .bind(now_ms())
@@ -1580,7 +1580,7 @@ async fn seed_narrative_layer_filters_outline_to_selected_mainline() {
 async fn seed_template_custom(db: &AnyPool, id: &str, room_type: &str, skeleton: serde_json::Value) {
     sqlx::query(
         "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, official, version, moderation, created_at) \
-         VALUES (?, '缺口②模板', ?, ?, '{\"mode\":\"open\"}', 1, 1, 'approved', ?)",
+         VALUES ($1, '缺口②模板', $2, $3, '{\"mode\":\"open\"}', 1, 1, 'approved', $4)",
     )
     .bind(id)
     .bind(room_type)
@@ -1636,7 +1636,7 @@ async fn idle_room_assembles_npc_and_locations_on_first_tick() {
     let wid = running_idle_world_with_members(&state, "asm", "tpl-idle-asm", 2).await;
 
     // 建成时未装配：assembled_json 恒 NULL。
-    let before: Option<String> = sqlx::query_scalar("SELECT assembled_json FROM worlds WHERE id=?")
+    let before: Option<String> = sqlx::query_scalar("SELECT assembled_json FROM worlds WHERE id=$1")
         .bind(&wid)
         .fetch_one(&state.db)
         .await
@@ -1648,7 +1648,7 @@ async fn idle_room_assembles_npc_and_locations_on_first_tick() {
     assert_eq!(process_tick_with_model(&state, &wid, 0, model).await.unwrap(), TickStatus::Done);
 
     // 装配落地：assembled_json 非 NULL，含 worldCharacterEntries + locationGraph。
-    let raw = text_one(&state.db, "SELECT assembled_json FROM worlds WHERE id=?", &wid).await;
+    let raw = text_one(&state.db, "SELECT assembled_json FROM worlds WHERE id=$1", &wid).await;
     let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
     let entries = v["assembly"]["worldCharacterEntries"].as_array().expect("装配后应含 worldCharacterEntries");
     assert_eq!(entries.len(), 1, "1 个世界 NPC 应装配进 worldCharacterEntries");
@@ -1659,7 +1659,7 @@ async fn idle_room_assembles_npc_and_locations_on_first_tick() {
     // NPC 进 active_cards：参与本回合决策 → 产出 actor 含 npc-a 的 world_events。
     let npc_events = i64_one(
         &state.db,
-        "SELECT COUNT(*) FROM world_events WHERE world_id=? AND actors_json LIKE '%npc-a%'",
+        "SELECT COUNT(*) FROM world_events WHERE world_id=$1 AND actors_json LIKE '%npc-a%'",
         &wid,
     )
     .await;
@@ -1695,7 +1695,7 @@ async fn idle_npc_assembly_breaks_insufficient_members_deadlock() {
     assert_eq!(status, TickStatus::Done, "单玩家 idle + NPC 模板：装配后 active_cards==2 → 正常推进");
 
     // NPC 确已装配进实例（active_cards 的来源）。
-    let raw = text_one(&state.db, "SELECT assembled_json FROM worlds WHERE id=?", &wid).await;
+    let raw = text_one(&state.db, "SELECT assembled_json FROM worlds WHERE id=$1", &wid).await;
     let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(v["assembly"]["worldCharacterEntries"].as_array().unwrap().len(), 1, "NPC 应装配进实例");
 }
@@ -1720,13 +1720,13 @@ async fn idle_assembly_is_idempotent_across_ticks() {
     // tick 0：装配（首次）。
     insert_tick(&state.db, &wid, 0, 0).await.unwrap();
     assert_eq!(process_tick_with_model(&state, &wid, 0, model.clone()).await.unwrap(), TickStatus::Done);
-    let raw0 = text_one(&state.db, "SELECT assembled_json FROM worlds WHERE id=?", &wid).await;
+    let raw0 = text_one(&state.db, "SELECT assembled_json FROM worlds WHERE id=$1", &wid).await;
     let v0: serde_json::Value = serde_json::from_str(&raw0).unwrap();
 
     // tick 1：不得重装（is_some 短路）。
     insert_tick(&state.db, &wid, 1, 1).await.unwrap();
     assert_eq!(process_tick_with_model(&state, &wid, 1, model.clone()).await.unwrap(), TickStatus::Done);
-    let raw1 = text_one(&state.db, "SELECT assembled_json FROM worlds WHERE id=?", &wid).await;
+    let raw1 = text_one(&state.db, "SELECT assembled_json FROM worlds WHERE id=$1", &wid).await;
     let v1: serde_json::Value = serde_json::from_str(&raw1).unwrap();
 
     assert_eq!(v0["assembledAt"], v1["assembledAt"], "第二 tick 不得重装（assembledAt 不变）");
@@ -1775,7 +1775,7 @@ async fn idle_room_assembly_sampling_narrows_outline() {
     assert_eq!(process_tick_with_model(&state, &wid, 0, model).await.unwrap(), TickStatus::Done);
 
     // 装配采样审计段钉入（16 位十六进制 seed；被选主线 = fated + 1 = 2，模板全量 5）。
-    let raw = text_one(&state.db, "SELECT assembled_json FROM worlds WHERE id=?", &wid).await;
+    let raw = text_one(&state.db, "SELECT assembled_json FROM worlds WHERE id=$1", &wid).await;
     let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
     let seed = v["assembly"]["sampling"]["seed"].as_str().expect("超集 idle 实例应产出采样审计段（seed）");
     assert_eq!(seed.len(), 16, "seed 应为 u64 十六进制");
@@ -1794,7 +1794,7 @@ async fn idle_room_assembly_sampling_narrows_outline() {
 // ---------- 引擎 LLM 鲁棒性：max_output_tokens 从世界钉住的 model_routes 读取 ----------
 
 async fn seed_routes_json(db: &AnyPool, version: &str, routes: serde_json::Value) {
-    sqlx::query("INSERT INTO model_routes (id, version, routes_json, active, created_at) VALUES (?, ?, ?, 1, ?)")
+    sqlx::query("INSERT INTO model_routes (id, version, routes_json, active, created_at) VALUES ($1, $2, $3, 1, $4)")
         .bind(new_id("mr"))
         .bind(version)
         .bind(routes.to_string())
@@ -1848,17 +1848,17 @@ async fn event_non_idle_manual_only_idle_back_to_back() {
     // 首轮调度：idle 无 outstanding → 背靠背排出 tick 0；chapter/arena 不自动排（房型闸）。
     super::schedule_due_ticks(&state).await.unwrap();
     assert_eq!(
-        i64_one(&state.db, "SELECT COUNT(*) FROM world_ticks WHERE world_id=?", &idle).await,
+        i64_one(&state.db, "SELECT COUNT(*) FROM world_ticks WHERE world_id=$1", &idle).await,
         1,
         "event×idle 应背靠背自动排出首 tick"
     );
     assert_eq!(
-        i64_one(&state.db, "SELECT COUNT(*) FROM world_ticks WHERE world_id=?", &chap).await,
+        i64_one(&state.db, "SELECT COUNT(*) FROM world_ticks WHERE world_id=$1", &chap).await,
         0,
         "event×chapter 不应被调度器自动排 tick（手动端点驱动）"
     );
     assert_eq!(
-        i64_one(&state.db, "SELECT COUNT(*) FROM world_ticks WHERE world_id=?", &arena).await,
+        i64_one(&state.db, "SELECT COUNT(*) FROM world_ticks WHERE world_id=$1", &arena).await,
         0,
         "event×arena 不应被调度器自动排 tick（手动端点驱动）"
     );
@@ -1867,28 +1867,28 @@ async fn event_non_idle_manual_only_idle_back_to_back() {
     assert_eq!(super::schedule_tick(&state, &chap).await.unwrap(), Some(0), "手动端点排下 chapter 首 tick");
     assert_eq!(super::schedule_tick(&state, &arena).await.unwrap(), Some(0), "手动端点排下 arena 首 tick");
     assert_eq!(
-        i64_one(&state.db, "SELECT COUNT(*) FROM world_ticks WHERE world_id=?", &chap).await,
+        i64_one(&state.db, "SELECT COUNT(*) FROM world_ticks WHERE world_id=$1", &chap).await,
         1
     );
     assert_eq!(
-        i64_one(&state.db, "SELECT COUNT(*) FROM world_ticks WHERE world_id=?", &arena).await,
+        i64_one(&state.db, "SELECT COUNT(*) FROM world_ticks WHERE world_id=$1", &arena).await,
         1
     );
 
     // 再轮调度：chapter/arena 仍不追加自动 tick（保持手动排的 1 个）；idle 首 tick 仍 pending → 不背靠背再排。
     super::schedule_due_ticks(&state).await.unwrap();
     assert_eq!(
-        i64_one(&state.db, "SELECT COUNT(*) FROM world_ticks WHERE world_id=?", &chap).await,
+        i64_one(&state.db, "SELECT COUNT(*) FROM world_ticks WHERE world_id=$1", &chap).await,
         1,
         "调度器不应给 event×chapter 追加自动 tick"
     );
     assert_eq!(
-        i64_one(&state.db, "SELECT COUNT(*) FROM world_ticks WHERE world_id=?", &arena).await,
+        i64_one(&state.db, "SELECT COUNT(*) FROM world_ticks WHERE world_id=$1", &arena).await,
         1,
         "调度器不应给 event×arena 追加自动 tick"
     );
     assert_eq!(
-        i64_one(&state.db, "SELECT COUNT(*) FROM world_ticks WHERE world_id=?", &idle).await,
+        i64_one(&state.db, "SELECT COUNT(*) FROM world_ticks WHERE world_id=$1", &idle).await,
         1,
         "idle 首 tick 未 done（pending），本轮 outstanding≠0 → 不背靠背再排"
     );
@@ -1910,7 +1910,7 @@ async fn pin_two_locations_with_npcs(db: &AnyPool, world_id: &str) {
             ]
         }
     });
-    sqlx::query("UPDATE worlds SET assembled_json=? WHERE id=?")
+    sqlx::query("UPDATE worlds SET assembled_json=$1 WHERE id=$2")
         .bind(assembled.to_string())
         .bind(world_id)
         .execute(db)
@@ -2036,8 +2036,8 @@ async fn idle_world_ending_grants_growth_to_present_cards_once() {
     // tick 0：未到上限 → Done，世界仍 running，不发终局历练。
     insert_tick(&state.db, &wid, 0, 0).await.unwrap();
     assert_eq!(process_tick_with_model(&state, &wid, 0, model.clone()).await.unwrap(), TickStatus::Done);
-    assert_eq!(i64_one(&state.db, "SELECT mileage FROM cloud_characters WHERE id=?", "cmlgA").await, 0);
-    assert_eq!(i64_one(&state.db, "SELECT mileage FROM cloud_characters WHERE id=?", "cmlgB").await, 0);
+    assert_eq!(i64_one(&state.db, "SELECT mileage FROM cloud_characters WHERE id=$1", "cmlgA").await, 0);
+    assert_eq!(i64_one(&state.db, "SELECT mileage FROM cloud_characters WHERE id=$1", "cmlgB").await, 0);
 
     // tick 1：到 max_world_ticks → Concluded（真正结算那一次）→ 两张在场卡各 +60。
     insert_tick(&state.db, &wid, 1, 1).await.unwrap();
@@ -2047,12 +2047,12 @@ async fn idle_world_ending_grants_growth_to_present_cards_once() {
     );
     assert_eq!(world_status(&state.db, &wid).await, "ended");
     assert_eq!(
-        i64_one(&state.db, "SELECT mileage FROM cloud_characters WHERE id=?", "cmlgA").await,
+        i64_one(&state.db, "SELECT mileage FROM cloud_characters WHERE id=$1", "cmlgA").await,
         60,
         "idle 终局每在场卡 +60（与终局停机同事务）"
     );
     assert_eq!(
-        i64_one(&state.db, "SELECT mileage FROM cloud_characters WHERE id=?", "cmlgB").await,
+        i64_one(&state.db, "SELECT mileage FROM cloud_characters WHERE id=$1", "cmlgB").await,
         60,
         "两张在场卡都应获得终局历练"
     );
@@ -2063,8 +2063,8 @@ async fn idle_world_ending_grants_growth_to_present_cards_once() {
         process_tick_with_model(&state, &wid, 2, model.clone()).await.unwrap(),
         TickStatus::Skipped("world_not_running")
     );
-    assert_eq!(i64_one(&state.db, "SELECT mileage FROM cloud_characters WHERE id=?", "cmlgA").await, 60);
-    assert_eq!(i64_one(&state.db, "SELECT mileage FROM cloud_characters WHERE id=?", "cmlgB").await, 60);
+    assert_eq!(i64_one(&state.db, "SELECT mileage FROM cloud_characters WHERE id=$1", "cmlgA").await, 60);
+    assert_eq!(i64_one(&state.db, "SELECT mileage FROM cloud_characters WHERE id=$1", "cmlgB").await, 60);
 }
 
 // ==================== R1 三层结算 ③ 世界线层：贡献归因 → 公示产出表 → 确定发放 ====================
@@ -2088,7 +2088,7 @@ async fn seed_template_worldline(
     sqlx::query(
         "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, official, \
          version, moderation, star_rating, created_at) \
-         VALUES (?, '产出表模板', 'idle', ?, '{\"mode\":\"open\"}', 1, 1, 'approved', ?, ?)",
+         VALUES ($1, '产出表模板', 'idle', $2, '{\"mode\":\"open\"}', 1, 1, 'approved', $3, $4)",
     )
     .bind(id)
     .bind(skeleton.to_string())
@@ -2115,7 +2115,7 @@ fn two_tier_payout(template_id: &str) -> serde_json::Value {
 async fn contribution_of(db: &AnyPool, wid: &str, cid: &str) -> (i64, i64, i64) {
     sqlx::query_as::<_, (i64, i64, i64)>(
         "SELECT score_milli, milestone_score_milli, settled_at FROM world_contributions \
-         WHERE world_id=? AND character_id=?",
+         WHERE world_id=$1 AND character_id=$2",
     )
     .bind(wid)
     .bind(cid)
@@ -2126,7 +2126,7 @@ async fn contribution_of(db: &AnyPool, wid: &str, cid: &str) -> (i64, i64, i64) 
 }
 
 async fn backpack_hook_count(db: &AnyPool, user: &str, hook_key: &str) -> i64 {
-    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM backpacks WHERE user_id=? AND reward_hook_key=?")
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM backpacks WHERE user_id=$1 AND reward_hook_key=$2")
         .bind(user)
         .bind(hook_key)
         .fetch_one(db)
@@ -2164,7 +2164,7 @@ async fn worldline_settlement_pays_by_public_payout_table() {
     );
 
     // 产出表随实例钉住（skeleton → assemble_instance → assembled_json），不是运行期临时拼的。
-    let raw: String = sqlx::query_scalar("SELECT assembled_json FROM worlds WHERE id=?")
+    let raw: String = sqlx::query_scalar("SELECT assembled_json FROM worlds WHERE id=$1")
         .bind(&wid)
         .fetch_one(&state.db)
         .await
@@ -2178,7 +2178,7 @@ async fn worldline_settlement_pays_by_public_payout_table() {
     assert_eq!(wrapper["starRating"], json!(3));
 
     // 贡献分绝不进引擎状态（平权红线）：narrative_state_json 里不得出现贡献账本痕迹。
-    let ns: String = sqlx::query_scalar("SELECT narrative_state_json FROM worlds WHERE id=?")
+    let ns: String = sqlx::query_scalar("SELECT narrative_state_json FROM worlds WHERE id=$1")
         .bind(&wid)
         .fetch_one(&state.db)
         .await
@@ -2208,7 +2208,7 @@ async fn worldline_settlement_pays_by_public_payout_table() {
         assert!(settled > 0, "{cid} 结算后应打上 settled_at 幂等标记");
         // ① 保底 60 + ③ 推动档 80。
         assert_eq!(
-            i64_one(&state.db, "SELECT mileage FROM cloud_characters WHERE id=?", cid).await,
+            i64_one(&state.db, "SELECT mileage FROM cloud_characters WHERE id=$1", cid).await,
             140,
             "{cid} 应得 ① 出席 60 + ③ 世界线「推动」档 80"
         );
@@ -2223,7 +2223,7 @@ async fn worldline_settlement_pays_by_public_payout_table() {
     assert_eq!(
         i64_one(
             &state.db,
-            "SELECT COUNT(*) FROM audit_logs WHERE action='world.worldline_settled' AND subject=?",
+            "SELECT COUNT(*) FROM audit_logs WHERE action='world.worldline_settled' AND subject=$1",
             &wid
         )
         .await,
@@ -2275,7 +2275,7 @@ async fn worldline_collapse_zeroes_tier3_halves_baseline_and_keeps_locked_items(
     assert_eq!(contribution_of(&state.db, &wid, "ccolB").await.1, 1250);
 
     // 关键角色 ccolA 永久退场 → 世界线崩塌。
-    sqlx::query("UPDATE world_members SET status='left' WHERE world_id=? AND cloud_character_id=?")
+    sqlx::query("UPDATE world_members SET status='left' WHERE world_id=$1 AND cloud_character_id=$2")
         .bind(&wid)
         .bind("ccolA")
         .execute(&state.db)
@@ -2291,7 +2291,7 @@ async fn worldline_collapse_zeroes_tier3_halves_baseline_and_keeps_locked_items(
 
     // ① 减半：出席产出 60 → 30（不是 0，也不是 60，更不含任何 ③ 层加成）。
     assert_eq!(
-        i64_one(&state.db, "SELECT mileage FROM cloud_characters WHERE id=?", "ccolB").await,
+        i64_one(&state.db, "SELECT mileage FROM cloud_characters WHERE id=$1", "ccolB").await,
         30,
         "崩塌 → ① 保底层减半（60×0.5），且 ③ 归零（否则会是 30+20 或 60+20）"
     );
@@ -2305,7 +2305,7 @@ async fn worldline_collapse_zeroes_tier3_halves_baseline_and_keeps_locked_items(
     assert_eq!(
         i64_one(
             &state.db,
-            "SELECT COUNT(*) FROM audit_logs WHERE action='world.worldline_settled' AND subject=?",
+            "SELECT COUNT(*) FROM audit_logs WHERE action='world.worldline_settled' AND subject=$1",
             &wid
         )
         .await,
@@ -2314,7 +2314,7 @@ async fn worldline_collapse_zeroes_tier3_halves_baseline_and_keeps_locked_items(
     );
     // ② 保留：崩塌不回收任何已锁定产出（锁定语义正为此设计——本层根本不参与崩塌折算）。
     let locked_kept: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM backpacks WHERE user_id=? AND item_id=?")
+        sqlx::query_scalar("SELECT COUNT(*) FROM backpacks WHERE user_id=$1 AND item_id=$2")
             .bind("ucolB")
             .bind("locked_hook_item")
             .fetch_one(&state.db)
@@ -2355,7 +2355,7 @@ async fn worldline_payout_never_exceeds_star_rating_power_tier_cap() {
 
     // 历练照发（① 60 + ③ 50），但超顶道具一件都没进包。
     assert_eq!(
-        i64_one(&state.db, "SELECT mileage FROM cloud_characters WHERE id=?", "ccap3A").await,
+        i64_one(&state.db, "SELECT mileage FROM cloud_characters WHERE id=$1", "ccap3A").await,
         110
     );
     assert_eq!(
@@ -2364,7 +2364,7 @@ async fn worldline_payout_never_exceeds_star_rating_power_tier_cap() {
         "powerTier 4 > 1★ → 产出封顶剔除，绝不绕过"
     );
     assert_eq!(
-        i64_one(&state.db, "SELECT COUNT(*) FROM items WHERE id=?", "over_tier_relic").await,
+        i64_one(&state.db, "SELECT COUNT(*) FROM items WHERE id=$1", "over_tier_relic").await,
         0,
         "超顶道具连定义都不该落库（grant_item_tx 根本没被调用）"
     );
@@ -2430,7 +2430,7 @@ async fn seed_template_with_identity_pool(db: &AnyPool, id: &str, pool: serde_js
     });
     sqlx::query(
         "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, official, version, moderation, created_at) \
-         VALUES (?, '身份池模板', 'idle', ?, '{\"mode\":\"open\"}', 1, 1, 'approved', ?)",
+         VALUES ($1, '身份池模板', 'idle', $2, '{\"mode\":\"open\"}', 1, 1, 'approved', $3)",
     )
     .bind(id)
     .bind(skeleton.to_string())
@@ -2474,7 +2474,7 @@ async fn running_world_with_identities(
     seed_member(&state.db, &wid, "uA", "chA").await;
     seed_member(&state.db, &wid, "uB", "chB").await;
 
-    sqlx::query("UPDATE worlds SET assembled_json=? WHERE id=?")
+    sqlx::query("UPDATE worlds SET assembled_json=$1 WHERE id=$2")
         .bind(json!({ "assembly": { "identityAssignments": assignments } }).to_string())
         .bind(&wid)
         .execute(&state.db)
@@ -2534,7 +2534,7 @@ async fn identity_never_pollutes_active_cards_redline() {
         json!([["chA", "official"], ["chB", "merchant"]]),
     )
     .await;
-    let before = text_one(&state.db, "SELECT card_json FROM cloud_characters WHERE id=?", "chA").await;
+    let before = text_one(&state.db, "SELECT card_json FROM cloud_characters WHERE id=$1", "chA").await;
     let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
     let model: Arc<dyn ModelClient> = Arc::new(CapturingMock { decide_prompts: prompts.clone() });
 
@@ -2553,7 +2553,7 @@ async fn identity_never_pollutes_active_cards_redline() {
         "红线：身份不得出现在角色卡任何字段里"
     );
     assert_eq!(
-        text_one(&state.db, "SELECT card_json FROM cloud_characters WHERE id=?", "chA").await,
+        text_one(&state.db, "SELECT card_json FROM cloud_characters WHERE id=$1", "chA").await,
         before,
         "红线：云端角色卡原文必须逐字节不变"
     );
@@ -2673,7 +2673,7 @@ async fn broken_assembled_json_leaves_self_identity_absent() {
     );
 
     // ② 整段 assembled_json 直接是非 JSON 文本。
-    sqlx::query("UPDATE worlds SET assembled_json='{ 这不是 JSON' WHERE id=?")
+    sqlx::query("UPDATE worlds SET assembled_json='{ 这不是 JSON' WHERE id=$1")
         .bind(&wid)
         .execute(&state.db)
         .await
@@ -2763,7 +2763,7 @@ async fn broken_assembled_json_degrades_silently_without_blocking_tick() {
     assert_eq!(ctx_of(&prompts.lock().unwrap().clone(), "chA")["others"], json!({ "chB": "王" }));
 
     // ② 再叠一层：整段 assembled_json 直接写成非 JSON 文本。
-    sqlx::query("UPDATE worlds SET assembled_json='{ 这不是 JSON' WHERE id=?")
+    sqlx::query("UPDATE worlds SET assembled_json='{ 这不是 JSON' WHERE id=$1")
         .bind(&wid)
         .execute(&state.db)
         .await
@@ -2848,7 +2848,7 @@ async fn assignments_without_pool_in_template_degrade_completely() {
     let mut p = CreateWorldParams::official("tpl-nopool", 1, "无池世界");
     p.status = Some("running".into());
     let wid = create_world(&state.db, p).await.unwrap();
-    sqlx::query("UPDATE worlds SET assembled_json=? WHERE id=?")
+    sqlx::query("UPDATE worlds SET assembled_json=$1 WHERE id=$2")
         .bind(json!({ "assembly": { "identityAssignments": [["chA", "official"]] } }).to_string())
         .bind(&wid)
         .execute(&state.db)
@@ -2861,7 +2861,7 @@ async fn assignments_without_pool_in_template_degrade_completely() {
     );
 
     // 模板行整个查不到（脏数据）同样退化。
-    sqlx::query("UPDATE worlds SET template_id='tpl-missing' WHERE id=?")
+    sqlx::query("UPDATE worlds SET template_id='tpl-missing' WHERE id=$1")
         .bind(&wid)
         .execute(&state.db)
         .await
@@ -2911,7 +2911,7 @@ impl ModelClient for CriticIssuesMock {
 async fn critic_row(db: &AnyPool, world_id: &str, tick_no: i64) -> (i64, i64, i64, String) {
     sqlx::query_as::<_, (i64, i64, i64, String)>(
         "SELECT consistency_issue_count, causal_issue_count, revision_suggestion_count, report_json \
-         FROM world_tick_critic WHERE world_id=? AND tick_no=?",
+         FROM world_tick_critic WHERE world_id=$1 AND tick_no=$2",
     )
     .bind(world_id)
     .bind(tick_no)
@@ -2951,7 +2951,7 @@ async fn critic_report_is_persisted_with_structured_fields_readable_back() {
     insert_tick(&state.db, &wid, 1, 1).await.unwrap();
     assert_eq!(process_tick_with_model(&state, &wid, 1, model).await.unwrap(), TickStatus::Done);
     assert_eq!(
-        i64_one(&state.db, "SELECT COUNT(*) FROM world_tick_critic WHERE world_id=?", &wid).await,
+        i64_one(&state.db, "SELECT COUNT(*) FROM world_tick_critic WHERE world_id=$1", &wid).await,
         2,
         "两个已提交 tick 各落一行"
     );
@@ -2982,7 +2982,7 @@ async fn critic_report_never_reaches_engine_state_redline() {
 
     // ② 也不得混进对外事件投影（critic 是内部观测，不是公共事实）。
     let events_dump: String = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM world_events WHERE world_id=? AND (COALESCE(public_projection_json,'') LIKE '%现代口语%' \
+        "SELECT COUNT(*) FROM world_events WHERE world_id=$1 AND (COALESCE(public_projection_json,'') LIKE '%现代口语%' \
          OR COALESCE(private_projections_json,'') LIKE '%现代口语%')",
     )
     .bind(&wid)
@@ -2993,7 +2993,7 @@ async fn critic_report_never_reaches_engine_state_redline() {
     assert_eq!(events_dump, "0", "critic 文本不得出现在任何事件投影");
 
     // ③ critic 确实落到了它该在的地方（防"两边都没有"的假绿）。
-    assert_eq!(i64_one(&state.db, "SELECT COUNT(*) FROM world_tick_critic WHERE world_id=?", &wid).await, 1);
+    assert_eq!(i64_one(&state.db, "SELECT COUNT(*) FROM world_tick_critic WHERE world_id=$1", &wid).await, 1);
 }
 
 /// **分母**：critic 跑过但一条问题都没有时**仍要落一行**（计数全 0）——否则「干净的 tick」与
@@ -3021,7 +3021,7 @@ async fn clean_critic_still_writes_a_row_and_uncommitted_ticks_write_none() {
         TickStatus::Skipped("superseded")
     );
     assert_eq!(
-        i64_one(&state.db, "SELECT COUNT(*) FROM world_tick_critic WHERE world_id=?", &wid).await,
+        i64_one(&state.db, "SELECT COUNT(*) FROM world_tick_critic WHERE world_id=$1", &wid).await,
         1,
         "未提交回合不得留下孤儿 critic 行（与状态 CAS 同事务的直接后果）"
     );
@@ -3029,7 +3029,7 @@ async fn clean_critic_still_writes_a_row_and_uncommitted_ticks_write_none() {
     // 分子/分母都能纯 SQL 算出来：矛盾率 = 有问题的 tick / critic 跑过的 tick。
     let with_issues = i64_one(
         &state.db,
-        "SELECT COUNT(*) FROM world_tick_critic WHERE world_id=? AND (consistency_issue_count > 0 OR causal_issue_count > 0)",
+        "SELECT COUNT(*) FROM world_tick_critic WHERE world_id=$1 AND (consistency_issue_count > 0 OR causal_issue_count > 0)",
         &wid,
     )
     .await;
@@ -3474,7 +3474,7 @@ async fn offpeak_world(state: &AppState, tag: &str, room_type: &str, tick_per_da
 async fn seed_done_tick_at(db: &AnyPool, world_id: &str, tick_no: i64, created_at: i64) {
     sqlx::query(
         "INSERT INTO world_ticks (id, world_id, tick_no, base_revision, status, cost_tokens, created_at) \
-         VALUES (?, ?, ?, 0, 'done', 0, ?)",
+         VALUES ($1, $2, $3, 0, 'done', 0, $4)",
     )
     .bind(new_id("tick"))
     .bind(world_id)
@@ -3486,7 +3486,7 @@ async fn seed_done_tick_at(db: &AnyPool, world_id: &str, tick_no: i64, created_a
 }
 
 async fn max_tick_no(db: &AnyPool, world_id: &str) -> i64 {
-    i64_one(db, "SELECT COALESCE(MAX(tick_no), -1) FROM world_ticks WHERE world_id=?", world_id).await
+    i64_one(db, "SELECT COALESCE(MAX(tick_no), -1) FROM world_ticks WHERE world_id=$1", world_id).await
 }
 
 /// 🔴 **回归保护：开关关闭时调度行为逐字不变**。
@@ -3504,7 +3504,7 @@ async fn offpeak_disabled_keeps_scheduling_byte_identical() {
     assert_eq!(max_tick_no(&state.db, &iv).await, 1, "开关关闭 → 到点即排，与接线前一致");
 
     // 新增三列必须是中性值（既有 cost.* 聚合看到的世界完全没变）。
-    let row = sqlx::query("SELECT off_peak, price_ratio_pct, defer_ms FROM world_ticks WHERE world_id=? AND tick_no=1")
+    let row = sqlx::query("SELECT off_peak, price_ratio_pct, defer_ms FROM world_ticks WHERE world_id=$1 AND tick_no=1")
         .bind(&iv)
         .fetch_one(&state.db)
         .await
@@ -3550,7 +3550,7 @@ async fn offpeak_defers_outside_window_then_schedules_inside() {
         super::schedule_due_ticks(&state).await.unwrap();
         assert_eq!(max_tick_no(&state.db, &wid).await, 1, "折扣时段应把被压的拍排出来");
         let row = sqlx::query(
-            "SELECT off_peak, price_ratio_pct FROM world_ticks WHERE world_id=? AND tick_no=1",
+            "SELECT off_peak, price_ratio_pct FROM world_ticks WHERE world_id=$1 AND tick_no=1",
         )
         .bind(&wid)
         .fetch_one(&state.db)
@@ -3588,7 +3588,7 @@ async fn offpeak_live_rooms_are_scheduled_even_outside_window() {
     assert_eq!(max_tick_no(&state.db, &dense).await, 1, "🔴 密集拍直播场不得被延后");
     // 直播场的拍不得被记成「享了折扣」。
     for w in [&arena, &dense] {
-        let op = i64_one(&state.db, "SELECT off_peak FROM world_ticks WHERE world_id=? AND tick_no=1", w).await;
+        let op = i64_one(&state.db, "SELECT off_peak FROM world_ticks WHERE world_id=$1 AND tick_no=1", w).await;
         assert_eq!(op, 0, "直播场没享折扣，不许记成享了");
     }
     super::offpeak::defer_tracker().clear(&serial);
@@ -3616,7 +3616,7 @@ async fn offpeak_starvation_guard_schedules_outside_window() {
     // 兜底跑出来的拍是原价跑的，不许记成折扣。
     let op = i64_one(
         &state.db,
-        "SELECT off_peak FROM world_ticks WHERE world_id=? AND tick_no=1",
+        "SELECT off_peak FROM world_ticks WHERE world_id=$1 AND tick_no=1",
         &starved,
     )
     .await;
@@ -3677,7 +3677,7 @@ async fn offpeak_priority_orders_longest_deferred_first() {
         }
         assert_eq!(order, vec![b.clone(), c.clone(), a.clone()], "应按被压时长降序入队");
         // 被压时长如实落进逐拍台账（>0 才说明错峰真的生效过）。
-        let dm = i64_one(&state.db, "SELECT defer_ms FROM world_ticks WHERE world_id=? AND tick_no=1", &b).await;
+        let dm = i64_one(&state.db, "SELECT defer_ms FROM world_ticks WHERE world_id=$1 AND tick_no=1", &b).await;
         assert!(dm >= 60 * 60_000, "b 的 defer_ms 应≥1 小时，实际 {dm}");
     }
     for w in [&a, &b, &c] {
@@ -3702,7 +3702,7 @@ async fn offpeak_concurrent_scheduling_never_duplicates_ticks() {
         super::schedule_due_ticks(&state).await.unwrap();
     }
     assert_eq!(
-        i64_one(&state.db, "SELECT COUNT(*) FROM world_ticks WHERE world_id=?", &wid).await,
+        i64_one(&state.db, "SELECT COUNT(*) FROM world_ticks WHERE world_id=$1", &wid).await,
         2,
         "重复轮询不得排出重复拍"
     );
@@ -3734,7 +3734,7 @@ async fn offpeak_applies_to_back_to_back_idle_rooms() {
             (super::offpeak::ENV_WINDOWS, window_excluding_now()),
         ]);
         wid = offpeak_world(&state, "offe", "idle", 3).await;
-        sqlx::query("UPDATE worlds SET timeline_mode='event' WHERE id=?")
+        sqlx::query("UPDATE worlds SET timeline_mode='event' WHERE id=$1")
             .bind(&wid)
             .execute(&state.db)
             .await
@@ -3751,7 +3751,7 @@ async fn offpeak_applies_to_back_to_back_idle_rooms() {
         ]);
         super::schedule_due_ticks(&state).await.unwrap();
         assert_eq!(max_tick_no(&state.db, &wid).await, 1, "折扣时段应恢复背靠背");
-        let op = i64_one(&state.db, "SELECT off_peak FROM world_ticks WHERE world_id=? AND tick_no=1", &wid).await;
+        let op = i64_one(&state.db, "SELECT off_peak FROM world_ticks WHERE world_id=$1 AND tick_no=1", &wid).await;
         assert_eq!(op, 1);
     }
     super::offpeak::defer_tracker().clear(&wid);
@@ -3770,7 +3770,7 @@ async fn offpeak_does_not_stack_ticks_on_unfinished_round() {
     // 一拍 pending 且已滞留很久（早该到点了）。
     sqlx::query(
         "INSERT INTO world_ticks (id, world_id, tick_no, base_revision, status, created_at) \
-         VALUES (?, ?, 0, 0, 'pending', ?)",
+         VALUES ($1, $2, 0, 0, 'pending', $3)",
     )
     .bind(new_id("tick"))
     .bind(&wid)
@@ -3783,7 +3783,7 @@ async fn offpeak_does_not_stack_ticks_on_unfinished_round() {
     assert_eq!(max_tick_no(&state.db, &wid).await, 0, "在飞的拍未完成前不得叠新拍");
 
     // 该拍收尾后，下一轮立刻排出（不叠拍 ≠ 卡死）。
-    sqlx::query("UPDATE world_ticks SET status='done' WHERE world_id=? AND tick_no=0")
+    sqlx::query("UPDATE world_ticks SET status='done' WHERE world_id=$1 AND tick_no=0")
         .bind(&wid)
         .execute(&state.db)
         .await

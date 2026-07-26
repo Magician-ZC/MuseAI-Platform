@@ -103,8 +103,8 @@ pub const MODERATION_APPROVED: &str = "approved";
 /// `list_events` 与 `stream_loop` 断线补偿共用同一口径——两处各写一份 SQL 必然漂移，
 /// 漏掉任一处的 `moderation = 'approved'` 就等于整层拦截失效。
 const VISIBLE_EVENTS_SQL: &str = "SELECT * FROM world_events \
-     WHERE world_id = ? AND sequence > ? AND (visibility = 'public' OR audience_json LIKE ?) \
-     AND moderation = 'approved' ORDER BY sequence ASC LIMIT ?";
+     WHERE world_id = $1 AND sequence > $2 AND (visibility = 'public' OR audience_json LIKE $3) \
+     AND moderation = 'approved' ORDER BY sequence ASC LIMIT $4";
 
 /// WS 断线重连补偿的单次上限（原为 SQL 内联字面量 500，抽出以复用 VISIBLE_EVENTS_SQL）。
 const STREAM_BACKFILL_LIMIT: i64 = 500;
@@ -256,7 +256,7 @@ pub async fn insert_events_tx(
     tick_no: i64,
     projected: &[ProjectedEvent],
 ) -> Result<Vec<StoredEvent>, ApiError> {
-    let base: i64 = sqlx::query("SELECT COALESCE(MAX(sequence), -1) AS m FROM world_events WHERE world_id = ?")
+    let base: i64 = sqlx::query("SELECT COALESCE(MAX(sequence), -1) AS m FROM world_events WHERE world_id = $1")
         .bind(world_id)
         .fetch_one(&mut **tx)
         .await?
@@ -278,7 +278,7 @@ pub async fn insert_events_tx(
             "INSERT INTO world_events (id, world_id, tick_no, sequence, domain_event_id, event_type, \
              actors_json, visibility, audience_json, public_projection_json, private_projections_json, \
              arbiter_note, moderation, ai_label, occurred_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 1, $14)",
         )
         .bind(&id)
         .bind(world_id)
@@ -344,7 +344,7 @@ pub async fn persist_and_broadcast_public_event(
     extra: Value,
 ) -> Result<StoredEvent, ApiError> {
     let mut tx = state.db.begin().await?;
-    let base: i64 = sqlx::query("SELECT COALESCE(MAX(sequence), -1) AS m FROM world_events WHERE world_id = ?")
+    let base: i64 = sqlx::query("SELECT COALESCE(MAX(sequence), -1) AS m FROM world_events WHERE world_id = $1")
         .bind(world_id)
         .fetch_one(&mut *tx)
         .await?
@@ -367,7 +367,7 @@ pub async fn persist_and_broadcast_public_event(
         "INSERT INTO world_events (id, world_id, tick_no, sequence, domain_event_id, event_type, \
          actors_json, visibility, audience_json, public_projection_json, private_projections_json, \
          arbiter_note, moderation, ai_label, occurred_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'public', NULL, ?, NULL, NULL, 'approved', 1, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'public', NULL, $8, NULL, NULL, 'approved', 1, $9)",
     )
     .bind(&id)
     .bind(world_id)
@@ -417,7 +417,7 @@ pub async fn can_view_world(db: &AnyPool, world_id: &str, principal: &str) -> Re
         return Ok(true);
     }
     let is_member = sqlx::query(
-        "SELECT 1 AS x FROM world_members WHERE world_id = ? AND user_id = ? AND status='active' LIMIT 1",
+        "SELECT 1 AS x FROM world_members WHERE world_id = $1 AND user_id = $2 AND status='active' LIMIT 1",
     )
     .bind(world_id)
     .bind(principal)
@@ -626,7 +626,7 @@ async fn world_state_summary(
 
     // viewer 在本世界持有的角色（成员）；观战者为空集 → 见不到任何私有关系。
     let rows = sqlx::query(
-        "SELECT cloud_character_id FROM world_members WHERE world_id = ? AND user_id = ? AND status = 'active'",
+        "SELECT cloud_character_id FROM world_members WHERE world_id = $1 AND user_id = $2 AND status = 'active'",
     )
     .bind(&id)
     .bind(&user.user_id)
@@ -763,7 +763,7 @@ mod tests {
     }
 
     async fn set_state(db: &AnyPool, world: &str, s: &str) {
-        sqlx::query("UPDATE worlds SET narrative_state_json = ? WHERE id = ?")
+        sqlx::query("UPDATE worlds SET narrative_state_json = $1 WHERE id = $2")
             .bind(s)
             .bind(world)
             .execute(db)
@@ -772,7 +772,7 @@ mod tests {
     }
 
     async fn set_assembled(db: &AnyPool, world: &str, s: &str) {
-        sqlx::query("UPDATE worlds SET assembled_json = ? WHERE id = ?")
+        sqlx::query("UPDATE worlds SET assembled_json = $1 WHERE id = $2")
             .bind(s)
             .bind(world)
             .execute(db)
@@ -952,7 +952,7 @@ mod tests {
         seed_user(&state.db, "u2").await;
         seed_world(&state.db, "w1", 3, "running").await;
         // 收敛为 private：观战不再开放，仅成员/房主可见。
-        sqlx::query("UPDATE worlds SET visibility='private' WHERE id=?")
+        sqlx::query("UPDATE worlds SET visibility='private' WHERE id=$1")
             .bind("w1")
             .execute(&state.db)
             .await

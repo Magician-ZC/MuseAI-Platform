@@ -349,7 +349,7 @@ pub async fn ensure_template(db: &AnyPool) -> Result<i64, ApiError> {
     let res = sqlx::query(
         "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, official, \
          version, moderation, withdrawn, star_rating, star_source, created_at) \
-         VALUES (?, ?, 'idle', ?, '{\"mode\":\"open\"}', 1, 1, 'approved', 0, ?, 'curated', ?)",
+         VALUES ($1, $2, 'idle', $3, '{\"mode\":\"open\"}', 1, 1, 'approved', 0, $4, 'curated', $5)",
     )
     .bind(MICROWORLD_TEMPLATE_ID)
     .bind(MICROWORLD_TITLE)
@@ -371,7 +371,7 @@ pub async fn ensure_template(db: &AnyPool) -> Result<i64, ApiError> {
 
 /// 读现有模板行：骨架一致 → 返回 version；不一致 → 就地升版后返回新 version；无行 → None。
 async fn read_template(db: &AnyPool, desired: &str) -> Result<Option<i64>, ApiError> {
-    let Some(row) = sqlx::query("SELECT skeleton_json, version FROM world_templates WHERE id = ?")
+    let Some(row) = sqlx::query("SELECT skeleton_json, version FROM world_templates WHERE id = $1")
         .bind(MICROWORLD_TEMPLATE_ID)
         .fetch_optional(db)
         .await?
@@ -385,9 +385,9 @@ async fn read_template(db: &AnyPool, desired: &str) -> Result<Option<i64>, ApiEr
     }
     // 骨架变了 → 升版（CAS：只有拿到旧 version 的那一方写得进去）。
     let updated = sqlx::query(
-        "UPDATE world_templates SET skeleton_json = ?, version = ?, title = ?, star_rating = ?, \
+        "UPDATE world_templates SET skeleton_json = $1, version = $2, title = $3, star_rating = $4, \
          star_source = 'curated', moderation = 'approved', withdrawn = 0 \
-         WHERE id = ? AND version = ?",
+         WHERE id = $5 AND version = $6",
     )
     .bind(desired)
     .bind(version + 1)
@@ -401,7 +401,7 @@ async fn read_template(db: &AnyPool, desired: &str) -> Result<Option<i64>, ApiEr
         return Ok(Some(version + 1));
     }
     // 输了 CAS：另一方已经升过版，读回它的结果（不再递归升版，避免版本号打架）。
-    let v: Option<i64> = sqlx::query_scalar("SELECT version FROM world_templates WHERE id = ?")
+    let v: Option<i64> = sqlx::query_scalar("SELECT version FROM world_templates WHERE id = $1")
         .bind(MICROWORLD_TEMPLATE_ID)
         .fetch_optional(db)
         .await?;

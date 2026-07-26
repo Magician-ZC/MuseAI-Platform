@@ -68,7 +68,7 @@ pub async fn moderate_and_queue(
     if verdict == ModerationVerdict::Pending {
         sqlx::query(
             "INSERT INTO audit_queue (id, subject_kind, subject_id, machine_verdict, machine_hits, status, created_at) \
-             VALUES (?, ?, ?, ?, ?, 'open', ?)",
+             VALUES ($1, $2, $3, $4, $5, 'open', $6)",
         )
         .bind(crate::db::new_id("aq"))
         .bind(subject_kind)
@@ -191,7 +191,7 @@ pub async fn moderate_runtime_projection(
         if runtime_audit_admits(severity) {
             sqlx::query(
                 "INSERT INTO audit_queue (id, subject_kind, subject_id, machine_verdict, machine_hits, status, created_at) \
-                 VALUES (?, ?, ?, ?, ?, 'open', ?)",
+                 VALUES ($1, $2, $3, $4, $5, 'open', $6)",
             )
             .bind(crate::db::new_id("aq"))
             .bind("world_event")
@@ -217,7 +217,7 @@ pub async fn record_risk(
     detail: serde_json::Value,
 ) -> Result<(), ApiError> {
     sqlx::query(
-        "INSERT INTO risk_events (id, user_id, world_id, kind, detail_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO risk_events (id, user_id, world_id, kind, detail_json, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(crate::db::new_id("risk"))
     .bind(user_id)
@@ -246,7 +246,7 @@ pub async fn record_risk_tx(
     detail: serde_json::Value,
 ) -> Result<(), ApiError> {
     sqlx::query(
-        "INSERT INTO risk_events (id, user_id, world_id, kind, detail_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO risk_events (id, user_id, world_id, kind, detail_json, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(crate::db::new_id("risk"))
     .bind(user_id)
@@ -411,7 +411,7 @@ mod tests {
         let day = crate::runtime::day_string(crate::db::now_ms());
         let rid = crate::reports::generate_report(&state, "w1", "u1", "c1", &day).await.unwrap();
         let content: String =
-            sqlx::query_scalar("SELECT content_json FROM daily_reports WHERE id = ?")
+            sqlx::query_scalar("SELECT content_json FROM daily_reports WHERE id = $1")
                 .bind(&rid)
                 .fetch_one(&state.db)
                 .await

@@ -71,7 +71,7 @@ async fn open_flag(state: &AppState, scope: &str, target: &str) {
     sqlx::query(
         "INSERT INTO runtime_flags (id, flag, scope, target_id, enabled, starts_at, ends_at, \
          updated_by, updated_at, reason, created_at) \
-         VALUES (?, ?, ?, ?, 1, 0, 0, 'test', ?, '用例开闸', ?)",
+         VALUES ($1, $2, $3, $4, 1, 0, 0, 'test', $5, '用例开闸', $6)",
     )
     .bind(new_id("rf"))
     .bind(ENV_IFLINE_PARALLEL)
@@ -95,7 +95,7 @@ async fn seed_char(state: &AppState, id: &str, owner: &str) {
     sqlx::query(
         "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, \
          rights_declaration, moderation, withdrawn, created_at) \
-         VALUES (?, ?, 'loc', 1, ?, 'original', 'approved', 0, ?)",
+         VALUES ($1, $2, 'loc', 1, $3, 'original', 'approved', 0, $4)",
     )
     .bind(id)
     .bind(owner)
@@ -109,7 +109,7 @@ async fn seed_char(state: &AppState, id: &str, owner: &str) {
 async fn seed_tick(state: &AppState, world: &str, tick_no: i64, status: &str) {
     sqlx::query(
         "INSERT INTO world_ticks (id, world_id, tick_no, base_revision, status, cost_tokens, created_at) \
-         VALUES (?, ?, ?, ?, ?, 120, ?)",
+         VALUES ($1, $2, $3, $4, $5, 120, $6)",
     )
     .bind(format!("tk_{world}_{tick_no}"))
     .bind(world)
@@ -126,7 +126,7 @@ async fn seed_event(state: &AppState, world: &str, tick_no: i64, seq: i64, actor
     sqlx::query(
         "INSERT INTO world_events (id, world_id, tick_no, sequence, domain_event_id, event_type, \
          actors_json, visibility, public_projection_json, occurred_at) \
-         VALUES (?, ?, ?, ?, ?, 'action', ?, 'public', '{\"text\":\"他在城门口退了一步\"}', ?)",
+         VALUES ($1, $2, $3, $4, $5, 'action', $6, 'public', '{\"text\":\"他在城门口退了一步\"}', $7)",
     )
     .bind(format!("ev_{world}_{seq}"))
     .bind(world)
@@ -146,7 +146,7 @@ async fn seed_card(state: &AppState, id: &str, owner: &str, world: &str) {
         "INSERT INTO subplot_cards (id, owner_id, star_rating, label, origin_kind, grant_key, \
          source_world_id, source_template_id, source_template_version, synthesized_from_json, \
          status, consumed_into, acquired_at, consumed_at) \
-         VALUES (?, ?, 2, '城门一步', 'settlement', ?, ?, 'tpl', 1, '[]', 'owned', NULL, ?, NULL)",
+         VALUES ($1, $2, 2, '城门一步', 'settlement', $3, $4, 'tpl', 1, '[]', 'owned', NULL, $5, NULL)",
     )
     .bind(id)
     .bind(owner)
@@ -183,7 +183,7 @@ fn terminal_state() -> Value {
 }
 
 async fn set_state(state: &AppState, world: &str, value: &Value, revision: i64) {
-    sqlx::query("UPDATE worlds SET narrative_state_json = ?, state_revision = ? WHERE id = ?")
+    sqlx::query("UPDATE worlds SET narrative_state_json = $1, state_revision = $2 WHERE id = $3")
         .bind(value.to_string())
         .bind(revision)
         .bind(world)
@@ -291,7 +291,7 @@ async fn count_rows(db: &AnyPool, table: &str) -> i64 {
 }
 
 async fn card_status(db: &AnyPool, card_id: &str) -> (String, Option<String>) {
-    let r = sqlx::query("SELECT status, consumed_into FROM subplot_cards WHERE id = ?")
+    let r = sqlx::query("SELECT status, consumed_into FROM subplot_cards WHERE id = $1")
         .bind(card_id)
         .fetch_one(db)
         .await
@@ -448,7 +448,7 @@ async fn red_line_ifline_is_not_a_world_row() {
         members_before,
         "🔴 if 线绝不新建 world_members 行（那是结算管线的参与者名单）"
     );
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM worlds WHERE id = ?")
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM worlds WHERE id = $1")
         .bind(id)
         .fetch_one(&state.db)
         .await
@@ -956,7 +956,7 @@ fn red_line_never_mints_assets() {
     }
     // 唯一被允许的资产写入：把已发出的副本卡从 owned 改成 consumed（净收缩）。
     assert!(
-        src.contains("UPDATE subplot_cards SET status = ?"),
+        src.contains("UPDATE subplot_cards SET status = $1"),
         "烧卡必须走副本卡既有的状态机（owned → consumed 的 CAS）"
     );
 }
@@ -1146,7 +1146,7 @@ async fn seed_routes(state: &AppState) {
     let routes = json!({
         "default": { "interface": "OpenAI-compatible", "baseUrl": "http://mock", "apiKey": "k", "model": "mock" }
     });
-    sqlx::query("INSERT INTO model_routes (id, version, routes_json, active, created_at) VALUES (?, 'm1', ?, 1, ?)")
+    sqlx::query("INSERT INTO model_routes (id, version, routes_json, active, created_at) VALUES ($1, 'm1', $2, 1, $3)")
         .bind(new_id("mr"))
         .bind(routes.to_string())
         .bind(now_ms())
@@ -1173,7 +1173,7 @@ async fn seed_assembled(state: &AppState, world: &str) {
             "enabledEndings": ["城门未闭"]
         }
     });
-    sqlx::query("UPDATE worlds SET assembled_json = ? WHERE id = ?")
+    sqlx::query("UPDATE worlds SET assembled_json = $1 WHERE id = $2")
         .bind(assembled.to_string())
         .bind(world)
         .execute(&state.db)
@@ -1232,7 +1232,7 @@ async fn red_line_ifline_ending_grants_nothing() {
     let id = seed_open_ifline(&state).await;
     set_state(&state, "w1", &terminal_capped_state(), 7).await;
     // 分叉态在开 if 线时已冻结，故直接把冻结那份换成「跑一拍即终局」的版本。
-    sqlx::query("UPDATE ifline_worlds SET snapshot_json = ? WHERE id = ?")
+    sqlx::query("UPDATE ifline_worlds SET snapshot_json = $1 WHERE id = $2")
         .bind(terminal_capped_state().to_string())
         .bind(&id)
         .execute(&state.db)
@@ -1315,7 +1315,7 @@ async fn red_line_ifline_ending_grants_nothing() {
 
     // 审计必须把「什么都没发」这件事记下来（将来任何人翻记录都能一眼确认）。
     let reason: String = sqlx::query_scalar(
-        "SELECT reason FROM audit_logs WHERE action = 'ifline.ended' AND subject = ?",
+        "SELECT reason FROM audit_logs WHERE action = 'ifline.ended' AND subject = $1",
     )
     .bind(format!("ifline:{id}"))
     .fetch_one(&state.db)
@@ -1451,7 +1451,7 @@ async fn run_seed_is_pinned_on_first_advance_and_never_changes() {
 
     let model = ScriptedModel::new();
     advance(&state, &id, &model).await.expect("推进成功");
-    let seed1: String = sqlx::query_scalar("SELECT run_seed FROM ifline_worlds WHERE id = ?")
+    let seed1: String = sqlx::query_scalar("SELECT run_seed FROM ifline_worlds WHERE id = $1")
         .bind(&id)
         .fetch_one(&state.db)
         .await
@@ -1459,7 +1459,7 @@ async fn run_seed_is_pinned_on_first_advance_and_never_changes() {
     assert_eq!(seed1, expected, "种子必须由不可变身份要素确定性派生");
 
     advance(&state, &id, &model).await.expect("再推一拍");
-    let seed2: String = sqlx::query_scalar("SELECT run_seed FROM ifline_worlds WHERE id = ?")
+    let seed2: String = sqlx::query_scalar("SELECT run_seed FROM ifline_worlds WHERE id = $1")
         .bind(&id)
         .fetch_one(&state.db)
         .await
@@ -1492,7 +1492,7 @@ async fn red_line_foreign_players_never_enter_beat_cast() {
     );
 
     // 钉住的阵容里也不能留着他（否则下一拍又会被抽中）。
-    let cast_json: String = sqlx::query_scalar("SELECT cast_json FROM ifline_worlds WHERE id = ?")
+    let cast_json: String = sqlx::query_scalar("SELECT cast_json FROM ifline_worlds WHERE id = $1")
         .bind(&id)
         .fetch_one(&state.db)
         .await
@@ -1500,7 +1500,7 @@ async fn red_line_foreign_players_never_enter_beat_cast() {
     assert!(!cast_json.contains("\"c2\""), "🔴 钉住的阵容里不许留他人玩家角色：{cast_json}");
 
     // 逐拍台账可审。
-    let stored: String = sqlx::query_scalar("SELECT cast_json FROM ifline_beats WHERE ifline_id = ?")
+    let stored: String = sqlx::query_scalar("SELECT cast_json FROM ifline_beats WHERE ifline_id = $1")
         .bind(&id)
         .fetch_one(&state.db)
         .await
@@ -1508,7 +1508,7 @@ async fn red_line_foreign_players_never_enter_beat_cast() {
     assert!(!stored.contains("\"c2\""), "逐拍台账同样不许出现他人玩家角色");
 
     // 活态里也不能因为跑了一拍就把 c2 带回来。
-    let live: String = sqlx::query_scalar("SELECT live_state_json FROM ifline_worlds WHERE id = ?")
+    let live: String = sqlx::query_scalar("SELECT live_state_json FROM ifline_worlds WHERE id = $1")
         .bind(&id)
         .fetch_one(&state.db)
         .await
@@ -1556,7 +1556,7 @@ async fn snapshot_stays_frozen_while_live_state_advances() {
     let state = test_state().await;
     let id = seed_open_ifline(&state).await;
     let snap_before: String =
-        sqlx::query_scalar("SELECT snapshot_json FROM ifline_worlds WHERE id = ?")
+        sqlx::query_scalar("SELECT snapshot_json FROM ifline_worlds WHERE id = $1")
             .bind(&id)
             .fetch_one(&state.db)
             .await
@@ -1567,7 +1567,7 @@ async fn snapshot_stays_frozen_while_live_state_advances() {
     advance(&state, &id, &model).await.expect("再推一拍");
 
     let (snap_after, live, rev): (String, String, i64) = sqlx::query_as(
-        "SELECT snapshot_json, live_state_json, live_revision FROM ifline_worlds WHERE id = ?",
+        "SELECT snapshot_json, live_state_json, live_revision FROM ifline_worlds WHERE id = $1",
     )
     .bind(&id)
     .fetch_one(&state.db)
@@ -1594,7 +1594,7 @@ async fn second_advance_on_same_beat_is_rejected_without_burning_tokens() {
     // 手工占掉第 0 拍（模拟"另一个请求已经抢到了这一拍"）。
     sqlx::query(
         "INSERT INTO ifline_beats (id, ifline_id, beat_no, status, base_revision, created_at) \
-         VALUES (?, ?, 0, 'running', 0, ?)",
+         VALUES ($1, $2, 0, 'running', 0, $3)",
     )
     .bind(new_id("ifb"))
     .bind(&id)
@@ -1617,7 +1617,7 @@ async fn beat_cap_forces_ending_without_calling_the_model() {
     let state = test_state().await;
     let id = seed_open_ifline(&state).await;
     // 直接把计数顶到上限（不改 env：env 是进程级的，会串味到并发跑的其它用例）。
-    sqlx::query("UPDATE ifline_worlds SET beat_count = ?, status = 'running' WHERE id = ?")
+    sqlx::query("UPDATE ifline_worlds SET beat_count = $1, status = 'running' WHERE id = $2")
         .bind(runner::ifline_max_beats())
         .bind(&id)
         .execute(&state.db)
@@ -1652,7 +1652,7 @@ async fn cost_is_recorded_per_beat_and_rolled_up() {
 
     let (sum, n): (i64, i64) = sqlx::query_as(
         "SELECT CAST(COALESCE(SUM(cost_tokens), 0) AS BIGINT), CAST(COUNT(*) AS BIGINT) \
-         FROM ifline_beats WHERE ifline_id = ?",
+         FROM ifline_beats WHERE ifline_id = $1",
     )
     .bind(&id)
     .fetch_one(&state.db)
@@ -1662,7 +1662,7 @@ async fn cost_is_recorded_per_beat_and_rolled_up() {
     assert!(sum > 0, "跑了模型就必须记 token 成本，否则付费功能的成本会系统性失真");
 
     let total: i64 =
-        sqlx::query_scalar("SELECT cost_tokens_total FROM ifline_worlds WHERE id = ?")
+        sqlx::query_scalar("SELECT cost_tokens_total FROM ifline_worlds WHERE id = $1")
             .bind(&id)
             .fetch_one(&state.db)
             .await
@@ -1702,7 +1702,7 @@ async fn ifline_beats_never_enter_worldline_slo_input() {
     );
     assert!(count_rows(&state.db, "ifline_beats").await > 0, "它落的是自己那张表");
     // critic 数据留着（供将来的**独立** if 线质量读数），但不并入世界线指标。
-    let critic: String = sqlx::query_scalar("SELECT critic_json FROM ifline_beats WHERE ifline_id = ?")
+    let critic: String = sqlx::query_scalar("SELECT critic_json FROM ifline_beats WHERE ifline_id = $1")
         .bind(&id)
         .fetch_one(&state.db)
         .await
@@ -1720,7 +1720,7 @@ async fn advance_endpoints_are_404_when_flag_off() {
     let state = test_state().await;
     let id = seed_open_ifline(&state).await;
     // 关阀（删掉开闸记录）。
-    sqlx::query("DELETE FROM runtime_flags WHERE flag = ?")
+    sqlx::query("DELETE FROM runtime_flags WHERE flag = $1")
         .bind(ENV_IFLINE_PARALLEL)
         .execute(&state.db)
         .await
@@ -1737,7 +1737,7 @@ async fn advance_endpoints_are_404_when_flag_off() {
     }
     assert_eq!(count_rows(&state.db, "ifline_beats").await, 0, "关闭时一拍都不许落库");
     let (beats, cost): (i64, i64) =
-        sqlx::query_as("SELECT beat_count, cost_tokens_total FROM ifline_worlds WHERE id = ?")
+        sqlx::query_as("SELECT beat_count, cost_tokens_total FROM ifline_worlds WHERE id = $1")
             .bind(&id)
             .fetch_one(&state.db)
             .await
@@ -1778,7 +1778,7 @@ async fn failed_beat_still_advances_the_counter_so_the_line_never_deadlocks() {
     let state = test_state().await;
     let id = seed_open_ifline(&state).await;
     // 把活态弄成引擎无法解析的东西 → 抢占之后失败（这一步刻意选在抢占之后的路径上）。
-    sqlx::query("UPDATE ifline_worlds SET live_state_json = ?, status = 'running' WHERE id = ?")
+    sqlx::query("UPDATE ifline_worlds SET live_state_json = $1, status = 'running' WHERE id = $2")
         .bind(r#"{"characters":"这不是一个对象"}"#)
         .bind(&id)
         .execute(&state.db)
@@ -1791,13 +1791,13 @@ async fn failed_beat_still_advances_the_counter_so_the_line_never_deadlocks() {
 
     // 这一拍标 failed，且**拍数已推进**。
     let (status, note): (String, Option<String>) =
-        sqlx::query_as("SELECT status, note FROM ifline_beats WHERE ifline_id = ? AND beat_no = 0")
+        sqlx::query_as("SELECT status, note FROM ifline_beats WHERE ifline_id = $1 AND beat_no = 0")
             .bind(&id)
             .fetch_one(&state.db)
             .await
             .unwrap();
     assert_eq!(status, "failed", "note={note:?}");
-    let beats: i64 = sqlx::query_scalar("SELECT beat_count FROM ifline_worlds WHERE id = ?")
+    let beats: i64 = sqlx::query_scalar("SELECT beat_count FROM ifline_worlds WHERE id = $1")
         .bind(&id)
         .fetch_one(&state.db)
         .await
@@ -1805,7 +1805,7 @@ async fn failed_beat_still_advances_the_counter_so_the_line_never_deadlocks() {
     assert_eq!(beats, 1, "🔴 失败拍也必须推进拍数，否则玩家永远撞在同一个被占掉的 beat_no 上");
 
     // 🔴 关键断言：修好活态后**下一次推进能真的走通**（不是又一个 409）。
-    sqlx::query("UPDATE ifline_worlds SET live_state_json = '' WHERE id = ?")
+    sqlx::query("UPDATE ifline_worlds SET live_state_json = '' WHERE id = $1")
         .bind(&id)
         .execute(&state.db)
         .await
@@ -1816,7 +1816,7 @@ async fn failed_beat_still_advances_the_counter_so_the_line_never_deadlocks() {
 
     // 失败拍不计成本（没有成功的尝试可计），也不推进活态修订号。
     let cost: i64 = sqlx::query_scalar(
-        "SELECT cost_tokens FROM ifline_beats WHERE ifline_id = ? AND beat_no = 0",
+        "SELECT cost_tokens FROM ifline_beats WHERE ifline_id = $1 AND beat_no = 0",
     )
     .bind(&id)
     .fetch_one(&state.db)

@@ -46,7 +46,7 @@ async fn open_ooc_entry(db: &AnyPool, scope: &str, target: &str) {
     sqlx::query(
         "INSERT INTO runtime_flags (id, flag, scope, target_id, enabled, starts_at, ends_at, \
          updated_by, updated_at, reason, created_at) \
-         VALUES (?, 'MUSE_OOC_ANNOTATIONS', ?, ?, 1, 0, 0, 'test', ?, 'slo 用例', ?)",
+         VALUES ($1, 'MUSE_OOC_ANNOTATIONS', $2, $3, 1, 0, 0, 'test', $4, 'slo 用例', $5)",
     )
     .bind(format!("rf_{scope}_{target}"))
     .bind(scope)
@@ -72,7 +72,7 @@ async fn ins_ooc_appeal(
     sqlx::query(
         "INSERT INTO ooc_appeals (id, world_id, tick_no, character_id, user_id, reason_code, \
          reason_text, status, reviewer_id, review_reason, reviewed_at, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, '演得不像', ?, '', '', 0, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6, '演得不像', $7, '', '', 0, $8)",
     )
     .bind(id)
     .bind(world)
@@ -90,7 +90,7 @@ async fn ins_ooc_appeal(
 async fn ins_compensation(db: &AnyPool, id: &str, appeal: &str, world: &str, character: &str, grants: i64) {
     sqlx::query(
         "INSERT INTO dream_quota_compensations (id, appeal_id, world_id, character_id, user_id, \
-         grants, granted_by, reason, created_at) VALUES (?, ?, ?, ?, ?, ?, 'admin1', '确认模型错误', ?)",
+         grants, granted_by, reason, created_at) VALUES ($1, $2, $3, $4, $5, $6, 'admin1', '确认模型错误', $7)",
     )
     .bind(id)
     .bind(appeal)
@@ -113,7 +113,7 @@ async fn ins_world(db: &AnyPool, id: &str, status: &str) {
     sqlx::query(
         "INSERT INTO worlds (id, template_id, template_version, engine_version, prompt_set_version, \
          model_route_version, room_type, title, status, created_at, updated_at) \
-         VALUES (?, 'tpl_slo', 1, 'e1', 'p1', 'm1', 'idle', 'SLO 世界', ?, ?, ?)",
+         VALUES ($1, 'tpl_slo', 1, 'e1', 'p1', 'm1', 'idle', 'SLO 世界', $2, $3, $4)",
     )
     .bind(id)
     .bind(status)
@@ -127,7 +127,7 @@ async fn ins_world(db: &AnyPool, id: &str, status: &str) {
 async fn ins_member(db: &AnyPool, world: &str, character: &str) {
     sqlx::query(
         "INSERT INTO world_members (id, world_id, user_id, cloud_character_id, status, joined_at) \
-         VALUES (?, ?, ?, ?, 'active', ?)",
+         VALUES ($1, $2, $3, $4, 'active', $5)",
     )
     .bind(format!("wm_{world}_{character}"))
     .bind(world)
@@ -142,7 +142,7 @@ async fn ins_member(db: &AnyPool, world: &str, character: &str) {
 async fn ins_contribution(db: &AnyPool, world: &str, character: &str, score_milli: i64, updated_at: i64) {
     sqlx::query(
         "INSERT INTO world_contributions (world_id, character_id, score_milli, milestone_score_milli, \
-         settled_at, updated_at) VALUES (?, ?, ?, 0, 0, ?)",
+         settled_at, updated_at) VALUES ($1, $2, $3, 0, 0, $4)",
     )
     .bind(world)
     .bind(character)
@@ -156,7 +156,7 @@ async fn ins_contribution(db: &AnyPool, world: &str, character: &str, score_mill
 async fn ins_tick(db: &AnyPool, world: &str, tick_no: i64, status: &str, tokens: i64, created_at: i64) {
     sqlx::query(
         "INSERT INTO world_ticks (id, world_id, tick_no, base_revision, status, cost_tokens, created_at) \
-         VALUES (?, ?, ?, 0, ?, ?, ?)",
+         VALUES ($1, $2, $3, 0, $4, $5, $6)",
     )
     .bind(format!("tk_{world}_{tick_no}"))
     .bind(world)
@@ -172,7 +172,7 @@ async fn ins_tick(db: &AnyPool, world: &str, tick_no: i64, status: &str, tokens:
 async fn ins_event(db: &AnyPool, world: &str, tick_no: i64, seq: i64, event_type: &str, actors: &[&str]) {
     sqlx::query(
         "INSERT INTO world_events (id, world_id, tick_no, sequence, domain_event_id, event_type, \
-         actors_json, visibility, occurred_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'public', ?)",
+         actors_json, visibility, occurred_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 'public', $8)",
     )
     .bind(format!("ev_{world}_{tick_no}_{seq}"))
     .bind(world)
@@ -190,7 +190,7 @@ async fn ins_event(db: &AnyPool, world: &str, tick_no: i64, seq: i64, event_type
 async fn ins_world_ended_audit(db: &AnyPool, world: &str, reason_with_ending: &str) {
     sqlx::query(
         "INSERT INTO audit_logs (id, actor_id, actor_role, action, subject, reason, created_at) \
-         VALUES (?, 'system', 'system', 'world.ended', ?, ?, ?)",
+         VALUES ($1, 'system', 'system', 'world.ended', $2, $3, $4)",
     )
     .bind(format!("aud_{world}"))
     .bind(world)
@@ -205,7 +205,7 @@ async fn ins_character(db: &AnyPool, id: &str, withdrawn: i64) {
     sqlx::query(
         "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, \
          rights_declaration, moderation, withdrawn, created_at) \
-         VALUES (?, ?, 'loc', 1, '{}', 'original', 'approved', ?, ?)",
+         VALUES ($1, $2, 'loc', 1, '{}', 'original', 'approved', $3, $4)",
     )
     .bind(id)
     .bind(format!("u_{id}"))
@@ -683,7 +683,7 @@ async fn ooc_appeal_rate_never_reads_moderation_appeals() {
     ins_tick(&db, "o_w1", 1, "done", 100, IN_WINDOW).await;
     sqlx::query(
         "INSERT INTO moderation_appeals (id, subject_kind, subject_id, owner_id, appeal_text, \
-         status, created_at) VALUES ('map1', 'character', 'ch_x', 'u_x', '求复审', 'open', ?)",
+         status, created_at) VALUES ('map1', 'character', 'ch_x', 'u_x', '求复审', 'open', $1)",
     )
     .bind(IN_WINDOW)
     .execute(&db)
@@ -867,7 +867,7 @@ async fn contradiction_rate_counts_only_real_contradictions() {
         sqlx::query(
             "INSERT INTO world_tick_critic (world_id, tick_no, consistency_issue_count, \
              causal_issue_count, revision_suggestion_count, report_json, created_at) \
-             VALUES ('w1', ?, ?, ?, ?, '{}', ?)",
+             VALUES ('w1', $1, $2, $3, $4, '{}', $5)",
         )
         .bind(tick)
         .bind(consistency)

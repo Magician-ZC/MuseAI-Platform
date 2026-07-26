@@ -99,7 +99,7 @@ async fn post(app: &axum::Router, uri: &str, token: Option<&str>, body: Value) -
 async fn seed_user(state: &AppState, id: &str, phone: Option<&str>, role: &str, status: &str) {
     sqlx::query(
         "INSERT INTO users (id, phone, nickname, age_declared, role, status, created_at, updated_at) \
-         VALUES (?, ?, '昵称', 1, ?, ?, ?, ?)",
+         VALUES ($1, $2, '昵称', 1, $3, $4, $5, $6)",
     )
     .bind(id)
     .bind(phone)
@@ -270,12 +270,12 @@ async fn audit_approve_writes_back_character_moderation() {
     sqlx::query(
         "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, \
          rights_declaration, moderation, withdrawn, created_at) \
-         VALUES ('ch1','usr1','loc',1,'{}','original','pending',0,?)",
+         VALUES ('ch1','usr1','loc',1,'{}','original','pending',0,$1)",
     )
     .bind(now_ms()).execute(&state.db).await.unwrap();
     sqlx::query(
         "INSERT INTO audit_queue (id, subject_kind, subject_id, machine_verdict, status, created_at) \
-         VALUES ('aq1','character','ch1','flagged','open',?)",
+         VALUES ('aq1','character','ch1','flagged','open',$1)",
     )
     .bind(now_ms()).execute(&state.db).await.unwrap();
 
@@ -317,7 +317,7 @@ async fn audit_detail_returns_card_full_text_manifest_and_author_history() {
     sqlx::query(
         "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, \
          rights_declaration, moderation, withdrawn, manifest_json, created_at) \
-         VALUES ('chH','ownerX','locH',2,'{\"identity\":{\"name\":\"历史卡\"}}','original','approved',0,'{\"fields\":[]}',?)",
+         VALUES ('chH','ownerX','locH',2,'{\"identity\":{\"name\":\"历史卡\"}}','original','approved',0,'{\"fields\":[]}',$1)",
     )
     .bind(now - 1000)
     .execute(&state.db)
@@ -326,7 +326,7 @@ async fn audit_detail_returns_card_full_text_manifest_and_author_history() {
     sqlx::query(
         "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, \
          rights_declaration, moderation, withdrawn, manifest_json, created_at) \
-         VALUES ('chC','ownerX','locC',1,'{\"identity\":{\"name\":\"当前卡\"},\"dramaticCore\":{\"coreContradiction\":\"忠诚与自由\"}}','original','pending',0,'{\"purpose\":\"叙事决策\"}',?)",
+         VALUES ('chC','ownerX','locC',1,'{\"identity\":{\"name\":\"当前卡\"},\"dramaticCore\":{\"coreContradiction\":\"忠诚与自由\"}}','original','pending',0,'{\"purpose\":\"叙事决策\"}',$1)",
     )
     .bind(now)
     .execute(&state.db)
@@ -335,7 +335,7 @@ async fn audit_detail_returns_card_full_text_manifest_and_author_history() {
     sqlx::query(
         "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, \
          rights_declaration, moderation, withdrawn, created_at) \
-         VALUES ('chOther','ownerY','locO',1,'{}','original','approved',0,?)",
+         VALUES ('chOther','ownerY','locO',1,'{}','original','approved',0,$1)",
     )
     .bind(now)
     .execute(&state.db)
@@ -343,7 +343,7 @@ async fn audit_detail_returns_card_full_text_manifest_and_author_history() {
     .unwrap();
     sqlx::query(
         "INSERT INTO audit_queue (id, subject_kind, subject_id, machine_verdict, machine_hits, status, created_at) \
-         VALUES ('aqD','character','chC','flagged','[{\"rule\":\"imperative_override\"}]','open',?)",
+         VALUES ('aqD','character','chC','flagged','[{\"rule\":\"imperative_override\"}]','open',$1)",
     )
     .bind(now)
     .execute(&state.db)
@@ -376,7 +376,7 @@ async fn audit_detail_role_gate_and_not_found() {
     let app = build_router(state.clone());
     sqlx::query(
         "INSERT INTO audit_queue (id, subject_kind, subject_id, machine_verdict, status, created_at) \
-         VALUES ('aqR','character','x','ok','open',?)",
+         VALUES ('aqR','character','x','ok','open',$1)",
     )
     .bind(now_ms())
     .execute(&state.db)
@@ -437,7 +437,7 @@ async fn template_create_and_review_flow() {
     // approve → 模板 moderation approved。
     let (st, _) = post(&app, &format!("/api/admin/audit-queue/{aq_id}/approve"), Some(&admin), json!({})).await;
     assert_eq!(st, StatusCode::OK);
-    let m = sqlx::query("SELECT moderation FROM world_templates WHERE id=?")
+    let m = sqlx::query("SELECT moderation FROM world_templates WHERE id=$1")
         .bind(&tpl_id).fetch_one(&state.db).await.unwrap().try_get::<String, _>("moderation").unwrap();
     assert_eq!(m, "approved");
 }
@@ -551,7 +551,7 @@ async fn seed_template_for_star(app: &axum::Router, state: &AppState) -> String 
 }
 
 async fn star_row(state: &AppState, id: &str) -> (i64, String) {
-    sqlx::query_as("SELECT star_rating, star_source FROM world_templates WHERE id = ?")
+    sqlx::query_as("SELECT star_rating, star_source FROM world_templates WHERE id = $1")
         .bind(id)
         .fetch_one(&state.db)
         .await
@@ -684,7 +684,7 @@ async fn prompt_activation_is_mutually_exclusive_within_scope() {
     let (st, cb) = post(&app, &format!("/api/admin/prompts/{id_b}/canary"), Some(&admin), json!({ "worldIds": ["w1", "w2"] })).await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(cb["canaryWorldIds"], json!(["w1", "w2"]));
-    let raw = sqlx::query("SELECT canary_world_ids FROM prompt_versions WHERE id=?")
+    let raw = sqlx::query("SELECT canary_world_ids FROM prompt_versions WHERE id=$1")
         .bind(&id_b).fetch_one(&state.db).await.unwrap().try_get::<String, _>("canary_world_ids").unwrap();
     assert_eq!(raw, "[\"w1\",\"w2\"]");
 }
@@ -735,7 +735,7 @@ async fn world_create_pause_resume_and_diagnostics() {
     let wid = body["worldId"].as_str().unwrap().to_string();
 
     // 预算写入。
-    let budget = sqlx::query("SELECT daily_token_budget FROM world_budgets WHERE world_id=?")
+    let budget = sqlx::query("SELECT daily_token_budget FROM world_budgets WHERE world_id=$1")
         .bind(&wid).fetch_one(&state.db).await.unwrap().try_get::<i64, _>("daily_token_budget").unwrap();
     assert_eq!(budget, 1000);
 
@@ -749,14 +749,14 @@ async fn world_create_pause_resume_and_diagnostics() {
     // pause → paused。
     let (st, _) = post(&app, &format!("/api/admin/worlds/{wid}/pause"), Some(&admin), json!({})).await;
     assert_eq!(st, StatusCode::OK);
-    let s = sqlx::query("SELECT status FROM worlds WHERE id=?")
+    let s = sqlx::query("SELECT status FROM worlds WHERE id=$1")
         .bind(&wid).fetch_one(&state.db).await.unwrap().try_get::<String, _>("status").unwrap();
     assert_eq!(s, "paused");
 
     // resume → running。
     let (st, _) = post(&app, &format!("/api/admin/worlds/{wid}/resume"), Some(&admin), json!({})).await;
     assert_eq!(st, StatusCode::OK);
-    let s = sqlx::query("SELECT status FROM worlds WHERE id=?")
+    let s = sqlx::query("SELECT status FROM worlds WHERE id=$1")
         .bind(&wid).fetch_one(&state.db).await.unwrap().try_get::<String, _>("status").unwrap();
     assert_eq!(s, "running");
 
@@ -787,7 +787,7 @@ async fn world_create_lethality_option() {
     let admin = admin_token(&state);
 
     async fn stored(state: &AppState, wid: &str) -> String {
-        sqlx::query("SELECT lethality FROM worlds WHERE id=?")
+        sqlx::query("SELECT lethality FROM worlds WHERE id=$1")
             .bind(wid)
             .fetch_one(&state.db)
             .await
@@ -906,7 +906,7 @@ async fn world_create_timeline_mode() {
     .await;
     assert_eq!(st, StatusCode::OK);
     let wid = body["worldId"].as_str().unwrap().to_string();
-    let tm = sqlx::query("SELECT timeline_mode FROM worlds WHERE id=?")
+    let tm = sqlx::query("SELECT timeline_mode FROM worlds WHERE id=$1")
         .bind(&wid).fetch_one(&state.db).await.unwrap().try_get::<String, _>("timeline_mode").unwrap();
     assert_eq!(tm, "event");
 
@@ -920,7 +920,7 @@ async fn world_create_timeline_mode() {
     .await;
     assert_eq!(st, StatusCode::OK);
     let wid2 = body["worldId"].as_str().unwrap().to_string();
-    let tm2 = sqlx::query("SELECT timeline_mode FROM worlds WHERE id=?")
+    let tm2 = sqlx::query("SELECT timeline_mode FROM worlds WHERE id=$1")
         .bind(&wid2).fetch_one(&state.db).await.unwrap().try_get::<String, _>("timeline_mode").unwrap();
     assert_eq!(tm2, "interval");
 
@@ -944,7 +944,7 @@ async fn world_create_timeline_mode() {
     .await;
     assert_eq!(st, StatusCode::OK, "event × chapter 应允许建房（Stage3 放宽）");
     let wid_chap = body["worldId"].as_str().unwrap().to_string();
-    let tm_chap = sqlx::query("SELECT timeline_mode FROM worlds WHERE id=?")
+    let tm_chap = sqlx::query("SELECT timeline_mode FROM worlds WHERE id=$1")
         .bind(&wid_chap).fetch_one(&state.db).await.unwrap().try_get::<String, _>("timeline_mode").unwrap();
     assert_eq!(tm_chap, "event");
 
@@ -959,7 +959,7 @@ async fn world_create_timeline_mode() {
     .await;
     assert_eq!(st, StatusCode::OK, "event × arena 应允许建房（Stage3 放宽）");
     let wid_arena = body["worldId"].as_str().unwrap().to_string();
-    let tm_arena = sqlx::query("SELECT timeline_mode FROM worlds WHERE id=?")
+    let tm_arena = sqlx::query("SELECT timeline_mode FROM worlds WHERE id=$1")
         .bind(&wid_arena).fetch_one(&state.db).await.unwrap().try_get::<String, _>("timeline_mode").unwrap();
     assert_eq!(tm_arena, "event");
 }
@@ -976,19 +976,19 @@ async fn metrics_overview_aggregates() {
     seed_user(&state, "u2", None, "user", "banned").await;
 
     // 日报：2 条，1 条已打开。
-    sqlx::query("INSERT INTO daily_reports (id, world_id, user_id, character_id, report_day, content_json, opened_at, created_at) VALUES ('dr1','w1','u1','c1','2026-07-20','{}',?,?)")
+    sqlx::query("INSERT INTO daily_reports (id, world_id, user_id, character_id, report_day, content_json, opened_at, created_at) VALUES ('dr1','w1','u1','c1','2026-07-20','{}',$1,$2)")
         .bind(now_ms()).bind(now_ms()).execute(&state.db).await.unwrap();
-    sqlx::query("INSERT INTO daily_reports (id, world_id, user_id, character_id, report_day, content_json, opened_at, created_at) VALUES ('dr2','w1','u1','c2','2026-07-20','{}',NULL,?)")
+    sqlx::query("INSERT INTO daily_reports (id, world_id, user_id, character_id, report_day, content_json, opened_at, created_at) VALUES ('dr2','w1','u1','c2','2026-07-20','{}',NULL,$1)")
         .bind(now_ms()).execute(&state.db).await.unwrap();
 
     // tick：1 done(100) + 1 failed(50)。
-    sqlx::query("INSERT INTO world_ticks (id, world_id, tick_no, base_revision, status, cost_tokens, created_at) VALUES ('t1','w1',0,0,'done',100,?)")
+    sqlx::query("INSERT INTO world_ticks (id, world_id, tick_no, base_revision, status, cost_tokens, created_at) VALUES ('t1','w1',0,0,'done',100,$1)")
         .bind(now_ms()).execute(&state.db).await.unwrap();
-    sqlx::query("INSERT INTO world_ticks (id, world_id, tick_no, base_revision, status, cost_tokens, created_at) VALUES ('t2','w1',1,0,'failed',50,?)")
+    sqlx::query("INSERT INTO world_ticks (id, world_id, tick_no, base_revision, status, cost_tokens, created_at) VALUES ('t2','w1',1,0,'failed',50,$1)")
         .bind(now_ms()).execute(&state.db).await.unwrap();
 
     // 审核积压：1 条 open。
-    sqlx::query("INSERT INTO audit_queue (id, subject_kind, subject_id, machine_verdict, status, created_at) VALUES ('aq1','character','ch1','ok','open',?)")
+    sqlx::query("INSERT INTO audit_queue (id, subject_kind, subject_id, machine_verdict, status, created_at) VALUES ('aq1','character','ch1','ok','open',$1)")
         .bind(now_ms()).execute(&state.db).await.unwrap();
 
     let (st, m) = get(&app, "/api/admin/metrics/overview", Some(&admin)).await;
@@ -1020,7 +1020,7 @@ fn utc_day(ms: i64) -> String {
 async fn ins_user_at(state: &AppState, id: &str, created_at: i64) {
     sqlx::query(
         "INSERT INTO users (id, phone, nickname, age_declared, role, status, created_at, updated_at) \
-         VALUES (?, NULL, '趋势用户', 1, 'user', 'active', ?, ?)",
+         VALUES ($1, NULL, '趋势用户', 1, 'user', 'active', $2, $3)",
     )
     .bind(id).bind(created_at).bind(created_at)
     .execute(&state.db).await.unwrap();
@@ -1029,7 +1029,7 @@ async fn ins_user_at(state: &AppState, id: &str, created_at: i64) {
 async fn ins_tick_at(state: &AppState, id: &str, world: &str, tick_no: i64, tokens: i64, created_at: i64) {
     sqlx::query(
         "INSERT INTO world_ticks (id, world_id, tick_no, base_revision, status, cost_tokens, created_at) \
-         VALUES (?, ?, ?, 0, 'done', ?, ?)",
+         VALUES ($1, $2, $3, 0, 'done', $4, $5)",
     )
     .bind(id).bind(world).bind(tick_no).bind(tokens).bind(created_at)
     .execute(&state.db).await.unwrap();
@@ -1038,7 +1038,7 @@ async fn ins_tick_at(state: &AppState, id: &str, world: &str, tick_no: i64, toke
 async fn ins_event_at(state: &AppState, id: &str, occurred_at: i64) {
     sqlx::query(
         "INSERT INTO world_events (id, world_id, tick_no, sequence, domain_event_id, event_type, \
-         actors_json, visibility, occurred_at) VALUES (?, 'w_tr', 0, 0, ?, 'social', '[]', 'public', ?)",
+         actors_json, visibility, occurred_at) VALUES ($1, 'w_tr', 0, 0, $2, 'social', '[]', 'public', $3)",
     )
     .bind(id).bind(id).bind(occurred_at)
     .execute(&state.db).await.unwrap();
@@ -1047,7 +1047,7 @@ async fn ins_event_at(state: &AppState, id: &str, occurred_at: i64) {
 async fn ins_gift_at(state: &AppState, id: &str, cnt: i64, created_at: i64) {
     sqlx::query(
         "INSERT INTO gift_events (id, world_id, sku, gift_count, mapped, created_at) \
-         VALUES (?, 'w_tr', 'rose', ?, 1, ?)",
+         VALUES ($1, 'w_tr', 'rose', $2, 1, $3)",
     )
     .bind(id).bind(cnt).bind(created_at)
     .execute(&state.db).await.unwrap();
@@ -1055,7 +1055,7 @@ async fn ins_gift_at(state: &AppState, id: &str, cnt: i64, created_at: i64) {
 
 /// 带业务时间的复式分录（趋势按 postings.created_at 分桶；账户/journal 复用对账测试的 ins_account/ins_journal）。
 async fn ins_posting_at(state: &AppState, id: &str, journal_id: &str, account_id: &str, delta: i64, created_at: i64) {
-    sqlx::query("INSERT INTO ledger_postings (id, journal_id, account_id, delta_cents, created_at) VALUES (?, ?, ?, ?, ?)")
+    sqlx::query("INSERT INTO ledger_postings (id, journal_id, account_id, delta_cents, created_at) VALUES ($1, $2, $3, $4, $5)")
         .bind(id).bind(journal_id).bind(account_id).bind(delta).bind(created_at)
         .execute(&state.db).await.unwrap();
 }
@@ -1206,7 +1206,7 @@ async fn economy_overview_aggregates_orders_ledger_balances_gifts() {
     for (oid, amt, status) in [("o_keep", 100i64, "fulfilled"), ("o_ref", 300i64, "refunded")] {
         sqlx::query(
             "INSERT INTO orders (id, user_id, kind, amount_cents, status, created_at, updated_at) \
-             VALUES (?, 'u_pay', 'recharge', ?, ?, ?, ?)",
+             VALUES ($1, 'u_pay', 'recharge', $2, $3, $4, $5)",
         )
         .bind(oid).bind(amt).bind(status).bind(now).bind(now)
         .execute(&state.db).await.unwrap();
@@ -1214,7 +1214,7 @@ async fn economy_overview_aggregates_orders_ledger_balances_gifts() {
     // 另加一笔 created 订单（未履约，进状态计数但不入账本）。
     sqlx::query(
         "INSERT INTO orders (id, user_id, kind, amount_cents, status, created_at, updated_at) \
-         VALUES ('o_new', 'u_pay', 'recharge', 50, 'created', ?, ?)",
+         VALUES ('o_new', 'u_pay', 'recharge', 50, 'created', $1, $2)",
     )
     .bind(now).bind(now).execute(&state.db).await.unwrap();
 
@@ -1225,19 +1225,19 @@ async fn economy_overview_aggregates_orders_ledger_balances_gifts() {
     ] {
         sqlx::query(
             "INSERT INTO ledger_entries (id, user_id, order_id, delta_cents, reason, created_at) \
-             VALUES (?, 'u_pay', ?, ?, ?, ?)",
+             VALUES ($1, 'u_pay', $2, $3, $4, $5)",
         )
         .bind(lid).bind(oid).bind(delta).bind(reason).bind(now)
         .execute(&state.db).await.unwrap();
     }
-    sqlx::query("INSERT INTO billing_balances (user_id, balance_cents, updated_at) VALUES ('u_pay', 100, ?)")
+    sqlx::query("INSERT INTO billing_balances (user_id, balance_cents, updated_at) VALUES ('u_pay', 100, $1)")
         .bind(now).execute(&state.db).await.unwrap();
 
     // 礼物流水：两世界共 3 条事件、礼物量 1+2+5=8。
     for (gid, world, cnt) in [("g1", "w1", 1i64), ("g2", "w1", 2i64), ("g3", "w2", 5i64)] {
         sqlx::query(
             "INSERT INTO gift_events (id, world_id, sku, gift_count, mapped, created_at) \
-             VALUES (?, ?, 'rose', ?, 1, ?)",
+             VALUES ($1, $2, 'rose', $3, 1, $4)",
         )
         .bind(gid).bind(world).bind(cnt).bind(now)
         .execute(&state.db).await.unwrap();
@@ -1289,24 +1289,24 @@ async fn economy_overview_role_gate_finance_and_admin_only() {
 async fn ins_account(state: &AppState, id: &str, kind: &str, owner: Option<&str>, balance: i64) {
     sqlx::query(
         "INSERT INTO ledger_accounts (id, kind, owner_id, scope_id, balance_cents, withdrawable, created_at, updated_at) \
-         VALUES (?, ?, ?, NULL, ?, 0, ?, ?)",
+         VALUES ($1, $2, $3, NULL, $4, 0, $5, $6)",
     )
     .bind(id).bind(kind).bind(owner).bind(balance).bind(now_ms()).bind(now_ms())
     .execute(&state.db).await.unwrap();
 }
 
 async fn ins_journal(state: &AppState, id: &str, reason: &str) {
-    sqlx::query("INSERT INTO ledger_journals (id, reason, ref_kind, ref_id, world_id, created_at) VALUES (?, ?, 'x', 'x', NULL, ?)")
+    sqlx::query("INSERT INTO ledger_journals (id, reason, ref_kind, ref_id, world_id, created_at) VALUES ($1, $2, 'x', 'x', NULL, $3)")
         .bind(id).bind(reason).bind(now_ms()).execute(&state.db).await.unwrap();
 }
 
 async fn ins_posting(state: &AppState, id: &str, journal_id: &str, account_id: &str, delta: i64) {
-    sqlx::query("INSERT INTO ledger_postings (id, journal_id, account_id, delta_cents, created_at) VALUES (?, ?, ?, ?, ?)")
+    sqlx::query("INSERT INTO ledger_postings (id, journal_id, account_id, delta_cents, created_at) VALUES ($1, $2, $3, $4, $5)")
         .bind(id).bind(journal_id).bind(account_id).bind(delta).bind(now_ms()).execute(&state.db).await.unwrap();
 }
 
 async fn ins_billing(state: &AppState, uid: &str, balance: i64) {
-    sqlx::query("INSERT INTO billing_balances (user_id, balance_cents, updated_at) VALUES (?, ?, ?)")
+    sqlx::query("INSERT INTO billing_balances (user_id, balance_cents, updated_at) VALUES ($1, $2, $3)")
         .bind(uid).bind(balance).bind(now_ms()).execute(&state.db).await.unwrap();
 }
 
@@ -1390,9 +1390,9 @@ async fn risk_events_and_data_requests() {
     let app = build_router(state.clone());
     let admin = admin_token(&state);
 
-    sqlx::query("INSERT INTO risk_events (id, user_id, world_id, kind, detail_json, created_at) VALUES ('r1','u1','w1','injection','{\"hit\":1}',?)")
+    sqlx::query("INSERT INTO risk_events (id, user_id, world_id, kind, detail_json, created_at) VALUES ('r1','u1','w1','injection','{\"hit\":1}',$1)")
         .bind(now_ms()).execute(&state.db).await.unwrap();
-    sqlx::query("INSERT INTO risk_events (id, user_id, world_id, kind, detail_json, created_at) VALUES ('r2','u1','w1','abuse','{}',?)")
+    sqlx::query("INSERT INTO risk_events (id, user_id, world_id, kind, detail_json, created_at) VALUES ('r2','u1','w1','abuse','{}',$1)")
         .bind(now_ms()).execute(&state.db).await.unwrap();
 
     // kind 过滤。
@@ -1402,7 +1402,7 @@ async fn risk_events_and_data_requests() {
     assert_eq!(body["events"][0]["kind"], "injection");
 
     // 工单：export pending → run → done + resultKey。
-    sqlx::query("INSERT INTO data_requests (id, user_id, kind, status, created_at, updated_at) VALUES ('dq1','u1','export','pending',?,?)")
+    sqlx::query("INSERT INTO data_requests (id, user_id, kind, status, created_at, updated_at) VALUES ('dq1','u1','export','pending',$1,$2)")
         .bind(now_ms()).bind(now_ms()).execute(&state.db).await.unwrap();
 
     let (st, body) = get(&app, "/api/admin/data-requests?status=pending", Some(&admin)).await;
@@ -1431,7 +1431,7 @@ async fn delete_data_request_stays_pending_not_marked_done() {
     let state = test_state().await;
     let app = build_router(state.clone());
     let admin = admin_token(&state);
-    sqlx::query("INSERT INTO data_requests (id, user_id, kind, status, created_at, updated_at) VALUES ('dq_del','u1','delete','pending',?,?)")
+    sqlx::query("INSERT INTO data_requests (id, user_id, kind, status, created_at, updated_at) VALUES ('dq_del','u1','delete','pending',$1,$2)")
         .bind(now_ms()).bind(now_ms()).execute(&state.db).await.unwrap();
 
     let (st, body) = post(&app, "/api/admin/data-requests/dq_del/run", Some(&admin), json!({})).await;
@@ -1461,7 +1461,7 @@ async fn seed_character(
     sqlx::query(
         "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, \
          rights_declaration, moderation, withdrawn, avatar_moderation, created_at) \
-         VALUES (?, ?, 'loc', 1, ?, 'original', ?, 0, ?, ?)",
+         VALUES ($1, $2, 'loc', 1, $3, 'original', $4, 0, $5, $6)",
     )
     .bind(id)
     .bind(owner)
@@ -1477,7 +1477,7 @@ async fn seed_character(
 async fn seed_appeal(state: &AppState, id: &str, subject_id: &str, owner: &str, status: &str, created_at: i64) {
     sqlx::query(
         "INSERT INTO moderation_appeals (id, subject_kind, subject_id, owner_id, appeal_text, status, created_at) \
-         VALUES (?, 'character', ?, ?, '申诉正文', ?, ?)",
+         VALUES ($1, 'character', $2, $3, '申诉正文', $4, $5)",
     )
     .bind(id)
     .bind(subject_id)
@@ -1500,7 +1500,7 @@ async fn review_reject_writes_reject_reason_to_queue_row() {
     for (aq, subject) in [("aq_rr", "ch_rr"), ("aq_ok", "ch_ok")] {
         sqlx::query(
             "INSERT INTO audit_queue (id, subject_kind, subject_id, machine_verdict, status, created_at) \
-             VALUES (?, 'character', ?, 'flagged', 'open', ?)",
+             VALUES ($1, 'character', $2, 'flagged', 'open', $3)",
         )
         .bind(aq).bind(subject).bind(now_ms()).execute(&state.db).await.unwrap();
     }
@@ -1774,7 +1774,7 @@ async fn create_template_saga_pairing_rules() {
     })).await;
     assert_eq!(st, StatusCode::OK, "不传 saga 字段应通过: {body}");
     let tpl_id = body["templateId"].as_str().unwrap().to_string();
-    let row = sqlx::query("SELECT saga_id, stage_no FROM world_templates WHERE id = ?")
+    let row = sqlx::query("SELECT saga_id, stage_no FROM world_templates WHERE id = $1")
         .bind(&tpl_id)
         .fetch_one(&state.db)
         .await
@@ -1873,7 +1873,7 @@ async fn ins_world(state: &AppState, id: &str, status: &str, created_at: i64) {
     sqlx::query(
         "INSERT INTO worlds (id, template_id, template_version, engine_version, prompt_set_version, \
          model_route_version, room_type, title, status, created_at, updated_at) \
-         VALUES (?, 'tpl_cost', 1, 'e1', 'p1', 'm1', 'idle', '成本世界', ?, ?, ?)",
+         VALUES ($1, 'tpl_cost', 1, 'e1', 'p1', 'm1', 'idle', '成本世界', $2, $3, $4)",
     )
     .bind(id)
     .bind(status)
@@ -1896,7 +1896,7 @@ async fn ins_tick_st(
 ) {
     sqlx::query(
         "INSERT INTO world_ticks (id, world_id, tick_no, base_revision, status, cost_tokens, created_at) \
-         VALUES (?, ?, ?, 0, ?, ?, ?)",
+         VALUES ($1, $2, $3, 0, $4, $5, $6)",
     )
     .bind(id)
     .bind(world)
@@ -1912,7 +1912,7 @@ async fn ins_tick_st(
 async fn ins_member(state: &AppState, id: &str, world: &str, user: &str, status: &str) {
     sqlx::query(
         "INSERT INTO world_members (id, world_id, user_id, cloud_character_id, status, joined_at) \
-         VALUES (?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(id)
     .bind(world)
@@ -2062,7 +2062,7 @@ async fn ins_tick_offpeak(
     sqlx::query(
         "INSERT INTO world_ticks (id, world_id, tick_no, base_revision, status, cost_tokens, \
          created_at, off_peak, price_ratio_pct, defer_ms) \
-         VALUES (?, ?, ?, 0, 'done', ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, 0, 'done', $4, $5, $6, $7, $8)",
     )
     .bind(id)
     .bind(world)
@@ -2347,7 +2347,7 @@ async fn diagnostics_budget_exposes_cny_and_usage_ratio() {
 
     // 熔断计数器停在今天：花掉 400_000 token。
     let today = crate::runtime::day_string(now_ms());
-    sqlx::query("UPDATE world_budgets SET spent_tokens_today = 400000, budget_day = ? WHERE world_id = ?")
+    sqlx::query("UPDATE world_budgets SET spent_tokens_today = 400000, budget_day = $1 WHERE world_id = $2")
         .bind(&today)
         .bind(&wid)
         .execute(&state.db)
@@ -2376,7 +2376,7 @@ async fn diagnostics_budget_exposes_cny_and_usage_ratio() {
     assert_eq!(b["usageRatio"].as_f64().unwrap(), 0.4_f64.max(cny_ratio));
 
     // 计数器停留在过去某天 → 不得当"今日"：有效消耗归零，用量比归零。
-    sqlx::query("UPDATE world_budgets SET budget_day = '1970-01-01' WHERE world_id = ?")
+    sqlx::query("UPDATE world_budgets SET budget_day = '1970-01-01' WHERE world_id = $1")
         .bind(&wid)
         .execute(&state.db)
         .await
@@ -2414,7 +2414,7 @@ async fn diagnostics_budget_exposes_cny_and_usage_ratio() {
 async fn slo_ins_contribution(state: &AppState, world: &str, character: &str, score_milli: i64) {
     sqlx::query(
         "INSERT INTO world_contributions (world_id, character_id, score_milli, milestone_score_milli, \
-         settled_at, updated_at) VALUES (?, ?, ?, 0, 0, ?)",
+         settled_at, updated_at) VALUES ($1, $2, $3, 0, 0, $4)",
     )
     .bind(world)
     .bind(character)
@@ -2428,7 +2428,7 @@ async fn slo_ins_contribution(state: &AppState, world: &str, character: &str, sc
 async fn slo_ins_event(state: &AppState, world: &str, tick_no: i64, seq: i64, kind: &str, actors: &[&str]) {
     sqlx::query(
         "INSERT INTO world_events (id, world_id, tick_no, sequence, domain_event_id, event_type, \
-         actors_json, visibility, occurred_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'public', ?)",
+         actors_json, visibility, occurred_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 'public', $8)",
     )
     .bind(format!("slo_ev_{world}_{tick_no}_{seq}"))
     .bind(world)
@@ -2473,7 +2473,7 @@ async fn metrics_overview_exposes_narrative_slo_four_computable_metrics() {
     for (w, reason) in [("slo_w2", "time_cap|ending=none"), ("slo_w3", "mainline_complete|ending=peace")] {
         sqlx::query(
             "INSERT INTO audit_logs (id, actor_id, actor_role, action, subject, reason, created_at) \
-             VALUES (?, 'system', 'system', 'world.ended', ?, ?, ?)",
+             VALUES ($1, 'system', 'system', 'world.ended', $2, $3, $4)",
         )
         .bind(format!("slo_aud_{w}"))
         .bind(w)
@@ -2668,7 +2668,7 @@ fn admin_cover_body(bytes: &[u8], mime: &str) -> Value {
 /// 从上传路径造不出 pending/rejected，范式同 worlds::tests 的 force_cover_moderation。
 async fn set_world_cover(state: &AppState, world_id: &str, url: &str, moderation: &str) {
     sqlx::query(
-        "UPDATE worlds SET cover_object_key = ?, cover_url = ?, cover_moderation = ? WHERE id = ?",
+        "UPDATE worlds SET cover_object_key = $1, cover_url = $2, cover_moderation = $3 WHERE id = $4",
     )
     .bind(format!("covers/{world_id}.png"))
     .bind(url)
@@ -2758,7 +2758,7 @@ async fn admin_create_world_accepts_cover_and_reuses_upload_pipeline() {
     assert_eq!(body["coverUrl"], format!("/api/assets/objects/covers/{wid}.png"));
 
     // 三列落库，键以世界 id 命名（与单独调用上传端点完全同源）。
-    let row = sqlx::query("SELECT cover_object_key, cover_url, cover_moderation FROM worlds WHERE id = ?")
+    let row = sqlx::query("SELECT cover_object_key, cover_url, cover_moderation FROM worlds WHERE id = $1")
         .bind(&wid)
         .fetch_one(&state.db)
         .await
@@ -2777,7 +2777,7 @@ async fn admin_create_world_accepts_cover_and_reuses_upload_pipeline() {
     );
 
     // 建房留痕带上封面裁决（"谁在什么时候给哪个世界配了什么图"可溯）。
-    let reason: String = sqlx::query("SELECT reason FROM audit_logs WHERE action = 'world.create' AND subject = ?")
+    let reason: String = sqlx::query("SELECT reason FROM audit_logs WHERE action = 'world.create' AND subject = $1")
         .bind(&wid)
         .fetch_one(&state.db)
         .await
@@ -2823,7 +2823,7 @@ async fn admin_create_world_reports_cover_failure_without_failing_the_world() {
     assert!(body.get("coverUrl").is_none(), "失败不得下发 URL: {body}");
 
     // 世界确实建成了，封面三列保持空（没有半吊子落库）。
-    let row = sqlx::query("SELECT cover_url, cover_moderation FROM worlds WHERE id = ?")
+    let row = sqlx::query("SELECT cover_url, cover_moderation FROM worlds WHERE id = $1")
         .bind(&wid)
         .fetch_one(&state.db)
         .await
@@ -2832,7 +2832,7 @@ async fn admin_create_world_reports_cover_failure_without_failing_the_world() {
     assert!(row.try_get::<Option<String>, _>("cover_moderation").unwrap().is_none());
 
     // 失败同样进建房留痕。
-    let reason: String = sqlx::query("SELECT reason FROM audit_logs WHERE action = 'world.create' AND subject = ?")
+    let reason: String = sqlx::query("SELECT reason FROM audit_logs WHERE action = 'world.create' AND subject = $1")
         .bind(&wid)
         .fetch_one(&state.db)
         .await
@@ -2945,7 +2945,7 @@ async fn world_create_series_enrollment() {
     assert_eq!(ok["seriesInstanceNo"], json!(1));
     assert_eq!(ok["seriesMaxInstances"], json!(3));
 
-    let origin: String = sqlx::query("SELECT origin_world_id FROM world_series WHERE id = ?")
+    let origin: String = sqlx::query("SELECT origin_world_id FROM world_series WHERE id = $1")
         .bind(&sid)
         .fetch_one(&state.db)
         .await
@@ -2953,7 +2953,7 @@ async fn world_create_series_enrollment() {
         .try_get("origin_world_id")
         .unwrap();
     assert_eq!(origin, wid, "1 号实例即建房参数的复制源");
-    let no: i64 = sqlx::query("SELECT instance_no FROM world_series_instances WHERE world_id = ?")
+    let no: i64 = sqlx::query("SELECT instance_no FROM world_series_instances WHERE world_id = $1")
         .bind(&wid)
         .fetch_one(&state.db)
         .await
@@ -2961,7 +2961,7 @@ async fn world_create_series_enrollment() {
         .try_get("instance_no")
         .unwrap();
     assert_eq!(no, 1);
-    let reason: String = sqlx::query("SELECT reason FROM audit_logs WHERE action='world.create' AND subject=?")
+    let reason: String = sqlx::query("SELECT reason FROM audit_logs WHERE action='world.create' AND subject=$1")
         .bind(&wid)
         .fetch_one(&state.db)
         .await
@@ -3038,7 +3038,7 @@ async fn ins_template(
     sqlx::query(
         "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, \
          official, version, moderation, saga_id, stage_no, created_at) \
-         VALUES (?, ?, 'chapter', ?, '{}', 1, 1, ?, ?, ?, ?)",
+         VALUES ($1, $2, 'chapter', $3, '{}', 1, 1, $4, $5, $6, $7)",
     )
     .bind(id)
     .bind(title)
@@ -3063,7 +3063,7 @@ async fn ins_world_of(
     sqlx::query(
         "INSERT INTO worlds (id, template_id, template_version, engine_version, prompt_set_version, \
          model_route_version, room_type, title, status, assembled_json, created_at, updated_at) \
-         VALUES (?, ?, 1, 'e1', 'p1', 'm1', 'chapter', '校准世界', ?, ?, ?, ?)",
+         VALUES ($1, $2, 1, 'e1', 'p1', 'm1', 'chapter', '校准世界', $3, $4, $5, $6)",
     )
     .bind(id)
     .bind(template_id)
@@ -3081,7 +3081,7 @@ async fn ins_world_of(
 async fn ins_member_cid(state: &AppState, world_id: &str, cid: &str, status: &str) {
     sqlx::query(
         "INSERT INTO world_members (id, world_id, user_id, cloud_character_id, status, joined_at) \
-         VALUES (?, ?, 'u1', ?, ?, ?)",
+         VALUES ($1, $2, 'u1', $3, $4, $5)",
     )
     .bind(new_id("wm"))
     .bind(world_id)
@@ -3173,7 +3173,7 @@ async fn saga_detail_orders_stages_and_reports_shape() {
     sqlx::query(
         "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, \
          official, version, moderation, saga_id, stage_no, created_at) \
-         VALUES ('tpl_bad', '坏骨架', 'chapter', '{{ 不是 JSON', '{}', 1, 1, 'pending', 'saga_x', 3, ?)",
+         VALUES ('tpl_bad', '坏骨架', 'chapter', '{{ 不是 JSON', '{}', 1, 1, 'pending', 'saga_x', 3, $1)",
     )
     .bind(now_ms())
     .execute(&state.db)

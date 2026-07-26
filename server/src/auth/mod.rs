@@ -211,7 +211,7 @@ async fn store_refresh(db: &sqlx::AnyPool, user_id: &str, ttl_secs: i64) -> Resu
     let token = random_token();
     let now = now_ms();
     sqlx::query(
-        "INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at, revoked, created_at) VALUES (?, ?, ?, ?, 0, ?)",
+        "INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at, revoked, created_at) VALUES ($1, $2, $3, $4, 0, $5)",
     )
     .bind(new_id("rt"))
     .bind(user_id)
@@ -245,7 +245,7 @@ async fn challenge(
     let now = now_ms();
     // 同手机号 60s 限频
     let last: Option<(i64,)> =
-        sqlx::query_as("SELECT created_at FROM sms_challenges WHERE phone = ? ORDER BY created_at DESC LIMIT 1")
+        sqlx::query_as("SELECT created_at FROM sms_challenges WHERE phone = $1 ORDER BY created_at DESC LIMIT 1")
             .bind(&phone)
             .fetch_optional(&state.db)
             .await?;
@@ -259,7 +259,7 @@ async fn challenge(
     let challenge_id = new_id("chal");
     let expires_at = now + CHALLENGE_TTL_MS;
     sqlx::query(
-        "INSERT INTO sms_challenges (id, phone, code_hash, expires_at, consumed, created_at) VALUES (?, ?, ?, ?, 0, ?)",
+        "INSERT INTO sms_challenges (id, phone, code_hash, expires_at, consumed, created_at) VALUES ($1, $2, $3, $4, 0, $5)",
     )
     .bind(&challenge_id)
     .bind(&phone)
@@ -301,7 +301,7 @@ async fn login(
 
     let now = now_ms();
     let challenge: Option<(String, String, i64, i64)> = sqlx::query_as(
-        "SELECT id, code_hash, expires_at, consumed FROM sms_challenges WHERE phone = ? ORDER BY created_at DESC LIMIT 1",
+        "SELECT id, code_hash, expires_at, consumed FROM sms_challenges WHERE phone = $1 ORDER BY created_at DESC LIMIT 1",
     )
     .bind(&phone)
     .fetch_optional(&state.db)
@@ -317,14 +317,14 @@ async fn login(
     if code_hash != sha256_hex(&code) {
         return Err(ApiError::BadRequest("验证码错误".into()));
     }
-    sqlx::query("UPDATE sms_challenges SET consumed = 1 WHERE id = ?")
+    sqlx::query("UPDATE sms_challenges SET consumed = 1 WHERE id = $1")
         .bind(&chal_id)
         .execute(&state.db)
         .await?;
 
     // upsert user（服务端权威：手机号唯一，不重复建号）
     let existing: Option<(String, String, i64, String)> =
-        sqlx::query_as("SELECT id, nickname, age_declared, status FROM users WHERE phone = ?")
+        sqlx::query_as("SELECT id, nickname, age_declared, status FROM users WHERE phone = $1")
             .bind(&phone)
             .fetch_optional(&state.db)
             .await?;
@@ -332,7 +332,7 @@ async fn login(
         if status == "banned" {
             return Err(ApiError::Forbidden);
         }
-        sqlx::query("UPDATE users SET updated_at = ? WHERE id = ?")
+        sqlx::query("UPDATE users SET updated_at = $1 WHERE id = $2")
             .bind(now)
             .bind(&id)
             .execute(&state.db)
@@ -341,7 +341,7 @@ async fn login(
     } else {
         let id = new_id("user");
         sqlx::query(
-            "INSERT INTO users (id, phone, nickname, age_declared, status, created_at, updated_at) VALUES (?, ?, '', 0, 'active', ?, ?)",
+            "INSERT INTO users (id, phone, nickname, age_declared, status, created_at, updated_at) VALUES ($1, $2, '', 0, 'active', $3, $4)",
         )
         .bind(&id)
         .bind(&phone)
@@ -380,7 +380,7 @@ async fn refresh(
 
     let now = now_ms();
     let row: Option<(String, String, i64, i64)> =
-        sqlx::query_as("SELECT id, user_id, expires_at, revoked FROM refresh_tokens WHERE token_hash = ?")
+        sqlx::query_as("SELECT id, user_id, expires_at, revoked FROM refresh_tokens WHERE token_hash = $1")
             .bind(&token_hash)
             .fetch_optional(&state.db)
             .await?;
@@ -388,7 +388,7 @@ async fn refresh(
     if revoked != 0 || expires_at < now {
         return Err(ApiError::Unauthorized);
     }
-    sqlx::query("UPDATE refresh_tokens SET revoked = 1 WHERE id = ?")
+    sqlx::query("UPDATE refresh_tokens SET revoked = 1 WHERE id = $1")
         .bind(&rt_id)
         .execute(&state.db)
         .await?;
@@ -408,7 +408,7 @@ async fn logout(State(state): State<AppState>, user: AuthUser, headers: HeaderMa
     if let Some(cached) = guard.cached_response {
         return Ok(json_response(cached));
     }
-    sqlx::query("UPDATE refresh_tokens SET revoked = 1 WHERE user_id = ? AND revoked = 0")
+    sqlx::query("UPDATE refresh_tokens SET revoked = 1 WHERE user_id = $1 AND revoked = 0")
         .bind(&user.user_id)
         .execute(&state.db)
         .await?;
@@ -441,7 +441,7 @@ async fn identity_verification(
     }
     let id = new_id("idv");
     sqlx::query(
-        "INSERT INTO identity_verification_refs (id, user_id, provider, reference_id, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO identity_verification_refs (id, user_id, provider, reference_id, status, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(&id)
     .bind(&user.user_id)
@@ -475,7 +475,7 @@ async fn age_declaration(
     if let Some(cached) = guard.cached_response {
         return Ok(json_response(cached));
     }
-    let affected = sqlx::query("UPDATE users SET age_declared = ?, updated_at = ? WHERE id = ?")
+    let affected = sqlx::query("UPDATE users SET age_declared = $1, updated_at = $2 WHERE id = $3")
         .bind(age_value)
         .bind(now_ms())
         .bind(&user.user_id)

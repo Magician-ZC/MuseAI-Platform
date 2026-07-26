@@ -391,7 +391,7 @@ fn build_manifest(skeleton: &Value, rights: &str, version: i64) -> Value {
 /// 返回属主 id（官方模板 owner_id 为 NULL → None）。
 async fn loadable_template_owner(db: &AnyPool, id: &str) -> Result<Option<String>, ApiError> {
     let row: Option<(Option<String>, String, i64)> =
-        sqlx::query_as("SELECT owner_id, moderation, withdrawn FROM world_templates WHERE id = ?")
+        sqlx::query_as("SELECT owner_id, moderation, withdrawn FROM world_templates WHERE id = $1")
             .bind(id)
             .fetch_optional(db)
             .await?;
@@ -405,12 +405,12 @@ async fn loadable_template_owner(db: &AnyPool, id: &str) -> Result<Option<String
 /// 单个发布物的 (浏览数, 收藏数)。计数由登记行 COUNT(*) 派生——不维护可变计数列，故无热点行。
 async fn engagement_counts(db: &AnyPool, template_id: &str) -> Result<(i64, i64), ApiError> {
     let views: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM world_template_views WHERE template_id = ?")
+        sqlx::query_scalar("SELECT COUNT(*) FROM world_template_views WHERE template_id = $1")
             .bind(template_id)
             .fetch_one(db)
             .await?;
     let favorites: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM world_template_favorites WHERE template_id = ?")
+        sqlx::query_scalar("SELECT COUNT(*) FROM world_template_favorites WHERE template_id = $1")
             .bind(template_id)
             .fetch_one(db)
             .await?;
@@ -425,7 +425,7 @@ async fn engagement_counts_by_owner(
     let views: Vec<(String, i64)> = sqlx::query_as(
         "SELECT v.template_id, COUNT(*) FROM world_template_views v \
          JOIN world_templates t ON t.id = v.template_id \
-         WHERE t.owner_id = ? GROUP BY v.template_id",
+         WHERE t.owner_id = $1 GROUP BY v.template_id",
     )
     .bind(owner_id)
     .fetch_all(db)
@@ -433,7 +433,7 @@ async fn engagement_counts_by_owner(
     let favorites: Vec<(String, i64)> = sqlx::query_as(
         "SELECT f.template_id, COUNT(*) FROM world_template_favorites f \
          JOIN world_templates t ON t.id = f.template_id \
-         WHERE t.owner_id = ? GROUP BY f.template_id",
+         WHERE t.owner_id = $1 GROUP BY f.template_id",
     )
     .bind(owner_id)
     .fetch_all(db)
@@ -465,7 +465,7 @@ async fn record_view(
     let bucket = now / view_dedup_window_ms();
     let res = sqlx::query(
         "INSERT INTO world_template_views (template_id, viewer_id, window_bucket, first_viewed_at) \
-         VALUES (?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4)",
     )
     .bind(&id)
     .bind(&user.user_id)
@@ -496,7 +496,7 @@ async fn add_favorite(
         return Err(ApiError::Conflict("不能收藏自己发布的世界".into()));
     }
     let res = sqlx::query(
-        "INSERT INTO world_template_favorites (template_id, user_id, created_at) VALUES (?, ?, ?)",
+        "INSERT INTO world_template_favorites (template_id, user_id, created_at) VALUES ($1, $2, $3)",
     )
     .bind(&id)
     .bind(&user.user_id)
@@ -520,7 +520,7 @@ async fn remove_favorite(
     user: AuthUser,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
-    sqlx::query("DELETE FROM world_template_favorites WHERE template_id = ? AND user_id = ?")
+    sqlx::query("DELETE FROM world_template_favorites WHERE template_id = $1 AND user_id = $2")
         .bind(&id)
         .bind(&user.user_id)
         .execute(&state.db)
@@ -536,7 +536,7 @@ async fn my_favorite(
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
     let n: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM world_template_favorites WHERE template_id = ? AND user_id = ?",
+        "SELECT COUNT(*) FROM world_template_favorites WHERE template_id = $1 AND user_id = $2",
     )
     .bind(&id)
     .bind(&user.user_id)
@@ -598,7 +598,7 @@ async fn publish(
 
     // 服务端权威版本号：按 owner + title 递增，忽略客户端任何 version 声明。
     let max_version: Option<i64> =
-        sqlx::query_scalar("SELECT MAX(version) FROM world_templates WHERE owner_id = ? AND title = ?")
+        sqlx::query_scalar("SELECT MAX(version) FROM world_templates WHERE owner_id = $1 AND title = $2")
             .bind(&user.user_id)
             .bind(&title)
             .fetch_one(&state.db)
@@ -627,7 +627,7 @@ async fn publish(
     sqlx::query(
         "INSERT INTO world_templates \
          (id, title, room_type, skeleton_json, admission_json, official, version, moderation, withdrawn, owner_id, rights_declaration, manifest_json, star_rating, star_source, created_at) \
-         VALUES (?, ?, ?, ?, ?, 0, ?, ?, 0, ?, ?, ?, ?, 'auto', ?)",
+         VALUES ($1, $2, $3, $4, $5, 0, $6, $7, 0, $8, $9, $10, $11, 'auto', $12)",
     )
     .bind(&id)
     .bind(&title)
@@ -666,7 +666,7 @@ async fn publish(
 async fn list_mine(State(state): State<AppState>, user: AuthUser) -> Result<Response, ApiError> {
     let rows: Vec<(String, String, i64, Option<String>, String, i64, i64, i64)> = sqlx::query_as(
         "SELECT id, title, version, rights_declaration, moderation, withdrawn, star_rating, created_at \
-         FROM world_templates WHERE owner_id = ? ORDER BY created_at DESC, version DESC",
+         FROM world_templates WHERE owner_id = $1 ORDER BY created_at DESC, version DESC",
     )
     .bind(&user.user_id)
     .fetch_all(&state.db)
@@ -699,7 +699,7 @@ async fn list_mine(State(state): State<AppState>, user: AuthUser) -> Result<Resp
 /// GET /assets/worlds/{id}/status：审核态 + 内联可审计 manifest（owner 隔离，非本人 404 不泄露存在性）。
 async fn status(State(state): State<AppState>, user: AuthUser, Path(id): Path<String>) -> Result<Response, ApiError> {
     let row: Option<(String, i64, i64, Option<String>)> = sqlx::query_as(
-        "SELECT moderation, version, withdrawn, manifest_json FROM world_templates WHERE id = ? AND owner_id = ?",
+        "SELECT moderation, version, withdrawn, manifest_json FROM world_templates WHERE id = $1 AND owner_id = $2",
     )
     .bind(&id)
     .bind(&user.user_id)
@@ -726,7 +726,7 @@ async fn status(State(state): State<AppState>, user: AuthUser, Path(id): Path<St
 /// GET /assets/worlds/{id}/manifest：可审计 manifest（owner 隔离，非本人 404）。
 async fn manifest(State(state): State<AppState>, user: AuthUser, Path(id): Path<String>) -> Result<Response, ApiError> {
     let row: Option<(Option<String>,)> =
-        sqlx::query_as("SELECT manifest_json FROM world_templates WHERE id = ? AND owner_id = ?")
+        sqlx::query_as("SELECT manifest_json FROM world_templates WHERE id = $1 AND owner_id = $2")
             .bind(&id)
             .bind(&user.user_id)
             .fetch_optional(&state.db)
@@ -753,7 +753,7 @@ async fn withdraw(
         return Ok(json_response(cached));
     }
     let owned: Option<(String,)> =
-        sqlx::query_as("SELECT id FROM world_templates WHERE id = ? AND owner_id = ?")
+        sqlx::query_as("SELECT id FROM world_templates WHERE id = $1 AND owner_id = $2")
             .bind(&id)
             .bind(&user.user_id)
             .fetch_optional(&state.db)
@@ -761,7 +761,7 @@ async fn withdraw(
     if owned.is_none() {
         return Err(ApiError::NotFound);
     }
-    sqlx::query("UPDATE world_templates SET withdrawn = 1 WHERE id = ? AND owner_id = ?")
+    sqlx::query("UPDATE world_templates SET withdrawn = 1 WHERE id = $1 AND owner_id = $2")
         .bind(&id)
         .bind(&user.user_id)
         .execute(&state.db)
@@ -887,7 +887,7 @@ mod tests {
 
         // 入库：official=0（创作者资产）、owner_id=发布者、skeleton_json 落盘。
         let row: (i64, Option<String>, String, String) = sqlx::query_as(
-            "SELECT official, owner_id, moderation, skeleton_json FROM world_templates WHERE id = ?",
+            "SELECT official, owner_id, moderation, skeleton_json FROM world_templates WHERE id = $1",
         )
         .bind(&id)
         .fetch_one(&state.db)
@@ -977,7 +977,7 @@ mod tests {
 
         let id = v["id"].as_str().unwrap().to_string();
         let row: (i64, String) =
-            sqlx::query_as("SELECT star_rating, star_source FROM world_templates WHERE id = ?")
+            sqlx::query_as("SELECT star_rating, star_source FROM world_templates WHERE id = $1")
                 .bind(&id)
                 .fetch_one(&state.db)
                 .await
@@ -999,7 +999,7 @@ mod tests {
 
         let id = v["id"].as_str().unwrap().to_string();
         let row: (i64, String) =
-            sqlx::query_as("SELECT star_rating, star_source FROM world_templates WHERE id = ?")
+            sqlx::query_as("SELECT star_rating, star_source FROM world_templates WHERE id = $1")
                 .bind(&id)
                 .fetch_one(&state.db)
                 .await
@@ -1027,13 +1027,13 @@ mod tests {
         let id = v["id"].as_str().unwrap().to_string();
 
         // safety::moderate_and_queue 为唯一写入方：恰好 1 条 audit_queue（subject_id=模板 id）+ 1 条 risk_event。
-        let aq: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_queue WHERE subject_id = ?")
+        let aq: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_queue WHERE subject_id = $1")
             .bind(&id)
             .fetch_one(&state.db)
             .await
             .unwrap();
         assert_eq!(aq, 1, "命中超集应恰好 1 条 audit_queue（端点不二次写）");
-        let kind: String = sqlx::query_scalar("SELECT subject_kind FROM audit_queue WHERE subject_id = ?")
+        let kind: String = sqlx::query_scalar("SELECT subject_kind FROM audit_queue WHERE subject_id = $1")
             .bind(&id)
             .fetch_one(&state.db)
             .await
@@ -1361,7 +1361,7 @@ mod tests {
         let (_st, v) =
             send(&app, "POST", "/api/assets/worlds", Some(&access), Some("rt1"), Some(publish_body(valid_superset()))).await;
         let id = v["id"].as_str().unwrap().to_string();
-        let raw: String = sqlx::query_scalar("SELECT skeleton_json FROM world_templates WHERE id = ?")
+        let raw: String = sqlx::query_scalar("SELECT skeleton_json FROM world_templates WHERE id = $1")
             .bind(&id)
             .fetch_one(&state.db)
             .await

@@ -91,7 +91,7 @@ fn json_response(body: String) -> Response {
 
 /// 读用户余额；无行视为 0。
 async fn read_balance(db: &sqlx::AnyPool, user_id: &str) -> Result<i64, ApiError> {
-    let row: Option<(i64,)> = sqlx::query_as("SELECT balance_cents FROM billing_balances WHERE user_id = ?")
+    let row: Option<(i64,)> = sqlx::query_as("SELECT balance_cents FROM billing_balances WHERE user_id = $1")
         .bind(user_id)
         .fetch_optional(db)
         .await?;
@@ -118,7 +118,7 @@ async fn create_order(
     // 红线：保守拒充（规格 §2.2 未成年人默认保护）。仅"已声明成年"（age_declared==1）放行；
     // 未声明(0)、未成年(2)、用户行缺失一律 403——无法可靠判断年龄前保守限制付费（堵住"仅拦 2"的空防）。
     // 置于履约前：被拒请求零账务副作用（无 order / 无 ledger / 无 balance）。声明入口：POST /auth/age-declaration。
-    let age: Option<(i64,)> = sqlx::query_as("SELECT age_declared FROM users WHERE id = ?")
+    let age: Option<(i64,)> = sqlx::query_as("SELECT age_declared FROM users WHERE id = $1")
         .bind(&user.user_id)
         .fetch_optional(&state.db)
         .await?;
@@ -149,7 +149,7 @@ async fn create_order(
     let mut tx = state.db.begin().await?;
     sqlx::query(
         "INSERT INTO orders (id, user_id, kind, amount_cents, status, external_ref, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, 'created', ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, 'created', $5, $6, $7)",
     )
     .bind(&order_id)
     .bind(&user.user_id)
@@ -160,7 +160,7 @@ async fn create_order(
     .bind(now)
     .execute(&mut *tx)
     .await?;
-    sqlx::query("UPDATE orders SET status = 'paid', updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE orders SET status = 'paid', updated_at = $1 WHERE id = $2")
         .bind(now)
         .bind(&order_id)
         .execute(&mut *tx)
@@ -168,7 +168,7 @@ async fn create_order(
     // 账本双录：余额 +amount 必配一条 ledger +amount。
     sqlx::query(
         "INSERT INTO ledger_entries (id, user_id, order_id, delta_cents, reason, created_at) \
-         VALUES (?, ?, ?, ?, 'recharge', ?)",
+         VALUES ($1, $2, $3, $4, 'recharge', $5)",
     )
     .bind(new_id("ldg"))
     .bind(&user.user_id)
@@ -178,7 +178,7 @@ async fn create_order(
     .execute(&mut *tx)
     .await?;
     sqlx::query(
-        "INSERT INTO billing_balances (user_id, balance_cents, updated_at) VALUES (?, ?, ?) \
+        "INSERT INTO billing_balances (user_id, balance_cents, updated_at) VALUES ($1, $2, $3) \
          ON CONFLICT(user_id) DO UPDATE SET \
            balance_cents = billing_balances.balance_cents + excluded.balance_cents, \
            updated_at = excluded.updated_at",
@@ -208,13 +208,13 @@ async fn create_order(
         ],
     )
     .await?;
-    sqlx::query("UPDATE orders SET status = 'fulfilled', updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE orders SET status = 'fulfilled', updated_at = $1 WHERE id = $2")
         .bind(now)
         .bind(&order_id)
         .execute(&mut *tx)
         .await?;
     // 事务内读回余额，保证返回值恰好反映本次履约（不受并发影响）。
-    let balance: (i64,) = sqlx::query_as("SELECT balance_cents FROM billing_balances WHERE user_id = ?")
+    let balance: (i64,) = sqlx::query_as("SELECT balance_cents FROM billing_balances WHERE user_id = $1")
         .bind(&user.user_id)
         .fetch_one(&mut *tx)
         .await?;
@@ -256,13 +256,13 @@ async fn create_refund(
     let mut tx = state.db.begin().await?;
     // 行锁 / 串行化：Postgres 下自赋值 UPDATE 等价 SELECT ... FOR UPDATE，序列化并发退款；
     // SQLite 单连接事务本就互斥，此语句为无害占位。防两个并发退款请求双逆向。
-    sqlx::query("UPDATE orders SET status = status WHERE id = ?")
+    sqlx::query("UPDATE orders SET status = status WHERE id = $1")
         .bind(&order_id)
         .execute(&mut *tx)
         .await?;
 
     let row: Option<(String, i64, String)> =
-        sqlx::query_as("SELECT user_id, amount_cents, status FROM orders WHERE id = ?")
+        sqlx::query_as("SELECT user_id, amount_cents, status FROM orders WHERE id = $1")
             .bind(&order_id)
             .fetch_optional(&mut *tx)
             .await?;
@@ -279,7 +279,7 @@ async fn create_refund(
             // 账本双录：余额 -amount 必配一条 ledger -amount。
             sqlx::query(
                 "INSERT INTO ledger_entries (id, user_id, order_id, delta_cents, reason, created_at) \
-                 VALUES (?, ?, ?, ?, 'refund', ?)",
+                 VALUES ($1, $2, $3, $4, 'refund', $5)",
             )
             .bind(new_id("ldg"))
             .bind(&user.user_id)
@@ -288,7 +288,7 @@ async fn create_refund(
             .bind(now)
             .execute(&mut *tx)
             .await?;
-            sqlx::query("UPDATE billing_balances SET balance_cents = balance_cents - ?, updated_at = ? WHERE user_id = ?")
+            sqlx::query("UPDATE billing_balances SET balance_cents = balance_cents - $1, updated_at = $2 WHERE user_id = $3")
                 .bind(amount)
                 .bind(now)
                 .bind(&user.user_id)
@@ -314,7 +314,7 @@ async fn create_refund(
                 ],
             )
             .await?;
-            sqlx::query("UPDATE orders SET status = 'refunded', updated_at = ? WHERE id = ?")
+            sqlx::query("UPDATE orders SET status = 'refunded', updated_at = $1 WHERE id = $2")
                 .bind(now)
                 .bind(&order_id)
                 .execute(&mut *tx)
@@ -324,7 +324,7 @@ async fn create_refund(
         _ => return Err(ApiError::Conflict("仅已履约（fulfilled）订单可退款".into())),
     };
 
-    let balance: (i64,) = sqlx::query_as("SELECT balance_cents FROM billing_balances WHERE user_id = ?")
+    let balance: (i64,) = sqlx::query_as("SELECT balance_cents FROM billing_balances WHERE user_id = $1")
         .bind(&user.user_id)
         .fetch_one(&mut *tx)
         .await?;

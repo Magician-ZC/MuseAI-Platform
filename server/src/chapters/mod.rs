@@ -37,7 +37,7 @@ async fn user_active_character(
 ) -> Result<Option<String>, ApiError> {
     let row = sqlx::query(
         "SELECT cloud_character_id FROM world_members \
-         WHERE world_id = ? AND user_id = ? AND status = 'active' LIMIT 1",
+         WHERE world_id = $1 AND user_id = $2 AND status = 'active' LIMIT 1",
     )
     .bind(world_id)
     .bind(user_id)
@@ -52,7 +52,7 @@ async fn user_active_character(
 /// 主线硬节点数（通关判定的退化回退）：读模板骨架 mainlineNodes 长度。
 /// 超集实例优先读 `/assembly/sampling/selectedMainline` 长度（见 chapter_finish），仅无采样时回退此处。
 async fn mainline_node_count(db: &AnyPool, template_id: &str) -> Result<usize, ApiError> {
-    let row = sqlx::query("SELECT skeleton_json FROM world_templates WHERE id = ?")
+    let row = sqlx::query("SELECT skeleton_json FROM world_templates WHERE id = $1")
         .bind(template_id)
         .fetch_optional(db)
         .await?;
@@ -126,7 +126,7 @@ async fn chapter_start(
 
     // 置 running（open→running），使会话 tick 可被 runtime 处理。
     if world.status == "open" {
-        sqlx::query("UPDATE worlds SET status = 'running', updated_at = ? WHERE id = ? AND status = 'open'")
+        sqlx::query("UPDATE worlds SET status = 'running', updated_at = $1 WHERE id = $2 AND status = 'open'")
             .bind(crate::db::now_ms())
             .bind(&world_id)
             .execute(&state.db)
@@ -192,7 +192,7 @@ async fn chapter_finish(
         attempt += 1;
 
         // 每次重试重读最新 assembled_json + state_revision（CAS 基准）。
-        let row = sqlx::query("SELECT assembled_json, state_revision FROM worlds WHERE id = ?")
+        let row = sqlx::query("SELECT assembled_json, state_revision FROM worlds WHERE id = $1")
             .bind(&world_id)
             .fetch_optional(&state.db)
             .await?
@@ -264,8 +264,8 @@ async fn chapter_finish(
         // 事务：CAS 占位（推进 state_revision + 写 chapterState）→ 命中后发货，全成或全败。
         let mut tx = state.db.begin().await?;
         let cas = sqlx::query(
-            "UPDATE worlds SET assembled_json = ?, state_revision = ?, updated_at = ? \
-             WHERE id = ? AND state_revision = ?",
+            "UPDATE worlds SET assembled_json = $1, state_revision = $2, updated_at = $3 \
+             WHERE id = $4 AND state_revision = $5",
         )
         .bind(wrapper.to_string())
         .bind(base_revision + 1)
@@ -309,7 +309,7 @@ async fn chapter_finish(
         if cleared && !was_cleared {
             let participants: Vec<(String, String)> = sqlx::query_as(
                 "SELECT cloud_character_id, user_id FROM world_members \
-                 WHERE world_id = ? AND status = 'active'",
+                 WHERE world_id = $1 AND status = 'active'",
             )
             .bind(&world_id)
             .fetch_all(&mut *tx)

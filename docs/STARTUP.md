@@ -111,6 +111,7 @@ cd server && MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo ru
 | `MUSE_SAFETY_LEXICON` | **开启** | 运行时敏感词库总开关(§15 第 2 层)。**默认开启且应保持开启**——内容安全是合规主体责任下的恒开设施,此开关定位是误伤应急阀,不是灰度位 |
 | `MUSE_SAFETY_LEXICON_EXTRA` | 空 | 运营补充敏感词(逗号/分号/换行分隔),归类 `custom`、低危 |
 | `MUSE_SAFETY_RUNTIME_AUDIT` | `high` | 运行时命中入人审队列的策略:`high`(仅高危)/`all`/`none`。**命中一律记 risk_events**,本开关只管是否额外入 `audit_queue`(每 tick 每事件都入队会淹掉人审)。配错值回落 `high`,不静默放宽或收紧 |
+| `MUSE_CORS_ORIGINS` | 本地开发六项(见下) | 跨源白名单(逗号分隔)。**三个前端都与 server 不同源**:玩家端 Vite `:1420`、运营后台 Vite `:1430`、Tauri webview(`tauri://localhost` / `https://tauri.localhost`),而 server 在 `:8787`。🔴 **生产必配**——不配则只放行本地开发来源,线上域名会被拦。非法条目跳过并告警,全部非法则退化为「不放行任何跨源」(fail-closed:配错了宁可前端连不上、立刻可见,也不静默放宽成通配)。**刻意不提供通配选项**:这些接口虽有 JWT 鉴权,放开任意源仍是无谓攻击面 |
 
 > 上表即全部 `MUSE_*` 变量(校验命令:`grep -rhoE '"MUSE_[A-Z0-9_]+"' server/src crates | sort -u`)。
 
@@ -214,6 +215,22 @@ MUSE_TEST_DATABASE_URL=postgres://$USER@localhost:5432/muse_test \
 >
 > ⚠️ 同一个 PG 库上不要并行跑两个测试进程(取号器是进程内的,会撞名);需要并行时用
 > `MUSE_TEST_SCHEMA_PREFIX` 给各自不同的前缀。
+>
+> 🔴 **本地反复跑 PG 那遍会把磁盘撑爆——记得定期清数据目录。** 隔离方案是每个测试池独占
+> 一个 schema、建池时先 `DROP SCHEMA IF EXISTS` 清同名残留,所以**残留 schema 的数量**上界
+> 恒定(= 历史最大并发用例数)。但恒定的是数量,不是**数据目录体积**:一轮全量约 1000 个 schema
+> × 66 张表,每张表哪怕只有几十 KB 初始页,几轮下来数据目录就是 GB 级——实测 6 轮累积 **8.1G**,
+> 直接把盘写满、导致任何命令都跑不了(连 `df` 都因为要建临时文件而失败)。
+> CI 上碰不到这个问题(容器跑完即销毁),**只有本地反复跑才会累积**。
+> 跑完记得 `rm -rf` 掉你的 PG 数据目录,或干脆用一次性容器:
+>
+> ```bash
+> docker run --rm -d -p 55432:5432 -e POSTGRES_PASSWORD=x -e LC_MESSAGES=C postgres:16
+> ```
+>
+> ⚠️ `LC_MESSAGES=C` 不是可选项:`testkit` 里钉占位符可移植性的那条断言 grep 的是英文
+> `syntax error`,中文 locale 的 PG 会输出「语法错误」导致该用例误红(CI 的 `postgres:16`
+> 镜像默认就是 C locale,所以 CI 上不会遇到)。
 
 后端进程端到端冒烟(dev):
 

@@ -215,7 +215,7 @@ pub(crate) async fn entry_ever_open(db: &AnyPool) -> bool {
         return true;
     }
     let n = sqlx::query(
-        "SELECT CAST(COUNT(*) AS BIGINT) AS n FROM runtime_flags WHERE flag = ? AND enabled = 1",
+        "SELECT CAST(COUNT(*) AS BIGINT) AS n FROM runtime_flags WHERE flag = $1 AND enabled = 1",
     )
     .bind(ENV_OOC_ANNOTATIONS)
     .fetch_one(db)
@@ -330,7 +330,7 @@ async fn audit_tx(
 ) -> Result<(), ApiError> {
     sqlx::query(
         "INSERT INTO audit_logs (id, actor_id, actor_role, action, subject, reason, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(new_id("aud"))
     .bind(&actor.user_id)
@@ -405,7 +405,7 @@ async fn audit_tx(
 pub(crate) async fn dream_quota_bonus(db: &AnyPool, world_id: &str, character_id: &str) -> i64 {
     sqlx::query(
         "SELECT CAST(COALESCE(SUM(grants), 0) AS BIGINT) AS n FROM dream_quota_compensations \
-         WHERE world_id = ? AND character_id = ?",
+         WHERE world_id = $1 AND character_id = $2",
     )
     .bind(world_id)
     .bind(character_id)
@@ -496,7 +496,7 @@ async fn create_appeal(
 
     // 世界必须存在（状态不限：世界已 ended 仍可申诉——申诉的是过去的一拍，
     // 而「对已结束世界的那一拍不服」恰恰是最常见的情形）。
-    let world_exists: Option<(String,)> = sqlx::query_as("SELECT id FROM worlds WHERE id = ?")
+    let world_exists: Option<(String,)> = sqlx::query_as("SELECT id FROM worlds WHERE id = $1")
         .bind(&world_id)
         .fetch_optional(&state.db)
         .await?;
@@ -507,7 +507,7 @@ async fn create_appeal(
     // 卡必须属本人且在过这个世界（服务端权威，§9.6）。伪造他人角色 → 记风控 + RiskBlocked，
     // 口径与 `interventions::create_intervention` 一致。
     let member: Option<(String,)> = sqlx::query_as(
-        "SELECT id FROM world_members WHERE world_id = ? AND cloud_character_id = ? AND user_id = ?",
+        "SELECT id FROM world_members WHERE world_id = $1 AND cloud_character_id = $2 AND user_id = $3",
     )
     .bind(&world_id)
     .bind(&req.character_id)
@@ -528,7 +528,7 @@ async fn create_appeal(
 
     // 那一拍必须已落定。
     let tick: Option<(String,)> = sqlx::query_as(
-        "SELECT id FROM world_ticks WHERE world_id = ? AND tick_no = ? AND status = 'done'",
+        "SELECT id FROM world_ticks WHERE world_id = $1 AND tick_no = $2 AND status = 'done'",
     )
     .bind(&world_id)
     .bind(req.tick_no)
@@ -550,7 +550,7 @@ async fn create_appeal(
     let insert = sqlx::query(
         "INSERT INTO ooc_appeals (id, world_id, tick_no, character_id, user_id, reason_code, \
          reason_text, status, reviewer_id, review_reason, reviewed_at, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '', 0, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, '', '', 0, $9)",
     )
     .bind(&appeal_id)
     .bind(&world_id)
@@ -624,7 +624,7 @@ async fn put_annotation(
         return Err(ApiError::BadRequest(format!("内心批注不能超过 {ANNOTATION_MAX_CHARS} 字")));
     }
     if body.is_empty() {
-        sqlx::query("DELETE FROM character_annotations WHERE appeal_id = ? AND owner_id = ?")
+        sqlx::query("DELETE FROM character_annotations WHERE appeal_id = $1 AND owner_id = $2")
             .bind(&appeal_id)
             .bind(&user.user_id)
             .execute(&state.db)
@@ -663,7 +663,7 @@ async fn write_annotation(
     body: &str,
 ) -> Result<(), ApiError> {
     let existing: Option<(String,)> =
-        sqlx::query_as("SELECT id FROM character_annotations WHERE appeal_id = ?")
+        sqlx::query_as("SELECT id FROM character_annotations WHERE appeal_id = $1")
             .bind(appeal_id)
             .fetch_optional(&state.db)
             .await?;
@@ -679,8 +679,8 @@ async fn write_annotation(
 
     if existing.is_some() {
         sqlx::query(
-            "UPDATE character_annotations SET body = ?, moderation = ?, updated_at = ? \
-             WHERE id = ? AND owner_id = ?",
+            "UPDATE character_annotations SET body = $1, moderation = $2, updated_at = $3 \
+             WHERE id = $4 AND owner_id = $5",
         )
         .bind(body)
         .bind(moderation)
@@ -692,7 +692,7 @@ async fn write_annotation(
     } else {
         sqlx::query(
             "INSERT INTO character_annotations (id, owner_id, character_id, world_id, tick_no, \
-             appeal_id, body, moderation, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             appeal_id, body, moderation, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
         .bind(&ann_id)
         .bind(owner_id)
@@ -743,8 +743,8 @@ async fn my_appeals(
     // 实际条数对不上，翻页越翻越少，是最容易被当成「数据丢了」的那类 bug。
     let rows = match q.status.as_deref() {
         Some(status) => sqlx::query(&format!(
-            "SELECT {APPEAL_COLUMNS} FROM ooc_appeals WHERE user_id = ? AND status = ? \
-             ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
+            "SELECT {APPEAL_COLUMNS} FROM ooc_appeals WHERE user_id = $1 AND status = $2 \
+             ORDER BY created_at DESC, id DESC LIMIT $3 OFFSET $4"
         ))
         .bind(&user.user_id)
         .bind(status)
@@ -753,8 +753,8 @@ async fn my_appeals(
         .fetch_all(&state.db)
         .await?,
         None => sqlx::query(&format!(
-            "SELECT {APPEAL_COLUMNS} FROM ooc_appeals WHERE user_id = ? \
-             ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
+            "SELECT {APPEAL_COLUMNS} FROM ooc_appeals WHERE user_id = $1 \
+             ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3"
         ))
         .bind(&user.user_id)
         .bind(limit)
@@ -805,7 +805,7 @@ async fn my_character_annotations(
 
     // 卡必须属本人。
     let owns: Option<(String,)> =
-        sqlx::query_as("SELECT id FROM cloud_characters WHERE id = ? AND owner_id = ?")
+        sqlx::query_as("SELECT id FROM cloud_characters WHERE id = $1 AND owner_id = $2")
             .bind(&character_id)
             .bind(&user.user_id)
             .fetch_optional(&state.db)
@@ -818,8 +818,8 @@ async fn my_character_annotations(
     let offset = q.offset.unwrap_or(0).max(0);
     let rows = sqlx::query(
         "SELECT id, world_id, tick_no, appeal_id, body, moderation, created_at, updated_at \
-         FROM character_annotations WHERE owner_id = ? AND character_id = ? \
-         ORDER BY world_id ASC, tick_no ASC, id ASC LIMIT ? OFFSET ?",
+         FROM character_annotations WHERE owner_id = $1 AND character_id = $2 \
+         ORDER BY world_id ASC, tick_no ASC, id ASC LIMIT $3 OFFSET $4",
     )
     .bind(&user.user_id)
     .bind(&character_id)
@@ -868,7 +868,7 @@ async fn list_appeals_admin(
     let status = q.status.unwrap_or_else(|| STATUS_PENDING.to_string());
     let rows = sqlx::query(&format!(
         "SELECT {APPEAL_COLUMNS} FROM ooc_appeals \
-         WHERE status = ? ORDER BY created_at ASC, id ASC LIMIT ? OFFSET ?"
+         WHERE status = $1 ORDER BY created_at ASC, id ASC LIMIT $2 OFFSET $3"
     ))
     .bind(&status)
     .bind(limit)
@@ -965,8 +965,8 @@ async fn review_appeal(
 
     // ① 状态 CAS：只有从 pending 出发的那一次能成功。
     let updated = sqlx::query(
-        "UPDATE ooc_appeals SET status = ?, reviewer_id = ?, review_reason = ?, reviewed_at = ? \
-         WHERE id = ? AND status = ?",
+        "UPDATE ooc_appeals SET status = $1, reviewer_id = $2, review_reason = $3, reviewed_at = $4 \
+         WHERE id = $5 AND status = $6",
     )
     .bind(new_status)
     .bind(&admin.0.user_id)
@@ -986,7 +986,7 @@ async fn review_appeal(
     if confirmed {
         sqlx::query(
             "INSERT INTO dream_quota_compensations (id, appeal_id, world_id, character_id, user_id, \
-             grants, granted_by, reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             grants, granted_by, reason, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         )
         .bind(new_id("dqc"))
         .bind(&appeal_id)
@@ -1069,7 +1069,7 @@ const APPEAL_COLUMNS: &str = "id, world_id, tick_no, character_id, user_id, reas
      reason_text, status, reviewer_id, review_reason, reviewed_at, created_at";
 
 async fn fetch_appeal(db: &AnyPool, id: &str) -> Result<Option<AppealRow>, ApiError> {
-    let row = sqlx::query(&format!("SELECT {APPEAL_COLUMNS} FROM ooc_appeals WHERE id = ?"))
+    let row = sqlx::query(&format!("SELECT {APPEAL_COLUMNS} FROM ooc_appeals WHERE id = $1"))
         .bind(id)
         .fetch_optional(db)
         .await?;
@@ -1084,7 +1084,7 @@ async fn find_appeal_by_slot(
 ) -> Result<Option<AppealRow>, ApiError> {
     let row = sqlx::query(&format!(
         "SELECT {APPEAL_COLUMNS} FROM ooc_appeals \
-         WHERE world_id = ? AND tick_no = ? AND character_id = ?"
+         WHERE world_id = $1 AND tick_no = $2 AND character_id = $3"
     ))
     .bind(world_id)
     .bind(tick_no)
@@ -1122,7 +1122,7 @@ fn annotation_json(r: &sqlx::any::AnyRow) -> Result<Value, ApiError> {
 async fn appeal_response(db: &AnyPool, a: &AppealRow, created: bool) -> Result<Value, ApiError> {
     let ann = sqlx::query(
         "SELECT id, world_id, tick_no, appeal_id, body, moderation, created_at, updated_at \
-         FROM character_annotations WHERE appeal_id = ?",
+         FROM character_annotations WHERE appeal_id = $1",
     )
     .bind(&a.id)
     .fetch_optional(db)
@@ -1133,7 +1133,7 @@ async fn appeal_response(db: &AnyPool, a: &AppealRow, created: bool) -> Result<V
     };
 
     let comp = sqlx::query(
-        "SELECT grants, created_at FROM dream_quota_compensations WHERE appeal_id = ?",
+        "SELECT grants, created_at FROM dream_quota_compensations WHERE appeal_id = $1",
     )
     .bind(&a.id)
     .fetch_optional(db)

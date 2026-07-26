@@ -464,18 +464,18 @@ fn sim_template_id(scenario: &str) -> String {
 /// 一个测试库里共享的部分：模型路由 + 用户 + 云角色卡（**每库播一次**）。
 async fn seed_sim_shared(state: &AppState) {
     let db = &state.db;
-    if !row_exists(db, "SELECT 1 FROM model_routes WHERE version = ?", SIM_ROUTES_VERSION).await {
+    if !row_exists(db, "SELECT 1 FROM model_routes WHERE version = $1", SIM_ROUTES_VERSION).await {
         seed_model_routes(db, SIM_ROUTES_VERSION).await;
     }
     for (cid, uid) in GOLDEN_MEMBERS {
-        if !row_exists(db, "SELECT 1 FROM users WHERE id = ?", uid).await {
+        if !row_exists(db, "SELECT 1 FROM users WHERE id = $1", uid).await {
             seed_user(db, uid).await;
         }
-        if !row_exists(db, "SELECT 1 FROM cloud_characters WHERE id = ?", cid).await {
+        if !row_exists(db, "SELECT 1 FROM cloud_characters WHERE id = $1", cid).await {
             sqlx::query(
                 "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, \
                  rights_declaration, moderation, withdrawn, created_at) \
-                 VALUES (?, ?, 'local', 1, ?, 'original', 'approved', 0, ?)",
+                 VALUES ($1, $2, 'local', 1, $3, 'original', 'approved', 0, $4)",
             )
             .bind(*cid)
             .bind(*uid)
@@ -491,13 +491,13 @@ async fn seed_sim_shared(state: &AppState) {
 /// 场景模板（每场景一份，同场景的多个副本共用 ⇒ `template_version` 与骨架字节一致）。
 async fn seed_sim_template(state: &AppState, sc: &SimScenario) {
     let id = sim_template_id(sc.name);
-    if row_exists(&state.db, "SELECT 1 FROM world_templates WHERE id = ?", &id).await {
+    if row_exists(&state.db, "SELECT 1 FROM world_templates WHERE id = $1", &id).await {
         return;
     }
     sqlx::query(
         "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, official, \
          version, moderation, star_rating, created_at) \
-         VALUES (?, ?, 'idle', ?, '{\"mode\":\"open\"}', 1, ?, 'approved', ?, ?)",
+         VALUES ($1, $2, 'idle', $3, '{\"mode\":\"open\"}', 1, $4, 'approved', $5, $6)",
     )
     .bind(&id)
     .bind(format!("长安夜宴（仿真·{}）", sc.name))
@@ -524,8 +524,8 @@ async fn seed_sim_world(state: &AppState, sc: &SimScenario, world_id: &str) {
          model_route_version, room_type, title, status, visibility, host_user_id, member_limit, \
          tick_per_day, timeline_mode, lethality, assembled_json, state_revision, narrative_state_json, \
          created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, 'idle', '长安夜宴', 'running', 'official', NULL, 10, 3, 'event', \
-         ?, NULL, 0, '{}', ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6, 'idle', '长安夜宴', 'running', 'official', NULL, 10, 3, 'event', \
+         $7, NULL, 0, '{}', $8, $9)",
     )
     .bind(world_id)
     .bind(sim_template_id(sc.name))
@@ -542,7 +542,7 @@ async fn seed_sim_world(state: &AppState, sc: &SimScenario, world_id: &str) {
 
     sqlx::query(
         "INSERT INTO world_budgets (world_id, daily_token_budget, daily_cny_budget_cents, \
-         spent_tokens_today, budget_day, fused, updated_at) VALUES (?, 100000000, 0, 0, '', 0, ?)",
+         spent_tokens_today, budget_day, fused, updated_at) VALUES ($1, 100000000, 0, 0, '', 0, $2)",
     )
     .bind(world_id)
     .bind(now)
@@ -555,7 +555,7 @@ async fn seed_sim_world(state: &AppState, sc: &SimScenario, world_id: &str) {
     for (idx, (cid, uid)) in GOLDEN_MEMBERS.iter().enumerate() {
         sqlx::query(
             "INSERT INTO world_members (id, world_id, user_id, cloud_character_id, boundary_json, status, joined_at) \
-             VALUES (?, ?, ?, ?, '{}', 'active', ?)",
+             VALUES ($1, $2, $3, $4, '{}', 'active', $5)",
         )
         .bind(format!("wm-{world_id}-{idx}"))
         .bind(world_id)
@@ -674,7 +674,7 @@ async fn run_world(state: &AppState, sc: &SimScenario, seed: u64) -> SimRunRecor
     }
 
     let spent_tokens: i64 =
-        sqlx::query_scalar("SELECT spent_tokens_today FROM world_budgets WHERE world_id = ?")
+        sqlx::query_scalar("SELECT spent_tokens_today FROM world_budgets WHERE world_id = $1")
             .bind(&world_id)
             .fetch_one(&state.db)
             .await
@@ -1097,7 +1097,7 @@ async fn ending_selection_varies_with_instance_seed() {
         *endings.entry(record.facts.ending_id.clone()).or_insert(0) += 1;
 
         let assembled: Option<String> =
-            sqlx::query_scalar("SELECT assembled_json FROM worlds WHERE id = ?")
+            sqlx::query_scalar("SELECT assembled_json FROM worlds WHERE id = $1")
                 .bind(&record.world_id)
                 .fetch_one(&state.db)
                 .await
@@ -1178,7 +1178,7 @@ async fn blocked_ticks_record_real_token_cost_without_polluting_narrative_slo() 
     use sqlx::Row as _;
     let rows: Vec<(i64, i64, String)> = sqlx::query(
         "SELECT tick_no, cost_tokens, COALESCE(error, '') AS err FROM world_ticks \
-         WHERE world_id = ? ORDER BY tick_no ASC",
+         WHERE world_id = $1 ORDER BY tick_no ASC",
     )
     .bind(&record.world_id)
     .fetch_all(&state.db)
@@ -1221,7 +1221,7 @@ async fn blocked_ticks_record_real_token_cost_without_polluting_narrative_slo() 
     // 5) 反方向的守卫：**没跑过模型的拍必须仍记 0**，一刀切改成非 0 就是反方向的虚报。
     //    这里用同一个世界现造一个空转拍（把世界置 paused → 下一拍命中 `world_not_running`，
     //    在引擎构建之前就返回），断言它既不记成本、也不动预算。
-    sqlx::query("UPDATE worlds SET status='paused' WHERE id = ?")
+    sqlx::query("UPDATE worlds SET status='paused' WHERE id = $1")
         .bind(&record.world_id)
         .execute(&state.db)
         .await
@@ -1230,7 +1230,7 @@ async fn blocked_ticks_record_real_token_cost_without_polluting_narrative_slo() 
     let status = drive_tick(&state, &SimModel::new(seed, sc.temper).into(), &record.world_id, noop_tick).await;
     assert_eq!(status, TickStatus::Skipped("world_not_running"), "paused 世界的拍应命中空转分支");
     let noop_cost: i64 =
-        sqlx::query_scalar("SELECT cost_tokens FROM world_ticks WHERE world_id = ? AND tick_no = ?")
+        sqlx::query_scalar("SELECT cost_tokens FROM world_ticks WHERE world_id = $1 AND tick_no = $2")
             .bind(&record.world_id)
             .bind(noop_tick)
             .fetch_one(&state.db)
@@ -1238,7 +1238,7 @@ async fn blocked_ticks_record_real_token_cost_without_polluting_narrative_slo() 
             .unwrap();
     assert_eq!(noop_cost, 0, "一次模型都没调过的拍必须记 0（#42 的反向边界）");
     let spent_after: i64 =
-        sqlx::query_scalar("SELECT spent_tokens_today FROM world_budgets WHERE world_id = ?")
+        sqlx::query_scalar("SELECT spent_tokens_today FROM world_budgets WHERE world_id = $1")
             .bind(&record.world_id)
             .fetch_one(&state.db)
             .await

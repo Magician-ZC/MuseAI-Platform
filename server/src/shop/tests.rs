@@ -35,7 +35,7 @@ async fn fund_wallet(db: &AnyPool, uid: &str, amount: i64) {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO billing_balances (user_id, balance_cents, updated_at) VALUES (?, ?, ?) \
+        "INSERT INTO billing_balances (user_id, balance_cents, updated_at) VALUES ($1, $2, $3) \
          ON CONFLICT(user_id) DO UPDATE SET balance_cents = billing_balances.balance_cents + excluded.balance_cents, updated_at = excluded.updated_at",
     )
     .bind(uid)
@@ -51,7 +51,7 @@ async fn fund_wallet(db: &AnyPool, uid: &str, amount: i64) {
 async fn seed_template(db: &AnyPool, id: &str, owner: &str) {
     sqlx::query(
         "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, official, version, moderation, owner_id, created_at) \
-         VALUES (?, 't', 'idle', '{}', '{\"mode\":\"open\"}', 0, 1, 'approved', ?, ?)",
+         VALUES ($1, 't', 'idle', '{}', '{\"mode\":\"open\"}', 0, 1, 'approved', $2, $3)",
     )
     .bind(id)
     .bind(owner)
@@ -67,7 +67,7 @@ async fn seed_world(db: &AnyPool, world_id: &str, template_id: &str) {
         "INSERT INTO worlds (id, template_id, template_version, engine_version, prompt_set_version, \
          model_route_version, room_type, title, status, visibility, member_limit, tick_per_day, \
          state_revision, narrative_state_json, created_at, updated_at) \
-         VALUES (?, ?, 1, 'e1', 'p1', 'm1', 'idle', 'w', 'open', 'private', 10, 3, 0, '{}', ?, ?)",
+         VALUES ($1, $2, 1, 'e1', 'p1', 'm1', 'idle', 'w', 'open', 'private', 10, 3, 0, '{}', $3, $4)",
     )
     .bind(world_id)
     .bind(template_id)
@@ -79,7 +79,7 @@ async fn seed_world(db: &AnyPool, world_id: &str, template_id: &str) {
 }
 
 async fn acct_balance(db: &AnyPool, account_id: &str) -> i64 {
-    let row: Option<(i64,)> = sqlx::query_as("SELECT balance_cents FROM ledger_accounts WHERE id = ?")
+    let row: Option<(i64,)> = sqlx::query_as("SELECT balance_cents FROM ledger_accounts WHERE id = $1")
         .bind(account_id)
         .fetch_optional(db)
         .await
@@ -88,7 +88,7 @@ async fn acct_balance(db: &AnyPool, account_id: &str) -> i64 {
 }
 
 async fn billing_balance(db: &AnyPool, uid: &str) -> i64 {
-    let row: Option<(i64,)> = sqlx::query_as("SELECT balance_cents FROM billing_balances WHERE user_id = ?")
+    let row: Option<(i64,)> = sqlx::query_as("SELECT balance_cents FROM billing_balances WHERE user_id = $1")
         .bind(uid)
         .fetch_optional(db)
         .await

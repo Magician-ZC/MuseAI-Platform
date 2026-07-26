@@ -293,7 +293,7 @@ async fn publish(
 
     // 服务端权威版本号：按 owner + localCardId 递增，忽略客户端任何 version 声明。
     let max_version: Option<i64> =
-        sqlx::query_scalar("SELECT MAX(version) FROM cloud_characters WHERE owner_id = ? AND local_card_id = ?")
+        sqlx::query_scalar("SELECT MAX(version) FROM cloud_characters WHERE owner_id = $1 AND local_card_id = $2")
             .bind(&user.user_id)
             .bind(&local_card_id)
             .fetch_one(&state.db)
@@ -319,7 +319,7 @@ async fn publish(
     let (source_fingerprint, pristine) = source_identity(&req.card_json);
 
     sqlx::query(
-        "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, rights_declaration, moderation, withdrawn, manifest_json, source_fingerprint, pristine, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
+        "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, rights_declaration, moderation, withdrawn, manifest_json, source_fingerprint, pristine, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8, $9, $10, $11)",
     )
     .bind(&id)
     .bind(&user.user_id)
@@ -356,7 +356,7 @@ async fn publish(
 /// GET /assets/characters/mine：我的云端版本列表（owner 隔离，含审核态与历练值）。
 async fn list_mine(State(state): State<AppState>, user: AuthUser) -> Result<Response, ApiError> {
     let rows: Vec<(String, String, i64, String, String, i64, i64, Option<String>, Option<String>, i64)> = sqlx::query_as(
-        "SELECT id, local_card_id, version, rights_declaration, moderation, withdrawn, created_at, avatar_url, avatar_moderation, mileage FROM cloud_characters WHERE owner_id = ? ORDER BY created_at DESC, version DESC",
+        "SELECT id, local_card_id, version, rights_declaration, moderation, withdrawn, created_at, avatar_url, avatar_moderation, mileage FROM cloud_characters WHERE owner_id = $1 ORDER BY created_at DESC, version DESC",
     )
     .bind(&user.user_id)
     .fetch_all(&state.db)
@@ -392,7 +392,7 @@ async fn fetch_appeal_view(
 ) -> Result<serde_json::Value, ApiError> {
     let row: Option<(String, String, Option<String>, i64, Option<i64>)> = sqlx::query_as(
         "SELECT status, appeal_text, resolution_reason, created_at, resolved_at \
-         FROM moderation_appeals WHERE subject_kind = ? AND subject_id = ?",
+         FROM moderation_appeals WHERE subject_kind = $1 AND subject_id = $2",
     )
     .bind(subject_kind)
     .bind(subject_id)
@@ -416,7 +416,7 @@ async fn fetch_appeal_view(
 /// 无队列行/无理由则中文兜底）与 appeal（该主体申诉行，无则 null）。
 async fn status(State(state): State<AppState>, user: AuthUser, Path(id): Path<String>) -> Result<Response, ApiError> {
     let row: Option<(String, i64, i64, Option<String>)> = sqlx::query_as(
-        "SELECT moderation, version, withdrawn, manifest_json FROM cloud_characters WHERE id = ? AND owner_id = ?",
+        "SELECT moderation, version, withdrawn, manifest_json FROM cloud_characters WHERE id = $1 AND owner_id = $2",
     )
     .bind(&id)
     .bind(&user.user_id)
@@ -430,7 +430,7 @@ async fn status(State(state): State<AppState>, user: AuthUser, Path(id): Path<St
     // rejectReason：仅 moderation=='rejected' 时给值，否则 null。
     let reject_reason = if moderation == "rejected" {
         let reason: Option<Option<String>> = sqlx::query_scalar(
-            "SELECT reject_reason FROM audit_queue WHERE subject_kind = 'character' AND subject_id = ? \
+            "SELECT reject_reason FROM audit_queue WHERE subject_kind = 'character' AND subject_id = $1 \
              ORDER BY created_at DESC, id DESC LIMIT 1",
         )
         .bind(&id)
@@ -479,7 +479,7 @@ async fn appeal(
 ) -> Result<Response, ApiError> {
     // owner 鉴权：非本人或不存在 → 404（硬隔离）。
     let row: Option<(String, Option<String>)> = sqlx::query_as(
-        "SELECT moderation, avatar_moderation FROM cloud_characters WHERE id = ? AND owner_id = ?",
+        "SELECT moderation, avatar_moderation FROM cloud_characters WHERE id = $1 AND owner_id = $2",
     )
     .bind(&id)
     .bind(&user.user_id)
@@ -503,7 +503,7 @@ async fn appeal(
     // 每主体终身一次：唯一索引 (subject_kind, subject_id) 冲突 → 409。
     let inserted = sqlx::query(
         "INSERT INTO moderation_appeals (id, subject_kind, subject_id, owner_id, appeal_text, status, created_at) \
-         VALUES (?, 'character', ?, ?, ?, 'pending', ?)",
+         VALUES ($1, 'character', $2, $3, $4, 'pending', $5)",
     )
     .bind(&appeal_id)
     .bind(&id)
@@ -537,7 +537,7 @@ async fn appeal(
 /// 独立端点便于发布前预览与合规审计取用；非本人 → 404 不泄露存在性。
 async fn manifest(State(state): State<AppState>, user: AuthUser, Path(id): Path<String>) -> Result<Response, ApiError> {
     let row: Option<(Option<String>,)> =
-        sqlx::query_as("SELECT manifest_json FROM cloud_characters WHERE id = ? AND owner_id = ?")
+        sqlx::query_as("SELECT manifest_json FROM cloud_characters WHERE id = $1 AND owner_id = $2")
             .bind(&id)
             .bind(&user.user_id)
             .fetch_optional(&state.db)
@@ -564,7 +564,7 @@ async fn upload_avatar(
 ) -> Result<Response, ApiError> {
     // owner 鉴权：非本人或不存在 → 404（硬隔离，不泄露存在性）。
     let owned: Option<(String,)> =
-        sqlx::query_as("SELECT id FROM cloud_characters WHERE id = ? AND owner_id = ?")
+        sqlx::query_as("SELECT id FROM cloud_characters WHERE id = $1 AND owner_id = $2")
             .bind(&id)
             .bind(&user.user_id)
             .fetch_optional(&state.db)
@@ -602,7 +602,7 @@ async fn upload_avatar(
     let avatar_url = format!("/api/assets/objects/{object_key}");
 
     sqlx::query(
-        "UPDATE cloud_characters SET avatar_object_key = ?, avatar_url = ?, avatar_moderation = ? WHERE id = ? AND owner_id = ?",
+        "UPDATE cloud_characters SET avatar_object_key = $1, avatar_url = $2, avatar_moderation = $3 WHERE id = $4 AND owner_id = $5",
     )
     .bind(&object_key)
     .bind(&avatar_url)
@@ -649,7 +649,7 @@ async fn withdraw(
         return Ok(json_response(cached));
     }
     let owned: Option<(String,)> =
-        sqlx::query_as("SELECT id FROM cloud_characters WHERE id = ? AND owner_id = ?")
+        sqlx::query_as("SELECT id FROM cloud_characters WHERE id = $1 AND owner_id = $2")
             .bind(&id)
             .bind(&user.user_id)
             .fetch_optional(&state.db)
@@ -657,7 +657,7 @@ async fn withdraw(
     if owned.is_none() {
         return Err(ApiError::NotFound);
     }
-    sqlx::query("UPDATE cloud_characters SET withdrawn = 1 WHERE id = ? AND owner_id = ?")
+    sqlx::query("UPDATE cloud_characters SET withdrawn = 1 WHERE id = $1 AND owner_id = $2")
         .bind(&id)
         .bind(&user.user_id)
         .execute(&state.db)
@@ -683,7 +683,7 @@ async fn delete_character(
         return Ok(json_response(cached));
     }
     let owned: Option<(String,)> =
-        sqlx::query_as("SELECT id FROM cloud_characters WHERE id = ? AND owner_id = ?")
+        sqlx::query_as("SELECT id FROM cloud_characters WHERE id = $1 AND owner_id = $2")
             .bind(&id)
             .bind(&user.user_id)
             .fetch_optional(&state.db)
@@ -693,20 +693,20 @@ async fn delete_character(
     }
 
     // 是否已投放：world_members 是否引用该云端角色。
-    let placed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_members WHERE cloud_character_id = ?")
+    let placed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_members WHERE cloud_character_id = $1")
         .bind(&id)
         .fetch_one(&state.db)
         .await?;
     let now = now_ms();
     let req_id = new_id("dr");
     let resp = if placed == 0 {
-        sqlx::query("DELETE FROM cloud_characters WHERE id = ? AND owner_id = ?")
+        sqlx::query("DELETE FROM cloud_characters WHERE id = $1 AND owner_id = $2")
             .bind(&id)
             .bind(&user.user_id)
             .execute(&state.db)
             .await?;
         sqlx::query(
-            "INSERT INTO data_requests (id, user_id, kind, status, created_at, updated_at) VALUES (?, ?, 'delete', 'done', ?, ?)",
+            "INSERT INTO data_requests (id, user_id, kind, status, created_at, updated_at) VALUES ($1, $2, 'delete', 'done', $3, $4)",
         )
         .bind(&req_id)
         .bind(&user.user_id)
@@ -717,13 +717,13 @@ async fn delete_character(
         serde_json::json!({ "id": id, "scope": "immediate", "status": "done", "retained": [] })
     } else {
         // 已投放：不立删（运行中世界仍引用不可变快照），停止后续投放 + 登记异步删除任务。
-        sqlx::query("UPDATE cloud_characters SET withdrawn = 1 WHERE id = ? AND owner_id = ?")
+        sqlx::query("UPDATE cloud_characters SET withdrawn = 1 WHERE id = $1 AND owner_id = $2")
             .bind(&id)
             .bind(&user.user_id)
             .execute(&state.db)
             .await?;
         sqlx::query(
-            "INSERT INTO data_requests (id, user_id, kind, status, created_at, updated_at) VALUES (?, ?, 'delete', 'pending', ?, ?)",
+            "INSERT INTO data_requests (id, user_id, kind, status, created_at, updated_at) VALUES ($1, $2, 'delete', 'pending', $3, $4)",
         )
         .bind(&req_id)
         .bind(&user.user_id)

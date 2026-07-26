@@ -91,7 +91,7 @@ async fn login_upserts_same_phone_to_same_user() {
 
     // 直接种第二条有效 challenge（绕过 60s 限频，仅测 upsert 语义）。
     let code2 = "654321";
-    sqlx::query("INSERT INTO sms_challenges (id, phone, code_hash, expires_at, consumed, created_at) VALUES (?, ?, ?, ?, 0, ?)")
+    sqlx::query("INSERT INTO sms_challenges (id, phone, code_hash, expires_at, consumed, created_at) VALUES ($1, $2, $3, $4, 0, $5)")
         .bind(crate::db::new_id("chal"))
         .bind(phone)
         .bind(super::sha256_hex(code2))
@@ -179,7 +179,7 @@ async fn identity_verification_stores_reference_only() {
 
     // 只落 provider/referenceId/status —— 不存证件原文。
     let row: (String, String, String) =
-        sqlx::query_as("SELECT provider, reference_id, status FROM identity_verification_refs WHERE user_id = ?")
+        sqlx::query_as("SELECT provider, reference_id, status FROM identity_verification_refs WHERE user_id = $1")
             .bind(&uid)
             .fetch_one(&state.db)
             .await
@@ -193,7 +193,7 @@ async fn age_declaration_writes_adult_then_minor() {
     let (access, _r, uid) = login_new_user(&app, "13800000007").await;
 
     // 注册默认未声明（age_declared=0）
-    let age0 = sqlx::query_scalar::<_, i64>("SELECT age_declared FROM users WHERE id = ?")
+    let age0 = sqlx::query_scalar::<_, i64>("SELECT age_declared FROM users WHERE id = $1")
         .bind(&uid)
         .fetch_one(&state.db)
         .await
@@ -205,7 +205,7 @@ async fn age_declaration_writes_adult_then_minor() {
         send(&app, "POST", "/api/auth/age-declaration", Some(&access), None, Some(json!({ "isAdult": true }))).await;
     assert_eq!(st, StatusCode::OK, "{resp:?}");
     assert_eq!(resp["ageDeclared"], 1);
-    let age1 = sqlx::query_scalar::<_, i64>("SELECT age_declared FROM users WHERE id = ?")
+    let age1 = sqlx::query_scalar::<_, i64>("SELECT age_declared FROM users WHERE id = $1")
         .bind(&uid)
         .fetch_one(&state.db)
         .await
@@ -217,7 +217,7 @@ async fn age_declaration_writes_adult_then_minor() {
         send(&app, "POST", "/api/auth/age-declaration", Some(&access), None, Some(json!({ "isAdult": false }))).await;
     assert_eq!(st, StatusCode::OK, "{resp:?}");
     assert_eq!(resp["ageDeclared"], 2);
-    let age2 = sqlx::query_scalar::<_, i64>("SELECT age_declared FROM users WHERE id = ?")
+    let age2 = sqlx::query_scalar::<_, i64>("SELECT age_declared FROM users WHERE id = $1")
         .bind(&uid)
         .fetch_one(&state.db)
         .await

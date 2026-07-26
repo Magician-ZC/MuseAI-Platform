@@ -8,7 +8,7 @@ use sqlx::Row;
 
 use crate::app::AppState;
 use crate::auth::{AdminUser, AuthUser};
-use crate::db::now_ms;
+use crate::db::{now_ms, Placeholders};
 use crate::error::ApiError;
 
 use super::{audit, clamp_limit, parse_cursor, require_role, ActionQuery};
@@ -63,14 +63,28 @@ pub(super) async fn list_users(
           ORDER BY created_at DESC LIMIT 1) AS verification_status \
          FROM users WHERE 1=1",
     );
+    // 发号顺序 = 下面 bind 的顺序（term 段 4 个、cursor 段 3 个、LIMIT 1 个）；
+    // 哪几段出现要到运行时才知道，编号不能写死。
+    let mut ph = Placeholders::new();
     if term.is_some() {
-        sql.push_str(" AND (nickname LIKE ? OR phone LIKE ? OR email LIKE ? OR id = ?)");
+        sql.push_str(&format!(
+            " AND (nickname LIKE {} OR phone LIKE {} OR email LIKE {} OR id = {})",
+            ph.take(),
+            ph.take(),
+            ph.take(),
+            ph.take()
+        ));
     }
     let cursor = q.cursor.as_deref().and_then(parse_cursor);
     if cursor.is_some() {
-        sql.push_str(" AND (created_at < ? OR (created_at = ? AND id < ?))");
+        sql.push_str(&format!(
+            " AND (created_at < {} OR (created_at = {} AND id < {}))",
+            ph.take(),
+            ph.take(),
+            ph.take()
+        ));
     }
-    sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ?");
+    sql.push_str(&format!(" ORDER BY created_at DESC, id DESC LIMIT {}", ph.take()));
 
     let mut query = sqlx::query(&sql);
     if let Some(t) = term {
@@ -144,7 +158,7 @@ async fn set_status(
     action: &str,
     reason: &str,
 ) -> Result<Json<Value>, ApiError> {
-    let res = sqlx::query("UPDATE users SET status = ?, updated_at = ? WHERE id = ?")
+    let res = sqlx::query("UPDATE users SET status = $1, updated_at = $2 WHERE id = $3")
         .bind(status)
         .bind(now_ms())
         .bind(id)

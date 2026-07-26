@@ -16,7 +16,7 @@ async fn test_pool() -> AnyPool {
 
 /// 造用户（age_declared：0 未声明 / 1 成年 / 2 未成年）。
 async fn seed_user(db: &AnyPool, id: &str, age_declared: i64) {
-    sqlx::query("INSERT INTO users (id, nickname, age_declared, status, created_at, updated_at) VALUES (?, '', ?, 'active', ?, ?)")
+    sqlx::query("INSERT INTO users (id, nickname, age_declared, status, created_at, updated_at) VALUES ($1, '', $2, 'active', $3, $4)")
         .bind(id)
         .bind(age_declared)
         .bind(now_ms())
@@ -32,7 +32,7 @@ async fn seed_template(db: &AnyPool, id: &str, owner: Option<&str>, bps: Option<
     let official = if owner.is_some() { 0 } else { 1 };
     sqlx::query(
         "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, official, version, moderation, owner_id, revenue_share_bps, created_at) \
-         VALUES (?, 't', 'idle', '{}', '{\"mode\":\"open\"}', ?, 1, 'approved', ?, ?, ?)",
+         VALUES ($1, 't', 'idle', '{}', '{\"mode\":\"open\"}', $2, 1, 'approved', $3, $4, $5)",
     )
     .bind(id)
     .bind(official)
@@ -50,7 +50,7 @@ async fn seed_world(db: &AnyPool, world_id: &str, template_id: &str) {
         "INSERT INTO worlds (id, template_id, template_version, engine_version, prompt_set_version, \
          model_route_version, room_type, title, status, visibility, member_limit, tick_per_day, \
          state_revision, narrative_state_json, created_at, updated_at) \
-         VALUES (?, ?, 1, 'e1', 'p1', 'm1', 'idle', 'w', 'open', 'private', 10, 3, 0, '{}', ?, ?)",
+         VALUES ($1, $2, 1, 'e1', 'p1', 'm1', 'idle', 'w', 'open', 'private', 10, 3, 0, '{}', $3, $4)",
     )
     .bind(world_id)
     .bind(template_id)
@@ -80,7 +80,7 @@ async fn fund_wallet(db: &AnyPool, uid: &str, amount: i64) {
     .unwrap();
     // 单连接池：billing_balances 必须在同一 tx 内写（不可再向池借连接，否则死锁 PoolTimedOut）。
     sqlx::query(
-        "INSERT INTO billing_balances (user_id, balance_cents, updated_at) VALUES (?, ?, ?) \
+        "INSERT INTO billing_balances (user_id, balance_cents, updated_at) VALUES ($1, $2, $3) \
          ON CONFLICT(user_id) DO UPDATE SET balance_cents = billing_balances.balance_cents + excluded.balance_cents, updated_at = excluded.updated_at",
     )
     .bind(uid)
@@ -95,7 +95,7 @@ async fn fund_wallet(db: &AnyPool, uid: &str, amount: i64) {
 // ---------- DB 断言辅助 ----------
 
 async fn acct_balance(db: &AnyPool, account_id: &str) -> i64 {
-    let row: Option<(i64,)> = sqlx::query_as("SELECT balance_cents FROM ledger_accounts WHERE id = ?")
+    let row: Option<(i64,)> = sqlx::query_as("SELECT balance_cents FROM ledger_accounts WHERE id = $1")
         .bind(account_id)
         .fetch_optional(db)
         .await
@@ -104,7 +104,7 @@ async fn acct_balance(db: &AnyPool, account_id: &str) -> i64 {
 }
 
 async fn billing_balance(db: &AnyPool, uid: &str) -> i64 {
-    let row: Option<(i64,)> = sqlx::query_as("SELECT balance_cents FROM billing_balances WHERE user_id = ?")
+    let row: Option<(i64,)> = sqlx::query_as("SELECT balance_cents FROM billing_balances WHERE user_id = $1")
         .bind(uid)
         .fetch_optional(db)
         .await
@@ -118,7 +118,7 @@ async fn journal_count(db: &AnyPool) -> i64 {
 
 /// 可疑交易留痕计数（P4）：按 risk_events.kind 统计（minor_creator_hold / self_tip / large_charge）。
 async fn risk_count(db: &AnyPool, kind: &str) -> i64 {
-    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM risk_events WHERE kind = ?")
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM risk_events WHERE kind = $1")
         .bind(kind)
         .fetch_one(db)
         .await

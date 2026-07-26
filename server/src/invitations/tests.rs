@@ -28,7 +28,7 @@ use muse_engine::character::types::{CardLifecycle, CharacterCardV2, Identity};
 async fn seed_user_age(state: &AppState, id: &str, age: i64) {
     sqlx::query(
         "INSERT INTO users (id, nickname, age_declared, status, created_at, updated_at) \
-         VALUES (?, '', ?, 'active', ?, ?)",
+         VALUES ($1, '', $2, 'active', $3, $4)",
     )
     .bind(id)
     .bind(age)
@@ -67,7 +67,7 @@ async fn seed_char(state: &AppState, id: &str, owner: &str, name: &str) {
     sqlx::query(
         "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, \
          rights_declaration, moderation, withdrawn, created_at) \
-         VALUES (?, ?, 'local', 1, ?, 'original', 'approved', 0, ?)",
+         VALUES ($1, $2, 'local', 1, $3, 'original', 'approved', 0, $4)",
     )
     .bind(id)
     .bind(owner)
@@ -114,7 +114,7 @@ async fn get(app: &axum::Router, uri: &str, tk: &str) -> (StatusCode, Value) {
 
 async fn member_count(state: &AppState, world_id: &str) -> i64 {
     sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM world_members WHERE world_id = ? AND status = 'active'",
+        "SELECT COUNT(*) FROM world_members WHERE world_id = $1 AND status = 'active'",
     )
     .bind(world_id)
     .fetch_one(&state.db)
@@ -373,7 +373,7 @@ async fn only_invitee_can_respond() {
     assert_eq!(st, StatusCode::NOT_FOUND, "邀请人不得代收件人接受");
 
     let status: String =
-        sqlx::query_scalar("SELECT status FROM room_invitations WHERE id = ?")
+        sqlx::query_scalar("SELECT status FROM room_invitations WHERE id = $1")
             .bind(&iid)
             .fetch_one(&state.db)
             .await
@@ -559,7 +559,7 @@ async fn accepted_invitation_still_blocks_minor_from_deathmatch_join() {
     assert_eq!(member_count(&state, &wid).await, 1, "被拒即零副作用（只剩房主一行）");
 
     // 邀请本身仍是 accepted —— 邀请状态与入场资格是两件事，邀请永远不代表通行证。
-    let status: String = sqlx::query_scalar("SELECT status FROM room_invitations WHERE id = ?")
+    let status: String = sqlx::query_scalar("SELECT status FROM room_invitations WHERE id = $1")
         .bind(&iid)
         .fetch_one(&state.db)
         .await
@@ -718,7 +718,7 @@ async fn accept_rechecks_age_gate_when_deathmatch_switch_flips_on() {
     )
     .await;
     assert_eq!(st, StatusCode::FORBIDDEN, "开关打开后未成年不得接受生死状世界的邀请: {r}");
-    let status: String = sqlx::query_scalar("SELECT status FROM room_invitations WHERE id = ?")
+    let status: String = sqlx::query_scalar("SELECT status FROM room_invitations WHERE id = $1")
         .bind(&iid)
         .fetch_one(&state.db)
         .await

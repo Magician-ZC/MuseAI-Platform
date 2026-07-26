@@ -171,7 +171,7 @@ async fn entry_ever_open(db: &AnyPool) -> bool {
         return true;
     }
     let n = sqlx::query(
-        "SELECT CAST(COUNT(*) AS BIGINT) AS n FROM runtime_flags WHERE flag = ? AND enabled = 1",
+        "SELECT CAST(COUNT(*) AS BIGINT) AS n FROM runtime_flags WHERE flag = $1 AND enabled = 1",
     )
     .bind(ENV_SOCIAL_IDENTITY_UNLOCK)
     .fetch_one(db)
@@ -203,7 +203,7 @@ const AGE_DECLARED_ADULT: i64 = 1;
 /// 口径与 `worlds::join_world` 的生死状门、`invitations::deathmatch_age_gate_ok` **逐字一致**——
 /// 三处口径必须同源，否则「未成年保护」会有三种不同的含义，其中至少两种是错的。
 async fn is_adult(db: &AnyPool, user_id: &str) -> Result<bool, ApiError> {
-    let age: Option<(i64,)> = sqlx::query_as("SELECT age_declared FROM users WHERE id = ?")
+    let age: Option<(i64,)> = sqlx::query_as("SELECT age_declared FROM users WHERE id = $1")
         .bind(user_id)
         .fetch_optional(db)
         .await?;
@@ -422,7 +422,7 @@ async fn character_name(db: &AnyPool, character_id: &str) -> String {
         return "该角色".to_string();
     }
     let card: Option<String> =
-        sqlx::query_scalar("SELECT card_json FROM cloud_characters WHERE id = ?")
+        sqlx::query_scalar("SELECT card_json FROM cloud_characters WHERE id = $1")
             .bind(character_id)
             .fetch_optional(db)
             .await
@@ -453,8 +453,8 @@ async fn character_name(db: &AnyPool, character_id: &str) -> String {
 pub(crate) async fn is_blocked_pair(db: &AnyPool, a: &str, b: &str) -> Result<bool, ApiError> {
     let n: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM social_blocks \
-         WHERE (blocker_user_id = ? AND blocked_user_id = ?) \
-            OR (blocker_user_id = ? AND blocked_user_id = ?)",
+         WHERE (blocker_user_id = $1 AND blocked_user_id = $2) \
+            OR (blocker_user_id = $3 AND blocked_user_id = $4)",
     )
     .bind(a)
     .bind(b)
@@ -575,7 +575,7 @@ async fn died_together(db: &AnyPool, mine: &str, theirs: &str) -> Result<DiedTog
     let shared: Vec<(String,)> = sqlx::query_as(
         "SELECT DISTINCT m1.world_id FROM world_members m1 \
          JOIN world_members m2 ON m2.world_id = m1.world_id \
-         WHERE m1.cloud_character_id = ? AND m2.cloud_character_id = ? \
+         WHERE m1.cloud_character_id = $1 AND m2.cloud_character_id = $2 \
          ORDER BY m1.world_id ASC",
     )
     .bind(mine)
@@ -596,8 +596,8 @@ async fn died_together(db: &AnyPool, mine: &str, theirs: &str) -> Result<DiedTog
     // 「故人」印记（任一方向即算：他记得你、你记得他，是同一段羁绊）。
     let marked: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM memorial_marks \
-         WHERE (character_id = ? AND deceased_character_id = ?) \
-            OR (character_id = ? AND deceased_character_id = ?)",
+         WHERE (character_id = $1 AND deceased_character_id = $2) \
+            OR (character_id = $3 AND deceased_character_id = $4)",
     )
     .bind(mine)
     .bind(theirs)
@@ -628,7 +628,7 @@ async fn died_together(db: &AnyPool, mine: &str, theirs: &str) -> Result<DiedTog
 /// 某张卡封卷于哪个世界；在世 / 卡不存在 / 未记录落款 → `None`。
 async fn grave_of(db: &AnyPool, character_id: &str) -> Result<Option<String>, ApiError> {
     let row: Option<(String, Option<String>)> =
-        sqlx::query_as("SELECT memorial_status, memorial_world_id FROM cloud_characters WHERE id = ?")
+        sqlx::query_as("SELECT memorial_status, memorial_world_id FROM cloud_characters WHERE id = $1")
             .bind(character_id)
             .fetch_optional(db)
             .await?;
@@ -710,7 +710,7 @@ async fn evaluate_eligibility(
     mine: &str,
     theirs: &str,
 ) -> Result<Eligibility, ApiError> {
-    let state_json: String = sqlx::query_scalar("SELECT narrative_state_json FROM worlds WHERE id = ?")
+    let state_json: String = sqlx::query_scalar("SELECT narrative_state_json FROM worlds WHERE id = $1")
         .bind(world_id)
         .fetch_optional(db)
         .await?
@@ -721,7 +721,7 @@ async fn evaluate_eligibility(
     let shared_worlds: i64 = sqlx::query_scalar(
         "SELECT COUNT(DISTINCT m1.world_id) FROM world_members m1 \
          JOIN world_members m2 ON m2.world_id = m1.world_id \
-         WHERE m1.cloud_character_id = ? AND m2.cloud_character_id = ?",
+         WHERE m1.cloud_character_id = $1 AND m2.cloud_character_id = $2",
     )
     .bind(mine)
     .bind(theirs)
@@ -769,8 +769,8 @@ async fn evaluate_eligibility(
 async fn expire_stale_requests(db: &AnyPool) -> Result<u64, ApiError> {
     let now = now_ms();
     let res = sqlx::query(
-        "UPDATE social_unlock_requests SET status = ?, responded_at = ? \
-         WHERE status = 'pending' AND expires_at <= ?",
+        "UPDATE social_unlock_requests SET status = $1, responded_at = $2 \
+         WHERE status = 'pending' AND expires_at <= $3",
     )
     .bind(UNLOCK_EXPIRED)
     .bind(now)
@@ -789,7 +789,7 @@ async fn expire_stale_requests(db: &AnyPool) -> Result<u64, ApiError> {
 async fn my_mask_in_world(db: &AnyPool, world_id: &str, user_id: &str) -> Result<Option<String>, ApiError> {
     let row: Option<(String,)> = sqlx::query_as(
         "SELECT cloud_character_id FROM world_members \
-         WHERE world_id = ? AND user_id = ? ORDER BY joined_at ASC, id ASC LIMIT 1",
+         WHERE world_id = $1 AND user_id = $2 ORDER BY joined_at ASC, id ASC LIMIT 1",
     )
     .bind(world_id)
     .bind(user_id)
@@ -805,7 +805,7 @@ async fn my_mask_in_world(db: &AnyPool, world_id: &str, user_id: &str) -> Result
 /// 会把这条独有社交资产整条掐死。真正需要挡的是**未过审**的卡，那是 `moderation` 的事。
 async fn owner_of(db: &AnyPool, character_id: &str) -> Result<Option<(String, String)>, ApiError> {
     let row: Option<(String, String)> =
-        sqlx::query_as("SELECT owner_id, moderation FROM cloud_characters WHERE id = ?")
+        sqlx::query_as("SELECT owner_id, moderation FROM cloud_characters WHERE id = $1")
             .bind(character_id)
             .fetch_optional(db)
             .await?;
@@ -821,8 +821,8 @@ async fn unlock_status_for(
 ) -> Result<(String, Option<String>), ApiError> {
     let row: Option<(String, String, String)> = sqlx::query_as(
         "SELECT id, status, requester_character_id FROM social_unlock_requests \
-         WHERE world_id = ? AND ((requester_character_id = ? AND target_character_id = ?) \
-                              OR (requester_character_id = ? AND target_character_id = ?)) \
+         WHERE world_id = $1 AND ((requester_character_id = $2 AND target_character_id = $3) \
+                              OR (requester_character_id = $4 AND target_character_id = $5)) \
          ORDER BY created_at DESC LIMIT 1",
     )
     .bind(world_id)
@@ -875,7 +875,7 @@ async fn list_bonds(
     let limit = page_size();
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT user_id, cloud_character_id FROM world_members \
-         WHERE world_id = ? AND user_id <> ? ORDER BY joined_at ASC, id ASC LIMIT ?",
+         WHERE world_id = $1 AND user_id <> $2 ORDER BY joined_at ASC, id ASC LIMIT $3",
     )
     .bind(&world_id)
     .bind(&user.user_id)
@@ -962,7 +962,7 @@ async fn create_unlock_request(
 
     // 对端必须是这个世界的成员（社交对象来自共同经历，不是全站搜人）。
     let target_member: Option<(String,)> = sqlx::query_as(
-        "SELECT user_id FROM world_members WHERE world_id = ? AND cloud_character_id = ?",
+        "SELECT user_id FROM world_members WHERE world_id = $1 AND cloud_character_id = $2",
     )
     .bind(&world_id)
     .bind(&target_char)
@@ -994,7 +994,7 @@ async fn create_unlock_request(
     // 反向已有 pending → 不新建第二条线，引导去收件箱回应（那才是"双向自愿"的正确形状）。
     let reverse: Option<(String,)> = sqlx::query_as(
         "SELECT id FROM social_unlock_requests \
-         WHERE world_id = ? AND requester_character_id = ? AND target_character_id = ? AND status = 'pending'",
+         WHERE world_id = $1 AND requester_character_id = $2 AND target_character_id = $3 AND status = 'pending'",
     )
     .bind(&world_id)
     .bind(&target_char)
@@ -1010,7 +1010,7 @@ async fn create_unlock_request(
     // 同一条线只有一行（唯一索引）：pending 幂等复用；终局态一律拒绝（拒绝/过期/撤销即终局）。
     let existing: Option<(String, String, i64, i64)> = sqlx::query_as(
         "SELECT id, status, expires_at, created_at FROM social_unlock_requests \
-         WHERE world_id = ? AND requester_character_id = ? AND target_character_id = ?",
+         WHERE world_id = $1 AND requester_character_id = $2 AND target_character_id = $3",
     )
     .bind(&world_id)
     .bind(&mine)
@@ -1031,7 +1031,7 @@ async fn create_unlock_request(
     // 日配额（跨世界合计）。
     let now = now_ms();
     let sent_today: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM social_unlock_requests WHERE requester_user_id = ? AND created_at >= ?",
+        "SELECT COUNT(*) FROM social_unlock_requests WHERE requester_user_id = $1 AND created_at >= $2",
     )
     .bind(&user.user_id)
     .bind(now - QUOTA_WINDOW_MS)
@@ -1057,7 +1057,7 @@ async fn create_unlock_request(
         "INSERT INTO social_unlock_requests \
          (id, world_id, requester_user_id, requester_character_id, target_user_id, \
           target_character_id, status, eligibility_json, expires_at, responded_at, revoked_at, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, 0, 0, ?) \
+         VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8, 0, 0, $9) \
          ON CONFLICT(world_id, requester_character_id, target_character_id) DO NOTHING",
     )
     .bind(&id)
@@ -1076,7 +1076,7 @@ async fn create_unlock_request(
         // 并发对手先建好了同一条线 → 回读权威行，幂等返回（不再发通知）。
         let (eid, estatus, eexpires, ecreated): (String, String, i64, i64) = sqlx::query_as(
             "SELECT id, status, expires_at, created_at FROM social_unlock_requests \
-             WHERE world_id = ? AND requester_character_id = ? AND target_character_id = ?",
+             WHERE world_id = $1 AND requester_character_id = $2 AND target_character_id = $3",
         )
         .bind(&world_id)
         .bind(&mine)
@@ -1155,8 +1155,8 @@ async fn list_incoming_requests(
     let rows: Vec<(String, String, String, String, String, i64, i64)> = sqlx::query_as(
         "SELECT id, world_id, requester_user_id, requester_character_id, status, expires_at, created_at \
          FROM social_unlock_requests \
-         WHERE target_user_id = ? AND (? = 'all' OR status = ?) \
-         ORDER BY created_at DESC LIMIT ?",
+         WHERE target_user_id = $1 AND ($2 = 'all' OR status = $3) \
+         ORDER BY created_at DESC LIMIT $4",
     )
     .bind(&user.user_id)
     .bind(&filter)
@@ -1229,7 +1229,7 @@ async fn respond_unlock_request(
 
     let row: Option<(String, String, String, String, String, String)> = sqlx::query_as(
         "SELECT world_id, requester_user_id, requester_character_id, target_user_id, \
-                target_character_id, status FROM social_unlock_requests WHERE id = ?",
+                target_character_id, status FROM social_unlock_requests WHERE id = $1",
     )
     .bind(&request_id)
     .fetch_optional(&state.db)
@@ -1268,8 +1268,8 @@ async fn respond_unlock_request(
     let now = now_ms();
     // 条件 UPDATE（CAS）：并发下只有一次能把 pending 推进，避免读改写丢更新。
     let res = sqlx::query(
-        "UPDATE social_unlock_requests SET status = ?, responded_at = ? \
-         WHERE id = ? AND status = 'pending'",
+        "UPDATE social_unlock_requests SET status = $1, responded_at = $2 \
+         WHERE id = $3 AND status = 'pending'",
     )
     .bind(new_status)
     .bind(now)
@@ -1278,7 +1278,7 @@ async fn respond_unlock_request(
     .await?;
     if res.rows_affected() == 0 {
         let cur: String =
-            sqlx::query_scalar("SELECT status FROM social_unlock_requests WHERE id = ?")
+            sqlx::query_scalar("SELECT status FROM social_unlock_requests WHERE id = $1")
                 .bind(&request_id)
                 .fetch_one(&state.db)
                 .await?;
@@ -1342,8 +1342,8 @@ async fn list_identities(
     let rows: Vec<(String, String, String, String, String, String, i64)> = sqlx::query_as(
         "SELECT id, world_id, requester_user_id, requester_character_id, target_user_id, \
                 target_character_id, responded_at FROM social_unlock_requests \
-         WHERE status = 'accepted' AND (requester_user_id = ? OR target_user_id = ?) \
-         ORDER BY responded_at DESC LIMIT ?",
+         WHERE status = 'accepted' AND (requester_user_id = $1 OR target_user_id = $2) \
+         ORDER BY responded_at DESC LIMIT $3",
     )
     .bind(&user.user_id)
     .bind(&user.user_id)
@@ -1364,7 +1364,7 @@ async fn list_identities(
         if !is_adult(&state.db, &other_user).await? {
             continue;
         }
-        let nickname: Option<String> = sqlx::query_scalar("SELECT nickname FROM users WHERE id = ?")
+        let nickname: Option<String> = sqlx::query_scalar("SELECT nickname FROM users WHERE id = $1")
             .bind(&other_user)
             .fetch_optional(&state.db)
             .await?;
@@ -1406,7 +1406,7 @@ async fn list_blocks(State(state): State<AppState>, user: AuthUser) -> Result<Js
     ensure_enabled(&state.db, Some(&user.user_id), None).await?;
     let rows: Vec<(String, String, String, String, i64)> = sqlx::query_as(
         "SELECT id, blocked_character_id, world_id, reason, created_at FROM social_blocks \
-         WHERE blocker_user_id = ? ORDER BY created_at DESC LIMIT ?",
+         WHERE blocker_user_id = $1 ORDER BY created_at DESC LIMIT $2",
     )
     .bind(&user.user_id)
     .bind(page_size())
@@ -1460,7 +1460,7 @@ async fn create_block(
     // 已拉黑 → 直接复用既有那行，且**跳过配额判定**：否则黑名单满额时，对同一个人再点一次
     // 拉黑会误报「已达上限」，而那次调用本来什么都不需要新增。
     let existing: Option<(String,)> = sqlx::query_as(
-        "SELECT id FROM social_blocks WHERE blocker_user_id = ? AND blocked_user_id = ?",
+        "SELECT id FROM social_blocks WHERE blocker_user_id = $1 AND blocked_user_id = $2",
     )
     .bind(&user.user_id)
     .bind(&blocked_user)
@@ -1473,7 +1473,7 @@ async fn create_block(
             // 配额是**软闸**：并发下最多超出一格。为它上锁不值得——上限的目的是防单账号把
             // 黑名单当批量数据结构刷，差一格不影响这个目的。
             let total: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM social_blocks WHERE blocker_user_id = ?")
+                sqlx::query_scalar("SELECT COUNT(*) FROM social_blocks WHERE blocker_user_id = $1")
                     .bind(&user.user_id)
                     .fetch_one(&state.db)
                     .await?;
@@ -1487,7 +1487,7 @@ async fn create_block(
             sqlx::query(
                 "INSERT INTO social_blocks \
                  (id, blocker_user_id, blocked_user_id, blocked_character_id, world_id, reason, created_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7) \
                  ON CONFLICT(blocker_user_id, blocked_user_id) DO NOTHING",
             )
             .bind(new_id("sbk"))
@@ -1501,7 +1501,7 @@ async fn create_block(
             .await?;
             // 回读权威 id（无论是本次插入的还是并发对手插入的，此刻必然存在）。
             sqlx::query_scalar(
-                "SELECT id FROM social_blocks WHERE blocker_user_id = ? AND blocked_user_id = ?",
+                "SELECT id FROM social_blocks WHERE blocker_user_id = $1 AND blocked_user_id = $2",
             )
             .bind(&user.user_id)
             .bind(&blocked_user)
@@ -1512,10 +1512,10 @@ async fn create_block(
 
     // ② 撤销双方之间未终局 / 已达成的解锁 —— 双向一次改完。
     let revoked = sqlx::query(
-        "UPDATE social_unlock_requests SET status = ?, revoked_at = ? \
+        "UPDATE social_unlock_requests SET status = $1, revoked_at = $2 \
          WHERE status IN ('pending', 'accepted') \
-           AND ((requester_user_id = ? AND target_user_id = ?) \
-             OR (requester_user_id = ? AND target_user_id = ?))",
+           AND ((requester_user_id = $3 AND target_user_id = $4) \
+             OR (requester_user_id = $5 AND target_user_id = $6))",
     )
     .bind(UNLOCK_REVOKED)
     .bind(now)
@@ -1547,7 +1547,7 @@ async fn remove_block(
     Path(block_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_enabled(&state.db, Some(&user.user_id), None).await?;
-    let res = sqlx::query("DELETE FROM social_blocks WHERE id = ? AND blocker_user_id = ?")
+    let res = sqlx::query("DELETE FROM social_blocks WHERE id = $1 AND blocker_user_id = $2")
         .bind(&block_id)
         .bind(&user.user_id)
         .execute(&state.db)
@@ -1625,7 +1625,7 @@ async fn create_report(
         }
         _ => {
             let row: Option<(String, String, String)> = sqlx::query_as(
-                "SELECT requester_user_id, target_user_id, world_id FROM social_unlock_requests WHERE id = ?",
+                "SELECT requester_user_id, target_user_id, world_id FROM social_unlock_requests WHERE id = $1",
             )
             .bind(&subject_id)
             .fetch_optional(&state.db)
@@ -1655,7 +1655,7 @@ async fn create_report(
     // 冷却窗口内重复提交 → 幂等复用既有那条（既不刷队列，也不让举报人觉得"点了没反应"）。
     let recent: Option<(String, String, i64)> = sqlx::query_as(
         "SELECT id, status, created_at FROM social_reports \
-         WHERE reporter_user_id = ? AND subject_kind = ? AND subject_id = ? AND created_at >= ? \
+         WHERE reporter_user_id = $1 AND subject_kind = $2 AND subject_id = $3 AND created_at >= $4 \
          ORDER BY created_at DESC LIMIT 1",
     )
     .bind(&user.user_id)
@@ -1671,7 +1671,7 @@ async fn create_report(
     }
 
     let today: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM social_reports WHERE reporter_user_id = ? AND created_at >= ?",
+        "SELECT COUNT(*) FROM social_reports WHERE reporter_user_id = $1 AND created_at >= $2",
     )
     .bind(&user.user_id)
     .bind(now - QUOTA_WINDOW_MS)
@@ -1686,7 +1686,7 @@ async fn create_report(
         "INSERT INTO social_reports \
          (id, reporter_user_id, subject_kind, subject_id, subject_user_id, world_id, category, \
           detail, status, handled_by, resolution, created_at, resolved_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', '', '', ?, 0)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', '', '', $9, 0)",
     )
     .bind(&id)
     .bind(&user.user_id)
@@ -1702,7 +1702,7 @@ async fn create_report(
 
     // 累计升级：pending 数**恰好**达到阈值时写一条 risk_events（一次跨越只升级一次）。
     let pending: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM social_reports WHERE subject_user_id = ? AND status = 'pending'",
+        "SELECT COUNT(*) FROM social_reports WHERE subject_user_id = $1 AND status = 'pending'",
     )
     .bind(&subject_user)
     .fetch_one(&state.db)
@@ -1711,7 +1711,7 @@ async fn create_report(
     if escalated {
         sqlx::query(
             "INSERT INTO risk_events (id, user_id, world_id, kind, detail_json, created_at) \
-             VALUES (?, ?, ?, 'social_report_threshold', ?, ?)",
+             VALUES ($1, $2, $3, 'social_report_threshold', $4, $5)",
         )
         .bind(new_id("rsk"))
         .bind(&subject_user)
@@ -1781,8 +1781,8 @@ async fn list_reports_admin(
         sqlx::query_as(
             "SELECT id, reporter_user_id, subject_kind, subject_id, subject_user_id, world_id, \
                     category, detail, status, created_at, resolved_at FROM social_reports \
-             WHERE (? = 'all' OR status = ?) AND (? IS NULL OR created_at < ?) \
-             ORDER BY created_at DESC LIMIT ?",
+             WHERE ($1 = 'all' OR status = $2) AND ($3 IS NULL OR created_at < $4) \
+             ORDER BY created_at DESC LIMIT $5",
         )
         .bind(&filter)
         .bind(&filter)
@@ -1867,8 +1867,8 @@ async fn resolve_report_admin(
     let mut tx = state.db.begin().await?;
     // CAS：只有 pending 能被推进（重复处置 / 并发处置命中 0 行 → 409，不覆盖别人的结论）。
     let res = sqlx::query(
-        "UPDATE social_reports SET status = ?, handled_by = ?, resolution = ?, resolved_at = ? \
-         WHERE id = ? AND status = 'pending'",
+        "UPDATE social_reports SET status = $1, handled_by = $2, resolution = $3, resolved_at = $4 \
+         WHERE id = $5 AND status = 'pending'",
     )
     .bind(new_status)
     .bind(&admin.0.user_id)
@@ -1883,7 +1883,7 @@ async fn resolve_report_admin(
     }
     sqlx::query(
         "INSERT INTO audit_logs (id, actor_id, actor_role, action, subject, reason, created_at) \
-         VALUES (?, ?, ?, 'social.report_resolved', ?, ?, ?)",
+         VALUES ($1, $2, $3, 'social.report_resolved', $4, $5, $6)",
     )
     .bind(new_id("aud"))
     .bind(&admin.0.user_id)

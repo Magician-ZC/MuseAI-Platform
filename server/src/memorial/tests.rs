@@ -55,7 +55,7 @@ async fn seed_char(state: &AppState, id: &str, owner: &str, name: &str, mileage:
     sqlx::query(
         "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, \
          rights_declaration, moderation, withdrawn, created_at, mileage) \
-         VALUES (?, ?, 'local', 1, ?, 'original', 'approved', 0, ?, ?)",
+         VALUES ($1, $2, 'local', 1, $3, 'original', 'approved', 0, $4, $5)",
     )
     .bind(id)
     .bind(owner)
@@ -70,7 +70,7 @@ async fn seed_char(state: &AppState, id: &str, owner: &str, name: &str, mileage:
 /// 把叙事状态整块写进世界（**测试脚手架专用**：模拟引擎 tick 的产出。
 /// 生产侧本模块永不写这一列——红线断言 `red_line_never_rewrites_worldline` 守死）。
 async fn set_narrative_state(state: &AppState, world_id: &str, st: Value) {
-    sqlx::query("UPDATE worlds SET narrative_state_json = ? WHERE id = ?")
+    sqlx::query("UPDATE worlds SET narrative_state_json = $1 WHERE id = $2")
         .bind(st.to_string())
         .bind(world_id)
         .execute(&state.db)
@@ -79,7 +79,7 @@ async fn set_narrative_state(state: &AppState, world_id: &str, st: Value) {
 }
 
 async fn narrative_state_of(state: &AppState, world_id: &str) -> String {
-    sqlx::query_scalar::<_, String>("SELECT narrative_state_json FROM worlds WHERE id = ?")
+    sqlx::query_scalar::<_, String>("SELECT narrative_state_json FROM worlds WHERE id = $1")
         .bind(world_id)
         .fetch_one(&state.db)
         .await
@@ -91,7 +91,7 @@ async fn seed_death_consent(state: &AppState, world_id: &str, subjects: &[&str],
     sqlx::query(
         "INSERT INTO consent_requests (id, world_id, event_kind, subject_character_ids, detail, \
          status, responses_json, expires_at, created_at, resolved_at) \
-         VALUES (?, ?, 'death', ?, '致命一击', ?, '{}', ?, ?, ?)",
+         VALUES ($1, $2, 'death', $3, '致命一击', $4, '{}', $5, $6, $7)",
     )
     .bind(new_id("cr"))
     .bind(world_id)
@@ -123,7 +123,7 @@ fn narrative_with(relations: Value, pending_death_of: Option<&str>) -> Value {
 async fn seed_carried_item(state: &AppState, user: &str, item_id: &str, world_id: &str) {
     sqlx::query(
         "INSERT INTO items (id, narrative, effect_tags, origin_world_template_id, cosmology_json, \
-         power_tier, created_at) VALUES (?, '一柄旧剑', '[\"sharp\"]', 'tpl', '[]', 2, ?)",
+         power_tier, created_at) VALUES ($1, '一柄旧剑', '[\"sharp\"]', 'tpl', '[]', 2, $2)",
     )
     .bind(item_id)
     .bind(now_ms())
@@ -133,7 +133,7 @@ async fn seed_carried_item(state: &AppState, user: &str, item_id: &str, world_id
     sqlx::query(
         "INSERT INTO backpacks (id, user_id, item_id, acquired_world_id, status, carried_world_id, \
          power_tier_override, effect_tags_override, acquired_at) \
-         VALUES (?, ?, ?, ?, 'carried', ?, 1, '[\"dulled\"]', ?)",
+         VALUES ($1, $2, $3, $4, 'carried', $5, 1, '[\"dulled\"]', $6)",
     )
     .bind(new_id("bp"))
     .bind(user)
@@ -151,7 +151,7 @@ async fn count(state: &AppState, sql: &str) -> i64 {
 }
 
 async fn memorial_status_of(state: &AppState, char_id: &str) -> String {
-    sqlx::query_scalar::<_, String>("SELECT memorial_status FROM cloud_characters WHERE id = ?")
+    sqlx::query_scalar::<_, String>("SELECT memorial_status FROM cloud_characters WHERE id = $1")
         .bind(char_id)
         .fetch_one(&state.db)
         .await
@@ -159,7 +159,7 @@ async fn memorial_status_of(state: &AppState, char_id: &str) -> String {
 }
 
 async fn withdrawn_of(state: &AppState, char_id: &str) -> i64 {
-    sqlx::query_scalar::<_, i64>("SELECT withdrawn FROM cloud_characters WHERE id = ?")
+    sqlx::query_scalar::<_, i64>("SELECT withdrawn FROM cloud_characters WHERE id = $1")
         .bind(char_id)
         .fetch_one(&state.db)
         .await
@@ -784,7 +784,7 @@ async fn reincarnated_card_inherits_nothing_from_the_deceased() {
 
     let row = sqlx::query(
         "SELECT mileage, memorial_status, memorial_sealed_at, memorial_world_id \
-         FROM cloud_characters WHERE id = ?",
+         FROM cloud_characters WHERE id = $1",
     )
     .bind(&reborn)
     .fetch_one(&state.db)

@@ -11,7 +11,7 @@ use sqlx::Row;
 
 use crate::app::AppState;
 use crate::auth::{AdminUser, AuthUser};
-use crate::db::now_ms;
+use crate::db::{now_ms, Placeholders};
 use crate::error::ApiError;
 
 use super::{audit, clamp_limit, parse_cursor, require_role, ActionQuery};
@@ -33,15 +33,23 @@ pub(super) async fn list_queue(
     let page = clamp_limit(q.limit);
     let status = q.status.unwrap_or_else(|| "open".into());
 
-    let mut sql = String::from(
+    // 发号顺序 = 下面 bind 的顺序；cursor 段出不出现要到运行时才知道，编号不能写死。
+    let mut ph = Placeholders::new();
+    let mut sql = format!(
         "SELECT id, subject_kind, subject_id, machine_verdict, machine_hits, status, \
-         reviewer_id, reviewed_at, created_at FROM audit_queue WHERE status = ?",
+         reviewer_id, reviewed_at, created_at FROM audit_queue WHERE status = {}",
+        ph.take()
     );
     let cursor = q.cursor.as_deref().and_then(parse_cursor);
     if cursor.is_some() {
-        sql.push_str(" AND (created_at < ? OR (created_at = ? AND id < ?))");
+        sql.push_str(&format!(
+            " AND (created_at < {} OR (created_at = {} AND id < {}))",
+            ph.take(),
+            ph.take(),
+            ph.take()
+        ));
     }
-    sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ?");
+    sql.push_str(&format!(" ORDER BY created_at DESC, id DESC LIMIT {}", ph.take()));
 
     let mut query = sqlx::query(&sql).bind(&status);
     if let Some((ts, id)) = &cursor {
@@ -92,7 +100,7 @@ pub(super) async fn detail(
 
     let row = sqlx::query(
         "SELECT id, subject_kind, subject_id, machine_verdict, machine_hits, status, \
-         reviewer_id, reviewed_at, created_at FROM audit_queue WHERE id = ?",
+         reviewer_id, reviewed_at, created_at FROM audit_queue WHERE id = $1",
     )
     .bind(&id)
     .fetch_optional(&state.db)
@@ -122,7 +130,7 @@ pub(super) async fn detail(
 
     if subject_kind == "character" {
         if let Some(crow) =
-            sqlx::query("SELECT owner_id, card_json, manifest_json FROM cloud_characters WHERE id = ?")
+            sqlx::query("SELECT owner_id, card_json, manifest_json FROM cloud_characters WHERE id = $1")
                 .bind(&subject_id)
                 .fetch_optional(&state.db)
                 .await?
@@ -138,7 +146,7 @@ pub(super) async fn detail(
             // 同作者历史：同 owner 的其他云端角色（不含当前主体），供判断作者一贯性。
             let hist = sqlx::query(
                 "SELECT id, version, moderation, created_at FROM cloud_characters \
-                 WHERE owner_id = ? AND id != ? ORDER BY created_at DESC, version DESC",
+                 WHERE owner_id = $1 AND id != $2 ORDER BY created_at DESC, version DESC",
             )
             .bind(&owner_id)
             .bind(&subject_id)
@@ -192,7 +200,7 @@ async fn review(
     reason: &str,
 ) -> Result<Json<Value>, ApiError> {
     let row =
-        sqlx::query("SELECT subject_kind, subject_id, status FROM audit_queue WHERE id = ?")
+        sqlx::query("SELECT subject_kind, subject_id, status FROM audit_queue WHERE id = $1")
             .bind(queue_id)
             .fetch_optional(&state.db)
             .await?
@@ -208,7 +216,7 @@ async fn review(
     let reject_reason: Option<&str> =
         if verdict == "rejected" && !reason.trim().is_empty() { Some(reason) } else { None };
     sqlx::query(
-        "UPDATE audit_queue SET status = ?, reviewer_id = ?, reviewed_at = ?, reject_reason = ? WHERE id = ?",
+        "UPDATE audit_queue SET status = $1, reviewer_id = $2, reviewed_at = $3, reject_reason = $4 WHERE id = $5",
     )
     .bind(verdict)
     .bind(&actor.user_id)
@@ -222,7 +230,7 @@ async fn review(
     let moderation = if verdict == "approved" { "approved" } else { "rejected" };
     match subject_kind.as_str() {
         "character" => {
-            sqlx::query("UPDATE cloud_characters SET moderation = ? WHERE id = ?")
+            sqlx::query("UPDATE cloud_characters SET moderation = $1 WHERE id = $2")
                 .bind(moderation)
                 .bind(&subject_id)
                 .execute(&state.db)
@@ -230,7 +238,7 @@ async fn review(
         }
         // "template"（admin 官方模板）与 "world_template"（创作者 /assets/worlds 资产）同落 world_templates。
         "template" | "world_template" => {
-            sqlx::query("UPDATE world_templates SET moderation = ? WHERE id = ?")
+            sqlx::query("UPDATE world_templates SET moderation = $1 WHERE id = $2")
                 .bind(moderation)
                 .bind(&subject_id)
                 .execute(&state.db)
@@ -299,7 +307,7 @@ pub(super) async fn list_appeals(
          reviewer_id, created_at, resolved_at FROM moderation_appeals",
     );
     if status != "all" {
-        sql.push_str(" WHERE status = ?");
+        sql.push_str(&format!(" WHERE status = {}", Placeholders::new().take()));
     }
     sql.push_str(" ORDER BY created_at DESC, id DESC");
     let mut query = sqlx::query(&sql);
@@ -317,7 +325,7 @@ pub(super) async fn list_appeals(
         let mut subject = Value::Null;
         if subject_kind == "character" {
             if let Some(crow) = sqlx::query(
-                "SELECT owner_id, card_json, moderation, avatar_moderation FROM cloud_characters WHERE id = ?",
+                "SELECT owner_id, card_json, moderation, avatar_moderation FROM cloud_characters WHERE id = $1",
             )
             .bind(&subject_id)
             .fetch_optional(&state.db)
@@ -373,7 +381,7 @@ pub(super) async fn resolve_appeal(
         return Err(ApiError::BadRequest("复审理由必填且不超过 500 字符".into()));
     }
 
-    let row = sqlx::query("SELECT subject_kind, subject_id, status FROM moderation_appeals WHERE id = ?")
+    let row = sqlx::query("SELECT subject_kind, subject_id, status FROM moderation_appeals WHERE id = $1")
         .bind(&id)
         .fetch_optional(&state.db)
         .await?
@@ -388,18 +396,18 @@ pub(super) async fn resolve_appeal(
     if req.decision == "overturn" && subject_kind == "character" {
         // 改判只翻转当时处于 rejected 的那个维度（见函数注释）：卡优先，头像仅在卡未被驳回时翻转。
         let dims: Option<(String, Option<String>)> =
-            sqlx::query_as("SELECT moderation, avatar_moderation FROM cloud_characters WHERE id = ?")
+            sqlx::query_as("SELECT moderation, avatar_moderation FROM cloud_characters WHERE id = $1")
                 .bind(&subject_id)
                 .fetch_optional(&state.db)
                 .await?;
         if let Some((moderation, avatar_moderation)) = dims {
             if moderation == "rejected" {
-                sqlx::query("UPDATE cloud_characters SET moderation = 'approved' WHERE id = ?")
+                sqlx::query("UPDATE cloud_characters SET moderation = 'approved' WHERE id = $1")
                     .bind(&subject_id)
                     .execute(&state.db)
                     .await?;
             } else if avatar_moderation.as_deref() == Some("rejected") {
-                sqlx::query("UPDATE cloud_characters SET avatar_moderation = 'approved' WHERE id = ?")
+                sqlx::query("UPDATE cloud_characters SET avatar_moderation = 'approved' WHERE id = $1")
                     .bind(&subject_id)
                     .execute(&state.db)
                     .await?;
@@ -414,7 +422,7 @@ pub(super) async fn resolve_appeal(
         ("upheld", "appeal_uphold")
     };
     sqlx::query(
-        "UPDATE moderation_appeals SET status = ?, resolution_reason = ?, reviewer_id = ?, resolved_at = ? WHERE id = ?",
+        "UPDATE moderation_appeals SET status = $1, resolution_reason = $2, reviewer_id = $3, resolved_at = $4 WHERE id = $5",
     )
     .bind(new_status)
     .bind(&reason)
@@ -428,7 +436,7 @@ pub(super) async fn resolve_appeal(
 
     let row = sqlx::query(
         "SELECT id, subject_kind, subject_id, owner_id, appeal_text, status, resolution_reason, \
-         reviewer_id, created_at, resolved_at FROM moderation_appeals WHERE id = ?",
+         reviewer_id, created_at, resolved_at FROM moderation_appeals WHERE id = $1",
     )
     .bind(&id)
     .fetch_one(&state.db)

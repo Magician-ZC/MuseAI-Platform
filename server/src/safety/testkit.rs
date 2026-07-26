@@ -18,7 +18,7 @@ pub fn token(state: &AppState, user_id: &str) -> String {
 
 pub async fn seed_user(db: &AnyPool, id: &str) {
     sqlx::query(
-        "INSERT INTO users (id, nickname, age_declared, status, created_at, updated_at) VALUES (?, '', 1, 'active', ?, ?)",
+        "INSERT INTO users (id, nickname, age_declared, status, created_at, updated_at) VALUES ($1, '', 1, 'active', $2, $3)",
     )
     .bind(id)
     .bind(crate::db::now_ms())
@@ -34,7 +34,7 @@ pub async fn seed_world(db: &AnyPool, id: &str, revision: i64, status: &str) {
         "INSERT INTO worlds (id, template_id, template_version, engine_version, prompt_set_version, \
          model_route_version, room_type, title, status, visibility, member_limit, tick_per_day, \
          state_revision, narrative_state_json, created_at, updated_at) \
-         VALUES (?, 'tpl', 1, 'e1', 'p1', 'm1', 'idle', '测试世界', ?, 'official', 10, 3, ?, '{}', ?, ?)",
+         VALUES ($1, 'tpl', 1, 'e1', 'p1', 'm1', 'idle', '测试世界', $2, 'official', 10, 3, $3, '{}', $4, $5)",
     )
     .bind(id)
     .bind(status)
@@ -49,7 +49,7 @@ pub async fn seed_world(db: &AnyPool, id: &str, revision: i64, status: &str) {
 pub async fn seed_member(db: &AnyPool, id: &str, world_id: &str, user_id: &str, char_id: &str, status: &str) {
     sqlx::query(
         "INSERT INTO world_members (id, world_id, user_id, cloud_character_id, boundary_json, status, joined_at) \
-         VALUES (?, ?, ?, ?, '{}', ?, ?)",
+         VALUES ($1, $2, $3, $4, '{}', $5, $6)",
     )
     .bind(id)
     .bind(world_id)
@@ -72,7 +72,7 @@ pub async fn seed_backpack(
 ) {
     sqlx::query(
         "INSERT INTO backpacks (id, user_id, item_id, acquired_world_id, status, carried_world_id, acquired_at) \
-         VALUES (?, ?, ?, 'w0', ?, ?, ?)",
+         VALUES ($1, $2, $3, 'w0', $4, $5, $6)",
     )
     .bind(id)
     .bind(user_id)

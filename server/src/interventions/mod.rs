@@ -102,7 +102,7 @@ async fn create_intervention(
 
     // 世界存在 + 运行态 + revision CAS。（tick_per_day 原供额度时间窗，R1 改为每卡每阶段累计后不再参与计数。）
     let world: Option<(i64, String, i64)> =
-        sqlx::query_as("SELECT state_revision, status, tick_per_day FROM worlds WHERE id = ?")
+        sqlx::query_as("SELECT state_revision, status, tick_per_day FROM worlds WHERE id = $1")
             .bind(&world_id)
             .fetch_optional(&state.db)
             .await?;
@@ -116,7 +116,7 @@ async fn create_intervention(
 
     // 角色必须属于本人且 active 在场（服务端权威，§9.6）。
     let member: Option<(String,)> = sqlx::query_as(
-        "SELECT id FROM world_members WHERE world_id = ? AND cloud_character_id = ? AND user_id = ? AND status = 'active'",
+        "SELECT id FROM world_members WHERE world_id = $1 AND cloud_character_id = $2 AND user_id = $3 AND status = 'active'",
     )
     .bind(&world_id)
     .bind(&req.character_id)
@@ -149,7 +149,7 @@ async fn create_intervention(
         // 取该用户此道具的全部背包记录（含 sealed/consumed），据此区分三态：
         // 合法可用(owned / carried-here) / 良性不可用(sealed / consumed) / 伪造(不存在 / carried-elsewhere)。
         let rows: Vec<(String, Option<String>)> = sqlx::query_as(
-            "SELECT status, carried_world_id FROM backpacks WHERE user_id = ? AND item_id = ?",
+            "SELECT status, carried_world_id FROM backpacks WHERE user_id = $1 AND item_id = $2",
         )
         .bind(&user.user_id)
         .bind(item_id)
@@ -216,7 +216,7 @@ async fn create_intervention(
     let mut reject_reason: Option<String> = None;
     let used: i64 = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM interventions \
-         WHERE world_id = ? AND character_id = ? AND kind = 'whisper' \
+         WHERE world_id = $1 AND character_id = $2 AND kind = 'whisper' \
            AND status IN ('accepted', 'applied')",
     )
     .bind(&world_id)
@@ -249,7 +249,7 @@ async fn create_intervention(
 
     sqlx::query(
         "INSERT INTO interventions (id, world_id, user_id, character_id, kind, payload_json, expected_revision, status, reject_reason, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
     )
     .bind(&iid)
     .bind(&world_id)
@@ -283,7 +283,7 @@ async fn my_interventions(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let rows: Vec<(String, String, String, String, Option<String>, i64)> = sqlx::query_as(
         "SELECT id, kind, character_id, status, reject_reason, created_at FROM interventions \
-         WHERE world_id = ? AND user_id = ? ORDER BY created_at DESC LIMIT 50",
+         WHERE world_id = $1 AND user_id = $2 ORDER BY created_at DESC LIMIT 50",
     )
     .bind(&world_id)
     .bind(&user.user_id)
@@ -330,7 +330,7 @@ mod tests {
     ) {
         sqlx::query(
             "INSERT INTO interventions (id, world_id, user_id, character_id, kind, payload_json, expected_revision, status, created_at) \
-             VALUES (?, ?, ?, ?, ?, '{}', 0, ?, ?)",
+             VALUES ($1, $2, $3, $4, $5, '{}', 0, $6, $7)",
         )
         .bind(id)
         .bind(world)
@@ -711,7 +711,7 @@ mod tests {
             seed_intervention(&state, &format!("iv_c{i}"), "w_comp", "u1", "c1", "whisper", "accepted", 0).await;
         }
         let count_sql = "SELECT COUNT(*) FROM interventions \
-             WHERE world_id = ? AND character_id = ? AND kind = 'whisper' \
+             WHERE world_id = $1 AND character_id = $2 AND kind = 'whisper' \
                AND status IN ('accepted', 'applied')";
         let used_before: i64 = sqlx::query_scalar(count_sql)
             .bind("w_comp")

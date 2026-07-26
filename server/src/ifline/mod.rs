@@ -270,7 +270,7 @@ async fn entry_ever_open(db: &AnyPool) -> bool {
         return true;
     }
     let n = sqlx::query(
-        "SELECT CAST(COUNT(*) AS BIGINT) AS n FROM runtime_flags WHERE flag = ? AND enabled = 1",
+        "SELECT CAST(COUNT(*) AS BIGINT) AS n FROM runtime_flags WHERE flag = $1 AND enabled = 1",
     )
     .bind(ENV_IFLINE_PARALLEL)
     .fetch_one(db)
@@ -381,7 +381,7 @@ struct OriginWorld {
 async fn load_origin(db: &AnyPool, world_id: &str) -> Result<Option<OriginWorld>, ApiError> {
     let row = sqlx::query(
         "SELECT id, status, state_revision, narrative_state_json, template_id, template_version \
-         FROM worlds WHERE id = ?",
+         FROM worlds WHERE id = $1",
     )
     .bind(world_id)
     .fetch_optional(db)
@@ -403,7 +403,7 @@ async fn load_origin(db: &AnyPool, world_id: &str) -> Result<Option<OriginWorld>
 /// 拿它当分叉点等于分在半空中。
 async fn terminal_tick_no(db: &AnyPool, world_id: &str) -> Result<Option<i64>, ApiError> {
     let row = sqlx::query(
-        "SELECT MAX(tick_no) AS n FROM world_ticks WHERE world_id = ? AND status = 'done'",
+        "SELECT MAX(tick_no) AS n FROM world_ticks WHERE world_id = $1 AND status = 'done'",
     )
     .bind(world_id)
     .fetch_optional(db)
@@ -420,7 +420,7 @@ async fn foreign_character_ids(
     owner_id: &str,
 ) -> Result<Vec<String>, ApiError> {
     let rows = sqlx::query(
-        "SELECT cloud_character_id, user_id FROM world_members WHERE world_id = ? AND user_id <> ?",
+        "SELECT cloud_character_id, user_id FROM world_members WHERE world_id = $1 AND user_id <> $2",
     )
     .bind(world_id)
     .bind(owner_id)
@@ -717,7 +717,7 @@ async fn open_ifline(
 
     // ── 卡：属本人 + 在过该世界 + 在世 ─────────────────────────────────────
     let member: Option<(String,)> = sqlx::query_as(
-        "SELECT id FROM world_members WHERE world_id = ? AND cloud_character_id = ? AND user_id = ?",
+        "SELECT id FROM world_members WHERE world_id = $1 AND cloud_character_id = $2 AND user_id = $3",
     )
     .bind(&world_id)
     .bind(&character_id)
@@ -738,7 +738,7 @@ async fn open_ifline(
     }
 
     let card_row = sqlx::query(
-        "SELECT memorial_status, withdrawn FROM cloud_characters WHERE id = ? AND owner_id = ?",
+        "SELECT memorial_status, withdrawn FROM cloud_characters WHERE id = $1 AND owner_id = $2",
     )
     .bind(&character_id)
     .bind(&user.user_id)
@@ -796,7 +796,7 @@ async fn open_ifline(
          origin_template_version, fork_point, fork_tick_no, fork_state_revision, state_fidelity, \
          snapshot_json, redaction_json, protagonist_in_snapshot, premise, premise_moderation, \
          cost_card_ids_json, status, fork_key, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)",
     )
     .bind(&ifline_id)
     .bind(&user.user_id)
@@ -840,8 +840,8 @@ async fn open_ifline(
     // 抢不到（不属本人 / 已被并发请求熔掉 / 已作为合成材料消耗）→ 整笔回滚，if 线随之消失。
     for cid in &card_ids {
         let res = sqlx::query(
-            "UPDATE subplot_cards SET status = ?, consumed_at = ?, consumed_into = ? \
-             WHERE id = ? AND owner_id = ? AND status = ?",
+            "UPDATE subplot_cards SET status = $1, consumed_at = $2, consumed_into = $3 \
+             WHERE id = $4 AND owner_id = $5 AND status = $6",
         )
         .bind(CARD_STATUS_CONSUMED)
         .bind(now)
@@ -864,7 +864,7 @@ async fn open_ifline(
     // 全链审计（§0.2）：烧资产必须留痕。
     sqlx::query(
         "INSERT INTO audit_logs (id, actor_id, actor_role, action, subject, reason, created_at) \
-         VALUES (?, ?, 'user', 'ifline.opened', ?, ?, ?)",
+         VALUES ($1, $2, 'user', 'ifline.opened', $3, $4, $5)",
     )
     .bind(new_id("aud"))
     .bind(&user.user_id)
@@ -930,8 +930,8 @@ async fn my_iflines(
     // 对不上，翻页越翻越少，是最容易被当成「数据丢了」的那类 bug（口径同 `annotations::my_appeals`）。
     let rows = match q.status.as_deref() {
         Some(status) => sqlx::query(&format!(
-            "SELECT {IFLINE_COLUMNS} FROM ifline_worlds WHERE owner_id = ? AND status = ? \
-             ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
+            "SELECT {IFLINE_COLUMNS} FROM ifline_worlds WHERE owner_id = $1 AND status = $2 \
+             ORDER BY created_at DESC, id DESC LIMIT $3 OFFSET $4"
         ))
         .bind(&user.user_id)
         .bind(status)
@@ -940,8 +940,8 @@ async fn my_iflines(
         .fetch_all(&state.db)
         .await?,
         None => sqlx::query(&format!(
-            "SELECT {IFLINE_COLUMNS} FROM ifline_worlds WHERE owner_id = ? \
-             ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
+            "SELECT {IFLINE_COLUMNS} FROM ifline_worlds WHERE owner_id = $1 \
+             ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3"
         ))
         .bind(&user.user_id)
         .bind(limit)
@@ -1099,8 +1099,8 @@ async fn list_beats(
 
     let rows = sqlx::query(
         "SELECT id, beat_no, status, prose, moderation, cast_json, cost_tokens, terminal_reason, \
-         note, created_at FROM ifline_beats WHERE ifline_id = ? \
-         ORDER BY beat_no ASC LIMIT ? OFFSET ?",
+         note, created_at FROM ifline_beats WHERE ifline_id = $1 \
+         ORDER BY beat_no ASC LIMIT $2 OFFSET $3",
     )
     .bind(&ifline_id)
     .bind(limit)
@@ -1166,8 +1166,8 @@ async fn list_iflines_admin(
     let offset = q.offset.unwrap_or(0).max(0);
     let status = q.status.unwrap_or_else(|| STATUS_SEALED.to_string());
     let rows = sqlx::query(&format!(
-        "SELECT {IFLINE_COLUMNS} FROM ifline_worlds WHERE status = ? \
-         ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
+        "SELECT {IFLINE_COLUMNS} FROM ifline_worlds WHERE status = $1 \
+         ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3"
     ))
     .bind(&status)
     .bind(limit)
@@ -1242,7 +1242,7 @@ async fn ifline_cost_admin(
     let row = sqlx::query(
         "SELECT CAST(COALESCE(SUM(cost_tokens), 0) AS BIGINT) AS tokens, \
          CAST(COUNT(*) AS BIGINT) AS beats \
-         FROM ifline_beats WHERE created_at >= ? AND created_at < ?",
+         FROM ifline_beats WHERE created_at >= $1 AND created_at < $2",
     )
     .bind(since)
     .bind(until)
@@ -1254,7 +1254,7 @@ async fn ifline_cost_admin(
     let lines = sqlx::query(
         "SELECT CAST(COUNT(*) AS BIGINT) AS n, \
          CAST(COALESCE(SUM(cost_tokens_total), 0) AS BIGINT) AS total \
-         FROM ifline_worlds WHERE created_at >= ? AND created_at < ?",
+         FROM ifline_worlds WHERE created_at >= $1 AND created_at < $2",
     )
     .bind(since)
     .bind(until)
@@ -1272,7 +1272,7 @@ async fn ifline_cost_admin(
         "dashboardIntegration": {
             "mainDashboardIncludesIfline": false,
             "why": "主看板只 SUM world_ticks.cost_tokens；if 线的拍**不能**落 world_ticks——那是世界线的表，落进去会把 if 线接回 commit_tick → end_world_tx → settle_* 那条自动结算链路，踩穿「付费只买体验容量」。",
-            "howToIntegrate": "在 admin_api::dashboards 的成本聚合里并上：SELECT SUM(cost_tokens) FROM ifline_beats WHERE created_at >= ? AND created_at < ?（索引 idx_ifline_beats_created 已建好）。",
+            "howToIntegrate": "在 admin_api::dashboards 的成本聚合里并上：SELECT SUM(cost_tokens) FROM ifline_beats WHERE created_at >= $1 AND created_at < $2（索引 idx_ifline_beats_created 已建好）。",
             "status": "本批次未接：dashboards.rs 由并行批次在改，跨批次抢改会把两边的账都搅乱。已登记在 docs/VALIDATION.md 的遗留栏。",
         },
         "notes": [
@@ -1376,7 +1376,7 @@ impl IflineRow {
 }
 
 async fn fetch_ifline(db: &AnyPool, id: &str) -> Result<Option<IflineRow>, ApiError> {
-    let row = sqlx::query(&format!("SELECT {IFLINE_COLUMNS} FROM ifline_worlds WHERE id = ?"))
+    let row = sqlx::query(&format!("SELECT {IFLINE_COLUMNS} FROM ifline_worlds WHERE id = $1"))
         .bind(id)
         .fetch_optional(db)
         .await?;
@@ -1389,7 +1389,7 @@ async fn find_by_fork_key(
     fork_key: &str,
 ) -> Result<Option<IflineRow>, ApiError> {
     let row = sqlx::query(&format!(
-        "SELECT {IFLINE_COLUMNS} FROM ifline_worlds WHERE owner_id = ? AND fork_key = ?"
+        "SELECT {IFLINE_COLUMNS} FROM ifline_worlds WHERE owner_id = $1 AND fork_key = $2"
     ))
     .bind(owner_id)
     .bind(fork_key)

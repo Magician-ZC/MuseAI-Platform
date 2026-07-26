@@ -36,7 +36,7 @@ pub async fn create_consent(
     let subjects_json = serde_json::to_string(subject_character_ids).unwrap_or_else(|_| "[]".into());
     sqlx::query(
         "INSERT INTO consent_requests (id, world_id, event_kind, subject_character_ids, detail, status, responses_json, expires_at, created_at) \
-         VALUES (?, ?, ?, ?, ?, 'pending', '{}', ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, 'pending', '{}', $6, $7)",
     )
     .bind(&cid)
     .bind(world_id)
@@ -68,7 +68,7 @@ pub async fn create_consent(
 pub async fn expire_stale_consents(db: &AnyPool) -> Result<u64, ApiError> {
     let now = crate::db::now_ms();
     let res = sqlx::query(
-        "UPDATE consent_requests SET status = 'expired_conservative', resolved_at = ? WHERE status = 'pending' AND expires_at <= ?",
+        "UPDATE consent_requests SET status = 'expired_conservative', resolved_at = $1 WHERE status = 'pending' AND expires_at <= $2",
     )
     .bind(now)
     .bind(now)
@@ -81,7 +81,7 @@ async fn owners_of(db: &AnyPool, world_id: &str, char_ids: &[String]) -> Result<
     let mut owners: Vec<String> = Vec::new();
     for cid in char_ids {
         let row: Option<(String,)> =
-            sqlx::query_as("SELECT user_id FROM world_members WHERE world_id = ? AND cloud_character_id = ?")
+            sqlx::query_as("SELECT user_id FROM world_members WHERE world_id = $1 AND cloud_character_id = $2")
                 .bind(world_id)
                 .bind(cid)
                 .fetch_optional(db)
@@ -117,7 +117,7 @@ async fn my_consents(
 
     // 用户在各世界的角色。
     let members: Vec<(String, String)> =
-        sqlx::query_as("SELECT world_id, cloud_character_id FROM world_members WHERE user_id = ?")
+        sqlx::query_as("SELECT world_id, cloud_character_id FROM world_members WHERE user_id = $1")
             .bind(&user.user_id)
             .fetch_all(&state.db)
             .await?;
@@ -128,8 +128,8 @@ async fn my_consents(
     let status_filter = q.status.unwrap_or_else(|| "pending".into());
     let rows: Vec<(String, String, String, String, String, String, String, i64, i64)> = sqlx::query_as(
         "SELECT DISTINCT c.id, c.world_id, c.event_kind, c.subject_character_ids, c.detail, c.status, c.responses_json, c.expires_at, c.created_at \
-         FROM consent_requests c JOIN world_members m ON m.world_id = c.world_id AND m.user_id = ? \
-         WHERE (? = 'all' OR c.status = ?) ORDER BY c.created_at DESC LIMIT 100",
+         FROM consent_requests c JOIN world_members m ON m.world_id = c.world_id AND m.user_id = $1 \
+         WHERE ($2 = 'all' OR c.status = $3) ORDER BY c.created_at DESC LIMIT 100",
     )
     .bind(&user.user_id)
     .bind(&status_filter)
@@ -193,7 +193,7 @@ async fn respond(
     // 当事人校验（读，非并发关键路径）：subject 集合在 consent 创建后不可变，成员关系稳定，故先读判权限；
     // 真正的状态推进在下方事务内串行完成。
     let pre: Option<(String, String)> =
-        sqlx::query_as("SELECT world_id, subject_character_ids FROM consent_requests WHERE id = ?")
+        sqlx::query_as("SELECT world_id, subject_character_ids FROM consent_requests WHERE id = $1")
             .bind(&cid)
             .fetch_optional(&state.db)
             .await?;
@@ -202,7 +202,7 @@ async fn respond(
         return Err(ApiError::NotFound);
     }
     let my_chars: Vec<(String,)> =
-        sqlx::query_as("SELECT cloud_character_id FROM world_members WHERE world_id = ? AND user_id = ?")
+        sqlx::query_as("SELECT cloud_character_id FROM world_members WHERE world_id = $1 AND user_id = $2")
             .bind(&world_id)
             .bind(&user.user_id)
             .fetch_all(&state.db)
@@ -222,13 +222,13 @@ async fn respond(
 
     // 取同一 consent 的行锁：Postgres 下自赋值 UPDATE 等价 SELECT...FOR UPDATE，序列化并发响应；
     // SQLite 下单连接事务本就互斥，此语句为无害占位。
-    sqlx::query("UPDATE consent_requests SET status = status WHERE id = ?")
+    sqlx::query("UPDATE consent_requests SET status = status WHERE id = $1")
         .bind(&cid)
         .execute(&mut *tx)
         .await?;
 
     // 锁内重读权威状态；已解决 → 幂等返回，不重复写响应。
-    let cur: Option<(String,)> = sqlx::query_as("SELECT status FROM consent_requests WHERE id = ?")
+    let cur: Option<(String,)> = sqlx::query_as("SELECT status FROM consent_requests WHERE id = $1")
         .bind(&cid)
         .fetch_optional(&mut *tx)
         .await?;
@@ -244,7 +244,7 @@ async fn respond(
     for s in &my_subjects {
         sqlx::query(
             "INSERT INTO consent_responses (id, consent_id, subject_character_id, user_id, verdict, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
              ON CONFLICT(consent_id, subject_character_id) DO UPDATE SET verdict = excluded.verdict, updated_at = excluded.updated_at",
         )
         .bind(crate::db::new_id("cr"))
@@ -260,7 +260,7 @@ async fn respond(
 
     // 锁内读全部响应，重算裁决：任一 declined → declined；全部当事角色 approved → approved；否则 pending。
     let resp_rows: Vec<(String, String)> =
-        sqlx::query_as("SELECT subject_character_id, verdict FROM consent_responses WHERE consent_id = ?")
+        sqlx::query_as("SELECT subject_character_id, verdict FROM consent_responses WHERE consent_id = $1")
             .bind(&cid)
             .fetch_all(&mut *tx)
             .await?;
@@ -281,7 +281,7 @@ async fn respond(
     let resp_map: serde_json::Map<String, serde_json::Value> =
         resp_rows.iter().map(|(s, v)| (s.clone(), json!(v))).collect();
 
-    sqlx::query("UPDATE consent_requests SET responses_json = ?, status = ?, resolved_at = ? WHERE id = ?")
+    sqlx::query("UPDATE consent_requests SET responses_json = $1, status = $2, resolved_at = $3 WHERE id = $4")
         .bind(serde_json::to_string(&resp_map).unwrap_or_else(|_| "{}".into()))
         .bind(new_status)
         .bind(resolved_at)
@@ -306,7 +306,7 @@ mod tests {
     use tower::ServiceExt;
 
     async fn status_of(db: &AnyPool, cid: &str) -> String {
-        sqlx::query_scalar::<_, String>("SELECT status FROM consent_requests WHERE id = ?")
+        sqlx::query_scalar::<_, String>("SELECT status FROM consent_requests WHERE id = $1")
             .bind(cid)
             .fetch_one(db)
             .await

@@ -8,7 +8,7 @@ use sqlx::Row;
 
 use crate::app::AppState;
 use crate::auth::AdminUser;
-use crate::db::{new_id, now_ms};
+use crate::db::{new_id, now_ms, Placeholders};
 use crate::error::ApiError;
 
 use super::{audit, require_role, ActionQuery};
@@ -35,7 +35,7 @@ pub(super) async fn list_prompts(
          FROM prompt_versions WHERE 1=1",
     );
     if q.scope.is_some() {
-        sql.push_str(" AND scope = ?");
+        sql.push_str(&format!(" AND scope = {}", Placeholders::new().take()));
     }
     sql.push_str(" ORDER BY scope ASC, created_at DESC");
 
@@ -84,7 +84,7 @@ pub(super) async fn create_prompt(
     let id = new_id("pv");
     sqlx::query(
         "INSERT INTO prompt_versions (id, scope, version, content, active, canary_world_ids, created_at) \
-         VALUES (?, ?, ?, ?, 0, '[]', ?)",
+         VALUES ($1, $2, $3, $4, 0, '[]', $5)",
     )
     .bind(&id)
     .bind(&req.scope)
@@ -113,7 +113,7 @@ pub(super) async fn activate_prompt(
     Query(q): Query<ActionQuery>,
 ) -> Result<Json<Value>, ApiError> {
     require_role(&admin, &[])?; // 治理写操作 admin 专属。
-    let row = sqlx::query("SELECT scope, version FROM prompt_versions WHERE id = ?")
+    let row = sqlx::query("SELECT scope, version FROM prompt_versions WHERE id = $1")
         .bind(&id)
         .fetch_optional(&state.db)
         .await?
@@ -123,7 +123,7 @@ pub(super) async fn activate_prompt(
 
     // 互斥激活：单语句原子切换（同 scope 内目标置 active，其余置 inactive），
     // 避免「先全 inactive 再激活」两步之间读到零 active 的窗口。CASE 表达式双库可移植。
-    sqlx::query("UPDATE prompt_versions SET active = CASE WHEN id = ? THEN 1 ELSE 0 END WHERE scope = ?")
+    sqlx::query("UPDATE prompt_versions SET active = CASE WHEN id = $1 THEN 1 ELSE 0 END WHERE scope = $2")
         .bind(&id)
         .bind(&scope)
         .execute(&state.db)
@@ -155,7 +155,7 @@ pub(super) async fn canary_prompt(
     Json(req): Json<CanaryReq>,
 ) -> Result<Json<Value>, ApiError> {
     require_role(&admin, &[])?; // 治理写操作 admin 专属。
-    let exists = sqlx::query("SELECT 1 AS x FROM prompt_versions WHERE id = ?")
+    let exists = sqlx::query("SELECT 1 AS x FROM prompt_versions WHERE id = $1")
         .bind(&id)
         .fetch_optional(&state.db)
         .await?
@@ -164,7 +164,7 @@ pub(super) async fn canary_prompt(
         return Err(ApiError::NotFound);
     }
     let ids_json = serde_json::to_string(&req.world_ids).unwrap_or_else(|_| "[]".into());
-    sqlx::query("UPDATE prompt_versions SET canary_world_ids = ? WHERE id = ?")
+    sqlx::query("UPDATE prompt_versions SET canary_world_ids = $1 WHERE id = $2")
         .bind(&ids_json)
         .bind(&id)
         .execute(&state.db)
@@ -230,7 +230,7 @@ pub(super) async fn create_route(
     }
     let id = new_id("mr");
     sqlx::query(
-        "INSERT INTO model_routes (id, version, routes_json, active, created_at) VALUES (?, ?, ?, 0, ?)",
+        "INSERT INTO model_routes (id, version, routes_json, active, created_at) VALUES ($1, $2, $3, 0, $4)",
     )
     .bind(&id)
     .bind(&req.version)
@@ -251,7 +251,7 @@ pub(super) async fn activate_route(
     Query(q): Query<ActionQuery>,
 ) -> Result<Json<Value>, ApiError> {
     require_role(&admin, &[])?; // 治理写操作 admin 专属。
-    let row = sqlx::query("SELECT version FROM model_routes WHERE id = ?")
+    let row = sqlx::query("SELECT version FROM model_routes WHERE id = $1")
         .bind(&id)
         .fetch_optional(&state.db)
         .await?
@@ -259,7 +259,7 @@ pub(super) async fn activate_route(
     let version: String = row.try_get("version")?;
 
     // 全局单活跃路由：单语句原子切换（目标置 active，其余全 inactive），消除零 active 窗口。
-    sqlx::query("UPDATE model_routes SET active = CASE WHEN id = ? THEN 1 ELSE 0 END")
+    sqlx::query("UPDATE model_routes SET active = CASE WHEN id = $1 THEN 1 ELSE 0 END")
         .bind(&id)
         .execute(&state.db)
         .await?;

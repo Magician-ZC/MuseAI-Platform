@@ -69,7 +69,7 @@ fn sample_card_json(id: &str, name: &str) -> String {
 async fn seed_user(state: &AppState, id: &str) {
     sqlx::query(
         "INSERT INTO users (id, nickname, age_declared, status, created_at, updated_at) \
-         VALUES (?, '', 0, 'active', ?, ?)",
+         VALUES ($1, '', 0, 'active', $2, $3)",
     )
     .bind(id)
     .bind(now_ms())
@@ -83,7 +83,7 @@ async fn seed_char(state: &AppState, id: &str, owner: &str, moderation: &str, wi
     sqlx::query(
         "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, \
          rights_declaration, moderation, withdrawn, created_at) \
-         VALUES (?, ?, 'local', 1, ?, 'original', ?, ?, ?)",
+         VALUES ($1, $2, 'local', 1, $3, 'original', $4, $5, $6)",
     )
     .bind(id)
     .bind(owner)
@@ -149,7 +149,7 @@ async fn create_world_pins_versions_and_budget() {
     assert_eq!(w.status, "open");
     assert_eq!(w.visibility, "official");
 
-    let budget: i64 = sqlx::query("SELECT daily_token_budget FROM world_budgets WHERE world_id=?")
+    let budget: i64 = sqlx::query("SELECT daily_token_budget FROM world_budgets WHERE world_id=$1")
         .bind(&wid)
         .fetch_one(&state.db)
         .await
@@ -169,7 +169,7 @@ async fn create_world_defaults_timeline_mode_interval() {
     assert_eq!(p.timeline_mode, "interval");
     let wid = create_world(&state.db, p).await.unwrap();
 
-    let tm: String = sqlx::query("SELECT timeline_mode FROM worlds WHERE id=?")
+    let tm: String = sqlx::query("SELECT timeline_mode FROM worlds WHERE id=$1")
         .bind(&wid)
         .fetch_one(&state.db)
         .await
@@ -186,7 +186,7 @@ async fn create_world_persists_event_timeline_mode() {
     p.timeline_mode = "event".into();
     let wid = create_world(&state.db, p).await.unwrap();
 
-    let tm: String = sqlx::query("SELECT timeline_mode FROM worlds WHERE id=?")
+    let tm: String = sqlx::query("SELECT timeline_mode FROM worlds WHERE id=$1")
         .bind(&wid)
         .fetch_one(&state.db)
         .await
@@ -204,7 +204,7 @@ async fn create_world_normalizes_bogus_timeline_mode() {
     p.timeline_mode = "bogus".into();
     let wid = create_world(&state.db, p).await.unwrap();
 
-    let tm: String = sqlx::query("SELECT timeline_mode FROM worlds WHERE id=?")
+    let tm: String = sqlx::query("SELECT timeline_mode FROM worlds WHERE id=$1")
         .bind(&wid)
         .fetch_one(&state.db)
         .await
@@ -273,7 +273,7 @@ async fn join_enforces_server_authority() {
     assert_eq!(st_withdrawn, StatusCode::CONFLICT);
 
     // 只有一条 active 成员记录。
-    let n: i64 = sqlx::query("SELECT COUNT(*) AS n FROM world_members WHERE world_id=? AND status='active'")
+    let n: i64 = sqlx::query("SELECT COUNT(*) AS n FROM world_members WHERE world_id=$1 AND status='active'")
         .bind(&wid)
         .fetch_one(&state.db)
         .await
@@ -313,7 +313,7 @@ async fn leave_marks_member_left() {
     assert_eq!(st_leave, StatusCode::OK);
     assert_eq!(body["status"], "left");
 
-    let status: String = sqlx::query("SELECT status FROM world_members WHERE world_id=? AND cloud_character_id='chA'")
+    let status: String = sqlx::query("SELECT status FROM world_members WHERE world_id=$1 AND cloud_character_id='chA'")
         .bind(&wid)
         .fetch_one(&state.db)
         .await
@@ -328,7 +328,7 @@ async fn leave_marks_member_left() {
 /// 读某成员行的 (status, joined_at, left_at)。`left_at` 可空 → Option。
 async fn member_row(state: &AppState, world_id: &str, char_id: &str) -> (String, i64, Option<i64>) {
     sqlx::query_as::<_, (String, i64, Option<i64>)>(
-        "SELECT status, joined_at, left_at FROM world_members WHERE world_id=? AND cloud_character_id=?",
+        "SELECT status, joined_at, left_at FROM world_members WHERE world_id=$1 AND cloud_character_id=$2",
     )
     .bind(world_id)
     .bind(char_id)
@@ -381,7 +381,7 @@ async fn historical_left_members_keep_null_left_at_without_backfill() {
     // 直接落一行「老数据」：已退出但没有退出时刻（迁移前的形态）。
     sqlx::query(
         "INSERT INTO world_members (id, world_id, user_id, cloud_character_id, boundary_json, status, joined_at) \
-         VALUES (?, ?, 'usrOld', 'chOld', '{}', 'left', ?)",
+         VALUES ($1, $2, 'usrOld', 'chOld', '{}', 'left', $3)",
     )
     .bind(new_id("wm"))
     .bind(&wid)
@@ -469,7 +469,7 @@ async fn join_rejects_second_active_card_from_same_user() {
 
     // usrA 在库中仍只有一条 active 成员（chA2 未落行）。
     let n: i64 = sqlx::query(
-        "SELECT COUNT(*) AS n FROM world_members WHERE world_id=? AND user_id='usrA' AND status='active'",
+        "SELECT COUNT(*) AS n FROM world_members WHERE world_id=$1 AND user_id='usrA' AND status='active'",
     )
     .bind(&wid)
     .fetch_one(&state.db)
@@ -510,7 +510,7 @@ async fn join_allows_card_swap_after_leave() {
 
     // 全程 usrA 至多一条 active，且是换入的 chA2。
     let active_char: String = sqlx::query(
-        "SELECT cloud_character_id FROM world_members WHERE world_id=? AND user_id='usrA' AND status='active'",
+        "SELECT cloud_character_id FROM world_members WHERE world_id=$1 AND user_id='usrA' AND status='active'",
     )
     .bind(&wid)
     .fetch_one(&state.db)
@@ -540,7 +540,7 @@ async fn join_same_card_repeat_stays_idempotent() {
     assert_eq!(st2, StatusCode::OK, "同卡重复 join 应保持幂等成功: {body2}");
     assert_eq!(body2["membershipId"].as_str().unwrap(), mid, "应返回同一 membership");
 
-    let n: i64 = sqlx::query("SELECT COUNT(*) AS n FROM world_members WHERE world_id=?")
+    let n: i64 = sqlx::query("SELECT COUNT(*) AS n FROM world_members WHERE world_id=$1")
         .bind(&wid)
         .fetch_one(&state.db)
         .await
@@ -556,7 +556,7 @@ async fn join_same_card_repeat_stays_idempotent() {
 async fn seed_star_template(state: &AppState, id: &str, star: i64) {
     sqlx::query(
         "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, official, version, moderation, star_rating, created_at) \
-         VALUES (?, '星级模板', 'chapter', '{}', '{\"mode\":\"open\"}', 1, 1, 'approved', ?, ?)",
+         VALUES ($1, '星级模板', 'chapter', '{}', '{\"mode\":\"open\"}', 1, 1, 'approved', $2, $3)",
     )
     .bind(id)
     .bind(star)
@@ -567,7 +567,7 @@ async fn seed_star_template(state: &AppState, id: &str, star: i64) {
 }
 
 async fn set_mileage(state: &AppState, char_id: &str, mileage: i64) {
-    sqlx::query("UPDATE cloud_characters SET mileage = ? WHERE id = ?")
+    sqlx::query("UPDATE cloud_characters SET mileage = $1 WHERE id = $2")
         .bind(mileage)
         .bind(char_id)
         .execute(&state.db)
@@ -619,7 +619,7 @@ async fn join_three_star_gates_on_card_mileage() {
     assert!(msg.contains("299"), "文案应含当前历练: {msg}");
 
     // 被拒不落成员行。
-    let n: i64 = sqlx::query("SELECT COUNT(*) AS n FROM world_members WHERE world_id=?")
+    let n: i64 = sqlx::query("SELECT COUNT(*) AS n FROM world_members WHERE world_id=$1")
         .bind(&wid)
         .fetch_one(&state.db)
         .await
@@ -717,7 +717,7 @@ async fn seed_source_char(
     sqlx::query(
         "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, \
          rights_declaration, moderation, withdrawn, source_fingerprint, pristine, created_at) \
-         VALUES (?, ?, ?, 1, ?, 'original', 'approved', 0, ?, ?, ?)",
+         VALUES ($1, $2, $3, 1, $4, 'original', 'approved', 0, $5, $6, $7)",
     )
     .bind(id)
     .bind(owner)
@@ -732,7 +732,7 @@ async fn seed_source_char(
 }
 
 async fn active_member_count(state: &AppState, world_id: &str) -> i64 {
-    sqlx::query("SELECT COUNT(*) AS n FROM world_members WHERE world_id=? AND status='active'")
+    sqlx::query("SELECT COUNT(*) AS n FROM world_members WHERE world_id=$1 AND status='active'")
         .bind(world_id)
         .fetch_one(&state.db)
         .await
@@ -906,7 +906,7 @@ async fn publish_materializes_source_fingerprint_and_pristine() {
         let db = state.db.clone();
         async move {
             let row = sqlx::query(
-                "SELECT source_fingerprint, pristine FROM cloud_characters WHERE local_card_id = ?",
+                "SELECT source_fingerprint, pristine FROM cloud_characters WHERE local_card_id = $1",
             )
             .bind(local_id)
             .fetch_one(&db)
@@ -976,7 +976,7 @@ mod lethality {
     async fn seed_user_age(state: &AppState, id: &str, age: i64) {
         sqlx::query(
             "INSERT INTO users (id, nickname, age_declared, status, created_at, updated_at) \
-             VALUES (?, '', ?, 'active', ?, ?)",
+             VALUES ($1, '', $2, 'active', $3, $4)",
         )
         .bind(id)
         .bind(age)
@@ -995,7 +995,7 @@ mod lethality {
     }
 
     async fn stored_lethality(state: &AppState, wid: &str) -> String {
-        sqlx::query_scalar::<_, String>("SELECT lethality FROM worlds WHERE id = ?")
+        sqlx::query_scalar::<_, String>("SELECT lethality FROM worlds WHERE id = $1")
             .bind(wid)
             .fetch_one(&state.db)
             .await
@@ -1004,7 +1004,7 @@ mod lethality {
 
     async fn sign_audit_count(state: &AppState, wid: &str) -> i64 {
         sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM audit_logs WHERE action='world.death_contract_signed' AND subject=?",
+            "SELECT COUNT(*) FROM audit_logs WHERE action='world.death_contract_signed' AND subject=$1",
         )
         .bind(wid)
         .fetch_one(&state.db)
@@ -1026,7 +1026,7 @@ mod lethality {
             "INSERT INTO worlds (id, template_id, template_version, engine_version, prompt_set_version, \
              model_route_version, room_type, title, status, visibility, member_limit, tick_per_day, \
              state_revision, narrative_state_json, created_at, updated_at) \
-             VALUES (?, 'tpl', 1, 'e', 'p', 'm', 'idle', '历史世界', 'open', 'official', 10, 3, 0, '{}', ?, ?)",
+             VALUES ($1, 'tpl', 1, 'e', 'p', 'm', 'idle', '历史世界', 'open', 'official', 10, 3, 0, '{}', $2, $3)",
         )
         .bind(&wid)
         .bind(now)
@@ -1249,7 +1249,7 @@ mod lethality {
         // 痕内容：谁签的、哪张卡、什么档。
         let row = sqlx::query(
             "SELECT actor_id, actor_role, reason FROM audit_logs \
-             WHERE action='world.death_contract_signed' AND subject=?",
+             WHERE action='world.death_contract_signed' AND subject=$1",
         )
         .bind(&wid)
         .fetch_one(&state.db)
@@ -1349,7 +1349,7 @@ async fn world_detail_roster_gates_avatar_on_moderation() {
     let wid = create_world(&state.db, CreateWorldParams::official("tpl", 1, "头像世界")).await.unwrap();
     // 投放该角色（active 成员）。
     sqlx::query(
-        "INSERT INTO world_members (id, world_id, user_id, cloud_character_id, joined_at) VALUES (?, ?, 'usrAV', 'chAV', ?)",
+        "INSERT INTO world_members (id, world_id, user_id, cloud_character_id, joined_at) VALUES ($1, $2, 'usrAV', 'chAV', $3)",
     )
     .bind(new_id("wm"))
     .bind(&wid)
@@ -1367,7 +1367,7 @@ async fn world_detail_roster_gates_avatar_on_moderation() {
     assert!(body["roster"][0].get("avatarUrl").is_none(), "无头像不应带 avatarUrl");
 
     // 过审头像 → roster 带 avatarUrl。
-    sqlx::query("UPDATE cloud_characters SET avatar_url = ?, avatar_moderation = 'approved' WHERE id = 'chAV'")
+    sqlx::query("UPDATE cloud_characters SET avatar_url = $1, avatar_moderation = 'approved' WHERE id = 'chAV'")
         .bind("/api/assets/objects/avatars/chAV.png")
         .execute(&state.db)
         .await
@@ -1397,7 +1397,7 @@ async fn tick_insertion_is_idempotent() {
     assert!(runtime::insert_tick(&state.db, &wid, 0, 0).await.unwrap(), "首次插入应成功");
     assert!(!runtime::insert_tick(&state.db, &wid, 0, 0).await.unwrap(), "同 tick_no 重复插入应被拒");
 
-    let n: i64 = sqlx::query("SELECT COUNT(*) AS n FROM world_ticks WHERE world_id=? AND tick_no=0")
+    let n: i64 = sqlx::query("SELECT COUNT(*) AS n FROM world_ticks WHERE world_id=$1 AND tick_no=0")
         .bind(&wid)
         .fetch_one(&state.db)
         .await
@@ -1423,7 +1423,7 @@ async fn tick_skips_without_model_and_is_idempotent() {
     let s2 = runtime::process_tick(&state, &wid, 0).await.unwrap();
     assert_eq!(s2, TickStatus::Skipped("already_done"));
 
-    let tstatus: String = sqlx::query("SELECT status FROM world_ticks WHERE world_id=? AND tick_no=0")
+    let tstatus: String = sqlx::query("SELECT status FROM world_ticks WHERE world_id=$1 AND tick_no=0")
         .bind(&wid)
         .fetch_one(&state.db)
         .await
@@ -1445,7 +1445,7 @@ async fn budget_fuse_pauses_world() {
 
     // 今日已花满预算。
     let today = runtime::day_string(now_ms());
-    sqlx::query("UPDATE world_budgets SET spent_tokens_today=100, budget_day=? WHERE world_id=?")
+    sqlx::query("UPDATE world_budgets SET spent_tokens_today=100, budget_day=$1 WHERE world_id=$2")
         .bind(&today)
         .bind(&wid)
         .execute(&state.db)
@@ -1459,7 +1459,7 @@ async fn budget_fuse_pauses_world() {
     let w = load_world(&state.db, &wid).await.unwrap();
     assert_eq!(w.status, "paused", "熔断应暂停世界");
 
-    let fused: i64 = sqlx::query("SELECT fused FROM world_budgets WHERE world_id=?")
+    let fused: i64 = sqlx::query("SELECT fused FROM world_budgets WHERE world_id=$1")
         .bind(&wid)
         .fetch_one(&state.db)
         .await
@@ -1571,7 +1571,7 @@ mod discovery {
     async fn seed_world_event(db: &AnyPool, world_id: &str, occurred_at: i64) {
         sqlx::query(
             "INSERT INTO world_events (id, world_id, tick_no, sequence, domain_event_id, event_type, visibility, occurred_at) \
-             VALUES (?, ?, 0, 0, ?, 'dialogue_spoken', 'public', ?)",
+             VALUES ($1, $2, 0, 0, $3, 'dialogue_spoken', 'public', $4)",
         )
         .bind(new_id("we"))
         .bind(world_id)
@@ -1585,7 +1585,7 @@ mod discovery {
     /// 造 gift_events 行，created_at 由调用方指定以控 7 天打赏窗。
     async fn seed_gift(db: &AnyPool, world_id: &str, gift_count: i64, created_at: i64) {
         sqlx::query(
-            "INSERT INTO gift_events (id, world_id, sku, gift_count, created_at) VALUES (?, ?, 'rose', ?, ?)",
+            "INSERT INTO gift_events (id, world_id, sku, gift_count, created_at) VALUES ($1, $2, 'rose', $3, $4)",
         )
         .bind(new_id("ge"))
         .bind(world_id)
@@ -1599,7 +1599,7 @@ mod discovery {
     /// 造 active 成员行（status 默认 active；schema 无外键约束，直插即可）。
     async fn seed_member(db: &AnyPool, world_id: &str, character_id: &str) {
         sqlx::query(
-            "INSERT INTO world_members (id, world_id, user_id, cloud_character_id, joined_at) VALUES (?, ?, 'usrD', ?, ?)",
+            "INSERT INTO world_members (id, world_id, user_id, cloud_character_id, joined_at) VALUES ($1, $2, 'usrD', $3, $4)",
         )
         .bind(new_id("wm"))
         .bind(world_id)
@@ -1696,8 +1696,8 @@ mod discovery {
         let hot = create_world(&state.db, CreateWorldParams::official("tpl", 1, "火热世界")).await.unwrap();
         let cold = create_world(&state.db, CreateWorldParams::official("tpl", 1, "冷清世界")).await.unwrap();
         // 钉死 created_at：hot 更旧、cold 更新 → sort=new 下 cold 在前，热度榜必须逆转该顺序。
-        sqlx::query("UPDATE worlds SET created_at=? WHERE id=?").bind(now - 10_000).bind(&hot).execute(&state.db).await.unwrap();
-        sqlx::query("UPDATE worlds SET created_at=? WHERE id=?").bind(now).bind(&cold).execute(&state.db).await.unwrap();
+        sqlx::query("UPDATE worlds SET created_at=$1 WHERE id=$2").bind(now - 10_000).bind(&hot).execute(&state.db).await.unwrap();
+        sqlx::query("UPDATE worlds SET created_at=$1 WHERE id=$2").bind(now).bind(&cold).execute(&state.db).await.unwrap();
 
         // 热世界：近 48h 事件 3 条 + 近 7 天打赏 gift_count 共 4 + active 成员 1 → 3×1 + 4×5 + 1×2 = 25。
         seed_world_event(&state.db, &hot, now - hour).await;
@@ -1831,7 +1831,7 @@ mod cover_and_next_tick {
     /// 直接改库模拟机审给出非 approved 裁决（DevModeration::check_image 恒直过，
     /// 无法从上传路径造出 pending/rejected；范式同 assets::tests 对 avatar_moderation 的做法）。
     async fn force_cover_moderation(state: &AppState, world_id: &str, verdict: &str) {
-        sqlx::query("UPDATE worlds SET cover_moderation = ? WHERE id = ?")
+        sqlx::query("UPDATE worlds SET cover_moderation = $1 WHERE id = $2")
             .bind(verdict)
             .bind(world_id)
             .execute(&state.db)
@@ -2131,7 +2131,7 @@ mod cover_and_next_tick {
         seed_user(&state, "tickUser").await;
         let tk = token(&state, "tickUser");
         let wid = create_world(&state.db, CreateWorldParams::official("tpl_t", 1, "跑动世界")).await.unwrap();
-        sqlx::query("UPDATE worlds SET status='running' WHERE id=?")
+        sqlx::query("UPDATE worlds SET status='running' WHERE id=$1")
             .bind(&wid)
             .execute(&state.db)
             .await
@@ -2141,7 +2141,7 @@ mod cover_and_next_tick {
         let last_tick_at = now_ms() - 60_000;
         sqlx::query(
             "INSERT INTO world_ticks (id, world_id, tick_no, base_revision, status, created_at) \
-             VALUES (?, ?, 0, 0, 'done', ?)",
+             VALUES ($1, $2, 0, 0, 'done', $3)",
         )
         .bind(new_id("tick"))
         .bind(&wid)
@@ -2182,7 +2182,7 @@ mod cover_and_next_tick {
         let mut p = CreateWorldParams::official("tpl_b", 1, "放置房世界");
         p.timeline_mode = "event".into();
         let ev = create_world(&state.db, p).await.unwrap();
-        sqlx::query("UPDATE worlds SET status='running' WHERE id=?")
+        sqlx::query("UPDATE worlds SET status='running' WHERE id=$1")
             .bind(&ev)
             .execute(&state.db)
             .await
@@ -2211,7 +2211,7 @@ mod room_open {
 
     async fn seed_user_age(db: &AnyPool, id: &str, age: i64) {
         sqlx::query(
-            "INSERT INTO users (id, nickname, age_declared, status, created_at, updated_at) VALUES (?, '', ?, 'active', ?, ?)",
+            "INSERT INTO users (id, nickname, age_declared, status, created_at, updated_at) VALUES ($1, '', $2, 'active', $3, $4)",
         )
         .bind(id)
         .bind(age)
@@ -2228,7 +2228,7 @@ mod room_open {
         let official = if owner.is_some() { 0 } else { 1 };
         sqlx::query(
             "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, official, version, moderation, owner_id, revenue_share_bps, room_open_price_cents, withdrawn, created_at) \
-             VALUES (?, '模板房', 'idle', '{}', '{\"mode\":\"open\"}', ?, 1, 'approved', ?, ?, ?, 0, ?)",
+             VALUES ($1, '模板房', 'idle', '{}', '{\"mode\":\"open\"}', $2, 1, 'approved', $3, $4, $5, 0, $6)",
         )
         .bind(id)
         .bind(official)
@@ -2264,7 +2264,7 @@ mod room_open {
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO billing_balances (user_id, balance_cents, updated_at) VALUES (?, ?, ?) \
+            "INSERT INTO billing_balances (user_id, balance_cents, updated_at) VALUES ($1, $2, $3) \
              ON CONFLICT(user_id) DO UPDATE SET balance_cents = billing_balances.balance_cents + excluded.balance_cents, updated_at = excluded.updated_at",
         )
         .bind(uid)
@@ -2277,7 +2277,7 @@ mod room_open {
     }
 
     async fn acct_balance(db: &AnyPool, account_id: &str) -> i64 {
-        let row: Option<(i64,)> = sqlx::query_as("SELECT balance_cents FROM ledger_accounts WHERE id = ?")
+        let row: Option<(i64,)> = sqlx::query_as("SELECT balance_cents FROM ledger_accounts WHERE id = $1")
             .bind(account_id)
             .fetch_optional(db)
             .await
@@ -2286,7 +2286,7 @@ mod room_open {
     }
 
     async fn billing_balance(db: &AnyPool, uid: &str) -> i64 {
-        let row: Option<(i64,)> = sqlx::query_as("SELECT balance_cents FROM billing_balances WHERE user_id = ?")
+        let row: Option<(i64,)> = sqlx::query_as("SELECT balance_cents FROM billing_balances WHERE user_id = $1")
             .bind(uid)
             .fetch_optional(db)
             .await
@@ -2429,7 +2429,7 @@ mod room_open {
 
         sqlx::query(
             "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, official, version, moderation, owner_id, room_open_price_cents, withdrawn, created_at) \
-             VALUES ('tpl_pending','t','idle','{}','{\"mode\":\"open\"}',0,1,'pending','host',0,0,?)",
+             VALUES ('tpl_pending','t','idle','{}','{\"mode\":\"open\"}',0,1,'pending','host',0,0,$1)",
         )
         .bind(now_ms())
         .execute(&state.db)
@@ -2440,7 +2440,7 @@ mod room_open {
 
         sqlx::query(
             "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, official, version, moderation, owner_id, room_open_price_cents, withdrawn, created_at) \
-             VALUES ('tpl_wd','t','idle','{}','{\"mode\":\"open\"}',0,1,'approved','host',0,1,?)",
+             VALUES ('tpl_wd','t','idle','{}','{\"mode\":\"open\"}',0,1,'approved','host',0,1,$1)",
         )
         .bind(now_ms())
         .execute(&state.db)
@@ -2596,7 +2596,7 @@ mod series_autoscale {
 
         // 2 号真的落库并登记为第 2 号。
         let no: i64 = sqlx::query_scalar(
-            "SELECT instance_no FROM world_series_instances WHERE series_id = ? AND world_id = ?",
+            "SELECT instance_no FROM world_series_instances WHERE series_id = $1 AND world_id = $2",
         )
         .bind(&sid)
         .bind(&next)
@@ -2654,7 +2654,7 @@ mod series_autoscale {
 
         // 预算两列（B-2：非零 token/cny 上限，避免扩容出的房无上限烧钱）。
         let budgets: Vec<(i64, i64)> = sqlx::query_as(
-            "SELECT daily_token_budget, daily_cny_budget_cents FROM world_budgets WHERE world_id = ?",
+            "SELECT daily_token_budget, daily_cny_budget_cents FROM world_budgets WHERE world_id = $1",
         )
         .bind(&next)
         .fetch_all(&state.db)
@@ -2687,7 +2687,7 @@ mod series_autoscale {
         let next = next_world_id(&body).expect(&format!("{body}"));
 
         // ① 扩容没有替任何人占座。
-        let seated: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_members WHERE world_id = ?")
+        let seated: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_members WHERE world_id = $1")
             .bind(&next)
             .fetch_one(&state.db)
             .await
@@ -2793,7 +2793,7 @@ mod series_autoscale {
         let again = enroll_series(&state.db, &wid, "tpl_other", 99).await.unwrap();
         assert_eq!(again, sid, "重复登记应返回既有系列");
         assert_eq!(count_sql(&state, "SELECT COUNT(*) FROM world_series").await, 1);
-        let max: i64 = sqlx::query_scalar("SELECT max_instances FROM world_series WHERE id = ?")
+        let max: i64 = sqlx::query_scalar("SELECT max_instances FROM world_series WHERE id = $1")
             .bind(&sid)
             .fetch_one(&state.db)
             .await
@@ -2865,7 +2865,7 @@ mod be_biography_read {
     async fn seed_biography(state: &AppState, world_id: &str) {
         sqlx::query(
             "INSERT INTO world_biographies (world_id, kind, terminal_reason, ending_id, summary_json, sealed_at) \
-             VALUES (?, 'be', 'key_character_exit', 'ending_x', ?, ?)",
+             VALUES ($1, 'be', 'key_character_exit', 'ending_x', $2, $3)",
         )
         .bind(world_id)
         .bind(json!({ "schemaVersion": 1, "collapse": { "modelGenerated": false } }).to_string())

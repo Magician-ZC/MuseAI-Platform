@@ -69,7 +69,7 @@ async fn open_flag(state: &AppState, scope: &str, target: &str) {
     sqlx::query(
         "INSERT INTO runtime_flags (id, flag, scope, target_id, enabled, starts_at, ends_at, \
          updated_by, updated_at, reason, created_at) \
-         VALUES (?, ?, ?, ?, 1, 0, 0, 'test', ?, '用例开闸', ?)",
+         VALUES ($1, $2, $3, $4, 1, 0, 0, 'test', $5, '用例开闸', $6)",
     )
     .bind(new_id("rf"))
     .bind(ENV_SOCIAL_IDENTITY_UNLOCK)
@@ -87,7 +87,7 @@ async fn seed_char(state: &AppState, id: &str, owner: &str, name: &str) {
     sqlx::query(
         "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, \
          rights_declaration, moderation, withdrawn, created_at) \
-         VALUES (?, ?, 'loc', 1, ?, 'original', 'approved', 0, ?)",
+         VALUES ($1, $2, 'loc', 1, $3, 'original', 'approved', 0, $4)",
     )
     .bind(id)
     .bind(owner)
@@ -101,8 +101,8 @@ async fn seed_char(state: &AppState, id: &str, owner: &str, name: &str) {
 /// 把一张卡封卷为传世卡（模拟 `memorial::seal_character_tx` 的落定结果）。
 async fn seal_char(state: &AppState, char_id: &str, world_id: &str) {
     sqlx::query(
-        "UPDATE cloud_characters SET memorial_status = 'sealed', memorial_sealed_at = ?, \
-         memorial_world_id = ?, withdrawn = 1 WHERE id = ?",
+        "UPDATE cloud_characters SET memorial_status = 'sealed', memorial_sealed_at = $1, \
+         memorial_world_id = $2, withdrawn = 1 WHERE id = $3",
     )
     .bind(now_ms())
     .bind(world_id)
@@ -114,7 +114,7 @@ async fn seal_char(state: &AppState, char_id: &str, world_id: &str) {
 
 /// 写世界的关系图（引擎 `relation_dynamics` 的产出形状）。
 async fn set_relations(state: &AppState, world_id: &str, relations: Value) {
-    sqlx::query("UPDATE worlds SET narrative_state_json = ? WHERE id = ?")
+    sqlx::query("UPDATE worlds SET narrative_state_json = $1 WHERE id = $2")
         .bind(json!({ "relations": relations }).to_string())
         .bind(world_id)
         .execute(&state.db)
@@ -124,7 +124,7 @@ async fn set_relations(state: &AppState, world_id: &str, relations: Value) {
 
 /// 改年龄声明（0 未声明 / 1 成年 / 2 未成年）。
 async fn set_age(state: &AppState, user_id: &str, age: i64) {
-    sqlx::query("UPDATE users SET age_declared = ? WHERE id = ?")
+    sqlx::query("UPDATE users SET age_declared = $1 WHERE id = $2")
         .bind(age)
         .bind(user_id)
         .execute(&state.db)
@@ -446,7 +446,7 @@ async fn red_line_social_asset_has_zero_numeric_effect() {
     // 顺带造一条「故人」印记与一些资产，确保快照不是在空表上比较。
     sqlx::query(
         "INSERT INTO memorial_marks (id, character_id, owner_id, deceased_character_id, world_id, kind, granted_at) \
-         VALUES ('mm1', 'c1', 'u1', 'c2', 'w1', 'departed', ?)",
+         VALUES ('mm1', 'c1', 'u1', 'c2', 'w1', 'departed', $1)",
     )
     .bind(now_ms())
     .execute(&state.db)
@@ -643,7 +643,7 @@ async fn hostile_after_request_blocks_acceptance() {
     .await;
     assert_eq!(s, StatusCode::FORBIDDEN, "🔴 接受时必须按当下关系重算，快照不作数");
     let status: String =
-        sqlx::query_scalar("SELECT status FROM social_unlock_requests WHERE id = ?")
+        sqlx::query_scalar("SELECT status FROM social_unlock_requests WHERE id = $1")
             .bind(&rid)
             .fetch_one(&state.db)
             .await
@@ -837,7 +837,7 @@ async fn block_also_stops_room_invitations_even_when_social_flag_off() {
     assert_eq!(s, StatusCode::OK);
 
     // 关掉社交开关（模拟运营急停），只留邀请开关。
-    sqlx::query("UPDATE runtime_flags SET enabled = 0 WHERE flag = ?")
+    sqlx::query("UPDATE runtime_flags SET enabled = 0 WHERE flag = $1")
         .bind(ENV_SOCIAL_IDENTITY_UNLOCK)
         .execute(&state.db)
         .await
@@ -942,7 +942,7 @@ async fn report_enters_queue_dedupes_escalates_and_is_resolvable() {
     assert_eq!(s, StatusCode::OK);
     assert_eq!(res["status"], REPORT_ACTIONED);
     let audits: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM audit_logs WHERE action = 'social.report_resolved' AND subject = ?",
+        "SELECT COUNT(*) FROM audit_logs WHERE action = 'social.report_resolved' AND subject = $1",
     )
     .bind(&rid)
     .fetch_one(&state.db)

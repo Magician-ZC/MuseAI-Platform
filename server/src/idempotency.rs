@@ -21,7 +21,7 @@ pub async fn guard(
         return Ok(IdempotencyGuard { cached_response: None, key: None });
     };
     let existing: Option<(String, Option<String>)> = sqlx::query_as(
-        "SELECT payload_hash, response_json FROM idempotency_keys WHERE key = ? AND user_id = ? AND endpoint = ?",
+        "SELECT payload_hash, response_json FROM idempotency_keys WHERE key = $1 AND user_id = $2 AND endpoint = $3",
     )
     .bind(key)
     .bind(user_id)
@@ -37,7 +37,7 @@ pub async fn guard(
     }
 
     sqlx::query(
-        "INSERT INTO idempotency_keys (key, user_id, endpoint, payload_hash, created_at) VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO idempotency_keys (key, user_id, endpoint, payload_hash, created_at) VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(key)
     .bind(user_id)
@@ -53,7 +53,7 @@ impl IdempotencyGuard {
     /// handler 成功后回填响应
     pub async fn store_response(&self, db: &AnyPool, response_json: &str) -> Result<(), ApiError> {
         if let Some(key) = &self.key {
-            sqlx::query("UPDATE idempotency_keys SET response_json = ? WHERE key = ?")
+            sqlx::query("UPDATE idempotency_keys SET response_json = $1 WHERE key = $2")
                 .bind(response_json)
                 .bind(key)
                 .execute(db)

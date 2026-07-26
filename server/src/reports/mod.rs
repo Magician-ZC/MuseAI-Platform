@@ -27,7 +27,7 @@ pub async fn generate_report(
     report_day: &str,
 ) -> Result<String, ApiError> {
     if let Some((id,)) = sqlx::query_as::<_, (String,)>(
-        "SELECT id FROM daily_reports WHERE world_id = ? AND character_id = ? AND report_day = ?",
+        "SELECT id FROM daily_reports WHERE world_id = $1 AND character_id = $2 AND report_day = $3",
     )
     .bind(world_id)
     .bind(character_id)
@@ -58,7 +58,7 @@ pub async fn generate_report(
     let id = crate::db::new_id("rpt");
     let res = sqlx::query(
         "INSERT INTO daily_reports (id, world_id, user_id, character_id, report_day, content_json, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(&id)
     .bind(world_id)
@@ -74,7 +74,7 @@ pub async fn generate_report(
         // Low：并发下他者已生成（idx_daily_report_unique 冲突）→ 回退既有 id（幂等），不重复入队通知。
         Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
             let existing: Option<(String,)> = sqlx::query_as(
-                "SELECT id FROM daily_reports WHERE world_id = ? AND character_id = ? AND report_day = ?",
+                "SELECT id FROM daily_reports WHERE world_id = $1 AND character_id = $2 AND report_day = $3",
             )
             .bind(world_id)
             .bind(character_id)
@@ -119,7 +119,7 @@ async fn aggregate_visible(
     let (start, end) = day_bounds(report_day);
     let rows: Vec<(String, String, String, String, Option<String>, Option<String>, Option<String>, i64)> = sqlx::query_as(
         "SELECT id, event_type, visibility, actors_json, audience_json, public_projection_json, private_projections_json, occurred_at \
-         FROM world_events WHERE world_id = ? AND occurred_at >= ? AND occurred_at < ? \
+         FROM world_events WHERE world_id = $1 AND occurred_at >= $2 AND occurred_at < $3 \
          AND moderation = 'approved' ORDER BY occurred_at ASC LIMIT 200",
     )
     .bind(world_id)
@@ -234,7 +234,7 @@ async fn list_or_detail(
         // 按日详情 = 打开：回写 opened_at（仅首次），北极星埋点。
         // opened_at 按单份计（Low）：此处标记的每一份都在下方 SELECT 以「全量 content」随本响应返回，
         // 故按日打开 = 逐份打开当日全部报告，不产生「标记了却未返回」的虚高。单份精确打开另见 open_report。
-        sqlx::query("UPDATE daily_reports SET opened_at = ? WHERE user_id = ? AND report_day = ? AND opened_at IS NULL")
+        sqlx::query("UPDATE daily_reports SET opened_at = $1 WHERE user_id = $2 AND report_day = $3 AND opened_at IS NULL")
             .bind(crate::db::now_ms())
             .bind(&user.user_id)
             .bind(date)
@@ -242,7 +242,7 @@ async fn list_or_detail(
             .await?;
         let rows: Vec<(String, String, String, String, Option<i64>, i64)> = sqlx::query_as(
             "SELECT id, world_id, character_id, content_json, opened_at, created_at FROM daily_reports \
-             WHERE user_id = ? AND report_day = ? ORDER BY created_at DESC",
+             WHERE user_id = $1 AND report_day = $2 ORDER BY created_at DESC",
         )
         .bind(&user.user_id)
         .bind(date)
@@ -255,7 +255,7 @@ async fn list_or_detail(
     // 列表（浏览，不算打开）。
     let rows: Vec<(String, String, String, String, Option<i64>, i64)> = sqlx::query_as(
         "SELECT id, world_id, character_id, report_day, opened_at, created_at FROM daily_reports \
-         WHERE user_id = ? AND (? IS NULL OR created_at < ?) ORDER BY created_at DESC LIMIT 30",
+         WHERE user_id = $1 AND ($2 IS NULL OR created_at < $3) ORDER BY created_at DESC LIMIT 30",
     )
     .bind(&user.user_id)
     .bind(q.cursor)
@@ -285,14 +285,14 @@ async fn open_report(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // 打开单份日报：回写 opened_at（首次），北极星埋点。
-    sqlx::query("UPDATE daily_reports SET opened_at = ? WHERE id = ? AND user_id = ? AND opened_at IS NULL")
+    sqlx::query("UPDATE daily_reports SET opened_at = $1 WHERE id = $2 AND user_id = $3 AND opened_at IS NULL")
         .bind(crate::db::now_ms())
         .bind(&id)
         .bind(&user.user_id)
         .execute(&state.db)
         .await?;
     let row: Option<(String, String, String, String, Option<i64>, i64)> = sqlx::query_as(
-        "SELECT id, world_id, character_id, content_json, opened_at, created_at FROM daily_reports WHERE id = ? AND user_id = ?",
+        "SELECT id, world_id, character_id, content_json, opened_at, created_at FROM daily_reports WHERE id = $1 AND user_id = $2",
     )
     .bind(&id)
     .bind(&user.user_id)
@@ -323,7 +323,7 @@ mod tests {
     use tower::ServiceExt;
 
     async fn opened_at(db: &sqlx::AnyPool, id: &str) -> Option<i64> {
-        sqlx::query_scalar::<_, Option<i64>>("SELECT opened_at FROM daily_reports WHERE id = ?")
+        sqlx::query_scalar::<_, Option<i64>>("SELECT opened_at FROM daily_reports WHERE id = $1")
             .bind(id)
             .fetch_one(db)
             .await
@@ -346,7 +346,7 @@ mod tests {
         let state = test_state().await;
         seed_user(&state.db, "u1").await;
         let id = generate_report(&state, "w1", "u1", "c1", "2026-07-20").await.unwrap();
-        let content: String = sqlx::query_scalar::<_, String>("SELECT content_json FROM daily_reports WHERE id = ?")
+        let content: String = sqlx::query_scalar::<_, String>("SELECT content_json FROM daily_reports WHERE id = $1")
             .bind(&id)
             .fetch_one(&state.db)
             .await
@@ -392,7 +392,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO world_events (id, world_id, tick_no, sequence, domain_event_id, event_type, actors_json, \
              visibility, audience_json, private_projections_json, moderation, ai_label, occurred_at) \
-             VALUES ('ev1', 'w1', 1, 1, 'de1', 'dialogue', '[\"c1\"]', 'private', ?, ?, 'approved', 1, ?)",
+             VALUES ('ev1', 'w1', 1, 1, 'de1', 'dialogue', '[\"c1\"]', 'private', $1, $2, 'approved', 1, $3)",
         )
         .bind(json!(["u2"]).to_string())
         .bind(json!([{"audiencePrincipalIds": ["u2"], "summary": "u2 的秘密"}]).to_string())
@@ -402,7 +402,7 @@ mod tests {
         .unwrap();
 
         let id = generate_report(&state, "w1", "u1", "c1", "2026-07-20").await.unwrap();
-        let content: String = sqlx::query_scalar::<_, String>("SELECT content_json FROM daily_reports WHERE id = ?")
+        let content: String = sqlx::query_scalar::<_, String>("SELECT content_json FROM daily_reports WHERE id = $1")
             .bind(&id)
             .fetch_one(&state.db)
             .await
@@ -412,7 +412,7 @@ mod tests {
     }
 
     async fn content_of(db: &sqlx::AnyPool, id: &str) -> String {
-        sqlx::query_scalar::<_, String>("SELECT content_json FROM daily_reports WHERE id = ?")
+        sqlx::query_scalar::<_, String>("SELECT content_json FROM daily_reports WHERE id = $1")
             .bind(id)
             .fetch_one(db)
             .await
@@ -431,7 +431,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO world_events (id, world_id, tick_no, sequence, domain_event_id, event_type, actors_json, \
              visibility, audience_json, private_projections_json, moderation, ai_label, occurred_at) \
-             VALUES ('evp', 'w1', 1, 1, 'de-p', 'dialogue', '[\"c1\"]', 'private', ?, ?, 'approved', 1, ?)",
+             VALUES ('evp', 'w1', 1, 1, 'de-p', 'dialogue', '[\"c1\"]', 'private', $1, $2, 'approved', 1, $3)",
         )
         .bind(json!(["u1", "u2"]).to_string())
         .bind(json!([{"audiencePrincipalIds": ["u2"], "summary": "u2-private-secret"}]).to_string())
@@ -459,7 +459,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO world_events (id, world_id, tick_no, sequence, domain_event_id, event_type, actors_json, \
              visibility, public_projection_json, moderation, ai_label, occurred_at) \
-             VALUES ('evc1', 'w1', 1, 1, 'de-c1', 'dialogue', '[\"c1\"]', 'public', ?, 'approved', 1, ?)",
+             VALUES ('evc1', 'w1', 1, 1, 'de-c1', 'dialogue', '[\"c1\"]', 'public', $1, 'approved', 1, $2)",
         )
         .bind(json!({"summary": "highlight-of-c1"}).to_string())
         .bind(at)
@@ -469,7 +469,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO world_events (id, world_id, tick_no, sequence, domain_event_id, event_type, actors_json, \
              visibility, public_projection_json, moderation, ai_label, occurred_at) \
-             VALUES ('evc2', 'w1', 1, 2, 'de-c2', 'dialogue', '[\"c2\"]', 'public', ?, 'approved', 1, ?)",
+             VALUES ('evc2', 'w1', 1, 2, 'de-c2', 'dialogue', '[\"c2\"]', 'public', $1, 'approved', 1, $2)",
         )
         .bind(json!({"summary": "highlight-of-c2"}).to_string())
         .bind(at + 1)

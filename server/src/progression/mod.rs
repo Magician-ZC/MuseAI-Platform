@@ -104,7 +104,7 @@ pub(crate) async fn grant_mileage_tx(
     if amount <= 0 {
         return Err(ApiError::BadRequest("历练发放数额必须为正数".into()));
     }
-    let res = sqlx::query("UPDATE cloud_characters SET mileage = mileage + ? WHERE id = ?")
+    let res = sqlx::query("UPDATE cloud_characters SET mileage = mileage + $1 WHERE id = $2")
         .bind(amount)
         .bind(cloud_character_id)
         .execute(&mut **tx)
@@ -171,7 +171,7 @@ pub(crate) async fn load_payout_context_tx(
     tx: &mut Transaction<'_, Any>,
     world_id: &str,
 ) -> Result<PayoutContext, ApiError> {
-    let row = sqlx::query("SELECT assembled_json FROM worlds WHERE id = ?")
+    let row = sqlx::query("SELECT assembled_json FROM worlds WHERE id = $1")
         .bind(world_id)
         .fetch_optional(&mut **tx)
         .await?;
@@ -291,9 +291,9 @@ pub(crate) async fn accumulate_contributions_tx(
         }
         let milestone_delta = if milestone { delta } else { 0 };
         let updated = sqlx::query(
-            "UPDATE world_contributions SET score_milli = score_milli + ?, \
-             milestone_score_milli = milestone_score_milli + ?, updated_at = ? \
-             WHERE world_id = ? AND character_id = ?",
+            "UPDATE world_contributions SET score_milli = score_milli + $1, \
+             milestone_score_milli = milestone_score_milli + $2, updated_at = $3 \
+             WHERE world_id = $4 AND character_id = $5",
         )
         .bind(delta)
         .bind(milestone_delta)
@@ -306,7 +306,7 @@ pub(crate) async fn accumulate_contributions_tx(
             sqlx::query(
                 "INSERT INTO world_contributions \
                  (world_id, character_id, score_milli, milestone_score_milli, settled_at, updated_at) \
-                 VALUES (?, ?, ?, ?, 0, ?)",
+                 VALUES ($1, $2, $3, $4, 0, $5)",
             )
             .bind(world_id)
             .bind(cid)
@@ -379,7 +379,7 @@ async fn settle_worldline_with_ctx_tx(
         // 只认「里程碑推动者」：milestone_score_milli > 0 且尚未结算。无贡献者根本不参与本层。
         let row = sqlx::query(
             "SELECT milestone_score_milli FROM world_contributions \
-             WHERE world_id = ? AND character_id = ? AND settled_at = 0 AND milestone_score_milli > 0",
+             WHERE world_id = $1 AND character_id = $2 AND settled_at = 0 AND milestone_score_milli > 0",
         )
         .bind(world_id)
         .bind(cid)
@@ -392,8 +392,8 @@ async fn settle_worldline_with_ctx_tx(
 
         // 防线②：settled_at CAS 占位。0 行命中 = 已被并发/重复结算 → 跳过，绝不二次发放。
         let claimed = sqlx::query(
-            "UPDATE world_contributions SET settled_at = ?, updated_at = ? \
-             WHERE world_id = ? AND character_id = ? AND settled_at = 0",
+            "UPDATE world_contributions SET settled_at = $1, updated_at = $2 \
+             WHERE world_id = $3 AND character_id = $4 AND settled_at = 0",
         )
         .bind(now)
         .bind(now)
@@ -468,7 +468,7 @@ async fn settle_worldline_with_ctx_tx(
     if !granted.is_empty() {
         sqlx::query(
             "INSERT INTO audit_logs (id, actor_id, actor_role, action, subject, reason, created_at) \
-             VALUES (?, 'system', 'system', 'world.worldline_settled', ?, ?, ?)",
+             VALUES ($1, 'system', 'system', 'world.worldline_settled', $2, $3, $4)",
         )
         .bind(crate::db::new_id("aud"))
         .bind(world_id)
@@ -743,7 +743,7 @@ async fn seal_be_biography_tx(
     }
     // 幂等①：已封卷 → 不重复产出（重复触发不重复产传记）。
     let existed: Option<i64> =
-        sqlx::query_scalar("SELECT 1 FROM world_biographies WHERE world_id = ?")
+        sqlx::query_scalar("SELECT 1 FROM world_biographies WHERE world_id = $1")
             .bind(world_id)
             .fetch_optional(&mut **tx)
             .await?;
@@ -754,7 +754,7 @@ async fn seal_be_biography_tx(
     // ---- 崩塌原因：唯一来源 = audit_logs('world.ended')（runtime 在本事务内、本函数之前写入） ----
     let audit_row = sqlx::query(
         "SELECT reason, created_at FROM audit_logs \
-         WHERE action = 'world.ended' AND subject = ? ORDER BY created_at ASC LIMIT 1",
+         WHERE action = 'world.ended' AND subject = $1 ORDER BY created_at ASC LIMIT 1",
     )
     .bind(world_id)
     .fetch_optional(&mut **tx)
@@ -776,7 +776,7 @@ async fn seal_be_biography_tx(
     // ---- 世界元信息（只读） ----
     let w = sqlx::query(
         "SELECT title, room_type, template_id, template_version, lethality, tick_per_day, \
-         member_limit, created_at FROM worlds WHERE id = ?",
+         member_limit, created_at FROM worlds WHERE id = $1",
     )
     .bind(world_id)
     .fetch_optional(&mut **tx)
@@ -784,14 +784,14 @@ async fn seal_be_biography_tx(
     .ok_or(ApiError::NotFound)?;
     let template_id: String = w.try_get("template_id")?;
     let star_rating: i64 =
-        sqlx::query_scalar("SELECT star_rating FROM world_templates WHERE id = ?")
+        sqlx::query_scalar("SELECT star_rating FROM world_templates WHERE id = $1")
             .bind(&template_id)
             .fetch_optional(&mut **tx)
             .await?
             .unwrap_or(ctx.star_rating);
 
     // ---- 世界线摘要：拍数（按 tick 状态分档）+ 末拍号 ----
-    let tick_rows = sqlx::query("SELECT status, COUNT(*) AS n FROM world_ticks WHERE world_id = ? GROUP BY status")
+    let tick_rows = sqlx::query("SELECT status, COUNT(*) AS n FROM world_ticks WHERE world_id = $1 GROUP BY status")
         .bind(world_id)
         .fetch_all(&mut **tx)
         .await?;
@@ -801,27 +801,27 @@ async fn seal_be_biography_tx(
     }
     let total_ticks: i64 = ticks_by_status.values().sum();
     let last_tick_no: Option<i64> = sqlx::query_scalar(
-        "SELECT tick_no FROM world_ticks WHERE world_id = ? ORDER BY tick_no DESC LIMIT 1",
+        "SELECT tick_no FROM world_ticks WHERE world_id = $1 ORDER BY tick_no DESC LIMIT 1",
     )
     .bind(world_id)
     .fetch_optional(&mut **tx)
     .await?;
 
     // ---- 世界线摘要：事件计量（只计数，不复制正文） ----
-    let total_events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_events WHERE world_id = ?")
+    let total_events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_events WHERE world_id = $1")
         .bind(world_id)
         .fetch_one(&mut **tx)
         .await?;
     let event_kind_total: i64 =
-        sqlx::query_scalar("SELECT COUNT(DISTINCT event_type) FROM world_events WHERE world_id = ?")
+        sqlx::query_scalar("SELECT COUNT(DISTINCT event_type) FROM world_events WHERE world_id = $1")
             .bind(world_id)
             .fetch_one(&mut **tx)
             .await?;
     let kind_limit = be_bio_max_event_kinds();
     // 次序确定性：先按次数降序，同次数再按类型名升序 —— 两次封卷必得同一份 JSON。
     let event_rows = sqlx::query(
-        "SELECT event_type, COUNT(*) AS n FROM world_events WHERE world_id = ? \
-         GROUP BY event_type ORDER BY COUNT(*) DESC, event_type ASC LIMIT ?",
+        "SELECT event_type, COUNT(*) AS n FROM world_events WHERE world_id = $1 \
+         GROUP BY event_type ORDER BY COUNT(*) DESC, event_type ASC LIMIT $2",
     )
     .bind(world_id)
     .bind(kind_limit)
@@ -837,7 +837,7 @@ async fn seal_be_biography_tx(
 
     // ---- 参与者足迹：成员行（时刻与状态）× 贡献账本（确定性分值） ----
     let contrib_rows = sqlx::query(
-        "SELECT character_id, score_milli, milestone_score_milli FROM world_contributions WHERE world_id = ?",
+        "SELECT character_id, score_milli, milestone_score_milli FROM world_contributions WHERE world_id = $1",
     )
     .bind(world_id)
     .fetch_all(&mut **tx)
@@ -854,7 +854,7 @@ async fn seal_be_biography_tx(
         contributions.insert(cid, (score, milestone));
     }
 
-    let member_total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_members WHERE world_id = ?")
+    let member_total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_members WHERE world_id = $1")
         .bind(world_id)
         .fetch_one(&mut **tx)
         .await?;
@@ -863,7 +863,7 @@ async fn seal_be_biography_tx(
     let member_rows = sqlx::query(
         "SELECT m.cloud_character_id AS cid, m.status, m.joined_at, m.left_at, cc.card_json AS card \
          FROM world_members m LEFT JOIN cloud_characters cc ON cc.id = m.cloud_character_id \
-         WHERE m.world_id = ? ORDER BY m.joined_at ASC, m.id ASC LIMIT ?",
+         WHERE m.world_id = $1 ORDER BY m.joined_at ASC, m.id ASC LIMIT $2",
     )
     .bind(world_id)
     .bind(footprint_limit)
@@ -951,7 +951,7 @@ async fn seal_be_biography_tx(
     let now = crate::db::now_ms();
     sqlx::query(
         "INSERT INTO world_biographies (world_id, kind, terminal_reason, ending_id, summary_json, sealed_at) \
-         VALUES (?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(world_id)
     .bind(BIOGRAPHY_KIND_BE)
@@ -965,7 +965,7 @@ async fn seal_be_biography_tx(
     // 全链审计（§0.2）：封卷这件事本身也留痕。
     sqlx::query(
         "INSERT INTO audit_logs (id, actor_id, actor_role, action, subject, reason, created_at) \
-         VALUES (?, 'system', 'system', 'world.be_biography_sealed', ?, ?, ?)",
+         VALUES ($1, 'system', 'system', 'world.be_biography_sealed', $2, $3, $4)",
     )
     .bind(crate::db::new_id("aud"))
     .bind(world_id)
@@ -999,7 +999,7 @@ async fn seal_be_biography_tx(
 pub(crate) async fn total_mileage(db: &AnyPool, owner_id: &str) -> Result<i64, ApiError> {
     let rows: Vec<(i64,)> = sqlx::query_as(
         "SELECT mileage FROM cloud_characters \
-         WHERE owner_id = ? AND (withdrawn = 0 OR memorial_status = 'sealed')",
+         WHERE owner_id = $1 AND (withdrawn = 0 OR memorial_status = 'sealed')",
     )
     .bind(owner_id)
     .fetch_all(db)
@@ -1010,7 +1010,7 @@ pub(crate) async fn total_mileage(db: &AnyPool, owner_id: &str) -> Result<i64, A
 /// owner 现有未撤回云端角色数（发布卡位校验的分子）。
 pub(crate) async fn count_active_cards(db: &AnyPool, owner_id: &str) -> Result<i64, ApiError> {
     let n: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM cloud_characters WHERE owner_id = ? AND withdrawn = 0")
+        sqlx::query_scalar("SELECT COUNT(*) FROM cloud_characters WHERE owner_id = $1 AND withdrawn = 0")
             .bind(owner_id)
             .fetch_one(db)
             .await?;
@@ -1019,7 +1019,7 @@ pub(crate) async fn count_active_cards(db: &AnyPool, owner_id: &str) -> Result<i
 
 /// 用户当前卡位数（users.card_slots；行缺失按默认 3 兜底，不因历史数据报错）。
 pub(crate) async fn card_slots_of(db: &AnyPool, user_id: &str) -> Result<i64, ApiError> {
-    let slots: Option<i64> = sqlx::query_scalar("SELECT card_slots FROM users WHERE id = ?")
+    let slots: Option<i64> = sqlx::query_scalar("SELECT card_slots FROM users WHERE id = $1")
         .bind(user_id)
         .fetch_optional(db)
         .await?;
@@ -1059,7 +1059,7 @@ async fn unlock_card_slot(State(state): State<AppState>, user: AuthUser) -> Resu
         )));
     }
     // CAS：仅当卡位仍是读到的旧值才 +1（历练只增不减，阈值判定单调安全；并发解锁只成一次）。
-    let res = sqlx::query("UPDATE users SET card_slots = card_slots + 1, updated_at = ? WHERE id = ? AND card_slots = ?")
+    let res = sqlx::query("UPDATE users SET card_slots = card_slots + 1, updated_at = $1 WHERE id = $2 AND card_slots = $3")
         .bind(crate::db::now_ms())
         .bind(&user.user_id)
         .bind(slots)

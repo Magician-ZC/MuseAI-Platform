@@ -348,7 +348,7 @@ pub(super) async fn metrics_overview(
          CAST(off_peak AS BIGINT) AS off_peak_flag, \
          CAST(price_ratio_pct AS BIGINT) AS price_pct, \
          CAST(defer_ms AS BIGINT) AS defer_millis \
-         FROM world_ticks WHERE created_at >= ? AND created_at < ?",
+         FROM world_ticks WHERE created_at >= $1 AND created_at < $2",
     )
     .bind(cost_start)
     .bind(cost_end)
@@ -541,7 +541,7 @@ pub(super) async fn metrics_trends(
     };
 
     // ① 新增用户（users.created_at）。
-    let rows = sqlx::query("SELECT created_at FROM users WHERE created_at >= ? AND created_at < ?")
+    let rows = sqlx::query("SELECT created_at FROM users WHERE created_at >= $1 AND created_at < $2")
         .bind(start)
         .bind(end)
         .fetch_all(db)
@@ -555,7 +555,7 @@ pub(super) async fn metrics_trends(
     // ② tick：一条查询同时喂两个指标——当日有 tick 的 distinct 世界数 + 当日 token 消耗。
     let rows = sqlx::query(
         "SELECT world_id, cost_tokens, created_at FROM world_ticks \
-         WHERE created_at >= ? AND created_at < ?",
+         WHERE created_at >= $1 AND created_at < $2",
     )
     .bind(start)
     .bind(end)
@@ -570,7 +570,7 @@ pub(super) async fn metrics_trends(
 
     // ③ 世界事件（口径 world_events.occurred_at）。
     let rows =
-        sqlx::query("SELECT occurred_at FROM world_events WHERE occurred_at >= ? AND occurred_at < ?")
+        sqlx::query("SELECT occurred_at FROM world_events WHERE occurred_at >= $1 AND occurred_at < $2")
             .bind(start)
             .bind(end)
             .fetch_all(db)
@@ -584,7 +584,7 @@ pub(super) async fn metrics_trends(
     // ④ 礼物量（gift_events.gift_count；INTEGER 列 CAST 成 BIGINT 保证双库解码一致）。
     let rows = sqlx::query(
         "SELECT CAST(gift_count AS BIGINT) AS gift_count, created_at FROM gift_events \
-         WHERE created_at >= ? AND created_at < ?",
+         WHERE created_at >= $1 AND created_at < $2",
     )
     .bind(start)
     .bind(end)
@@ -601,7 +601,7 @@ pub(super) async fn metrics_trends(
     let rows = sqlx::query(
         "SELECT p.delta_cents, p.created_at FROM ledger_postings p \
          JOIN ledger_accounts a ON a.id = p.account_id \
-         WHERE a.kind = 'platform_revenue' AND p.created_at >= ? AND p.created_at < ?",
+         WHERE a.kind = 'platform_revenue' AND p.created_at >= $1 AND p.created_at < $2",
     )
     .bind(start)
     .bind(end)

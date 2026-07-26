@@ -19,7 +19,7 @@ use sqlx::{Any, AnyPool, Row, Transaction};
 use crate::admission::{self, AdmissionDecision, ItemDefinition, ItemOrigin, WorldAdmissionPolicy};
 use crate::app::AppState;
 use crate::auth::AuthUser;
-use crate::db::{new_id, now_ms};
+use crate::db::{new_id, now_ms, Placeholders};
 use crate::error::ApiError;
 use crate::idempotency;
 use crate::worlds::load_world;
@@ -46,7 +46,7 @@ fn map_item(row: &sqlx::any::AnyRow) -> Result<ItemDefinition, ApiError> {
 pub async fn load_item(db: &AnyPool, item_id: &str) -> Result<Option<ItemDefinition>, ApiError> {
     let row = sqlx::query(
         "SELECT id, narrative, effect_tags, origin_world_template_id, cosmology_json, power_tier \
-         FROM items WHERE id = ?",
+         FROM items WHERE id = $1",
     )
     .bind(item_id)
     .fetch_optional(db)
@@ -61,7 +61,7 @@ pub async fn load_item(db: &AnyPool, item_id: &str) -> Result<Option<ItemDefinit
 pub async fn load_admission_policy(db: &AnyPool, world_id: &str) -> Result<WorldAdmissionPolicy, ApiError> {
     let row = sqlx::query(
         "SELECT wt.admission_json AS aj FROM worlds w \
-         JOIN world_templates wt ON wt.id = w.template_id WHERE w.id = ?",
+         JOIN world_templates wt ON wt.id = w.template_id WHERE w.id = $1",
     )
     .bind(world_id)
     .fetch_optional(db)
@@ -86,7 +86,7 @@ pub(crate) async fn grant_item_tx(
     reward_hook_key: Option<&str>,
 ) -> Result<Option<String>, ApiError> {
     // 物品定义按 id 共享；已存在则跳过写入（SELECT-exists 守住常见路径，事务内避免不可移植的 upsert）。
-    let exists = sqlx::query("SELECT 1 AS x FROM items WHERE id = ?")
+    let exists = sqlx::query("SELECT 1 AS x FROM items WHERE id = $1")
         .bind(&item.id)
         .fetch_optional(&mut **tx)
         .await?
@@ -94,7 +94,7 @@ pub(crate) async fn grant_item_tx(
     if !exists {
         sqlx::query(
             "INSERT INTO items (id, narrative, effect_tags, origin_world_template_id, cosmology_json, power_tier, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(&item.id)
         .bind(&item.narrative)
@@ -110,7 +110,7 @@ pub(crate) async fn grant_item_tx(
     let bp_id = new_id("bp");
     let res = sqlx::query(
         "INSERT INTO backpacks (id, user_id, item_id, acquired_world_id, status, carried_world_id, reward_hook_key, acquired_at) \
-         VALUES (?, ?, ?, ?, 'owned', NULL, ?, ?)",
+         VALUES ($1, $2, $3, $4, 'owned', NULL, $5, $6)",
     )
     .bind(&bp_id)
     .bind(user_id)
@@ -152,7 +152,7 @@ async fn my_backpack(State(state): State<AppState>, user: AuthUser) -> Result<Js
         "SELECT b.id AS bp_id, b.status AS bp_status, b.acquired_world_id, b.carried_world_id, b.acquired_at, \
          i.id AS id, i.narrative, i.effect_tags, i.origin_world_template_id, i.cosmology_json, i.power_tier \
          FROM backpacks b JOIN items i ON i.id = b.item_id \
-         WHERE b.user_id = ? AND b.status != 'consumed' ORDER BY b.acquired_at DESC",
+         WHERE b.user_id = $1 AND b.status != 'consumed' ORDER BY b.acquired_at DESC",
     )
     .bind(&user.user_id)
     .fetch_all(&state.db)
@@ -209,12 +209,15 @@ async fn last_interaction_by_pair(
     if world_ids.is_empty() {
         return Ok(out);
     }
-    let placeholders = vec!["?"; world_ids.len()].join(",");
+    // 发号顺序 = 下面的 bind 顺序：先 user_id，再整串 world_ids。
+    let mut ph = Placeholders::new();
+    let user = ph.take();
+    let placeholders = ph.list(world_ids.len());
     // CAST(MAX(...) AS BIGINT)：双库可移植子集，PG/SQLite 通用，解码类型确定（同 worlds_ops 聚合先例）。
     let sql = format!(
         "SELECT world_id, character_id, CAST(MAX(created_at) AS BIGINT) AS last_at \
          FROM interventions \
-         WHERE user_id = ? AND status IN ('accepted', 'applied') AND world_id IN ({placeholders}) \
+         WHERE user_id = {user} AND status IN ('accepted', 'applied') AND world_id IN ({placeholders}) \
          GROUP BY world_id, character_id"
     );
     let mut query = sqlx::query(&sql).bind(user_id);
@@ -258,7 +261,7 @@ async fn my_memberships(State(state): State<AppState>, user: AuthUser) -> Result
          FROM world_members wm \
          JOIN worlds w ON w.id = wm.world_id \
          JOIN cloud_characters cc ON cc.id = wm.cloud_character_id \
-         WHERE wm.user_id = ? AND wm.status = 'active' \
+         WHERE wm.user_id = $1 AND wm.status = 'active' \
          ORDER BY wm.joined_at DESC, wm.id DESC",
     )
     .bind(&user.user_id)
@@ -367,7 +370,7 @@ async fn carry(
     let mut owned: Vec<Owned> = Vec::new();
     for item_id in &body.item_ids {
         let bp = sqlx::query(
-            "SELECT id FROM backpacks WHERE user_id = ? AND item_id = ? AND status != 'consumed' LIMIT 1",
+            "SELECT id FROM backpacks WHERE user_id = $1 AND item_id = $2 AND status != 'consumed' LIMIT 1",
         )
         .bind(&user.user_id)
         .bind(item_id)
@@ -397,7 +400,7 @@ async fn carry(
         return Err(ApiError::Conflict("world_not_joinable".into()));
     }
     let is_member = sqlx::query(
-        "SELECT 1 AS x FROM world_members WHERE world_id = ? AND user_id = ? AND status = 'active' LIMIT 1",
+        "SELECT 1 AS x FROM world_members WHERE world_id = $1 AND user_id = $2 AND status = 'active' LIMIT 1",
     )
     .bind(&world_id)
     .bind(&user.user_id)
@@ -432,8 +435,8 @@ async fn carry(
             .as_ref()
             .map(|t| serde_json::to_string(&t.effect_tags).unwrap_or_else(|_| "[]".into()));
         sqlx::query(
-            "UPDATE backpacks SET status = ?, carried_world_id = ?, power_tier_override = ?, \
-             effect_tags_override = ? WHERE id = ?",
+            "UPDATE backpacks SET status = $1, carried_world_id = $2, power_tier_override = $3, \
+             effect_tags_override = $4 WHERE id = $5",
         )
         .bind(new_status)
         .bind(carried_world)
@@ -480,7 +483,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, \
              rights_declaration, moderation, withdrawn, created_at) \
-             VALUES (?, ?, 'local', 1, ?, 'original', 'approved', 0, ?)",
+             VALUES ($1, $2, 'local', 1, $3, 'original', 'approved', 0, $4)",
         )
         .bind(id)
         .bind(owner)
@@ -494,8 +497,8 @@ mod tests {
     /// 给已播种的角色补头像（object_key/url/裁决）。裁决取 approved / pending / rejected。
     async fn set_avatar(db: &AnyPool, char_id: &str, url: &str, moderation: &str) {
         sqlx::query(
-            "UPDATE cloud_characters SET avatar_object_key = ?, avatar_url = ?, avatar_moderation = ? \
-             WHERE id = ?",
+            "UPDATE cloud_characters SET avatar_object_key = $1, avatar_url = $2, avatar_moderation = $3 \
+             WHERE id = $4",
         )
         .bind(format!("obj/{char_id}"))
         .bind(url)
@@ -520,7 +523,7 @@ mod tests {
     ) {
         sqlx::query(
             "INSERT INTO interventions (id, world_id, user_id, character_id, kind, payload_json, \
-             expected_revision, status, created_at) VALUES (?, ?, ?, ?, ?, '{}', 0, ?, ?)",
+             expected_revision, status, created_at) VALUES ($1, $2, $3, $4, $5, '{}', 0, $6, $7)",
         )
         .bind(id)
         .bind(world)
@@ -742,7 +745,7 @@ mod tests {
         seed_cloud_char(&state.db, "c1", "u1", &json!({ "identity": { "name": "沈霜" } }).to_string()).await;
         seed_member(&state.db, "m1", "w1", "u1", "c1", "active").await;
         // 世界带上关系图：即便有数据，本端点也不得据此合成任何强度值。
-        sqlx::query("UPDATE worlds SET narrative_state_json = ? WHERE id = 'w1'")
+        sqlx::query("UPDATE worlds SET narrative_state_json = $1 WHERE id = 'w1'")
             .bind(
                 json!({ "relations": [
                     { "from": "c1", "to": "npcX", "trust": 0.8, "affinity": 0.9, "fear": 0.0, "debt": 0.0 }

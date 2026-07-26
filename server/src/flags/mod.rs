@@ -673,7 +673,7 @@ async fn query_rows(db: &AnyPool, flag: Option<&str>) -> Result<Vec<FlagRecord>,
     let base = "SELECT id, flag, scope, target_id, enabled, starts_at, ends_at, \
                 updated_by, updated_at, reason, created_at FROM runtime_flags";
     let rows = match flag {
-        Some(f) => sqlx::query(&format!("{base} WHERE flag = ?")).bind(f).fetch_all(db).await?,
+        Some(f) => sqlx::query(&format!("{base} WHERE flag = $1")).bind(f).fetch_all(db).await?,
         None => sqlx::query(base).fetch_all(db).await?,
     };
     Ok(rows.iter().map(row_to_record).collect())
@@ -776,9 +776,9 @@ pub struct SetFlag<'a> {
 pub async fn set_flag(db: &AnyPool, p: SetFlag<'_>) -> Result<String, sqlx::Error> {
     let now = now_ms();
     let updated = sqlx::query(
-        "UPDATE runtime_flags SET enabled = ?, starts_at = ?, ends_at = ?, \
-         updated_by = ?, updated_at = ?, reason = ? \
-         WHERE flag = ? AND scope = ? AND target_id = ?",
+        "UPDATE runtime_flags SET enabled = $1, starts_at = $2, ends_at = $3, \
+         updated_by = $4, updated_at = $5, reason = $6 \
+         WHERE flag = $7 AND scope = $8 AND target_id = $9",
     )
     .bind(if p.enabled { 1_i64 } else { 0_i64 })
     .bind(p.starts_at)
@@ -794,7 +794,7 @@ pub async fn set_flag(db: &AnyPool, p: SetFlag<'_>) -> Result<String, sqlx::Erro
 
     if updated.rows_affected() > 0 {
         let id: String = sqlx::query_scalar(
-            "SELECT id FROM runtime_flags WHERE flag = ? AND scope = ? AND target_id = ?",
+            "SELECT id FROM runtime_flags WHERE flag = $1 AND scope = $2 AND target_id = $3",
         )
         .bind(p.flag)
         .bind(p.scope)
@@ -807,7 +807,7 @@ pub async fn set_flag(db: &AnyPool, p: SetFlag<'_>) -> Result<String, sqlx::Erro
     let id = crate::db::new_id("flg");
     let ins = sqlx::query(
         "INSERT INTO runtime_flags (id, flag, scope, target_id, enabled, starts_at, ends_at, \
-         updated_by, updated_at, reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         updated_by, updated_at, reason, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
     )
     .bind(&id)
     .bind(p.flag)
@@ -828,9 +828,9 @@ pub async fn set_flag(db: &AnyPool, p: SetFlag<'_>) -> Result<String, sqlx::Erro
         // 撞唯一索引 = 并发对手先建好了；改走 UPDATE，后写的赢。
         Err(_) => {
             sqlx::query(
-                "UPDATE runtime_flags SET enabled = ?, starts_at = ?, ends_at = ?, \
-                 updated_by = ?, updated_at = ?, reason = ? \
-                 WHERE flag = ? AND scope = ? AND target_id = ?",
+                "UPDATE runtime_flags SET enabled = $1, starts_at = $2, ends_at = $3, \
+                 updated_by = $4, updated_at = $5, reason = $6 \
+                 WHERE flag = $7 AND scope = $8 AND target_id = $9",
             )
             .bind(if p.enabled { 1_i64 } else { 0_i64 })
             .bind(p.starts_at)
@@ -844,7 +844,7 @@ pub async fn set_flag(db: &AnyPool, p: SetFlag<'_>) -> Result<String, sqlx::Erro
             .execute(db)
             .await?;
             sqlx::query_scalar(
-                "SELECT id FROM runtime_flags WHERE flag = ? AND scope = ? AND target_id = ?",
+                "SELECT id FROM runtime_flags WHERE flag = $1 AND scope = $2 AND target_id = $3",
             )
             .bind(p.flag)
             .bind(p.scope)
@@ -859,7 +859,7 @@ pub async fn set_flag(db: &AnyPool, p: SetFlag<'_>) -> Result<String, sqlx::Erro
 pub async fn get_record(db: &AnyPool, id: &str) -> Result<Option<FlagRecord>, sqlx::Error> {
     let row = sqlx::query(
         "SELECT id, flag, scope, target_id, enabled, starts_at, ends_at, \
-         updated_by, updated_at, reason, created_at FROM runtime_flags WHERE id = ?",
+         updated_by, updated_at, reason, created_at FROM runtime_flags WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(db)
@@ -869,6 +869,6 @@ pub async fn get_record(db: &AnyPool, id: &str) -> Result<Option<FlagRecord>, sq
 
 /// 删除一条记录（= 该目标回落到更宽作用域 / env）。
 pub async fn delete_record(db: &AnyPool, id: &str) -> Result<u64, sqlx::Error> {
-    let r = sqlx::query("DELETE FROM runtime_flags WHERE id = ?").bind(id).execute(db).await?;
+    let r = sqlx::query("DELETE FROM runtime_flags WHERE id = $1").bind(id).execute(db).await?;
     Ok(r.rows_affected())
 }

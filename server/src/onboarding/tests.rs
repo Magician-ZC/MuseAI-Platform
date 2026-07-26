@@ -58,7 +58,7 @@ fn token(state: &AppState, user_id: &str) -> String {
 async fn seed_user(db: &AnyPool, id: &str) {
     sqlx::query(
         "INSERT INTO users (id, nickname, age_declared, status, created_at, updated_at) \
-         VALUES (?, '', 1, 'active', ?, ?)",
+         VALUES ($1, '', 1, 'active', $2, $3)",
     )
     .bind(id)
     .bind(now_ms())
@@ -74,7 +74,7 @@ async fn seed_model_routes(db: &AnyPool, version: &str) {
     let routes = json!({
         "default": { "interface": "OpenAI-compatible", "baseUrl": "http://mock", "apiKey": "k", "model": "mock-model" }
     });
-    sqlx::query("INSERT INTO model_routes (id, version, routes_json, active, created_at) VALUES (?, ?, ?, 1, ?)")
+    sqlx::query("INSERT INTO model_routes (id, version, routes_json, active, created_at) VALUES ($1, $2, $3, 1, $4)")
         .bind(new_id("mr"))
         .bind(version)
         .bind(routes.to_string())
@@ -193,7 +193,7 @@ async fn endpoints_are_absent_when_switch_off_by_default() {
         assert_eq!(st, StatusCode::NOT_FOUND, "{method} {uri} 在开关关闭时应 404");
     }
     // 关闭态下不得有任何发放副作用。
-    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM onboarding_grants WHERE user_id = ?", "u_off").await, 0);
+    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM onboarding_grants WHERE user_id = $1", "u_off").await, 0);
 }
 
 /// 读取侧降级：**已经领过**的用户，在开关被关掉后同样读不出、开不了演（可逆急停阀）。
@@ -209,7 +209,7 @@ async fn existing_grant_is_unreadable_after_switch_off() {
         let (st, _) = post_json(&app, "/api/me/onboarding/gift", &tok, None, json!({})).await;
         assert_eq!(st, StatusCode::OK);
     }
-    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM onboarding_grants WHERE user_id = ?", "u_rev").await, 1);
+    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM onboarding_grants WHERE user_id = $1", "u_rev").await, 1);
 
     let _off = OnboardingSwitch::set(false);
     let (st, _) = get_json(&app, "/api/me/onboarding", &tok).await;
@@ -236,19 +236,19 @@ async fn claim_is_idempotent_without_idempotency_key() {
     assert_eq!(s2, StatusCode::OK, "重复领取是幂等成功，不是错误");
     assert_eq!(b1, b2, "两次领取必须返回逐字节相同的回执");
 
-    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM onboarding_grants WHERE user_id = ?", "u_idem").await, 1);
+    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM onboarding_grants WHERE user_id = $1", "u_idem").await, 1);
     assert_eq!(
-        count(&state.db, "SELECT COUNT(*) FROM cloud_characters WHERE owner_id = ?", "u_idem").await,
+        count(&state.db, "SELECT COUNT(*) FROM cloud_characters WHERE owner_id = $1", "u_idem").await,
         1,
         "只发一张预制卡"
     );
     assert_eq!(
-        count(&state.db, "SELECT COUNT(*) FROM worlds WHERE host_user_id = ?", "u_idem").await,
+        count(&state.db, "SELECT COUNT(*) FROM worlds WHERE host_user_id = $1", "u_idem").await,
         1,
         "只建一个微本世界（第二次领取的建房必须随事务回滚，不留残行）"
     );
     assert_eq!(
-        count(&state.db, "SELECT COUNT(*) FROM world_budgets WHERE world_id IN (SELECT id FROM worlds WHERE host_user_id = ?)", "u_idem").await,
+        count(&state.db, "SELECT COUNT(*) FROM world_budgets WHERE world_id IN (SELECT id FROM worlds WHERE host_user_id = $1)", "u_idem").await,
         1,
         "预算行同样不得残留"
     );
@@ -287,7 +287,7 @@ async fn claim_idempotency_key_returns_cached_response() {
     assert_eq!(s1, StatusCode::OK);
     assert_eq!(s2, StatusCode::OK);
     assert_eq!(b1, b2);
-    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM onboarding_grants WHERE user_id = ?", "u_key").await, 1);
+    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM onboarding_grants WHERE user_id = $1", "u_key").await, 1);
 }
 
 /// 未知 presetId → 400（绝不静默发一张别的卡）。
@@ -302,7 +302,7 @@ async fn unknown_preset_id_is_rejected() {
     let (st, _) =
         post_json(&app, "/api/me/onboarding/gift", &tok, None, json!({ "presetId": "preset_不存在" })).await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
-    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM onboarding_grants WHERE user_id = ?", "u_bad").await, 0);
+    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM onboarding_grants WHERE user_id = $1", "u_bad").await, 0);
 }
 
 // ==================== ③ 预制卡 approved 且能 join ====================
@@ -323,7 +323,7 @@ async fn preset_card_is_approved_and_passes_join() {
     let cid = body["cloudCharacterId"].as_str().unwrap().to_string();
 
     let row = sqlx::query(
-        "SELECT moderation, withdrawn, pristine, source_fingerprint, mileage FROM cloud_characters WHERE id = ?",
+        "SELECT moderation, withdrawn, pristine, source_fingerprint, mileage FROM cloud_characters WHERE id = $1",
     )
     .bind(&cid)
     .fetch_one(&state.db)
@@ -369,7 +369,7 @@ async fn microworld_advances_at_least_one_tick_with_single_player() {
     let (wid, cid) = claim_join_start(&app, &tok).await;
 
     // 只有一名玩家成员。
-    let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_members WHERE world_id = ? AND status='active'")
+    let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_members WHERE world_id = $1 AND status='active'")
         .bind(&wid)
         .fetch_one(&state.db)
         .await
@@ -389,7 +389,7 @@ async fn microworld_advances_at_least_one_tick_with_single_player() {
 
     // 装配确实钉进了 2 个 NPC（这是过门的实际原因，直接断言而不是只看结论）。
     let assembled: Option<String> =
-        sqlx::query_scalar("SELECT assembled_json FROM worlds WHERE id = ?").bind(&wid).fetch_one(&state.db).await.unwrap();
+        sqlx::query_scalar("SELECT assembled_json FROM worlds WHERE id = $1").bind(&wid).fetch_one(&state.db).await.unwrap();
     let assembled: Value = serde_json::from_str(&assembled.expect("首 tick 应触发装配")).unwrap();
     let npcs = assembled.pointer("/assembly/worldCharacterEntries").and_then(Value::as_array).unwrap();
     assert_eq!(npcs.len(), 2, "骨架的 2 个 NPC 必须全部过机审并钉进实例");
@@ -399,9 +399,9 @@ async fn microworld_advances_at_least_one_tick_with_single_player() {
 
     // 状态真的推进了（不是 noop）。
     let rev: i64 =
-        sqlx::query_scalar("SELECT state_revision FROM worlds WHERE id = ?").bind(&wid).fetch_one(&state.db).await.unwrap();
+        sqlx::query_scalar("SELECT state_revision FROM worlds WHERE id = $1").bind(&wid).fetch_one(&state.db).await.unwrap();
     assert_eq!(rev, 1, "state_revision 应从 0 推进到 1");
-    let done: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_ticks WHERE world_id = ? AND status='done'")
+    let done: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_ticks WHERE world_id = $1 AND status='done'")
         .bind(&wid)
         .fetch_one(&state.db)
         .await
@@ -439,7 +439,7 @@ async fn microworld_concludes_within_max_ticks() {
     assert!(matches!(statuses.last(), Some(TickStatus::Concluded)), "微本必须在上限内收束: {statuses:?}");
 
     let status: String =
-        sqlx::query_scalar("SELECT status FROM worlds WHERE id = ?").bind(&wid).fetch_one(&state.db).await.unwrap();
+        sqlx::query_scalar("SELECT status FROM worlds WHERE id = $1").bind(&wid).fetch_one(&state.db).await.unwrap();
     assert_eq!(status, "ended");
 
     // 状态端点据此判「完成微本」（T0 门槛「10 分钟内完成首个微本」的读口径）。
@@ -466,7 +466,7 @@ async fn start_requires_join_and_is_idempotent() {
     let (st, _) = post_json(&app, "/api/me/onboarding/microworld/start", &tok, None, json!({})).await;
     assert_eq!(st, StatusCode::CONFLICT, "未投放不得开演");
     let s: String =
-        sqlx::query_scalar("SELECT status FROM worlds WHERE id = ?").bind(&wid).fetch_one(&state.db).await.unwrap();
+        sqlx::query_scalar("SELECT status FROM worlds WHERE id = $1").bind(&wid).fetch_one(&state.db).await.unwrap();
     assert_eq!(s, "open");
 
     post_json(&app, &format!("/api/worlds/{wid}/join"), &tok, None, json!({ "cloudCharacterId": cid })).await;
@@ -490,7 +490,7 @@ async fn claim_rejected_when_card_slots_full() {
         sqlx::query(
             "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, \
              rights_declaration, moderation, withdrawn, created_at) \
-             VALUES (?, 'u_slot', ?, 1, '{}', 'original', 'approved', 0, ?)",
+             VALUES ($1, 'u_slot', $2, 1, '{}', 'original', 'approved', 0, $3)",
         )
         .bind(format!("cc_slot_{i}"))
         .bind(format!("local_{i}"))
@@ -505,7 +505,7 @@ async fn claim_rejected_when_card_slots_full() {
     let (st, body) = post_json(&app, "/api/me/onboarding/gift", &tok, None, json!({})).await;
     assert_eq!(st, StatusCode::CONFLICT, "卡位满应拒绝领取: {body}");
     assert!(body["error"]["message"].as_str().unwrap().contains("卡位已满"));
-    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM onboarding_grants WHERE user_id = ?", "u_slot").await, 0);
+    assert_eq!(count(&state.db, "SELECT COUNT(*) FROM onboarding_grants WHERE user_id = $1", "u_slot").await, 0);
 
     // 撤回一张释放卡位后即可领取（卡位是可解的约束，不是死门）。
     sqlx::query("UPDATE cloud_characters SET withdrawn = 1 WHERE id = 'cc_slot_0'").execute(&state.db).await.unwrap();
@@ -554,7 +554,7 @@ async fn two_users_preset_cards_can_join_same_world() {
         .await;
         assert_eq!(st, StatusCode::OK, "{u} 的预制卡不应被同源唯一拦下: {body}");
     }
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_members WHERE world_id = ? AND status='active'")
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_members WHERE world_id = $1 AND status='active'")
         .bind(&shared)
         .fetch_one(&state.db)
         .await
@@ -642,7 +642,7 @@ async fn ensure_template_is_idempotent_and_versions_on_change() {
     assert_eq!(v2, v1 + 1, "骨架变了 → 升版（老世界仍按钉住的老版本跑）");
 
     use sqlx::Row;
-    let row = sqlx::query("SELECT room_type, moderation, star_rating, official FROM world_templates WHERE id = ?")
+    let row = sqlx::query("SELECT room_type, moderation, star_rating, official FROM world_templates WHERE id = $1")
         .bind(microworld::MICROWORLD_TEMPLATE_ID)
         .fetch_one(&state.db)
         .await

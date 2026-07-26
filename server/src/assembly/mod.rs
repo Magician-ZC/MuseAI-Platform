@@ -1959,7 +1959,7 @@ async fn load_container_cards(
         }
         let row = sqlx::query(
             "SELECT owner_id, star_rating, status, source_template_id, source_template_version \
-             FROM subplot_cards WHERE id = ?",
+             FROM subplot_cards WHERE id = $1",
         )
         .bind(card_id)
         .fetch_optional(db)
@@ -1995,7 +1995,7 @@ async fn load_container_cards(
         }
         // 蓝图解引用：卡的内容 = 来源模板骨架。下架/未过审的来源 → 停止后续建房（§3.1）。
         let tpl = sqlx::query(
-            "SELECT skeleton_json, moderation, withdrawn FROM world_templates WHERE id = ?",
+            "SELECT skeleton_json, moderation, withdrawn FROM world_templates WHERE id = $1",
         )
         .bind(&tpl_id)
         .fetch_optional(db)
@@ -2039,7 +2039,7 @@ async fn record_container_cards(
         return Ok(());
     }
     let existing: Vec<String> =
-        sqlx::query("SELECT card_id FROM world_container_cards WHERE world_id = ?")
+        sqlx::query("SELECT card_id FROM world_container_cards WHERE world_id = $1")
             .bind(&world.id)
             .fetch_all(db)
             .await?
@@ -2055,7 +2055,7 @@ async fn record_container_cards(
         sqlx::query(
             "INSERT INTO world_container_cards \
              (id, world_id, card_id, card_version, owner_id, template_id, slot_no, assembled_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(crate::db::new_id("wcc"))
         .bind(&world.id)
@@ -2086,7 +2086,7 @@ pub(crate) fn empty_chapter_state() -> Value {
 
 /// 读取 worlds.assembled_json 包装对象；未装配则返回 {assembly:null, chapterState:初值}。
 pub(crate) async fn load_wrapper(db: &AnyPool, world_id: &str) -> Result<Value, ApiError> {
-    let row = sqlx::query("SELECT assembled_json FROM worlds WHERE id = ?")
+    let row = sqlx::query("SELECT assembled_json FROM worlds WHERE id = $1")
         .bind(world_id)
         .fetch_optional(db)
         .await?
@@ -2101,7 +2101,7 @@ pub(crate) async fn load_wrapper(db: &AnyPool, world_id: &str) -> Result<Value, 
 
 /// 写回 worlds.assembled_json 包装对象。
 pub(crate) async fn save_wrapper(db: &AnyPool, world_id: &str, wrapper: &Value) -> Result<(), ApiError> {
-    sqlx::query("UPDATE worlds SET assembled_json = ?, updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE worlds SET assembled_json = $1, updated_at = $2 WHERE id = $3")
         .bind(wrapper.to_string())
         .bind(now_ms())
         .bind(world_id)
@@ -2303,7 +2303,7 @@ pub async fn assemble_instance(state: &AppState, world_id: &str) -> Result<Assem
     // C-7：首次装配并发保护——仅当尚未装配（assembled_json IS NULL）时占位写入（CAS）。
     // 输了竞争（已被并发 start 装配写入）→ 复用已持久化结果，避免覆盖导致 chapterState 重置 / 装配发散。
     let claimed = sqlx::query(
-        "UPDATE worlds SET assembled_json = ?, updated_at = ? WHERE id = ? AND assembled_json IS NULL",
+        "UPDATE worlds SET assembled_json = $1, updated_at = $2 WHERE id = $3 AND assembled_json IS NULL",
     )
     .bind(wrapper.to_string())
     .bind(now_ms())
@@ -2337,7 +2337,7 @@ async fn load_skeleton(
     template_id: &str,
 ) -> Result<(Skeleton, i64, crate::admission::WorldAdmissionPolicy), ApiError> {
     let row =
-        sqlx::query("SELECT skeleton_json, star_rating, admission_json FROM world_templates WHERE id = ?")
+        sqlx::query("SELECT skeleton_json, star_rating, admission_json FROM world_templates WHERE id = $1")
             .bind(template_id)
             .fetch_optional(db)
             .await?;
@@ -2360,7 +2360,7 @@ async fn load_active_cards(db: &AnyPool, world_id: &str) -> Result<Vec<(String, 
     let rows = sqlx::query(
         "SELECT wm.cloud_character_id AS cid, cc.card_json AS card \
          FROM world_members wm JOIN cloud_characters cc ON cc.id = wm.cloud_character_id \
-         WHERE wm.world_id = ? AND wm.status = 'active' \
+         WHERE wm.world_id = $1 AND wm.status = 'active' \
          ORDER BY wm.joined_at ASC, wm.cloud_character_id ASC",
     )
     .bind(world_id)
@@ -4489,7 +4489,7 @@ mod container_tests {
         sqlx::query(
             "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, \
              official, version, moderation, star_rating, created_at) \
-             VALUES (?, '容器模板', 'chapter', ?, '{\"mode\":\"open\"}', 1, 1, 'approved', ?, ?)",
+             VALUES ($1, '容器模板', 'chapter', $2, '{\"mode\":\"open\"}', 1, 1, 'approved', $3, $4)",
         )
         .bind(id)
         .bind(skeleton.to_string())
@@ -4505,7 +4505,7 @@ mod container_tests {
             "INSERT INTO worlds (id, template_id, template_version, engine_version, prompt_set_version, \
              model_route_version, room_type, title, status, visibility, host_user_id, member_limit, \
              tick_per_day, state_revision, narrative_state_json, created_at, updated_at) \
-             VALUES (?, ?, 1, 'e1', 'p1', 'm1', 'chapter', '容器房', 'running', 'private', ?, 10, 3, 0, '{}', ?, ?)",
+             VALUES ($1, $2, 1, 'e1', 'p1', 'm1', 'chapter', '容器房', 'running', 'private', $3, 10, 3, 0, '{}', $4, $5)",
         )
         .bind(world_id)
         .bind(tpl)
@@ -4522,7 +4522,7 @@ mod container_tests {
             "INSERT INTO subplot_cards (id, owner_id, star_rating, label, origin_kind, grant_key, \
              source_world_id, source_template_id, source_template_version, synthesized_from_json, \
              status, acquired_at) \
-             VALUES (?, ?, ?, '剧情结晶', 'settlement', ?, 'w_src', ?, ?, '[]', 'owned', ?)",
+             VALUES ($1, $2, $3, '剧情结晶', 'settlement', $4, 'w_src', $5, $6, '[]', 'owned', $7)",
         )
         .bind(id)
         .bind(owner)
@@ -4538,7 +4538,7 @@ mod container_tests {
 
     /// 清掉已钉住的装配后重装（C-7 CAS 只允许首次写入）。
     async fn reassemble(state: &AppState, world_id: &str) -> String {
-        sqlx::query("UPDATE worlds SET assembled_json = NULL WHERE id = ?")
+        sqlx::query("UPDATE worlds SET assembled_json = NULL WHERE id = $1")
             .bind(world_id)
             .execute(&state.db)
             .await
@@ -4565,7 +4565,7 @@ mod container_tests {
         let with_container = reassemble(&state, "w_off").await;
 
         // 同一个世界、同一模板 id，只把 skeleton 换成"没有容器字段"的版本 → 产物必须逐字节相同。
-        sqlx::query("UPDATE world_templates SET skeleton_json = ? WHERE id = 'tpl_off'")
+        sqlx::query("UPDATE world_templates SET skeleton_json = $1 WHERE id = 'tpl_off'")
             .bind(container_json().to_string())
             .execute(&state.db)
             .await
@@ -4610,7 +4610,7 @@ mod container_tests {
 
         // 卡仍在手，一个字节都没被动过。
         for id in ["card_a", "card_b"] {
-            let row = sqlx::query("SELECT status, consumed_into FROM subplot_cards WHERE id = ?")
+            let row = sqlx::query("SELECT status, consumed_into FROM subplot_cards WHERE id = $1")
                 .bind(id)
                 .fetch_one(&state.db)
                 .await
@@ -4690,7 +4690,7 @@ mod container_tests {
             .unwrap();
         let mut c2 = container_json();
         c2["subplotCardRefs"] = json!([{ "cardId": "card_x", "cardVersion": 7 }]);
-        sqlx::query("UPDATE world_templates SET skeleton_json = ? WHERE id = 'tpl_reject'")
+        sqlx::query("UPDATE world_templates SET skeleton_json = $1 WHERE id = 'tpl_reject'")
             .bind(c2.to_string())
             .execute(&state.db)
             .await
@@ -4698,7 +4698,7 @@ mod container_tests {
         assert!(assemble_instance(&state, "w_r1").await.is_err(), "卡版本对不上必须拒绝（版本钉住）");
 
         // ⑤ 来源蓝图被下架 → 停止后续建房。
-        sqlx::query("UPDATE world_templates SET skeleton_json = ? WHERE id = 'tpl_reject'")
+        sqlx::query("UPDATE world_templates SET skeleton_json = $1 WHERE id = 'tpl_reject'")
             .bind(c.to_string())
             .execute(&state.db)
             .await
@@ -4735,7 +4735,7 @@ mod container_tests {
         }
         // 只读一次卡（解引用蓝图）是允许的，且必须是 SELECT。
         assert!(
-            src.contains("FROM SUBPLOT_CARDS WHERE ID = ?"),
+            src.contains("FROM SUBPLOT_CARDS WHERE ID = $1"),
             "装配层应当只以 SELECT 方式解引用副本卡（若本断言失败，多半是扫描截断点被前移了）"
         );
     }
@@ -4787,7 +4787,7 @@ mod member_order_tests {
         sqlx::query(
             "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, \
              rights_declaration, moderation, withdrawn, created_at) \
-             VALUES (?, 'u1', 'local', 1, ?, 'original', 'approved', 0, 0)",
+             VALUES ($1, 'u1', 'local', 1, $2, 'original', 'approved', 0, 0)",
         )
         .bind(id)
         .bind(card)
@@ -4805,7 +4805,7 @@ mod member_order_tests {
         for (world_id, first, second) in [("w_fwd", "c_alpha", "c_beta"), ("w_rev", "c_beta", "c_alpha")] {
             crate::safety::testkit::seed_world(&state.db, world_id, 0, "running").await;
             for cid in [first, second] {
-                if sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM cloud_characters WHERE id = ?")
+                if sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM cloud_characters WHERE id = $1")
                     .bind(cid)
                     .fetch_one(&state.db)
                     .await
@@ -4817,7 +4817,7 @@ mod member_order_tests {
                 // joined_at 恒为 777：模拟并发 join 撞同一毫秒。
                 sqlx::query(
                     "INSERT INTO world_members (id, world_id, user_id, cloud_character_id, \
-                     boundary_json, status, joined_at) VALUES (?, ?, 'u1', ?, '{}', 'active', 777)",
+                     boundary_json, status, joined_at) VALUES ($1, $2, 'u1', $3, '{}', 'active', 777)",
                 )
                 .bind(format!("m_{world_id}_{cid}"))
                 .bind(world_id)
@@ -4847,7 +4847,7 @@ mod member_order_tests {
             seed_char(&state.db, cid).await;
             sqlx::query(
                 "INSERT INTO world_members (id, world_id, user_id, cloud_character_id, \
-                 boundary_json, status, joined_at) VALUES (?, 'w_time', 'u1', ?, '{}', 'active', ?)",
+                 boundary_json, status, joined_at) VALUES ($1, 'w_time', 'u1', $2, '{}', 'active', $3)",
             )
             .bind(format!("m_{cid}"))
             .bind(cid)

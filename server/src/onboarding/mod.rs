@@ -264,7 +264,7 @@ struct Grant {
 
 async fn load_grant(db: &AnyPool, user_id: &str) -> Result<Option<Grant>, ApiError> {
     let Some(row) = sqlx::query(
-        "SELECT preset_id, cloud_character_id, world_id, created_at FROM onboarding_grants WHERE user_id = ?",
+        "SELECT preset_id, cloud_character_id, world_id, created_at FROM onboarding_grants WHERE user_id = $1",
     )
     .bind(user_id)
     .fetch_optional(db)
@@ -417,7 +417,7 @@ async fn claim_gift(
     sqlx::query(
         "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, \
          rights_declaration, moderation, withdrawn, source_fingerprint, pristine, created_at) \
-         VALUES (?, ?, ?, 1, ?, 'original', 'approved', 0, NULL, 0, ?)",
+         VALUES ($1, $2, $3, 1, $4, 'original', 'approved', 0, NULL, 0, $5)",
     )
     .bind(&cloud_character_id)
     .bind(&user.user_id)
@@ -500,7 +500,7 @@ async fn claim_gift(
     //    这就是「每人只领一次」的唯一权威，不依赖上面那条快路径的读-判-写。
     let res = sqlx::query(
         "INSERT INTO onboarding_grants (user_id, preset_id, cloud_character_id, world_id, created_at) \
-         VALUES (?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(&user.user_id)
     .bind(preset.id)
@@ -558,9 +558,9 @@ async fn my_onboarding(State(state): State<AppState>, user: AuthUser) -> Result<
 
     // 世界状态 + 本人是否已把卡投放进去（只读 world_members，绝不写，见模块头 ②）。
     let world_status: Option<String> =
-        sqlx::query_scalar("SELECT status FROM worlds WHERE id = ?").bind(&g.world_id).fetch_optional(&state.db).await?;
+        sqlx::query_scalar("SELECT status FROM worlds WHERE id = $1").bind(&g.world_id).fetch_optional(&state.db).await?;
     let joined: bool = sqlx::query(
-        "SELECT 1 AS x FROM world_members WHERE world_id = ? AND cloud_character_id = ? AND status = 'active' LIMIT 1",
+        "SELECT 1 AS x FROM world_members WHERE world_id = $1 AND cloud_character_id = $2 AND status = 'active' LIMIT 1",
     )
     .bind(&g.world_id)
     .bind(&g.cloud_character_id)
@@ -568,7 +568,7 @@ async fn my_onboarding(State(state): State<AppState>, user: AuthUser) -> Result<
     .await?
     .is_some();
     // 已跑过的拍数（观演进度；world_ticks 是唯一事实源）。
-    let ticks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_ticks WHERE world_id = ? AND status = 'done'")
+    let ticks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_ticks WHERE world_id = $1 AND status = 'done'")
         .bind(&g.world_id)
         .fetch_one(&state.db)
         .await?;
@@ -617,8 +617,8 @@ async fn start_microworld(State(state): State<AppState>, user: AuthUser) -> Resu
         .ok_or_else(|| ApiError::Conflict("还没有领取新人礼包，请先领取再开演".into()))?;
 
     let joined: bool = sqlx::query(
-        "SELECT 1 AS x FROM world_members WHERE world_id = ? AND cloud_character_id = ? \
-         AND user_id = ? AND status = 'active' LIMIT 1",
+        "SELECT 1 AS x FROM world_members WHERE world_id = $1 AND cloud_character_id = $2 \
+         AND user_id = $3 AND status = 'active' LIMIT 1",
     )
     .bind(&g.world_id)
     .bind(&g.cloud_character_id)
@@ -635,8 +635,8 @@ async fn start_microworld(State(state): State<AppState>, user: AuthUser) -> Resu
 
     // 归属守卫写进 SQL（`host_user_id = 本人`）：即便登记行被人篡改指向别人的世界，也开不动它。
     let res = sqlx::query(
-        "UPDATE worlds SET status = 'running', updated_at = ? \
-         WHERE id = ? AND status = 'open' AND host_user_id = ?",
+        "UPDATE worlds SET status = 'running', updated_at = $1 \
+         WHERE id = $2 AND status = 'open' AND host_user_id = $3",
     )
     .bind(now_ms())
     .bind(&g.world_id)
@@ -645,7 +645,7 @@ async fn start_microworld(State(state): State<AppState>, user: AuthUser) -> Resu
     .await?;
 
     if res.rows_affected() == 0 {
-        let status: String = sqlx::query_scalar("SELECT status FROM worlds WHERE id = ?")
+        let status: String = sqlx::query_scalar("SELECT status FROM worlds WHERE id = $1")
             .bind(&g.world_id)
             .fetch_optional(&state.db)
             .await?

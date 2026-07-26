@@ -32,7 +32,7 @@ pub async fn pick_highlight_event(
     // 被运行时词库拦下的事件仍落库留痕供人审，但绝不可进切片。
     let rows = sqlx::query(
         "SELECT id, event_type, arbiter_note, public_projection_json, sequence \
-         FROM world_events WHERE world_id = ? AND visibility = 'public' \
+         FROM world_events WHERE world_id = $1 AND visibility = 'public' \
          AND moderation = 'approved' ORDER BY sequence ASC",
     )
     .bind(world_id)
@@ -83,7 +83,7 @@ pub async fn generate_clip(
 ) -> Result<String, ApiError> {
     let row = sqlx::query(
         "SELECT event_type, actors_json, public_projection_json, visibility, moderation \
-         FROM world_events WHERE id = ? AND world_id = ?",
+         FROM world_events WHERE id = $1 AND world_id = $2",
     )
     .bind(event_id)
     .bind(world_id)
@@ -139,7 +139,7 @@ pub async fn generate_clip(
     // 记 clip_jobs。
     sqlx::query(
         "INSERT INTO clip_jobs (id, world_id, event_id, object_key, status, created_at) \
-         VALUES (?, ?, ?, ?, 'done', ?)",
+         VALUES ($1, $2, $3, $4, 'done', $5)",
     )
     .bind(&clip_id)
     .bind(world_id)
@@ -207,7 +207,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO world_events (id, world_id, tick_no, sequence, domain_event_id, event_type, \
              actors_json, visibility, public_projection_json, occurred_at) \
-             VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES ($1, $2, 0, $3, $4, $5, $6, $7, $8, $9)",
         )
         .bind(id)
         .bind(world_id)

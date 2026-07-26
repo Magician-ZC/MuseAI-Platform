@@ -67,7 +67,7 @@ async fn open_flag(state: &AppState, scope: &str, target: &str) {
     sqlx::query(
         "INSERT INTO runtime_flags (id, flag, scope, target_id, enabled, starts_at, ends_at, \
          updated_by, updated_at, reason, created_at) \
-         VALUES (?, ?, ?, ?, 1, 0, 0, 'test', ?, '用例开闸', ?)",
+         VALUES ($1, $2, $3, $4, 1, 0, 0, 'test', $5, '用例开闸', $6)",
     )
     .bind(new_id("rf"))
     .bind(ENV_OOC_ANNOTATIONS)
@@ -85,7 +85,7 @@ async fn seed_char(state: &AppState, id: &str, owner: &str) {
     sqlx::query(
         "INSERT INTO cloud_characters (id, owner_id, local_card_id, version, card_json, \
          rights_declaration, moderation, withdrawn, created_at) \
-         VALUES (?, ?, 'loc', 1, '{}', 'original', 'approved', 0, ?)",
+         VALUES ($1, $2, 'loc', 1, '{}', 'original', 'approved', 0, $3)",
     )
     .bind(id)
     .bind(owner)
@@ -98,7 +98,7 @@ async fn seed_char(state: &AppState, id: &str, owner: &str) {
 async fn seed_tick(state: &AppState, world: &str, tick_no: i64, status: &str) {
     sqlx::query(
         "INSERT INTO world_ticks (id, world_id, tick_no, base_revision, status, cost_tokens, created_at) \
-         VALUES (?, ?, ?, 0, ?, 120, ?)",
+         VALUES ($1, $2, $3, 0, $4, 120, $5)",
     )
     .bind(format!("tk_{world}_{tick_no}"))
     .bind(world)
@@ -114,7 +114,7 @@ async fn seed_event(state: &AppState, world: &str, tick_no: i64, seq: i64, actor
     sqlx::query(
         "INSERT INTO world_events (id, world_id, tick_no, sequence, domain_event_id, event_type, \
          actors_json, visibility, public_projection_json, occurred_at) \
-         VALUES (?, ?, ?, ?, ?, 'action', ?, 'public', '{\"text\":\"他在城门口退了一步\"}', ?)",
+         VALUES ($1, $2, $3, $4, $5, 'action', $6, 'public', '{\"text\":\"他在城门口退了一步\"}', $7)",
     )
     .bind(format!("ev_{world}_{seq}"))
     .bind(world)
@@ -132,7 +132,7 @@ async fn seed_whisper(state: &AppState, id: &str, world: &str, user: &str, chara
     sqlx::query(
         "INSERT INTO interventions (id, world_id, user_id, character_id, kind, payload_json, \
          expected_revision, status, created_at) \
-         VALUES (?, ?, ?, ?, 'whisper', '{\"text\":\"小心\"}', 0, ?, ?)",
+         VALUES ($1, $2, $3, $4, 'whisper', '{\"text\":\"小心\"}', 0, $5, $6)",
     )
     .bind(id)
     .bind(world)
@@ -228,7 +228,7 @@ async fn count_rows(db: &AnyPool, table: &str) -> i64 {
 async fn whisper_used(db: &AnyPool, world_id: &str, character_id: &str) -> i64 {
     sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM interventions \
-         WHERE world_id = ? AND character_id = ? AND kind = 'whisper' \
+         WHERE world_id = $1 AND character_id = $2 AND kind = 'whisper' \
            AND status IN ('accepted', 'applied')",
     )
     .bind(world_id)
@@ -623,7 +623,7 @@ async fn red_line_annotation_is_visible_only_to_its_owner() {
     )
     .await;
     assert_eq!(st, StatusCode::NOT_FOUND);
-    let body: String = sqlx::query_scalar("SELECT body FROM character_annotations WHERE appeal_id = ?")
+    let body: String = sqlx::query_scalar("SELECT body FROM character_annotations WHERE appeal_id = $1")
         .bind(&id)
         .fetch_one(&state.db)
         .await

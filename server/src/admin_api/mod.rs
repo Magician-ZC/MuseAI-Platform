@@ -147,7 +147,7 @@ pub(super) async fn audit(
 ) -> Result<(), ApiError> {
     sqlx::query(
         "INSERT INTO audit_logs (id, actor_id, actor_role, action, subject, reason, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(new_id("aud"))
     .bind(&actor.user_id)

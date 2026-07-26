@@ -660,7 +660,7 @@ pub(crate) async fn insert_tick_marked(
     base_revision: i64,
     mark: TickMark,
 ) -> Result<bool, ApiError> {
-    let exists = sqlx::query("SELECT 1 AS x FROM world_ticks WHERE world_id = ? AND tick_no = ?")
+    let exists = sqlx::query("SELECT 1 AS x FROM world_ticks WHERE world_id = $1 AND tick_no = $2")
         .bind(world_id)
         .bind(tick_no)
         .fetch_optional(db)
@@ -672,7 +672,7 @@ pub(crate) async fn insert_tick_marked(
     match sqlx::query(
         "INSERT INTO world_ticks (id, world_id, tick_no, base_revision, status, created_at, \
          off_peak, price_ratio_pct, defer_ms) \
-         VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8)",
     )
     .bind(new_id("tick"))
     .bind(world_id)
@@ -704,7 +704,7 @@ pub(crate) async fn schedule_tick_marked(
     mark: TickMark,
 ) -> Result<Option<i64>, ApiError> {
     let world = load_world(&state.db, world_id).await?;
-    let max: i64 = sqlx::query("SELECT COALESCE(MAX(tick_no), -1) AS m FROM world_ticks WHERE world_id = ?")
+    let max: i64 = sqlx::query("SELECT COALESCE(MAX(tick_no), -1) AS m FROM world_ticks WHERE world_id = $1")
         .bind(world_id)
         .fetch_one(&state.db)
         .await?
@@ -733,15 +733,15 @@ async fn schedule_due_ticks(state: &AppState) -> Result<(), ApiError> {
     let stale_before = now - CLAIM_STALE_MS;
     sqlx::query(
         "UPDATE world_ticks SET status='pending' \
-         WHERE status='running' AND started_at IS NOT NULL AND started_at < ? AND attempts < ?",
+         WHERE status='running' AND started_at IS NOT NULL AND started_at < $1 AND attempts < $2",
     )
     .bind(stale_before)
     .bind(MAX_TICK_ATTEMPTS)
     .execute(&state.db)
     .await?;
     sqlx::query(
-        "UPDATE world_ticks SET status='failed', error='max_attempts', finished_at=? \
-         WHERE status='running' AND started_at IS NOT NULL AND started_at < ? AND attempts >= ?",
+        "UPDATE world_ticks SET status='failed', error='max_attempts', finished_at=$1 \
+         WHERE status='running' AND started_at IS NOT NULL AND started_at < $2 AND attempts >= $3",
     )
     .bind(now)
     .bind(stale_before)
@@ -804,7 +804,7 @@ async fn schedule_due_ticks(state: &AppState) -> Result<(), ApiError> {
         if timeline_mode == "event" {
             let straggler_before = now - RECLAIM_PENDING_MIN_MS;
             let pend = sqlx::query(
-                "SELECT tick_no FROM world_ticks WHERE world_id = ? AND status = 'pending' AND created_at < ?",
+                "SELECT tick_no FROM world_ticks WHERE world_id = $1 AND status = 'pending' AND created_at < $2",
             )
             .bind(&world_id)
             .bind(straggler_before)
@@ -829,7 +829,7 @@ async fn schedule_due_ticks(state: &AppState) -> Result<(), ApiError> {
             //     上方 straggler 补偿 re-enqueue 仍保留（房型无关），只是不新增 tick。
             if room_type == "idle" {
                 let outstanding: i64 = sqlx::query(
-                    "SELECT COUNT(*) AS c FROM world_ticks WHERE world_id = ? AND status IN ('pending','running')",
+                    "SELECT COUNT(*) AS c FROM world_ticks WHERE world_id = $1 AND status IN ('pending','running')",
                 )
                 .bind(&world_id)
                 .fetch_one(&state.db)
@@ -844,7 +844,7 @@ async fn schedule_due_ticks(state: &AppState) -> Result<(), ApiError> {
                         //（它一天到晚满速烧 token，没有墙钟节奏可依）。
                         let cfg = offpeak_cfg.as_ref().expect("active 蕴含 cfg 已解析");
                         let last: Option<i64> = sqlx::query(
-                            "SELECT MAX(created_at) AS m FROM world_ticks WHERE world_id = ?",
+                            "SELECT MAX(created_at) AS m FROM world_ticks WHERE world_id = $1",
                         )
                         .bind(&world_id)
                         .fetch_one(&state.db)
@@ -880,7 +880,7 @@ async fn schedule_due_ticks(state: &AppState) -> Result<(), ApiError> {
         // 而非每轮无条件全量 re-enqueue（后者会让长回合被多 worker 重复投递，C-1）。
         let straggler_before = now - interval.max(RECLAIM_PENDING_MIN_MS);
         let pend = sqlx::query(
-            "SELECT tick_no FROM world_ticks WHERE world_id = ? AND status = 'pending' AND created_at < ?",
+            "SELECT tick_no FROM world_ticks WHERE world_id = $1 AND status = 'pending' AND created_at < $2",
         )
         .bind(&world_id)
         .bind(straggler_before)
@@ -899,7 +899,7 @@ async fn schedule_due_ticks(state: &AppState) -> Result<(), ApiError> {
 
         // 到点则排新 tick。
         let last: Option<i64> =
-            sqlx::query("SELECT MAX(created_at) AS m FROM world_ticks WHERE world_id = ?")
+            sqlx::query("SELECT MAX(created_at) AS m FROM world_ticks WHERE world_id = $1")
                 .bind(&world_id)
                 .fetch_one(&state.db)
                 .await?
@@ -924,7 +924,7 @@ async fn schedule_due_ticks(state: &AppState) -> Result<(), ApiError> {
         // 白占一个拍位而世界不推进。故错峰路径先确认没有在飞的 tick（与 event×idle 分支同口径）。
         // 这不会造成饿死：所有失败/冲突路径都会把 tick 终态化，超时 running 由本函数开头回收。
         let outstanding: i64 = sqlx::query(
-            "SELECT COUNT(*) AS c FROM world_ticks WHERE world_id = ? AND status IN ('pending','running')",
+            "SELECT COUNT(*) AS c FROM world_ticks WHERE world_id = $1 AND status IN ('pending','running')",
         )
         .bind(&world_id)
         .fetch_one(&state.db)
@@ -993,7 +993,7 @@ pub(crate) async fn resolve_model_routes(
     db: &AnyPool,
     version: &str,
 ) -> Result<Option<(ModelRoutes, u32)>, ApiError> {
-    let Some(row) = sqlx::query("SELECT routes_json FROM model_routes WHERE version = ? LIMIT 1")
+    let Some(row) = sqlx::query("SELECT routes_json FROM model_routes WHERE version = $1 LIMIT 1")
         .bind(version)
         .fetch_optional(db)
         .await?
@@ -1027,7 +1027,7 @@ pub(crate) async fn resolve_model_routes(
 /// `pub(crate)`：理由同 `resolve_model_routes`——提示词版本是运营可调的产品参数，
 /// 必须只有一个解析入口。
 pub(crate) async fn resolve_prompts(db: &AnyPool, version: &str) -> Result<NarrativePrompts, ApiError> {
-    let rows = sqlx::query("SELECT scope, content FROM prompt_versions WHERE version = ?")
+    let rows = sqlx::query("SELECT scope, content FROM prompt_versions WHERE version = $1")
         .bind(version)
         .fetch_all(db)
         .await?;
@@ -1121,7 +1121,7 @@ async fn seed_narrative_layer(
     }
 
     // 模板骨架（预审核内容池）：mainlineNodes → 大纲节点；forbiddenPredicates → 禁止谓词。
-    let Some(row) = sqlx::query("SELECT skeleton_json FROM world_templates WHERE id = ?")
+    let Some(row) = sqlx::query("SELECT skeleton_json FROM world_templates WHERE id = $1")
         .bind(&world.template_id)
         .fetch_optional(db)
         .await?
@@ -1252,7 +1252,7 @@ async fn load_carried_item_facts(
          FROM world_members wm \
          JOIN backpacks b ON b.user_id = wm.user_id AND b.carried_world_id = wm.world_id \
          JOIN items i ON i.id = b.item_id \
-         WHERE wm.world_id = ? AND wm.status = 'active' AND b.status = 'carried' \
+         WHERE wm.world_id = $1 AND wm.status = 'active' AND b.status = 'carried' \
          ORDER BY wm.cloud_character_id, i.id",
     )
     .bind(world_id)
@@ -1366,7 +1366,7 @@ async fn load_identity_display_names(db: &AnyPool, world: &WorldRow) -> BTreeMap
     if assignments.is_empty() {
         return BTreeMap::new();
     }
-    let Ok(Some(row)) = sqlx::query("SELECT skeleton_json FROM world_templates WHERE id = ?")
+    let Ok(Some(row)) = sqlx::query("SELECT skeleton_json FROM world_templates WHERE id = $1")
         .bind(&world.template_id)
         .fetch_optional(db)
         .await
@@ -1433,8 +1433,8 @@ async fn finish_tick_noop(
 ) -> Result<(), ApiError> {
     let now = now_ms();
     sqlx::query(
-        "UPDATE world_ticks SET status='done', cost_tokens=0, error=?, \
-         started_at=COALESCE(started_at, ?), finished_at=? WHERE world_id=? AND tick_no=?",
+        "UPDATE world_ticks SET status='done', cost_tokens=0, error=$1, \
+         started_at=COALESCE(started_at, $2), finished_at=$3 WHERE world_id=$4 AND tick_no=$5",
     )
     .bind(note)
     .bind(now)
@@ -1474,8 +1474,8 @@ async fn finish_tick_blocked(
     let cost = cost_tokens as i64;
     let mut tx = db.begin().await?;
     sqlx::query(
-        "UPDATE world_ticks SET status='done', cost_tokens=?, error='blocked', \
-         started_at=COALESCE(started_at, ?), finished_at=? WHERE world_id=? AND tick_no=?",
+        "UPDATE world_ticks SET status='done', cost_tokens=$1, error='blocked', \
+         started_at=COALESCE(started_at, $2), finished_at=$3 WHERE world_id=$4 AND tick_no=$5",
     )
     .bind(cost)
     .bind(now)
@@ -1486,7 +1486,7 @@ async fn finish_tick_blocked(
     .await?;
     // 预算累计：与 commit_tick 的那条 UPDATE 逐字同形（含 budget_day 刷新），保证熔断口径唯一。
     sqlx::query(
-        "UPDATE world_budgets SET spent_tokens_today = spent_tokens_today + ?, budget_day=?, updated_at=? WHERE world_id=?",
+        "UPDATE world_budgets SET spent_tokens_today = spent_tokens_today + $1, budget_day=$2, updated_at=$3 WHERE world_id=$4",
     )
     .bind(cost)
     .bind(day_string(now))
@@ -1502,7 +1502,7 @@ async fn finish_tick_blocked(
 /// 也不再留 pending 无限 re-enqueue/重跑。
 async fn finalize_cas_conflict(db: &AnyPool, world_id: &str, tick_no: i64) -> Result<(), ApiError> {
     sqlx::query(
-        "UPDATE world_ticks SET status='done', error='cas_conflict', finished_at=? WHERE world_id=? AND tick_no=?",
+        "UPDATE world_ticks SET status='done', error='cas_conflict', finished_at=$1 WHERE world_id=$2 AND tick_no=$3",
     )
     .bind(now_ms())
     .bind(world_id)
@@ -1513,7 +1513,7 @@ async fn finalize_cas_conflict(db: &AnyPool, world_id: &str, tick_no: i64) -> Re
 }
 
 async fn pause_world(db: &AnyPool, world_id: &str) -> Result<(), ApiError> {
-    sqlx::query("UPDATE worlds SET status='paused', updated_at=? WHERE id=? AND status='running'")
+    sqlx::query("UPDATE worlds SET status='paused', updated_at=$1 WHERE id=$2 AND status='running'")
         .bind(now_ms())
         .bind(world_id)
         .execute(db)
@@ -1551,7 +1551,7 @@ async fn load_endgame_policy(db: &AnyPool, world: &WorldRow) -> Result<RoomEndga
     let mut world_time_limit: Option<i64> = None;
     let mut key_character_ids: Vec<String> = Vec::new();
 
-    if let Some(row) = sqlx::query("SELECT skeleton_json FROM world_templates WHERE id = ?")
+    if let Some(row) = sqlx::query("SELECT skeleton_json FROM world_templates WHERE id = $1")
         .bind(&world.template_id)
         .fetch_optional(db)
         .await?
@@ -1632,7 +1632,7 @@ async fn key_character_exited(
     // (a) 成员表永久退场：left/retired。
     let members: Vec<(String,)> = sqlx::query_as(
         "SELECT cloud_character_id FROM world_members \
-         WHERE world_id = ? AND status IN ('left', 'retired')",
+         WHERE world_id = $1 AND status IN ('left', 'retired')",
     )
     .bind(world_id)
     .fetch_all(db)
@@ -1644,7 +1644,7 @@ async fn key_character_exited(
     // (b) 已 landed 的 permanent_exit consent（approved）：subject 命中关键角色。
     let consents = sqlx::query(
         "SELECT subject_character_ids FROM consent_requests \
-         WHERE world_id = ? AND status = 'approved' AND event_kind = 'permanent_exit'",
+         WHERE world_id = $1 AND status = 'approved' AND event_kind = 'permanent_exit'",
     )
     .bind(world_id)
     .fetch_all(db)
@@ -1707,7 +1707,7 @@ async fn finalize_ending_tx(
     // 终局审计留痕（reason + 选定结局）。
     sqlx::query(
         "INSERT INTO audit_logs (id, actor_id, actor_role, action, subject, reason, created_at) \
-         VALUES (?, 'system', 'system', 'world.ended', ?, ?, ?)",
+         VALUES ($1, 'system', 'system', 'world.ended', $2, $3, $4)",
     )
     .bind(new_id("aud"))
     .bind(world_id)
@@ -1729,7 +1729,7 @@ async fn finalize_ending_tx(
         for (cid, _) in participants {
             sqlx::query(
                 "INSERT INTO arena_rewards (id, world_id, character_id, kind, label, season, created_at) \
-                 VALUES (?, ?, ?, 'ending', ?, NULL, ?) \
+                 VALUES ($1, $2, $3, 'ending', $4, NULL, $5) \
                  ON CONFLICT(world_id, character_id, kind) DO NOTHING",
             )
             .bind(new_id("rw"))
@@ -1752,7 +1752,7 @@ async fn end_world_tx(
     world_id: &str,
     reason: &str,
 ) -> Result<u64, ApiError> {
-    let res = sqlx::query("UPDATE worlds SET status='ended', updated_at=? WHERE id=? AND status='running'")
+    let res = sqlx::query("UPDATE worlds SET status='ended', updated_at=$1 WHERE id=$2 AND status='running'")
         .bind(now_ms())
         .bind(world_id)
         .execute(&mut **tx)
@@ -1786,8 +1786,8 @@ async fn conclude_world_no_round(
     let now = now_ms();
     let mut tx = state.db.begin().await?;
     sqlx::query(
-        "UPDATE world_ticks SET status='done', cost_tokens=0, error=?, \
-         started_at=COALESCE(started_at, ?), finished_at=? WHERE world_id=? AND tick_no=?",
+        "UPDATE world_ticks SET status='done', cost_tokens=0, error=$1, \
+         started_at=COALESCE(started_at, $2), finished_at=$3 WHERE world_id=$4 AND tick_no=$5",
     )
     .bind(reason)
     .bind(now)
@@ -1826,7 +1826,7 @@ async fn fuse_and_pause(
     today: &str,
     spent: i64,
 ) -> Result<(), ApiError> {
-    sqlx::query("UPDATE world_budgets SET fused=1, budget_day=?, spent_tokens_today=?, updated_at=? WHERE world_id=?")
+    sqlx::query("UPDATE world_budgets SET fused=1, budget_day=$1, spent_tokens_today=$2, updated_at=$3 WHERE world_id=$4")
         .bind(today)
         .bind(spent)
         .bind(now_ms())
@@ -1845,7 +1845,7 @@ async fn mark_tick_failed_and_pause(
     note: &str,
 ) -> Result<(), ApiError> {
     sqlx::query(
-        "UPDATE world_ticks SET status='failed', error=?, finished_at=? WHERE world_id=? AND tick_no=?",
+        "UPDATE world_ticks SET status='failed', error=$1, finished_at=$2 WHERE world_id=$3 AND tick_no=$4",
     )
     .bind(note)
     .bind(now_ms())
@@ -1865,7 +1865,7 @@ async fn mark_tick_failed_and_pause(
 async fn load_approved_consent_subjects(db: &AnyPool, world_id: &str) -> Result<Vec<String>, ApiError> {
     let rows = sqlx::query(
         "SELECT subject_character_ids FROM consent_requests \
-         WHERE world_id = ? AND status = 'approved' \
+         WHERE world_id = $1 AND status = 'approved' \
          AND event_kind IN ('death', 'permanent_exit', 'permanent_relation_change')",
     )
     .bind(world_id)
@@ -1908,7 +1908,7 @@ async fn create_consents_for_round(state: &AppState, world_id: &str, events: &[D
         let subjects_json = serde_json::to_string(&subjects).unwrap_or_else(|_| "[]".into());
         let dup = sqlx::query(
             "SELECT 1 AS x FROM consent_requests \
-             WHERE world_id = ? AND event_kind = ? AND subject_character_ids = ? AND status = 'pending' LIMIT 1",
+             WHERE world_id = $1 AND event_kind = $2 AND subject_character_ids = $3 AND status = 'pending' LIMIT 1",
         )
         .bind(world_id)
         .bind(event_kind)
@@ -1988,7 +1988,7 @@ async fn persist_critic_report_tx(
     let res = sqlx::query(
         "INSERT INTO world_tick_critic (world_id, tick_no, consistency_issue_count, \
          causal_issue_count, revision_suggestion_count, report_json, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(world_id)
     .bind(tick_no)
@@ -2040,7 +2040,7 @@ async fn process_tick_inner(
 
     // 1) 读 tick 行。done/failed → 幂等跳过；超重试上限 → 终态化（C-9）。
     let Some(trow) =
-        sqlx::query("SELECT status, base_revision, attempts FROM world_ticks WHERE world_id=? AND tick_no=?")
+        sqlx::query("SELECT status, base_revision, attempts FROM world_ticks WHERE world_id=$1 AND tick_no=$2")
             .bind(world_id)
             .bind(tick_no)
             .fetch_optional(db)
@@ -2061,8 +2061,8 @@ async fn process_tick_inner(
 
     // 2) 原子认领（C-1）：pending→running CAS，attempts+1。rows=0 → 已被别的 worker 认领/非 pending，跳过。
     let claimed = sqlx::query(
-        "UPDATE world_ticks SET status='running', attempts=attempts+1, started_at=COALESCE(started_at, ?) \
-         WHERE world_id=? AND tick_no=? AND status='pending'",
+        "UPDATE world_ticks SET status='running', attempts=attempts+1, started_at=COALESCE(started_at, $1) \
+         WHERE world_id=$2 AND tick_no=$3 AND status='pending'",
     )
     .bind(now_ms())
     .bind(world_id)
@@ -2090,7 +2090,7 @@ async fn process_tick_inner(
     let mut remaining_tokens: u64 = DEFAULT_REMAINING_TOKENS;
     if let Some(brow) = sqlx::query(
         "SELECT daily_token_budget, daily_cny_budget_cents, spent_tokens_today, budget_day, fused \
-         FROM world_budgets WHERE world_id=?",
+         FROM world_budgets WHERE world_id=$1",
     )
     .bind(world_id)
     .fetch_optional(db)
@@ -2104,7 +2104,7 @@ async fn process_tick_inner(
         // 新的一天：重置窗口。
         if day != today {
             spent = 0;
-            sqlx::query("UPDATE world_budgets SET spent_tokens_today=0, budget_day=?, fused=0, updated_at=? WHERE world_id=?")
+            sqlx::query("UPDATE world_budgets SET spent_tokens_today=0, budget_day=$1, fused=0, updated_at=$2 WHERE world_id=$3")
                 .bind(&today)
                 .bind(now_ms())
                 .bind(world_id)
@@ -2179,7 +2179,7 @@ async fn process_tick_inner(
     let mrows = sqlx::query(
         "SELECT wm.cloud_character_id AS cid, wm.user_id AS uid, cc.card_json AS card \
          FROM world_members wm JOIN cloud_characters cc ON cc.id = wm.cloud_character_id \
-         WHERE wm.world_id = ? AND wm.status='active' \
+         WHERE wm.world_id = $1 AND wm.status='active' \
          ORDER BY wm.joined_at ASC, wm.cloud_character_id ASC",
     )
     .bind(world_id)
@@ -2312,7 +2312,7 @@ async fn process_tick_inner(
     let mut fed_intervention_ids: Vec<String> = Vec::new();
     let wrows = sqlx::query(
         "SELECT id, character_id, payload_json FROM interventions \
-         WHERE world_id=? AND status='accepted' AND kind='whisper' ORDER BY created_at ASC",
+         WHERE world_id=$1 AND status='accepted' AND kind='whisper' ORDER BY created_at ASC",
     )
     .bind(world_id)
     .fetch_all(db)
@@ -2585,7 +2585,7 @@ async fn commit_tick(
 
     // CAS：仅当世界仍处 base_revision 时推进；否则视为已被更早的 tick 处理 → 回滚 + 终态化（C-2）。
     let cas = sqlx::query(
-        "UPDATE worlds SET narrative_state_json=?, state_revision=?, game_time=?, updated_at=? WHERE id=? AND state_revision=?",
+        "UPDATE worlds SET narrative_state_json=$1, state_revision=$2, game_time=$3, updated_at=$4 WHERE id=$5 AND state_revision=$6",
     )
     .bind(&new_state_json)
     .bind(new_revision)
@@ -2645,8 +2645,8 @@ async fn commit_tick(
     }
 
     sqlx::query(
-        "UPDATE world_ticks SET status='done', cost_tokens=?, started_at=COALESCE(started_at, ?), \
-         finished_at=?, error=NULL WHERE world_id=? AND tick_no=?",
+        "UPDATE world_ticks SET status='done', cost_tokens=$1, started_at=COALESCE(started_at, $2), \
+         finished_at=$3, error=NULL WHERE world_id=$4 AND tick_no=$5",
     )
     .bind(cost)
     .bind(now)
@@ -2676,7 +2676,7 @@ async fn commit_tick(
 
     // Q-3：只消费本 tick 实际喂入的 accepted 干预（按 id 精确置 applied），不 blanket 标全部 accepted。
     for iid in fed_intervention_ids {
-        sqlx::query("UPDATE interventions SET status='applied' WHERE id=? AND world_id=? AND status='accepted'")
+        sqlx::query("UPDATE interventions SET status='applied' WHERE id=$1 AND world_id=$2 AND status='accepted'")
             .bind(iid)
             .bind(world_id)
             .execute(&mut *tx)
@@ -2685,7 +2685,7 @@ async fn commit_tick(
 
     // 预算累计（B-1：实测 token）。
     sqlx::query(
-        "UPDATE world_budgets SET spent_tokens_today = spent_tokens_today + ?, budget_day=?, updated_at=? WHERE world_id=?",
+        "UPDATE world_budgets SET spent_tokens_today = spent_tokens_today + $1, budget_day=$2, updated_at=$3 WHERE world_id=$4",
     )
     .bind(cost)
     .bind(day_string(now))

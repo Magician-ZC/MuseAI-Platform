@@ -45,6 +45,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::{AnyPool, Row};
 
+use crate::db::Placeholders;
 use crate::app::AppState;
 use crate::auth::AdminUser;
 use crate::error::ApiError;
@@ -160,7 +161,7 @@ pub(super) async fn list_sagas(
     let rows = sqlx::query(
         "SELECT saga_id, stage_no, moderation, star_rating, room_type, created_at \
          FROM world_templates WHERE saga_id <> '' \
-         ORDER BY saga_id ASC, stage_no ASC, id ASC LIMIT ?",
+         ORDER BY saga_id ASC, stage_no ASC, id ASC LIMIT $1",
     )
     .bind(SAGA_SCAN_MAX as i64 + 1)
     .fetch_all(&state.db)
@@ -310,7 +311,7 @@ pub(super) async fn saga_detail(
     let rows = sqlx::query(
         "SELECT id, title, room_type, moderation, star_rating, star_source, official, version, \
          stage_no, created_at, skeleton_json \
-         FROM world_templates WHERE saga_id = ? ORDER BY stage_no ASC, id ASC LIMIT ?",
+         FROM world_templates WHERE saga_id = $1 ORDER BY stage_no ASC, id ASC LIMIT $2",
     )
     .bind(&saga_id)
     .bind(SAGA_DETAIL_TEMPLATE_MAX)
@@ -403,7 +404,8 @@ async fn world_counts_by_template(
     }
     let live = live_status_sql();
     for chunk in ids.chunks(BIND_CHUNK) {
-        let placeholders = vec!["?"; chunk.len()].join(",");
+        // `{live}` 是内联的状态字面量（非参数），故本条只有 ids 这一串参数，从 $1 起发号。
+        let placeholders = Placeholders::new().list(chunk.len());
         let sql = format!(
             "SELECT template_id, COUNT(*) AS n, \
              CAST(COALESCE(SUM(CASE WHEN status IN ({live}) THEN 1 ELSE 0 END), 0) AS BIGINT) AS live_n \
@@ -525,7 +527,7 @@ pub(super) async fn list_identity_pools(
     loop {
         let page = sqlx::query(
             "SELECT id, title, room_type, moderation, saga_id, stage_no, skeleton_json \
-             FROM world_templates WHERE id > ? ORDER BY id ASC LIMIT ?",
+             FROM world_templates WHERE id > $1 ORDER BY id ASC LIMIT $2",
         )
         .bind(&cursor)
         .bind(SCAN_PAGE)
@@ -601,7 +603,8 @@ async fn active_members_by_world(
         return Ok(out);
     }
     for chunk in world_ids.chunks(BIND_CHUNK) {
-        let placeholders = vec!["?"; chunk.len()].join(",");
+        // 整条语句只有这一串参数，故从 $1 起顺序发号，与下面 bind 的循环顺序一致。
+        let placeholders = Placeholders::new().list(chunk.len());
         let sql = format!(
             "SELECT world_id, cloud_character_id FROM world_members \
              WHERE status = 'active' AND world_id IN ({placeholders})"
@@ -641,7 +644,7 @@ pub(super) async fn template_identity_pool(
 
     let tpl = sqlx::query(
         "SELECT id, title, room_type, version, moderation, saga_id, stage_no, skeleton_json \
-         FROM world_templates WHERE id = ?",
+         FROM world_templates WHERE id = $1",
     )
     .bind(&template_id)
     .fetch_optional(&state.db)
@@ -665,8 +668,8 @@ pub(super) async fn template_identity_pool(
 
     // 该模板开出的世界（最近 scan 个）。
     let world_rows = sqlx::query(
-        "SELECT id, title, status, assembled_json FROM worlds WHERE template_id = ? \
-         ORDER BY created_at DESC, id DESC LIMIT ?",
+        "SELECT id, title, status, assembled_json FROM worlds WHERE template_id = $1 \
+         ORDER BY created_at DESC, id DESC LIMIT $2",
     )
     .bind(&template_id)
     .bind(scan + 1)

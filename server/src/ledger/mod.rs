@@ -104,7 +104,7 @@ async fn ensure_account(tx: &mut Transaction<'_, Any>, account: &AccountRef) -> 
     // 双库通用 upsert：命中主键即跳过（账户一经创建余额由 postings 维护，DO NOTHING 不覆盖）。
     sqlx::query(
         "INSERT INTO ledger_accounts (id, kind, owner_id, scope_id, balance_cents, withdrawable, created_at, updated_at) \
-         VALUES (?, ?, ?, NULL, 0, 0, ?, ?) ON CONFLICT(id) DO NOTHING",
+         VALUES ($1, $2, $3, NULL, 0, 0, $4, $5) ON CONFLICT(id) DO NOTHING",
     )
     .bind(&id)
     .bind(account.kind())
@@ -139,7 +139,7 @@ pub async fn post_journal(
     let now = now_ms();
     let journal_id = new_id("jrnl");
     sqlx::query(
-        "INSERT INTO ledger_journals (id, reason, ref_kind, ref_id, world_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO ledger_journals (id, reason, ref_kind, ref_id, world_id, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(&journal_id)
     .bind(reason)
@@ -153,7 +153,7 @@ pub async fn post_journal(
     for p in postings {
         let account_id = ensure_account(tx, &p.account).await?;
         sqlx::query(
-            "INSERT INTO ledger_postings (id, journal_id, account_id, delta_cents, created_at) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO ledger_postings (id, journal_id, account_id, delta_cents, created_at) VALUES ($1, $2, $3, $4, $5)",
         )
         .bind(new_id("post"))
         .bind(&journal_id)
@@ -163,7 +163,7 @@ pub async fn post_journal(
         .execute(&mut **tx)
         .await?;
         // 物化余额同步（account.balance_cents == SUM(该账户 postings)）。
-        sqlx::query("UPDATE ledger_accounts SET balance_cents = balance_cents + ?, updated_at = ? WHERE id = ?")
+        sqlx::query("UPDATE ledger_accounts SET balance_cents = balance_cents + $1, updated_at = $2 WHERE id = $3")
             .bind(p.delta_cents)
             .bind(now)
             .bind(&account_id)
@@ -209,7 +209,7 @@ async fn resolve_share(
     };
     let row: Option<(Option<String>, Option<i64>)> = sqlx::query_as(
         "SELECT t.owner_id, t.revenue_share_bps FROM worlds w JOIN world_templates t ON w.template_id = t.id \
-         WHERE w.id = ?",
+         WHERE w.id = $1",
     )
     .bind(world_id)
     .fetch_optional(&mut **tx)
@@ -229,7 +229,7 @@ async fn resolve_share(
     let creator_cut = (price_cents as i128 * bps as i128 / 10_000) as i64;
     // 红线：未成年不得作创作者收款方 —— owner age_declared != 1（未声明/未成年/无行）→ 分成挂平台。
     // 记录本应分给创作者的额度（held_cents）供留痕，便于成年补实名后核查/追溯。
-    let owner_age: Option<(i64,)> = sqlx::query_as("SELECT age_declared FROM users WHERE id = ?")
+    let owner_age: Option<(i64,)> = sqlx::query_as("SELECT age_declared FROM users WHERE id = $1")
         .bind(&owner_id)
         .fetch_optional(&mut **tx)
         .await?;
@@ -274,11 +274,11 @@ pub async fn charge(
 
     // 行锁序列化并发扣费：Postgres 下自赋值 UPDATE ≈ SELECT ... FOR UPDATE（对齐 billing refund 技巧）；
     // SQLite 单连接事务本互斥，此语句为无害占位。防两个并发 charge 双扣透支。
-    sqlx::query("UPDATE billing_balances SET balance_cents = balance_cents WHERE user_id = ?")
+    sqlx::query("UPDATE billing_balances SET balance_cents = balance_cents WHERE user_id = $1")
         .bind(user_id)
         .execute(&mut **tx)
         .await?;
-    let balance: i64 = sqlx::query_as::<_, (i64,)>("SELECT balance_cents FROM billing_balances WHERE user_id = ?")
+    let balance: i64 = sqlx::query_as::<_, (i64,)>("SELECT balance_cents FROM billing_balances WHERE user_id = $1")
         .bind(user_id)
         .fetch_optional(&mut **tx)
         .await?
@@ -316,7 +316,7 @@ pub async fn charge(
     let journal_id = post_journal(tx, reason, ref_kind, ref_id, world_id, &postings).await?;
 
     // billing_balances 是 user_wallet 的物化视图：post_journal 已扣 user_wallet 账户，此处同步扣视图，维持恒等。
-    sqlx::query("UPDATE billing_balances SET balance_cents = balance_cents - ?, updated_at = ? WHERE user_id = ?")
+    sqlx::query("UPDATE billing_balances SET balance_cents = balance_cents - $1, updated_at = $2 WHERE user_id = $3")
         .bind(price_cents)
         .bind(now_ms())
         .bind(user_id)

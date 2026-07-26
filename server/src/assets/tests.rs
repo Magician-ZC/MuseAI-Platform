@@ -162,7 +162,7 @@ async fn delete_placed_is_deferred() {
     let id = v["id"].as_str().unwrap().to_string();
 
     // 种一条投放关系（world_members），模拟已投放。
-    sqlx::query("INSERT INTO world_members (id, world_id, user_id, cloud_character_id, joined_at) VALUES (?, 'w_test', ?, ?, ?)")
+    sqlx::query("INSERT INTO world_members (id, world_id, user_id, cloud_character_id, joined_at) VALUES ($1, 'w_test', $2, $3, $4)")
         .bind(crate::db::new_id("wm"))
         .bind(&uid)
         .bind(&id)
@@ -244,7 +244,7 @@ async fn injection_hit_card_writes_single_audit_and_single_risk() {
     let id = v["id"].as_str().unwrap().to_string();
     assert_eq!(v["moderation"], "pending", "注入命中 → 服务端权威转人审 pending");
 
-    let aq: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_queue WHERE subject_id = ?")
+    let aq: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_queue WHERE subject_id = $1")
         .bind(&id)
         .fetch_one(&state.db)
         .await
@@ -424,7 +424,7 @@ fn admin_token(state: &crate::app::AppState) -> String {
 
 /// 直接把卡置为机审驳回态（dev 机审 stub 恒过，测试经 SQL 模拟 Rejected 直拒——不产生 audit_queue 行）。
 async fn force_reject_card(state: &crate::app::AppState, id: &str) {
-    sqlx::query("UPDATE cloud_characters SET moderation = 'rejected' WHERE id = ?")
+    sqlx::query("UPDATE cloud_characters SET moderation = 'rejected' WHERE id = $1")
         .bind(id)
         .execute(&state.db)
         .await
@@ -460,7 +460,7 @@ async fn appeal_submit_keeps_moderation_and_is_once_per_subject() {
     assert!(a["resolvedAt"].is_null());
 
     // 红线：申诉提交不改任何 moderation——未过审继续不外泄。
-    let m: String = sqlx::query_scalar("SELECT moderation FROM cloud_characters WHERE id = ?")
+    let m: String = sqlx::query_scalar("SELECT moderation FROM cloud_characters WHERE id = $1")
         .bind(&id)
         .fetch_one(&state.db)
         .await
@@ -587,7 +587,7 @@ async fn appeal_allowed_when_only_avatar_rejected() {
     let (_st, v) =
         send(&app, "POST", "/api/assets/characters", Some(&access), Some("ap4"), Some(publish_body("card-AP4", "头像被驳"))).await;
     let id = v["id"].as_str().unwrap().to_string();
-    sqlx::query("UPDATE cloud_characters SET avatar_moderation = 'rejected' WHERE id = ?")
+    sqlx::query("UPDATE cloud_characters SET avatar_moderation = 'rejected' WHERE id = $1")
         .bind(&id)
         .execute(&state.db)
         .await
@@ -629,7 +629,7 @@ async fn appeal_e2e_human_reject_reason_then_overturn_restores_visibility() {
     assert_eq!(st, StatusCode::OK, "{v:?}");
     let id = v["id"].as_str().unwrap().to_string();
     assert_eq!(v["moderation"], "pending");
-    let aq_id: String = sqlx::query_scalar("SELECT id FROM audit_queue WHERE subject_id = ?")
+    let aq_id: String = sqlx::query_scalar("SELECT id FROM audit_queue WHERE subject_id = $1")
         .bind(&id)
         .fetch_one(&state.db)
         .await
@@ -666,7 +666,7 @@ async fn appeal_e2e_human_reject_reason_then_overturn_restores_visibility() {
     )
     .await;
     assert_eq!(st, StatusCode::OK);
-    let appeal_id: String = sqlx::query_scalar("SELECT id FROM moderation_appeals WHERE subject_id = ?")
+    let appeal_id: String = sqlx::query_scalar("SELECT id FROM moderation_appeals WHERE subject_id = $1")
         .bind(&id)
         .fetch_one(&state.db)
         .await
@@ -685,7 +685,7 @@ async fn appeal_e2e_human_reject_reason_then_overturn_restores_visibility() {
     assert_eq!(st, StatusCode::OK, "{res:?}");
     assert_eq!(res["status"], "overturned");
 
-    let m: String = sqlx::query_scalar("SELECT moderation FROM cloud_characters WHERE id = ?")
+    let m: String = sqlx::query_scalar("SELECT moderation FROM cloud_characters WHERE id = $1")
         .bind(&id)
         .fetch_one(&state.db)
         .await

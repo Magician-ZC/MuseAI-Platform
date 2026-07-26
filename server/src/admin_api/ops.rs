@@ -8,7 +8,7 @@ use sqlx::Row;
 
 use crate::app::AppState;
 use crate::auth::AdminUser;
-use crate::db::now_ms;
+use crate::db::{now_ms, Placeholders};
 use crate::error::ApiError;
 
 use super::{audit, clamp_limit, parse_cursor, require_role, ActionQuery};
@@ -33,14 +33,21 @@ pub(super) async fn list_risk_events(
     let mut sql = String::from(
         "SELECT id, user_id, world_id, kind, detail_json, created_at FROM risk_events WHERE 1=1",
     );
+    // 发号顺序 = 下面 bind 的顺序；kind/cursor 段出不出现要到运行时才知道。
+    let mut ph = Placeholders::new();
     if q.kind.is_some() {
-        sql.push_str(" AND kind = ?");
+        sql.push_str(&format!(" AND kind = {}", ph.take()));
     }
     let cursor = q.cursor.as_deref().and_then(parse_cursor);
     if cursor.is_some() {
-        sql.push_str(" AND (created_at < ? OR (created_at = ? AND id < ?))");
+        sql.push_str(&format!(
+            " AND (created_at < {} OR (created_at = {} AND id < {}))",
+            ph.take(),
+            ph.take(),
+            ph.take()
+        ));
     }
-    sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ?");
+    sql.push_str(&format!(" ORDER BY created_at DESC, id DESC LIMIT {}", ph.take()));
 
     let mut query = sqlx::query(&sql);
     if let Some(k) = &q.kind {
@@ -99,14 +106,21 @@ pub(super) async fn list_data_requests(
         "SELECT id, user_id, kind, status, result_key, created_at, updated_at \
          FROM data_requests WHERE 1=1",
     );
+    // 发号顺序 = 下面 bind 的顺序；status/cursor 段出不出现要到运行时才知道。
+    let mut ph = Placeholders::new();
     if q.status.is_some() {
-        sql.push_str(" AND status = ?");
+        sql.push_str(&format!(" AND status = {}", ph.take()));
     }
     let cursor = q.cursor.as_deref().and_then(parse_cursor);
     if cursor.is_some() {
-        sql.push_str(" AND (created_at < ? OR (created_at = ? AND id < ?))");
+        sql.push_str(&format!(
+            " AND (created_at < {} OR (created_at = {} AND id < {}))",
+            ph.take(),
+            ph.take(),
+            ph.take()
+        ));
     }
-    sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ?");
+    sql.push_str(&format!(" ORDER BY created_at DESC, id DESC LIMIT {}", ph.take()));
 
     let mut query = sqlx::query(&sql);
     if let Some(s) = &q.status {
@@ -153,7 +167,7 @@ pub(super) async fn run_data_request(
     Query(q): Query<ActionQuery>,
 ) -> Result<Json<Value>, ApiError> {
     require_role(&admin, &["support"])?;
-    let row = sqlx::query("SELECT kind, status FROM data_requests WHERE id = ?")
+    let row = sqlx::query("SELECT kind, status FROM data_requests WHERE id = $1")
         .bind(&id)
         .fetch_optional(&state.db)
         .await?
@@ -188,7 +202,7 @@ pub(super) async fn run_data_request(
 
     // export：占位实现（生成占位 result_key）→ 标记 done。
     let result_key = format!("export/{id}.json");
-    sqlx::query("UPDATE data_requests SET status = 'done', result_key = ?, updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE data_requests SET status = 'done', result_key = $1, updated_at = $2 WHERE id = $3")
         .bind(&result_key)
         .bind(now_ms())
         .bind(&id)

@@ -78,7 +78,7 @@ async fn webhook(
     }
 
     // 世界必须存在（礼物投向某世界；避免为不存在的世界写入环境事件）。
-    let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM worlds WHERE id = ?")
+    let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM worlds WHERE id = $1")
         .bind(&req.world_id)
         .fetch_optional(&state.db)
         .await?;
@@ -142,7 +142,7 @@ async fn apply_gift_tx(
 ) -> Result<GiftOutcome, ApiError> {
     // SKU → boon 映射查表（未命中或停用 = 未映射）。label 供进流展示文案。
     let mapping: Option<(String, String)> = sqlx::query_as::<_, (String, String)>(
-        "SELECT boon_json, label FROM gift_sku_map WHERE sku = ? AND enabled = 1",
+        "SELECT boon_json, label FROM gift_sku_map WHERE sku = $1 AND enabled = 1",
     )
     .bind(sku)
     .fetch_optional(&mut **tx)
@@ -251,7 +251,7 @@ async fn spectator_gift(
     let gift_id = new_id("gift");
     let mut tx = state.db.begin().await?;
     // SKU 单价（分）：未定价 / 未知 SKU → 0 → charge no-op（免费打赏，dev 播种 SKU 默认 0）。总价 = 单价 × count。
-    let unit_price: Option<(i64,)> = sqlx::query_as("SELECT price_cents FROM gift_sku_map WHERE sku = ?")
+    let unit_price: Option<(i64,)> = sqlx::query_as("SELECT price_cents FROM gift_sku_map WHERE sku = $1")
         .bind(&body.sku)
         .fetch_optional(&mut *tx)
         .await?;
@@ -287,7 +287,7 @@ async fn upsert_gift_boon(
 
     let rows = sqlx::query(
         "SELECT id, payload_json, aggregated_count FROM arena_env_events \
-         WHERE world_id = ? AND kind = 'gift_boon' AND applied_tick IS NULL",
+         WHERE world_id = $1 AND kind = 'gift_boon' AND applied_tick IS NULL",
     )
     .bind(world_id)
     .fetch_all(&mut **tx)
@@ -303,7 +303,7 @@ async fn upsert_gift_boon(
         if same_sku {
             let id: String = r.try_get("id")?;
             let next: i64 = r.try_get::<i64, _>("aggregated_count")? + add_count;
-            sqlx::query("UPDATE arena_env_events SET aggregated_count = ?, payload_json = ? WHERE id = ?")
+            sqlx::query("UPDATE arena_env_events SET aggregated_count = $1, payload_json = $2 WHERE id = $3")
                 .bind(next)
                 .bind(payload.to_string())
                 .bind(&id)
@@ -316,7 +316,7 @@ async fn upsert_gift_boon(
     let id = new_id("aee");
     sqlx::query(
         "INSERT INTO arena_env_events (id, world_id, applied_tick, kind, payload_json, aggregated_count, created_at) \
-         VALUES (?, ?, NULL, 'gift_boon', ?, ?, ?)",
+         VALUES ($1, $2, NULL, 'gift_boon', $3, $4, $5)",
     )
     .bind(&id)
     .bind(world_id)
@@ -344,7 +344,7 @@ async fn record_gift(
 ) -> Result<(), ApiError> {
     sqlx::query(
         "INSERT INTO gift_events (id, world_id, sku, gift_count, from_user, mapped, env_event_id, via, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     )
     .bind(id)
     .bind(world_id)
@@ -410,7 +410,7 @@ async fn list_clips(
     }
     let rows: Vec<(String, String, String, String, i64)> = sqlx::query_as(
         "SELECT id, event_id, object_key, status, created_at FROM clip_jobs \
-         WHERE world_id = ? ORDER BY created_at DESC LIMIT 100",
+         WHERE world_id = $1 ORDER BY created_at DESC LIMIT 100",
     )
     .bind(&world_id)
     .fetch_all(&state.db)

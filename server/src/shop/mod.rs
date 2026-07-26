@@ -51,7 +51,7 @@ async fn my_earnings(State(state): State<AppState>, user: AuthUser) -> Result<Js
     // 余额（无账户视为 0）。双重限定 owner_id 冗余守 owner 隔离（账户 id 已含 uid）。
     let acct: Option<(i64, i64)> = sqlx::query_as(
         "SELECT balance_cents, withdrawable FROM ledger_accounts \
-         WHERE id = ? AND kind = 'creator_earnings' AND owner_id = ?",
+         WHERE id = $1 AND kind = 'creator_earnings' AND owner_id = $2",
     )
     .bind(&account_id)
     .bind(&user.user_id)
@@ -64,7 +64,7 @@ async fn my_earnings(State(state): State<AppState>, user: AuthUser) -> Result<Js
         "SELECT p.delta_cents AS delta, p.created_at AS at, j.reason AS reason, \
          j.world_id AS world_id, j.ref_kind AS ref_kind, j.ref_id AS ref_id \
          FROM ledger_postings p JOIN ledger_journals j ON j.id = p.journal_id \
-         WHERE p.account_id = ? ORDER BY p.created_at DESC, p.id DESC LIMIT 200",
+         WHERE p.account_id = $1 ORDER BY p.created_at DESC, p.id DESC LIMIT 200",
     )
     .bind(&account_id)
     .fetch_all(&state.db)
@@ -122,7 +122,7 @@ async fn buy_cloud_growth(
 
     // SKU 校验（读只在 pool，先于 tx；释放连接再 begin，单连接池不自锁）。未知/停用 → 404。
     let sku_row: Option<(String, i64, i64, i64)> = sqlx::query_as(
-        "SELECT entitlement_kind, quantity, price_cents, enabled FROM growth_sku_map WHERE sku = ?",
+        "SELECT entitlement_kind, quantity, price_cents, enabled FROM growth_sku_map WHERE sku = $1",
     )
     .bind(&body.sku)
     .fetch_optional(&state.db)
@@ -141,7 +141,7 @@ async fn buy_cloud_growth(
     // 累加配额（(user_id, kind) 唯一 → 命中即累加 quantity，ref_id 记最近购买 journal）。
     sqlx::query(
         "INSERT INTO user_entitlements (id, user_id, kind, quantity, ref_id, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
          ON CONFLICT(user_id, kind) DO UPDATE SET \
            quantity = user_entitlements.quantity + excluded.quantity, \
            ref_id = excluded.ref_id, \
@@ -157,7 +157,7 @@ async fn buy_cloud_growth(
     .execute(&mut *tx)
     .await?;
     // 事务内读回累计配额（反映本次，不受并发影响）。
-    let total: (i64,) = sqlx::query_as("SELECT quantity FROM user_entitlements WHERE user_id = ? AND kind = ?")
+    let total: (i64,) = sqlx::query_as("SELECT quantity FROM user_entitlements WHERE user_id = $1 AND kind = $2")
         .bind(&user.user_id)
         .bind(&kind)
         .fetch_one(&mut *tx)
@@ -204,7 +204,7 @@ async fn buy_item(
     // SKU 目录（读只在 pool）。未知/停用 → 404。
     let row = sqlx::query(
         "SELECT price_cents, narrative, effect_tags, origin_world_template_id, cosmology_json, power_tier, enabled \
-         FROM item_sku_map WHERE sku = ?",
+         FROM item_sku_map WHERE sku = $1",
     )
     .bind(&sku)
     .fetch_optional(&state.db)

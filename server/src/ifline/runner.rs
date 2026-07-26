@@ -525,7 +525,7 @@ pub(super) async fn advance_one_beat(
         let seed = derive_run_seed(row);
         let hex = format!("{seed:016x}");
         // CAS：只有仍为空时才写，并发下先到的钉住，后到的读回同一个值（派生式确定 → 值必然相同）。
-        sqlx::query("UPDATE ifline_worlds SET run_seed = ? WHERE id = ? AND run_seed = ''")
+        sqlx::query("UPDATE ifline_worlds SET run_seed = $1 WHERE id = $2 AND run_seed = ''")
             .bind(&hex)
             .bind(&row.id)
             .execute(db)
@@ -538,7 +538,7 @@ pub(super) async fn advance_one_beat(
     let cast_json_raw = if row.cast_json.is_empty() {
         let built = extract_cast(origin.assembled_json.as_deref().unwrap_or("{}"), &foreign);
         let raw = built.to_string();
-        sqlx::query("UPDATE ifline_worlds SET cast_json = ? WHERE id = ? AND cast_json = ''")
+        sqlx::query("UPDATE ifline_worlds SET cast_json = $1 WHERE id = $2 AND cast_json = ''")
             .bind(&raw)
             .bind(&row.id)
             .execute(db)
@@ -594,7 +594,7 @@ pub(super) async fn advance_one_beat(
     let claimed = sqlx::query(
         "INSERT INTO ifline_beats (id, ifline_id, beat_no, status, base_revision, seed_hex, \
          cast_json, prose, moderation, critic_json, cost_tokens, terminal_reason, note, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, '', 'pending', '{}', 0, '', NULL, ?) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, '', 'pending', '{}', 0, '', NULL, $8) \
          ON CONFLICT (ifline_id, beat_no) DO NOTHING",
     )
     .bind(&beat_id)
@@ -861,7 +861,7 @@ async fn fail_beat(
     note: &str,
 ) -> Result<(), ApiError> {
     sqlx::query(
-        "UPDATE ifline_beats SET status = ?, note = ?, finished_at = ? WHERE id = ? AND status = ?",
+        "UPDATE ifline_beats SET status = $1, note = $2, finished_at = $3 WHERE id = $4 AND status = $5",
     )
     .bind(BEAT_FAILED)
     .bind(note)
@@ -939,8 +939,8 @@ async fn commit_beat(
     let mut tx = state.db.begin().await?;
 
     sqlx::query(
-        "UPDATE ifline_beats SET status = ?, prose = ?, moderation = ?, critic_json = ?, \
-         cost_tokens = ?, terminal_reason = ?, finished_at = ? WHERE id = ? AND status = ?",
+        "UPDATE ifline_beats SET status = $1, prose = $2, moderation = $3, critic_json = $4, \
+         cost_tokens = $5, terminal_reason = $6, finished_at = $7 WHERE id = $8 AND status = $9",
     )
     .bind(BEAT_DONE)
     .bind(c.prose)
@@ -957,9 +957,9 @@ async fn commit_beat(
     // 🔴 活态 CAS（`WHERE live_revision = ?`）：不是先查后写。并发下另一笔已推进过 → 命中 0 行 →
     // 整笔回滚，这一拍的状态不落库。宁可让玩家重推一次，也不允许两笔推进互相覆盖。
     let updated = sqlx::query(
-        "UPDATE ifline_worlds SET live_state_json = ?, live_revision = ?, beat_count = ?, \
-         cost_tokens_total = cost_tokens_total + ?, status = ?, ending_reason = ?, \
-         ending_label = ?, ended_at = ? WHERE id = ? AND live_revision = ?",
+        "UPDATE ifline_worlds SET live_state_json = $1, live_revision = $2, beat_count = $3, \
+         cost_tokens_total = cost_tokens_total + $4, status = $5, ending_reason = $6, \
+         ending_label = $7, ended_at = $8 WHERE id = $9 AND live_revision = $10",
     )
     .bind(c.new_state_json)
     .bind(c.new_revision)
@@ -985,7 +985,7 @@ async fn commit_beat(
         // 将来任何人翻这条记录，都能一眼看到 if 线的终局没有产出任何资产。
         sqlx::query(
             "INSERT INTO audit_logs (id, actor_id, actor_role, action, subject, reason, created_at) \
-             VALUES (?, ?, 'user', 'ifline.ended', ?, ?, ?)",
+             VALUES ($1, $2, 'user', 'ifline.ended', $3, $4, $5)",
         )
         .bind(new_id("aud"))
         .bind(&row.owner_id)
@@ -1034,8 +1034,8 @@ async fn commit_blocked(
     let now = now_ms();
     let mut tx = state.db.begin().await?;
     sqlx::query(
-        "UPDATE ifline_beats SET status = ?, cost_tokens = ?, note = ?, finished_at = ? \
-         WHERE id = ? AND status = ?",
+        "UPDATE ifline_beats SET status = $1, cost_tokens = $2, note = $3, finished_at = $4 \
+         WHERE id = $5 AND status = $6",
     )
     .bind(BEAT_BLOCKED)
     .bind(cost)
@@ -1047,8 +1047,8 @@ async fn commit_blocked(
     .await?;
     // 只推进拍数与成本，**不动 `live_state_json` / `live_revision`**（blocked 不提交状态）。
     sqlx::query(
-        "UPDATE ifline_worlds SET beat_count = ?, cost_tokens_total = cost_tokens_total + ? \
-         WHERE id = ? AND beat_count = ?",
+        "UPDATE ifline_worlds SET beat_count = $1, cost_tokens_total = cost_tokens_total + $2 \
+         WHERE id = $3 AND beat_count = $4",
     )
     .bind(beat_no + 1)
     .bind(cost)
@@ -1084,8 +1084,8 @@ async fn finalize_ending(
     let now = now_ms();
     // CAS on status：并发两笔同时到顶，只有一笔写成，另一笔读回同样的终局（幂等）。
     sqlx::query(
-        "UPDATE ifline_worlds SET status = ?, ending_reason = ?, ending_label = ?, ended_at = ? \
-         WHERE id = ? AND status <> ?",
+        "UPDATE ifline_worlds SET status = $1, ending_reason = $2, ending_label = $3, ended_at = $4 \
+         WHERE id = $5 AND status <> $6",
     )
     .bind(STATUS_ENDED)
     .bind(reason)
@@ -1100,7 +1100,7 @@ async fn finalize_ending(
 
 /// 失败拍也要推进计数（否则玩家会反复卡在同一拍）。CAS 保证幂等。
 async fn bump_beat_count(db: &AnyPool, ifline_id: &str, beat_no: i64) -> Result<(), ApiError> {
-    sqlx::query("UPDATE ifline_worlds SET beat_count = ? WHERE id = ? AND beat_count = ?")
+    sqlx::query("UPDATE ifline_worlds SET beat_count = $1 WHERE id = $2 AND beat_count = $3")
         .bind(beat_no + 1)
         .bind(ifline_id)
         .bind(beat_no)
@@ -1114,7 +1114,7 @@ async fn bump_beat_count(db: &AnyPool, ifline_id: &str, beat_no: i64) -> Result<
 // ═══════════════════════════════════════════════════════════════════════════
 
 async fn fetch_cast_json(db: &AnyPool, id: &str) -> Result<Option<String>, ApiError> {
-    let row = sqlx::query("SELECT cast_json FROM ifline_worlds WHERE id = ?")
+    let row = sqlx::query("SELECT cast_json FROM ifline_worlds WHERE id = $1")
         .bind(id)
         .fetch_optional(db)
         .await?;
@@ -1128,7 +1128,7 @@ async fn load_character_card(
     owner_id: &str,
 ) -> Result<Option<CharacterCardV2>, ApiError> {
     let row = sqlx::query(
-        "SELECT card_json FROM cloud_characters WHERE id = ? AND owner_id = ? AND withdrawn = 0",
+        "SELECT card_json FROM cloud_characters WHERE id = $1 AND owner_id = $2 AND withdrawn = 0",
     )
     .bind(character_id)
     .bind(owner_id)

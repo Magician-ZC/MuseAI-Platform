@@ -126,7 +126,7 @@ pub(crate) async fn collect_world_facts(
 ) -> Result<WorldQualityFacts, ApiError> {
     let mut f = WorldQualityFacts { world_id: world_id.to_string(), ..Default::default() };
 
-    f.status = sqlx::query("SELECT status FROM worlds WHERE id = ?")
+    f.status = sqlx::query("SELECT status FROM worlds WHERE id = $1")
         .bind(world_id)
         .fetch_optional(db)
         .await?
@@ -140,7 +140,7 @@ pub(crate) async fn collect_world_facts(
 
     let rows = sqlx::query(
         "SELECT status, COALESCE(error, '') AS err, CAST(COUNT(*) AS BIGINT) AS n \
-         FROM world_ticks WHERE world_id = ? GROUP BY status, COALESCE(error, '')",
+         FROM world_ticks WHERE world_id = $1 GROUP BY status, COALESCE(error, '')",
     )
     .bind(world_id)
     .fetch_all(db)
@@ -160,13 +160,13 @@ pub(crate) async fn collect_world_facts(
         }
     }
 
-    f.events_total = sqlx::query("SELECT CAST(COUNT(*) AS BIGINT) AS n FROM world_events WHERE world_id = ?")
+    f.events_total = sqlx::query("SELECT CAST(COUNT(*) AS BIGINT) AS n FROM world_events WHERE world_id = $1")
         .bind(world_id)
         .fetch_one(db)
         .await?
         .try_get("n")?;
     f.events_withheld = sqlx::query(
-        "SELECT CAST(COUNT(*) AS BIGINT) AS n FROM world_events WHERE world_id = ? AND moderation <> 'approved'",
+        "SELECT CAST(COUNT(*) AS BIGINT) AS n FROM world_events WHERE world_id = $1 AND moderation <> 'approved'",
     )
     .bind(world_id)
     .fetch_one(db)

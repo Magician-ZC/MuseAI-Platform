@@ -108,7 +108,7 @@ use tower::ServiceExt;
 async fn seed_user(db: &AnyPool, id: &str) {
     sqlx::query(
         "INSERT INTO users (id, phone, nickname, age_declared, role, status, created_at, updated_at) \
-         VALUES (?, ?, '昵称', 1, 'user', 'active', ?, ?)",
+         VALUES ($1, $2, '昵称', 1, 'user', 'active', $3, $4)",
     )
     .bind(id)
     .bind(format!("1{:010}", id.len() * 7919 % 1_000_000_000))
@@ -123,7 +123,7 @@ async fn seed_world(db: &AnyPool, id: &str) {
     sqlx::query(
         "INSERT INTO worlds (id, template_id, template_version, engine_version, prompt_set_version, \
          model_route_version, room_type, title, status, created_at, updated_at) \
-         VALUES (?, 'tpl_x', 1, 'e1', 'p1', 'm1', 'idle', '世界', 'open', ?, ?)",
+         VALUES ($1, 'tpl_x', 1, 'e1', 'p1', 'm1', 'idle', '世界', 'open', $2, $3)",
     )
     .bind(id)
     .bind(now_ms())
@@ -147,7 +147,7 @@ async fn raw_insert(
 ) {
     sqlx::query(
         "INSERT INTO runtime_flags (id, flag, scope, target_id, enabled, starts_at, ends_at, \
-         updated_by, updated_at, reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'tester', ?, '用例', ?)",
+         updated_by, updated_at, reason, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 'tester', $8, '用例', $9)",
     )
     .bind(id)
     .bind(flag)
@@ -719,7 +719,7 @@ async fn audit_trail_records_who_when_what_why() {
 
     // 记录行自身也留痕（现状面，与 audit_logs 流水面互补）。
     let rec = get_record(&state.db, &sqlx::query_scalar::<_, String>(
-        "SELECT id FROM runtime_flags WHERE flag = ? AND scope = 'user' AND target_id = 'usr_a'",
+        "SELECT id FROM runtime_flags WHERE flag = $1 AND scope = 'user' AND target_id = 'usr_a'",
     )
     .bind(F)
     .fetch_one(&state.db)

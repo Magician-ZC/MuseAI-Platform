@@ -4624,28 +4624,36 @@ mod member_order_tests {
     /// `progression::tests::red_line_engine_decision_paths_never_reference_mileage`。
     #[test]
     fn order_by_clause_pins_secondary_key() {
-        // ⚠️ include_str! 会把**本测试自己**也读进来，断言里的字面量会匹配到自身：
-        //    「必须存在」的断言因此永远为真（假绿），「不得存在」的断言因此永远为假（假红）。
-        //    故先按第一个 #[cfg(test)] 截断，只扫描生产代码段。
-        let cut = |s: &'static str| s.split("#[cfg(test)]").next().unwrap_or(s).to_string();
-        let src = cut(include_str!("mod.rs"));
-        // 成员卡装配（本文件）与 runtime 的成员遍历必须同口径，两处都查。
+        // ⚠️ `include_str!` 会把**本测试自己**也读进来，断言里的字面量会匹配到自身：
+        //    「必须存在」的断言因此永远为真（假绿）。
+        //
+        // 🔴 曾用「按第一个测试段标记截断、只扫生产段」来规避，但那个办法两次栽在同一件事上：
+        //    生产段一旦出现该标记的字面量（哪怕在注释里、哪怕在文件很靠前处新增了一个测试子模块），
+        //    截断点就前移，断言随即静默失效——第二次是 runtime 在 :593 新增子模块、
+        //    而目标 SQL 在 :2053，整段被切掉，断言直接假红。
+        //
+        // 现在改用**拆写 needle**：源码里只存在两个片段，拼接后的完整串在文件中出现且仅出现在
+        // 被检查的那条 SQL 里。不再需要截断，也就不存在"截断点被谁挪走"这回事。
+        let needle = concat!("ORDER BY wm.joined_at ASC, ", "wm.cloud_character_id ASC");
+        // 拆点必须选在「拼接后完整、但源码文本里不连续」的位置——
+        // 上一版拆在 ASC 与引号之间，源码里恰好构成 `ASC",` 而匹配到自身（假红）。
+        let bad = concat!("ORDER BY wm.", "joined_at ASC\",");
+
+        let src = include_str!("mod.rs");
         assert!(
-            src.contains("ORDER BY wm.joined_at ASC, wm.cloud_character_id ASC"),
+            src.contains(needle),
             "assembly::load_active_cards 的 ORDER BY 必须带 cloud_character_id 次级键：\n\
              joined_at 撞毫秒时行序由 DB 决定，装配产物会在重放间漂移（Postgres 上尤其如此，\n\
              SQLite 因走唯一索引恰好有序，行为测试证伪不了）"
         );
-        assert!(
-            !src.contains("ORDER BY wm.joined_at ASC\","),
-            "不得存在只按 joined_at 排序的成员查询"
-        );
+        assert!(!src.contains(bad), "不得存在只按 joined_at 排序的成员查询");
 
-        let runtime_src = cut(include_str!("../runtime/mod.rs"));
+        let runtime_src = include_str!("../runtime/mod.rs");
         assert!(
-            runtime_src.contains("ORDER BY wm.joined_at ASC, wm.cloud_character_id ASC"),
+            runtime_src.contains(needle),
             "runtime 的成员卡查询必须与 assembly 同口径——它构造的 other_cards_brief \n\
              与 principal 投影会直接喂给引擎，漂移影响比装配层更直接"
         );
+        assert!(!runtime_src.contains(bad), "runtime 侧同样不得只按 joined_at 排序");
     }
 }

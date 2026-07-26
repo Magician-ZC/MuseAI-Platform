@@ -2387,6 +2387,29 @@ async fn process_tick_inner(
         Some(m) => m,
         None => Arc::new(HttpModelClient::new()?),
     };
+    // 9.0) 录制 / 回放接线（任务 #46，`runtime::record`，**默认关闭**）。
+    //
+    // 这里是整条 tick 路径上模型客户端的**唯一出口**：`process_tick`（生产，内部造 HttpModelClient）
+    // 与 `process_tick_with_model`（注入，golden / simulation）都从这一个口子出去，故录制覆盖的是
+    // 生产同一条路径，不是给回归另开的第二条。
+    //
+    // 🔴 **默认关闭 = 当前行为一字节不变，是结构性的**：未配置时 `wrap_tick_model` 返回的就是上面
+    //    那一个 `Arc`（`Arc::ptr_eq` 成立），中间**没有任何一层包装** —— 不需要论证"包装恰好透明"。
+    //    锁在 `record::tests::off_returns_the_very_same_arc` + `..._round_trip_is_byte_identical`。
+    // 🔴 `_capture` 必须持有到本拍结束：录制落盘发生在它 Drop 时（本函数出口十余处，逐个补落盘
+    //    既漏得掉也读不动）。
+    let (model, _capture) = record::wrap_tick_model(
+        world_id,
+        tick_no,
+        model,
+        &fs,
+        &[
+            ("promptSetVersion", world.prompt_set_version.as_str()),
+            ("modelRouteVersion", world.model_route_version.as_str()),
+            ("templateId", world.template_id.as_str()),
+            ("timelineMode", world.timeline_mode.as_str()),
+        ],
+    )?;
     let prompts = resolve_prompts(db, &world.prompt_set_version).await?;
 
     // 9.5) #3b 回灌：本世界已获批(approved)的不可逆同意 subject → 引擎门控白名单。
@@ -2788,6 +2811,11 @@ pub fn spawn_workers(state: AppState) {
     tracing::info!(workers, "runtime 调度器与 worker 池已启动");
 }
 
+/// 世界 tick 模型调用的录制 / 回放接线（任务 #46）：`muse_engine::replay` 的平台轨接口层。
+/// **默认关闭**——未配置时接线点恒等返回同一个 `Arc`，默认路径逐字节零变化。
+/// 🔴 交付的是**工具接线**（`Implemented`），不是「角色一致性已验证」：真实模型录制需要用户自己的
+/// API Key，本仓没有，故至今零真实录制、质量口径亦未定。详见该文件头。
+mod record;
 /// 黄金世界回归（VALIDATION §4.1 验证基建）：固定 world_id + 固定 fixture + 剧本化模型，
 /// 比对结构化产物是否逐字节不变。binary-only crate 无 lib.rs，只能落在 `#[cfg(test)]` 子模块，
 /// 好处是自动进现有 `platform-test` CI job，CI 改动为零。

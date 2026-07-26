@@ -116,23 +116,25 @@ jobs:
           MUSE_TEST_DATABASE_URL: postgres://muse:muse@localhost:5432/muse_test
           MUSE_TEST_SCHEMA_PREFIX: muse_schema
 
-      # 🔴 **已知红，故暂不阻塞。** 根因不是测试写法，是生产代码：sqlx 的 `Any` 驱动
-      # 原样透传 SQL、不做 `?` → `$N` 改写，而全仓 900+ 条语句用的是 `?`——
-      # 于是 PG 上每条带参数的查询都是 42601 语法错。详见
-      # `testkit::tests::numbered_placeholders_are_portable_but_question_marks_are_not`。
-      #
-      # 这一步现在的作用是**把这个缺口摆在明面上、并让它的数字随迁移进度可见地缩小**。
-      # 收口条件（两件事一起做，缺一不可）：
-      #   ① 900+ 处调用点的 `?` 改成 `$N`；
-      #   ② 删掉 `continue-on-error`，并把 `--features billing,arena` 那一遍也加回来
-      #      （现在只跑 default：两个 feature 组合的失败根因完全相同，多跑一遍只是重复
-      #       同一堵红墙，白烧 ~4 分钟 CI）。
-      - name: Server tests on Postgres (全量 · 诊断 · 见注释，暂不阻塞)
-        continue-on-error: true
+      # ✅ **已收口，故阻塞。** 曾经的两条红线均已修完：
+      #   ① `?` → `$N`（sqlx 的 `Any` 驱动原样透传 SQL、不做占位符改写，PG 上每条带参
+      #      查询都是 42601 语法错）——见 `testkit::tests::
+      #      numbered_placeholders_are_portable_but_question_marks_are_not`；
+      #   ② `SUM()` 解码（PG 下 `SUM(bigint)` 返回 `numeric`，`Any` 驱动不认这个类型）——
+      #      投影出来的 SUM 一律 `CAST(... AS BIGINT)`。
+      # 两个 feature 组合各跑一遍：billing/arena 那批（ledger/billing/shop/arena/livegate）
+      # 全是金额聚合，正是 ② 的高发区，default 那遍覆盖不到。
+      - name: Server tests on Postgres (default features)
         run: cargo test --manifest-path server/Cargo.toml
         env:
           MUSE_TEST_DATABASE_URL: postgres://muse:muse@localhost:5432/muse_test
           MUSE_TEST_SCHEMA_PREFIX: muse_full
+
+      - name: Server tests on Postgres (billing + arena)
+        run: cargo test --manifest-path server/Cargo.toml --features billing,arena
+        env:
+          MUSE_TEST_DATABASE_URL: postgres://muse:muse@localhost:5432/muse_test
+          MUSE_TEST_SCHEMA_PREFIX: muse_full_ba
 
       - name: Setup Node
         uses: actions/setup-node@v4

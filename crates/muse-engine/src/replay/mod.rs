@@ -61,7 +61,18 @@
 //!   默认目录 [`DEFAULT_RECORDING_DIR`] → [`Recording::save`] / [`Recording::load`]。
 //!   **绝不写 `muse-objects/`** 之类 gitignore 的运行时目录之外的地方，路径合法性由 `HostFs` 兜。
 //!
-//! ## 怎么接到平台轨（本次未接线，见报告「遗留」）
+//! ## 平台轨接线（**已接**，2026-07-27 任务 #46）
+//!
+//! 接线在 `server/src/runtime/record.rs`，接点是 `runtime::process_tick_inner` 第 9 步
+//! ——模型客户端在整条 tick 路径上的唯一出口，故 `process_tick`（生产）与
+//! `process_tick_with_model`（golden / simulation 注入）都被覆盖。**默认关闭**：
+//! 未配置时接线点原样返回传进去的那一个 `Arc`（`Arc::ptr_eq` 成立，中间没有任何一层包装），
+//! 所以默认路径逐字节零变化。开关见该文件头（`MUSE_TICK_RECORD` / `MUSE_TICK_REPLAY` …）。
+//!
+//! ⚠️ 接线 ≠ 结论：**至今没有任何一份真实模型录制**（需用户自己的 API Key），
+//! 「差异多大算 OOC」的评分口径也还没有。本模块与接线合起来仍只到 `Implemented`。
+//!
+//! 下面是接法的最小形态（平台轨的实际实现多了会话管理、落盘守卫与降级纪律）：
 //!
 //! ```ignore
 //! // 录制：拿生产路径跑一遍真实模型，逐拍对齐拍号

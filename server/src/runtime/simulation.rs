@@ -42,9 +42,18 @@
 //! 这段话不只写在注释里——`QualitySource::SimulatedStub` 让它随每一份报告 JSON 一起走
 //! （`slo::quality` 的 `honesty` 字段）。**数会被复制进评审材料，注释不会。**
 //!
-//! 要真正度量内容质量，前置件仍是 **record-and-replay 的 `ModelClient`**
-//! （VALIDATION §4.1 标注的「唯一真新建件」，至今未建）：先用真实模型把一批世界录下来，
+//! 要真正度量内容质量，前置件是 **record-and-replay 的 `ModelClient`**
+//! （VALIDATION §4.1 标注的「唯一真新建件」）：先用真实模型把一批世界录下来，
 //! 再换 Prompt / 引擎重放录像。**本模块不假装自己是那个东西。**
+//!
+//! 该前置件的进度（截至 2026-07-27）：**工具已建**（`muse_engine::replay`，2026-07-26）、
+//! **接线已通**（`runtime::record`，任务 #46，接在 `process_tick_inner` 第 9 步，**默认关闭**）；
+//! 但**没有任何一份真实模型录制**（需用户自己的 API Key），质量口径（「差异多大算 OOC」）**也还没有**。
+//! 🔴 **所以本模块上面那段「诚实划界」一个字都不用改**：仿真仍然全程跑
+//! `SimModel` 这个规则化假模型，三个指标依旧**不度量内容质量**。
+//! 接线本身对本模块**零影响**——默认关闭时接线点原样返回同一个 `Arc`（`Arc::ptr_eq` 成立），
+//! `simulation/baseline.json` 因此一个字节都没动。要拿真实模型录一份，见
+//! `runtime::record::tests::record_golden_world_with_real_model`（`#[ignore]`，需自带凭据）。
 //!
 //! ## 确定性契约
 //!
@@ -318,6 +327,9 @@ fn breach_action(cid: &str) -> Option<&'static str> {
 /// 「同种子恒同结果」当场破裂，整个跨版本回归失去意义。
 ///
 /// 它**不是** record-and-replay：回放的是**规则**，不是真实模型响应。见文件头「诚实划界」。
+/// 真正的 record-and-replay 在 `muse_engine::replay`（工具）+ `runtime::record`（接线，默认关闭）；
+/// 本类型可以被套进录制器，但录出来的仍然只是这套规则——录制产物的
+/// `labels.responseSource=scriptedStub` 就是为了让这件事分得清。
 struct SimModel {
     world_seed: u64,
     temper: Temper,
@@ -1366,6 +1378,12 @@ async fn single_world_runs_full_lifecycle_and_reports_structured_result() {
 //    - 换模型的真实成本：token 是逐环节常数，只反映**调用构成**
 //    - 真实玩家行为：仿真里没有玩家干预、没有退出、没有托梦（这些 golden 各有专项）
 //
-// 🔜 **下一件事**：record-and-replay 的 `ModelClient`。有了它，本模块的场景表可以先用真实模型
-//    录一批，之后换 Prompt / 引擎重放录像——**那时**这三个指标才同时含有内容质量成分，
-//    也**只有那时**才谈得上「叙事质量已验证」。在它建成之前，本模块的任何数字都不得这样表述。
+// 🔜 **下一件事**：拿真实模型录一批 —— record-and-replay 的**工具与接线都已就位**
+//    （`muse_engine::replay` 2026-07-26 · `runtime::record` 2026-07-27 任务 #46，接在
+//    `process_tick_inner` 第 9 步，默认关闭），把本模块的场景表用真实模型录一批、之后换
+//    Prompt / 引擎重放录像，**那时**这三个指标才同时含有内容质量成分。
+//
+//    🔴 **但那一步还没发生**：本仓没有任何一份真实模型录制（需用户自己的 API Key），
+//    「差异多大算 OOC / 退化」的评分口径也还没有。所以在此之前，
+//    **本模块的任何数字仍然一律不得表述为「叙事质量已验证」**——工具就位不等于结论就位。
+//    录制入口：`cargo test --manifest-path server/Cargo.toml -- --ignored record_golden_world_with_real_model`。

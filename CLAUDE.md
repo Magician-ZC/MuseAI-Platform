@@ -11,12 +11,18 @@ MuseAI-Platform 是 MuseAI 的**双轨仓库**：
 平台轨常用命令（**仓库根没有 workspace `Cargo.toml`**，每个 crate 独立成包，cargo 命令必须 `cd` 进目录或带 `--manifest-path`）：
 ```bash
 cd server && cargo run --features billing,arena                 # 起平台 server(:8787)
-cargo test --manifest-path server/Cargo.toml                    # 464 passed（default，含黄金世界回归）
-cargo test --manifest-path server/Cargo.toml --features billing,arena   # 542 passed
-cargo test --manifest-path crates/muse-engine/Cargo.toml        # 244 passed
-cargo test --manifest-path server/Cargo.toml golden             # 12 项黄金世界回归（换模型/Prompt/引擎版本后必跑）
+cargo test --manifest-path server/Cargo.toml                    # 平台 server（default，含黄金世界回归）
+cargo test --manifest-path server/Cargo.toml --features billing,arena
+cargo test --manifest-path crates/muse-engine/Cargo.toml        # 宿主无关叙事引擎
+cargo test --manifest-path server/Cargo.toml golden             # 黄金世界回归（换模型/Prompt/引擎版本后必跑）
 cd admin && npm run build                                       # admin 类型检查+构建（端口 1430）
 ```
+
+> ⚠️ **本文不复述用例数**：这几个数字曾写死为 464 / 542 / 244 / golden 12，到 2026-07-27 实际已是
+> 798 / 876 / 287 / golden 14——**每一批开发都会让它过期，而一个看起来精确却是错的基线比没有更糟**
+> （它会让人把"数字对不上"误判成"我把测试跑挂了"）。基线以 `docs/STARTUP.md` §7 为唯一权威，
+> 需要当前值时直接跑一遍。同理见 `flags::KNOWN_FLAGS`（开关数）与 `docs/API.md`（路由数）——
+> 三处都已按此原则去掉硬编码计数。
 
 接口清单见 `docs/API.md`（路由 / 鉴权级别 / feature 门控 / admin 角色矩阵；改路由必须同步改它）。
 

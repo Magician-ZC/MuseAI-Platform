@@ -117,7 +117,7 @@ pub(super) fn golden_card_json(id: &str) -> String {
 /// （主线摘要 / 禁止谓词 / 结局池 / 隐藏池 / 身份池 / 产出表 / 世界固有角色）在所有测试点之间
 /// 逐字节一致——这才使"同一个黄金世界的不同剧情分支"这句话成立。
 #[derive(Debug, Clone)]
-struct GoldenParams {
+pub(super) struct GoldenParams {
     /// 主线里程碑 m1 的阈值（回合强度累积到此值即完成主线 → 引擎产 MainlineDone）。
     milestone_threshold: f64,
     /// 终局地板：`tick_no < min_world_ticks` 前一律不触发终局（防秒结束）。
@@ -130,7 +130,7 @@ struct GoldenParams {
 
 impl GoldenParams {
     /// 主回归：三拍把主线里程碑推过阈值（5.00 + 4.75 + 4.50 = 14.25 ≥ 12.0），第三拍即自然收尾。
-    fn main() -> Self {
+    pub(super) fn main() -> Self {
         Self {
             milestone_threshold: 12.0,
             min_world_ticks: 1,
@@ -220,7 +220,7 @@ async fn seed_golden_char(db: &AnyPool, cid: &str, owner: &str) {
 /// 🔴 不走 `create_world`：它用 `new_id("wld")`（uuid v4），而 world_id 进 `instance_seed`
 ///（`assembly/mod.rs`），随机 id ⇒ 每次跑的是不同副本 ⇒ 回归无从谈起。此处直接 INSERT，
 /// 字段与 `create_world_tx` 一一对应（含 `world_budgets` 那一行，否则预算预检读不到行）。
-async fn seed_golden_world(state: &AppState, world_id: &str, params: &GoldenParams) {
+pub(super) async fn seed_golden_world(state: &AppState, world_id: &str, params: &GoldenParams) {
     let db = &state.db;
     seed_golden_template(db, params).await;
     seed_model_routes(db, GOLDEN_ROUTES_VERSION).await;
@@ -314,7 +314,10 @@ pub(super) fn agent_tokens(agent: &str) -> (u32, u32) {
 /// 就是靠这张表编出来的。
 ///
 /// 🔴 **这不是 record-and-replay**：它回放的是**人写的剧本**，不是真实模型响应。见文件末「诚实划界」。
-struct ScriptedModel {
+/// 真正的 record-and-replay 是 `muse_engine::replay`（工具）+ `runtime::record`（接线，默认关闭）；
+/// 本类型可以被套进录制器当"待录的模型"，但一份用它录出来的录制里装的仍然只是这张剧本表——
+/// 故录制产物带 `labels.responseSource=scriptedStub` 把这件事钉死。
+pub(super) struct ScriptedModel {
     tick: AtomicI64,
     /// (agent, tick, cid) → 响应 JSON。查表顺序见 `lookup`。
     script: BTreeMap<(String, i64, String), String>,
@@ -346,11 +349,11 @@ impl ScriptedModel {
         self
     }
 
-    fn set_tick(&self, tick: i64) {
+    pub(super) fn set_tick(&self, tick: i64) {
         self.tick.store(tick, Ordering::SeqCst);
     }
 
-    fn captured(&self) -> Vec<(String, String)> {
+    pub(super) fn captured(&self) -> Vec<(String, String)> {
         self.captured.lock().unwrap().clone()
     }
 
@@ -451,7 +454,7 @@ async fn drive_tick(
 //    会把友善判成敌对）、「决裂」属不可逆关系变更（会触发同意门，把这一拍的行动整个拦下）。
 //    改台词前先读 `relation_dynamics::RelationRules` 与 `narrative::IrreversibleRules`。
 
-fn main_scripted_model() -> Arc<ScriptedModel> {
+pub(super) fn main_scripted_model() -> Arc<ScriptedModel> {
     let m = ScriptedModel::new()
         // ---- 拍 0：初遇，全员发言 ----
         .on(
@@ -532,7 +535,7 @@ fn main_scripted_model() -> Arc<ScriptedModel> {
 }
 
 /// 主回归总拍数：拍 2 里程碑达成即自然收尾（终局与状态 CAS 同事务，不需要额外一拍）。
-const MAIN_TICKS: i64 = 3;
+pub(super) const MAIN_TICKS: i64 = 3;
 
 /// 跑完整条主回归剧本，返回逐拍的 `TickStatus`。
 async fn run_main_scenario(state: &AppState, model: &Arc<ScriptedModel>) -> Vec<TickStatus> {
@@ -591,7 +594,7 @@ async fn conclusion_of(db: &AnyPool, world_id: &str) -> (String, String) {
 ///   `worldlinePayouts` / `arenaRewards`
 ///
 /// 刻意不收：`prose`（写作温度 0.8 硬编码，且从未落库）、`now_ms()` 墙钟、`new_id()` 行主键。
-async fn golden_snapshot(db: &AnyPool, world_id: &str) -> String {
+pub(super) async fn golden_snapshot(db: &AnyPool, world_id: &str) -> String {
     let w = load_world(db, world_id).await.unwrap();
     let narrative: Value = serde_json::from_str(&w.narrative_state_json).unwrap_or(Value::Null);
 
@@ -1489,7 +1492,20 @@ fn golden_fixture_is_well_formed() {
 //      反映不了"换了个模型，同样的局面它多说了三倍的话"。
 //
 // 🔜 **补上 ❌ 那一栏的前提：record-and-replay 的 `ModelClient`**（VALIDATION §4.1 标注的
-//    "唯一真新建件"，全仓目前不存在——现有三个 mock 都不能回放真实响应，`RecordingModel` 录的是
-//    prompt 输入而不是 response）。有了它，同一份黄金世界脚本可以先用真实模型录一遍，之后换
-//    Prompt/引擎重放录像，才谈得上"比对 OOC 与叙事质量"。**本次刻意不做**：它是独立的一件事，
-//    且没有它，"管线不回归"这条更基础的防线一样立不起来——先立这条。
+//    "唯一真新建件"）。进度分三段，**现在停在第 2 段**：
+//
+//    1. ✅ **工具**（2026-07-26，`muse_engine::replay`）：`RecordingClient` 包装任意 `ModelClient`
+//       录入参/出参；`ReplayClient` 结构上**没有 inner 字段**，未命中返回 `NotFound` 而不是回落真实模型；
+//       `diff_recordings` 把两份录制对齐到「哪一拍 · 哪个角色 · 哪个环节」再给字段级差异。
+//    2. ✅ **接线**（2026-07-27，任务 #46，`runtime::record`）：接在 `process_tick_inner` 第 9 步
+//       ——模型客户端在整条 tick 路径上的唯一出口，故 `process_tick`（生产）与本模块用的
+//       `process_tick_with_model`（注入）都被覆盖。**默认关闭**：未配置时接线点原样返回同一个 `Arc`
+//       （`Arc::ptr_eq` 成立，中间没有任何包装），所以本模块的基线**一个字节都没动**。
+//       端到端由 `record::tests::golden_world_record_replay_round_trip_is_byte_identical` 锁死：
+//       黄金世界主线跑三遍（关 / 录 / 放），结构化产物逐字节相等。
+//    3. ❌ **真实录制与质量口径**：本仓**没有任何一份真实模型录制**（那需要用户自己的 API Key），
+//       「差异多大算 OOC」这条评分口径**也还没有**。
+//
+//    ⚠️ 所以上面那一栏 ❌ **一条都没变**：本模块至今仍只跑人写的剧本，
+//    「回归全绿」依旧**不得**被读成「角色一致性已验证」。录制入口（需自带 Key）：
+//    `cargo test --manifest-path server/Cargo.toml -- --ignored record_golden_world_with_real_model`。

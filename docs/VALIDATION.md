@@ -108,28 +108,54 @@
 | 人设保险三级出口（事前底线 / 事中注解权 / 事后 if 线） | 事前 engine Implemented · 事中 **Implemented**（0037）· 事后 **Implemented（开局 + 推进）**（0039/0041） | T1 起（注解权是 T1 门槛的测量手段）/ if 线 T3 待测 | 三级**全部默认关闭** |
 | 内容中台工业线 | Concept | — | — |
 
-> 🔴 **平台生产数据库（Postgres）当前不可用 —— 2026-07-27 本地实测（PostgreSQL 17.5）**
+> 🟡 **平台生产数据库（Postgres）测试全量通过 —— 2026-07-27 本地实测（PostgreSQL 16.9）**
 >
-> `CLAUDE.md` 与 `docs/STARTUP.md` 写的「SQLite dev / Postgres prod」**在查询层不成立**。
-> 根因：`sqlx` 的 `Any` 驱动**原样透传 SQL 字符串、不做 `?` → `$N` 方言改写**
-> （`sqlx-core-0.8.6/src/any/connection/executor.rs` 把 `query.sql()` 直接交给 `PgConnection`），
-> 而全仓 900+ 条语句写的是 `?`。于是 PG 上**每一条带参数的查询**都是 `42601` 语法错。
-> 实测 525/599 条用例失败，数据库错误码分布 **100% 是 `42601`**，无第二种。
+> 上一版这里是红框「PG 当前不可用」。两条根因**均已收口**，全量用例在 PG 上两个 feature
+> 组合都绿，且与 SQLite 逐条同数：
 >
-> - **schema 层是通的**：39 份迁移（`0001-0041`，`0023`/`0028` 是有意空号）在 PG 上逐条通过、
->   建出 66 张表——「双库可移植 SQL 子集」在建表这一层零发现，且已由 CI 阻塞门禁锁住。
-> - **查询层是 broken 的**：`MUSE_DATABASE_URL=postgres://...` 从未真正跑通过一次。
->   那 251 个 PASS 全是不碰 DB 的纯函数用例。
-> - ⚠️ **这个 bug 遮住了其余所有可移植性问题**——类型强制、布尔/整数混用、`CAST`、
->   排序稳定性，一个都还没机会暴露，因为执行根本走不到那一步。占位符改完后 PG 全量再跑，
->   **预期会暴露第二批真问题**，不要把「改完占位符」当作「PG 可用」。
+> | 组合 | SQLite | Postgres |
+> |---|---|---|
+> | 默认 features | 784 passed | **784 passed / 0 failed** |
+> | `--features billing,arena` | 862 passed | **862 passed / 0 failed** |
 >
-> 修法已实证：`$N` 两个库都认（PG 原生；SQLite 把 `$1` 当具名参数、按首次出现顺序派号），
-> 约束是**严格顺序编号且不复用编号**，`.bind()` 的位置绑定即对得上——这条钉在
-> `testkit::tests::numbered_placeholders_are_portable_but_question_marks_are_not`，两库都绿。
+> ⚠️ 上表是 PG 收口当时（`c5af27b` 前后）的实测值。同一天稍晚 record-and-replay 接线
+> 又新增 14 个用例，计数变为 **798 / 876**（PG 侧一并复测仍为 0 failed）。
+> **这里刻意不再追平数字**——用例数每批都变，钉死它只会制造下一次的过期。
+> 要点是「两个 feature 组合在 PG 上零失败、且与 SQLite 逐条同数」这个**结论**，
+> 当前值以 `docs/STARTUP.md` §7 为准。
 >
-> **在收口之前，平台轨不具备 Postgres 上线条件。** 按 §0.3 状态语言，
-> 「Postgres prod」目前是 `Specified`，**不是** `Implemented`。
+> 两条根因（按发现顺序）：
+>
+> 1. **占位符方言**（已修）：`sqlx` 的 `Any` 驱动**原样透传 SQL 字符串、不做 `?` → `$N` 改写**
+>    （`sqlx-core-0.8.6/src/any/connection/executor.rs` 把 `query.sql()` 直接交给 `PgConnection`），
+>    而全仓 900+ 条语句写的是 `?` ⇒ PG 上每条带参查询都是 `42601`。修法：全仓改 `$N`——两库都认
+>    （PG 原生；SQLite 把 `$1` 当具名参数、按首次出现顺序派号），约束是**严格顺序编号且不复用编号**。
+>    钉在 `testkit::tests::numbered_placeholders_are_portable_but_question_marks_are_not`。
+> 2. **`SUM()` 解码**（已修）：PG 下 `SUM(bigint)` 返回 `numeric`，`Any` 驱动不认该类型
+>    （`Any driver does not support the Postgres type Numeric`）；SQLite 直接给整数。
+>    修法：**投影出来的** `SUM` 一律 `CAST(... AS BIGINT)`（`delta_cents` 等均为 BIGINT，
+>    其和为整数值，narrowing 无损；真溢出会报错而非静默截断）。仅出现在 `HAVING` / `WHERE`
+>    比较中的 `SUM` 不需要 CAST——不解码到 Rust 侧。
+>
+>    ⚠️ 这一条是①**遮住**的：占位符 bug 让执行走不到解码那步。生产侧的投影 SUM 早在成本看板
+>    那批就已全部 CAST，故 default 那遍先绿；`billing,arena` 独有的 `ledger/` `billing/` `shop/`
+>    `arena/` `livegate/` 全是金额聚合模块，从未在 PG 上跑过，是这一条的唯一暴露面。
+>
+> **按 §0.3 状态语言，「Postgres prod」= `Implemented`。** 只表示「代码写完、测试全绿」——
+> **不是** `Production-ready`，更**不是** `Validated`：
+>
+> - 从未在真实部署 / 真实并发 / 真实数据量下跑过；连接池、超时、迁移锁、故障恢复零验证。
+> - ⚠️ **已登记未修：排序稳定性**。PG 对 `ORDER BY` 的并列行不保证顺序，SQLite 则常按 rowid
+>   稳定返回。已审出约 30 处生产 SQL 的排序键不唯一且顺序可观测，其中数处并列是**结构性必然**
+>   （如 `events::insert_events_tx` 整批事件共用一个 `now_ms()`，而 `reports/mod.rs` 按
+>   `occurred_at ASC LIMIT 200` 取日报素材）。**当前 CI 全绿并不能证明这些是对的**——
+>   它们是非确定性的，绿只说明这一轮没抽中。清单与优先级见 **§3.3**。
+> - 已知未修的一处特殊情况：`auth/mod.rs` 的 `sms_challenges ORDER BY created_at DESC LIMIT 1`。
+>   该表无单调列、`id` 是 uuid v4，补次级键只能把「不稳定的任意」变成「稳定的任意」，
+>   **语义上仍不等于「最新那条」**。需产品决定或加单调序列，不得自行补一个假的确定性。
+>
+> CI（`.github/workflows/test.yml` 的 `platform-test`）已把 PG 全量两个 feature 组合都设为
+> **阻塞门禁**（`continue-on-error` 已删除）。
 
 ### 3.1 R1 批次台账（总规格 §19 地基批，**校验于 2026-07-26**）
 
@@ -323,6 +349,53 @@ if 线现在是「可开、可跑、可读、可审、可查成本」，但仍**
 > **纪律提醒**：本节存在的意义是 §4.3 那条"发布评审以台账为准，禁止口头'已完成'"。
 > 台账漏项 = 评审失去依据，与状态写错同等严重。改 R1 相关代码时同步改本表。
 
+### 3.3 Postgres 排序稳定性待办（登记于 2026-07-27，**未修**）
+
+PG 对 `ORDER BY` 并列行的顺序**不作任何保证**（可随计划、并行度、物理页序变化）；SQLite 则
+常按 rowid 稳定返回。仓库已按「补唯一次级键」范式修过三处（`load_active_cards`、
+`worlds/mod.rs` 公开阵容、`backpack/mod.rs` `my_memberships`）。下列是**同类但尚未修**的站点。
+
+> 🔴 **CI 全绿不能证明这些是对的。** 它们是非确定性的——绿只说明这一轮没抽中。
+> 本节是登记，不是「已解决」。修任一项都需评审：补次级键会改变现有返回顺序（两库皆然），
+> 而部分站点的正确排序键涉及产品语义（哪条算"最新"）。
+
+**P0 · 并列必然发生，且顺序进入模型输入 / 报告内容**
+
+| 站点 | 排序 | 为什么必然并列 |
+|---|---|---|
+| `reports/mod.rs:123` `world_events` | `ORDER BY occurred_at ASC LIMIT 200` | `events::insert_events_tx` 整批事件**共用一个** `now_ms()`，一个 tick 的事件时间戳全同。表内已有每世界单调的 `sequence` 列可用 |
+| `runtime/mod.rs:2315` `interventions` | `ORDER BY created_at ASC` | 多条 whisper 按行序**拼接成字符串**进 Q-3 prompt，顺序变即模型输入变，破坏回放/golden 确定性 |
+| `backpack/mod.rs:155` `my_backpack` | `ORDER BY b.acquired_at DESC` | 缺次级键——正是 `:265` `my_memberships` 已修站点的**同胞，当时漏了**；结算一次发多件道具共用 `now_ms()` |
+
+**P1 · 游标分页键不唯一 ⇒ 跨页静默丢行**（末行 `created_at` 当游标 + `created_at < cursor` 过滤，
+并列行跨页即永久丢失）：`notifications/mod.rs:293`、`reports/mod.rs:258`、`social/mod.rs:1785`。
+
+**P2 · `LIMIT n` 取到任意子集**（feature-gated 模块从未在 PG 跑过，优先）：`arena/mod.rs:270`、
+`livegate/mod.rs:413`、`consents/mod.rs:132`、`interventions/mod.rs:286`、`invitations/mod.rs:511/:553`、
+`notifications/mod.rs:175`（`due_at` 是排定时刻，整批同值是常态 ⇒ 超 500 待发时有**饥饿**风险）、
+`social/mod.rs:1159/:1346/:1409`。
+
+**P3 · 全量返回但并列可能**：`reports/mod.rs:245`、`assets/mod.rs:359`、`assets/worlds.rs:669`、
+`admin_api/audit.rs:149`、`memorial/mod.rs:747`、`admin_api/governance.rs:40/:193`、
+`admin_api/dashboards.rs:288`（按 `SUM()` 聚合值排序，零成本世界**结构性全部并列**，
+Rust 侧再切 `COST_TOP_N=10` ⇒ 榜单**成员**都是任意的）、`runtime/mod.rs:1256`、`worlds/mod.rs:1541`。
+
+**`LIMIT 1`「取最新那条」· 并列会改变系统实际采用的值**（不只是显示顺序）：
+`admin_api/users.rs:63`（KYC 状态，并列可能显示 `failed` 而实际 `verified`）、
+`progression/mod.rs:757`（写进 BE 传记的**死因**，注释自称"唯一确定性事实源"，并列即证伪）、
+`social/mod.rs:826/:1659`、`worlds/mod.rs:1233`（"哪个配置版本是 live"，目前 `dead_code`，latent）。
+
+**特殊：不得自行补假确定性** —— `auth/mod.rs:248/:304` `sms_challenges ORDER BY created_at DESC LIMIT 1`。
+该表无单调列、`id` 是 uuid v4；补次级键只能把「不稳定的任意」变成「稳定的任意」，语义上仍不是
+「最新那条」。`:304` 风险更高（决定校验哪条 OTP hash）。**需产品决定或加单调序列。**
+
+**相邻风险（并发正确性，非排序）**：`world_events.sequence` 由事务内
+`SELECT COALESCE(MAX(sequence),-1)+1` 读-改-写分配，而 `idx_world_events_world(world_id, sequence)`
+**非唯一**。SQLite 的单写者锁让它事实上串行；PG 在 READ COMMITTED 下不会。两个并发写者可分到
+同一 `sequence`，从而**反向把并列引入**所有依赖 `sequence` 唯一性的站点
+（`clips/mod.rs:36` 的"后来者胜"规则直接依赖它、`arena/mod.rs:240/:367`、`events/mod.rs:107`、`slo/mod.rs:253`）。
+加 `UNIQUE(world_id, sequence)` 可把静默的顺序损坏变成响亮的约束冲突——需迁移 + 评审。
+
 ## 4. 验证基建三件套（优先于新增功能）
 
 1. **黄金世界回归**：一个公版/原创标准样板（固定角色卡 + 世界模板 + 20-30 个关键剧情测试点，
@@ -343,8 +416,22 @@ if 线现在是「可开、可跑、可读、可审、可查成本」，但仍**
      `diff_recordings`（两份录制对齐到「哪一拍 · 哪个角色 · 哪个环节」再给字段级差异）。
      `ModelClient` trait **零改动**（纯包装，两个宿主无需同步）。
      🔴 交付的是**能回答「换了模型角色还是不是它自己」的工具**，不是那个问题的**答案**——
-     它至今**未接线**到黄金世界回归/仿真工装（要动 `runtime/mod.rs`），也**没有**任何真实模型录制入库，
+     ~~它至今**未接线**到黄金世界回归/仿真工装（要动 `runtime/mod.rs`）~~（**已过期，接线于
+     2026-07-27 完成，见下一条**），也**没有**任何真实模型录制入库，
      故本条**不得**被读作「角色一致性已验证」
+   - 🟡 **录制-回放接线**（2026-07-27，任务 #46，状态 `Implemented`）：`server/src/runtime/record.rs`，
+     接点 = `runtime::process_tick_inner` 第 9 步（模型客户端在整条 tick 路径上的**唯一出口**，
+     故生产 `process_tick` 与注入 `process_tick_with_model` 一并覆盖）。
+     **默认关闭**（§0.1）：未配置时接线点返回**传进去的那一个 `Arc`**（`Arc::ptr_eq` 成立，
+     中间没有任何一层包装），默认路径逐字节零变化 —— golden 基线与 `simulation/baseline.json`
+     一个字节未动。开关 `MUSE_TICK_RECORD` / `MUSE_TICK_REPLAY`（互斥）/ `MUSE_TICK_REPLAY_MATCH` /
+     `MUSE_TICK_RECORD_DIR` / `MUSE_TICK_RECORD_WORLD`，另有进程内按 world 覆盖供测试与录制入口用。
+     🔴 **录制失败降级、回放失败不降级**：录制出问题记 warn 退回真实模型（观测面不得弄挂世界）；
+     回放加载失败**直接让本拍失败** —— 回放一旦降级成真实模型，那次对比结果就是假的。
+     🔴 **仍不得读作「角色一致性已验证」**：本仓**没有任何一份真实模型录制**（需运营方自带 API Key），
+     「差异多大算 OOC / 退化」的评分口径**也还没有**。录制产物带 `labels.responseSource`
+     （`scriptedStub` / `real`）把「这份录制里装的是谁的响应」钉进产物本身，
+     同 `QualitySource::SimulatedStub` 的做法 —— **数会被复制进评审材料，文档不会。**
    - ⚠️ **落点受限**：`server` 是 binary-only crate（无 `lib.rs`），`server/tests/` 与独立 bin
      都访问不到 `pub(crate)` 的 runtime/assembly API——回归只能建成 `#[cfg(test)]` 子模块，
      好处是自动进现有 `platform-test` CI job，CI 改动为零
@@ -364,6 +451,10 @@ if 线现在是「可开、可跑、可读、可审、可查成本」，但仍**
      （prose 从未落库 + 写作温度硬编码 0.8）· 换模型的真实成本变化（token 是剧本常数，
      只反映调用构成变化）。补这一栏的前提件 record-and-replay `ModelClient` **已建**
      （`muse_engine::replay`，`Implemented`），但**尚未接进本回归**：黄金世界至今仍只跑人写的剧本。
+     **补记（2026-07-27，任务 #46）**：接线已通（`runtime::record`，见上一条），黄金世界现在
+     **可以**被录制 / 回放，端到端有用例锁死「关 / 录 / 放三跑，结构化产物逐字节相等」。
+     🔴 但这一栏 ❌ **一条都没变**：默认关闭，回归跑的仍是 `ScriptedModel`；
+     **零真实录制 + 无 OOC 评分口径**，两样缺一都不足以谈叙事质量。
 
    **首次运行即抓到一个真问题**：`load_active_cards` 的 `ORDER BY joined_at` 缺次级排序键，
    两成员撞同一毫秒时装配产物顺序在重放间漂移（生产并发 join 同样可能撞）。回归侧已用固定
@@ -423,7 +514,11 @@ if 线现在是「可开、可跑、可读、可审、可查成本」，但仍**
 这段话不只在文档里：`slo::quality::QualitySource::SimulatedStub` 让它作为 `honesty` 字段随每一份
 报告 JSON 一起走（**数会被复制进评审材料，文档不会**）。补齐内容质量成分的前置件是 §4.1 标注的
 record-and-replay `ModelClient`：**工具已建**（`muse_engine::replay`，2026-07-26，`Implemented`），
-**但仿真仍全程跑桩**——本节的三指标口径与「诚实划界」一字未变，接线之前不得据此谈内容质量。
+**接线已通**（`runtime::record`，2026-07-27 任务 #46，`Implemented`，默认关闭），
+**但仿真仍全程跑桩**——本节的三指标口径与「诚实划界」**一字未变**，
+`simulation/baseline.json` 也一个字节没动（默认关闭时接线点原样返回同一个 `Arc`）。
+🔴 还差的是**真实录制**（需运营方自带 API Key，本仓零份）与**质量口径**（「差异多大算 OOC」尚未定义），
+两样都到位之前不得据此谈内容质量。
 
 **当前基线**（`museai-sim-2026-07-26` 种子 · 4 场景 · 10 个世界 · 引擎 0.1.0）：
 完读 6 / 强制收尾 2（`time_limit`）/ 未收尾 2 ⇒ 完读率 60%；阻断 8 拍 / 引擎拍 57 ⇒ 阻断率 14%；
@@ -459,6 +554,54 @@ record-and-replay `ModelClient`：**工具已建**（`muse_engine::replay`，202
 > **境界档仍未做，原因与上段完全一致**（无 schema 落点）。
 > 另注意上段说的是「可视化**与调参**」，本次**只做了可视化，没做调参**：四个端点全只读，
 > 校准参数的写入路径仍是建模板。
+
+### 4.5 录制-回放接线（新增于 2026-07-27 · 任务 #46 · 状态 `Implemented`）
+
+§4.1 「唯一真新建件」的第二段：工具（2026-07-26）→ **接线（本节）** → 真实录制与质量口径（**未做**）。
+
+**落点**：`server/src/runtime/record.rs`（生产代码，非 `#[cfg(test)]`）+
+`server/src/runtime/record/tests.rs`。接点 = `runtime::process_tick_inner` 第 9 步。
+无路由、无迁移、无新表。
+
+| 项 | 内容 |
+|---|---|
+| **接在哪** | tick 路径上模型客户端的**唯一出口**，故 `process_tick`（生产，内部造 `HttpModelClient`）与 `process_tick_with_model`（注入，golden / simulation）一并覆盖 |
+| **默认** | **关闭**。未配置时接线点返回**传进去的那一个 `Arc`**（`Arc::ptr_eq` 成立，中间没有任何一层包装）——「默认路径零变化」是类型层面的恒等，不依赖「包装恰好透明」 |
+| **开关** | `MUSE_TICK_RECORD=<id>` · `MUSE_TICK_REPLAY=<id>`（与前者互斥，同时设 = 两个都不启用）· `MUSE_TICK_REPLAY_MATCH=prompt\|slot` · `MUSE_TICK_RECORD_DIR=<绝对路径>` · `MUSE_TICK_RECORD_WORLD=<worldId>`。空串 / `0` / `false` / `off` 一律当未设置。env **只在进程首次用到时读一次** |
+| **产物** | `<dir>/recordings/<id>.json`，每拍覆写为全量。`dir` 缺省 = 该世界的引擎数据目录（在 gitignore 的 `muse-objects/` 下） |
+| **降级纪律** | 录制失败 → 记 warn、退回真实模型，**绝不阻断 tick**（观测面不得弄挂世界）；回放加载/未命中 → **本拍失败**，🔴 **绝不回落真实模型**——回落会让一次「回放」偷偷变成一次真实调用，那份对比结果就是假的 |
+| **内存** | 录制全量驻留进程内存，故有 `MAX_RECORDED_CALLS`（20 000）上限；触顶后停止录制（已录部分保留在盘上），而不是慢性 OOM |
+
+**跑一次录制（需自带模型凭据，仓库不持有任何 Key）**：
+
+```bash
+MUSE_RECORD_BASE_URL=https://api.example.com/v1 \
+MUSE_RECORD_API_KEY=sk-你自己的key \
+MUSE_RECORD_MODEL=your-model-id \
+MUSE_RECORD_DIR=$PWD/muse-objects/recordings \
+  cargo test --manifest-path server/Cargo.toml \
+    -- --ignored --nocapture record_golden_world_with_real_model
+```
+
+跑完打印产物**绝对路径** + 调用条数 + 自检结果。之后换 Prompt / 换引擎版本对着它回放：
+`MUSE_TICK_REPLAY=<id> MUSE_TICK_RECORD_DIR=<同一目录>` 起 server；换模型再录一份，用
+`muse_engine::replay::diff::diff_recordings` 对齐到「哪一拍 · 哪个角色 · 哪个环节」比字段级差异。
+
+**默认关闭如何被证明**（两层，均为阻塞用例）：
+
+1. `record::tests::off_returns_the_very_same_arc` —— `Arc::ptr_eq` 恒等 + 不建目录不落文件。
+   **可证伪**：在 Off 分支塞任何一层包装，该用例立刻转红（实测过）。
+2. `record::tests::golden_world_record_replay_round_trip_is_byte_identical` —— 黄金世界主线
+   **关 / 录 / 放三跑**，`snap_off == snap_rec == snap_replay` 逐字节相等，且回放期间
+   注入的剧本模型 **`captured()` 为空**（真发生回落它就会被调用）。
+3. `runtime::golden` 全部 12 项与 `simulation/baseline.json` **一个字节未动**。
+
+🔴 **本节交付的是工具接线，不是任何叙事质量结论。** 至今：
+**零真实模型录制**（需运营方自带 API Key）+ **无 OOC / 退化的评分口径**。
+两样都不到位，故本节**不得**被读作「角色一致性已验证」或「已建立基线」。
+录制产物自带 `labels.responseSource`（`scriptedStub` / `real`）——一份桩录制和一份真实录制
+长得一模一样，不把来源钉进产物本身，半年后就会有人拿桩当基线
+（同 `QualitySource::SimulatedStub` 的做法：**数会被复制进评审材料，文档不会**）。
 
 ## 5. AI 失败安全降级（写入门槛，因公共事实不可回滚）
 

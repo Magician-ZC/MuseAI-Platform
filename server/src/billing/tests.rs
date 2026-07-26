@@ -89,8 +89,18 @@ async fn ledger_count(db: &sqlx::AnyPool, uid: &str) -> i64 {
 }
 
 /// 账本聚合：SUM(ledger.delta_cents)，供恒等式断言。
+///
+/// `CAST(... AS BIGINT)` 是跨库解码需要、不是断言让步：PG 下 `SUM(bigint)` 返回 `numeric`，
+/// `Any` 驱动不认这个类型（`Any driver does not support the Postgres type Numeric`），
+/// SQLite 则直接给整数。delta_cents 是 BIGINT，其和为整数值，narrowing 无损；真溢出会报错
+/// 而非静默截断。与 `admin_api/{dashboards,reconcile}.rs` 等生产侧一致（那边全部已 CAST）。
 async fn ledger_sum(db: &sqlx::AnyPool, uid: &str) -> i64 {
-    count(db, "SELECT COALESCE(SUM(delta_cents), 0) FROM ledger_entries WHERE user_id = $1", uid).await
+    count(
+        db,
+        "SELECT CAST(COALESCE(SUM(delta_cents), 0) AS BIGINT) FROM ledger_entries WHERE user_id = $1",
+        uid,
+    )
+    .await
 }
 
 /// 权威余额（直读表，无行视为 0）。

@@ -1436,7 +1436,7 @@ fn brief_with_identity(name: &str, display: Option<&String>) -> String {
 // → 一律 `None` → 导演 prompt **逐字节**与接线前一致；不 panic、不阻断 tick
 //（同 `load_identity_display_names` 与 `seed_narrative_layer` 的防御式口径）。
 //
-// 确定性：全员统一 ⇒ **零抽样、不占任何 RNG 域常量**（域清单里下一个可用的仍是 `0x5C`）。
+// 确定性：全员统一 ⇒ **零抽样、不占任何 RNG 域常量**（域清单里下一个可用的是 `0x5D`）。
 // 本节纯读、纯拼接，无随机、不依赖 map 迭代序 —— 同一实例恒得同一件戏服。
 
 /// 从实例 `assembled_json` 读回本篇戏服（`/assembly/realmTier` 的 `briefing` + `flavorNotes`）。
@@ -2819,6 +2819,15 @@ async fn commit_tick(
             payload_json: s.payload_json,
         });
     }
+
+    // §15 **第 3 层**（语义分类异步复核）的触发点。🔴 **必须在 `tx.commit()` 之后**：
+    // `check_text` 是网络调用，放进上面的事务会（a）单连接池下再借连接死锁 PoolTimedOut，
+    // （b）让 tick 事务的持有时长被外部 RTT 绑架——而 `world_event_seq` 的行级排他锁就在那个事务里。
+    // 这里只做**一次入队**（进程内队列，零 IO、零网络、不返回错误）：真正的复核在
+    // `safety::semantic` 自己的 worker 池里跑，与本 worker 池分开，两者的背压互不绑架。
+    // 默认关闭（`MUSE_SAFETY_SEMANTIC_RECHECK`）——关闭时这一行的唯一副作用是一次开关解析，
+    // 行为与接线前逐字节一致（用例 `safety::semantic::tests::disabled_is_byte_identical_to_before_wiring`）。
+    crate::safety::semantic::enqueue_after_commit(state, world_id, tick_no).await;
 
     // 集成接线（跨模块，非事务关键路径，失败不回滚 tick）：
     // ① #3b 消费本回合 ConsentRequested → 建同意请求（放置房不可逆行动的同意触发源，幂等去重）；

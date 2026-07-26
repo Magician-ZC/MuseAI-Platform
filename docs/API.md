@@ -815,8 +815,33 @@ if 线：   从终局那一拍岔出去的、只属于你的一条平行线   �
 | GET | `/api/admin/ooc-appeals?status=` | **reviewer** | OOC 申诉复核队列（migration 0037）。见 §4「OOC 注解权」 |
 | POST | `/api/admin/ooc-appeals/{id}/review` | **reviewer** | OOC 申诉复核（改判类，与内容风控申诉同档）。确认模型错误 → 补偿托梦配额；落 `audit_logs` |
 | GET | `/api/admin/risk-events` | operator, reviewer, support | 风控事件 |
+| GET | `/api/admin/safety/recheck?since=&until=` | operator | §15 **第 3 层**语义分类异步复核的运行台账 + 成本读数（migration 0046；实现在 `safety::semantic`，由 `admin_api::router()` 聚合挂载）。字段见下方「内容安全第 3 层」小节。🔴 响应恒带 `providerStub` / `source` / `honesty[]` —— 当前 provider 是 Dev 桩，这条链路**接通了但拦不住任何东西** |
 | GET | `/api/admin/data-requests` | support | 数据主体请求 |
 | POST | `/api/admin/data-requests/{id}/run` | support | 执行数据请求 |
+
+### 内容安全第 3 层：语义分类异步复核（`GET /api/admin/safety/recheck`）
+
+总规格 §15 五层漏斗的第 3 层。开关 **`MUSE_SAFETY_SEMANTIC_RECHECK`，默认关闭**（按世界灰度）。
+
+🔴 **先看这条**：`ModerationProvider` 当前唯一实现是 Dev 桩（`providers::DevModeration`），
+真实语义分类**一次都没有发生**。本层交付的是**管线**，不是防线；接真实服务商 = 换实现并把
+`is_dev_stub()` 覆写为 `false`。**不得**据此表述为「五层漏斗已完整」或「内容安全已就绪」。
+这个事实随数据走三处：`safety_recheck_runs.provider_stub` 列 · 每条 `risk_events.detail_json`
+的 `providerStub` · 本端点的 `providerStub` / `source` / `honesty[]`。
+
+| 维度 | 口径 |
+|---|---|
+| 触发 | `runtime::commit_tick` 在 **`tx.commit()` 之后**入队（`queue` topic 独立于 tick 队列，worker 也分池）。🔴 `check_text` 是网络调用，绝不进 tick 事务（单连接池死锁 + 事务时长被 RTT 绑架） |
+| 处置 | 非 Approved → `UPDATE world_events SET moderation` 从 `approved` **收紧**。`SET` 只有这一列、`WHERE` 钉着 `approved` ⇒ **正文逐字节不变**（§0.3）、**单向棘轮**（不放宽、不覆盖更严裁决） |
+| 抽样 | 公开投影全量（`MUSE_SAFETY_L3_PUBLIC_SAMPLE_BP`，默认 10000 万分比）；私有投影抽样（`..._PRIVATE_SAMPLE_BP`，默认 500）。**确定性**（`fnv1a_64` 种子 + SplitMix64，域常量 `0x5C`），重试拿到同一批样本 |
+| 失败 | 先重试（`MUSE_SAFETY_L3_MAX_ATTEMPTS` / `..._BACKOFF_MS` / `..._TIMEOUT_MS`），预算耗尽 → 🔴 **fail-closed**：收紧为 `pending` + 记险 + **无条件**进人审队列。方向不参数化——与 `MUSE_SAFETY_LEXICON` 的 fail-safe（默认「继续过滤」）自洽 |
+| 与第 4 层 | 播出面本就只出 `approved`，故收紧发生在直播水位线之前 ⇒ 观众根本看不到。`interceptedBeforeBroadcast` 是「`MUSE_LIVE_DELAY_TICKS` 够不够」的度量，口径对齐 `live_withholds.preemptive`。⚠️ 它**不等于**「没人看见」：延迟只作用于世界外，成员的读取面不延迟。已返回给客户端的字节收不回，平台也不另发撤回通知 |
+| 留痕 | 一律走 `safety` 既有入口（`record_risk` + 第 2/3 层共用的那条 `audit_queue` 写入语句），本层不另开写入路径 |
+| 成本 | `cost.ratioAvailable` 恒为 **`false`**：T5 门槛「内容审核成本 ≤ 生成成本的 5%」需要审核侧的计价口径，而 `check_text` 只回裁决、不回 token/费用。本端点先把**调用量**（`moderationCallsInWindow`）与**送审字符数**变成可查的数（此前一次调用都没被计过数），分母侧 `generationTokensInWindow` 已可得 |
+
+⚠️ **已知缺口（第 2 层就存在，本层让它更容易被触发）**：`admin_api::audit::writeback_target` 对
+`world_event` 主体返回 `None`，人审在队列里点「通过」**不会**把 `world_events.moderation`
+写回 `approved`。补它需要在 `world_events` 上开一条**放宽**路径，属红线邻近改动，应单独评审。
 
 ### 人工校准面（无迁移；总规格 §79/§83「人工校准 → 仿真试跑 → 世界质量回归」的第一环）
 

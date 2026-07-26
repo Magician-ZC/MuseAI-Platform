@@ -226,7 +226,7 @@ pub const STRICTER_MODERATION_GENRES: &[&str] = &["history"];
 ///
 /// 1. **全员统一** ⇒ 落点是 `Option<RealmTier>` 而**不是**池 / 数组。进「黑角域篇」全员领斗王档，
 ///    没有 per-character 差异，于是没有分配、没有配额、**没有抽样** —— 本维度因此
-///    **不占用任何 RNG 域常量**（域清单里下一个可用的仍是 `0x5C`），装配层只是把它原样钉住。
+///    **不占用任何 RNG 域常量**（域清单里下一个可用的是 `0x5D`），装配层只是把它原样钉住。
 ///    这也是它与身份池（§5，有池有配额有种子分配）的根本区别：**身份各不相同，境界人人一样**。
 /// 2. **零数值** ⇒ 全字段是字符串 / 字符串数组，**一个数字都没有**。§6「跨体系靠风味翻译，
 ///    不靠数值换算」+ §0.1 平权宪法：境界是布景不是战力。给它一个 `level: i64` 就等于开了
@@ -750,9 +750,12 @@ const DOMAIN_IDENTITY: u64 = 0x57;
 // 它们与装配采样物理隔离（不同 seed、不同进程路径），登记只为让「域常量唯一」这条纪律有单一清单。
 // 0x5B：`ifline::runner`（if 线付费副本推进）的逐拍演员表抽样子流 `DOMAIN_IFLINE_CAST`。
 // 同样物理隔离（种子来自 `ifline_worlds.run_seed`，与实例装配 seed 无交集）。
+// 0x5C：`safety::semantic`（§15 第 3 层语义分类异步复核）的**私有投影抽样**子流 `DOMAIN_L3_SAMPLE`。
+// 种子 = H(world_id ‖ tick_no ‖ domain_event_id)，与装配 seed 无交集；登记同样只为让域号唯一。
+// 它必须确定性的理由与装配不同：重试要拿到**同一批样本**，且事后复盘要算得回来「那条为什么没被查」。
 // 境界档（§6 拍板 3）**不占域**：它全员统一、无池无配额、装配层一次骰子都不掷，
 // 只把模板声明原样钉进 `assembled_json` —— 没有抽样就不该占号，取了号反而误导后来者。
-// **下一个可用域常量是 0x5C**；新增子流请在此续号并写明归属，不要跳号也不要复用。
+// **下一个可用域常量是 0x5D**；新增子流请在此续号并写明归属，不要跳号也不要复用。
 
 // ---------- 身份池分配权重（§5 拍板 4、5；纯叙事倾向常量，可调，禁止赋予任何数值含义） ----------
 
@@ -1318,7 +1321,7 @@ fn plan_sampling(
     let resolved_owned: Vec<EndingCandidate> = resolved_endings.iter().map(|&e| e.clone()).collect();
     let scored_endings = weight_endings_scored(&resolved_owned, profile, ending_threshold);
     let enabled_endings: Vec<String> = scored_endings.iter().map(|(id, _)| id.clone()).collect();
-    // 结局定盘：**续用同一条 `DOMAIN_ENDING` 子流**（不新开域，0x5C 仍空着）。这次消费**排在
+    // 结局定盘：**续用同一条 `DOMAIN_ENDING` 子流**（不新开域）。这次消费**排在
     // `resolve_variant_groups` 之后**，故变体分组与其后所有子流（NPC/地点/身份，各自独立域）
     // 的取数逐字节不变——新增的只是这条子流末尾多抽一个数。
     let selected_ending = pick_ending(&mut rng_end, &sorted_for_pick(&scored_endings));

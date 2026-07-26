@@ -19,6 +19,13 @@
 //!    **默认不写 `audit_queue`**，只有高危分类才入队（策略见 `MUSE_SAFETY_RUNTIME_AUDIT`）。
 //!    理由：运行时每 tick 每事件都可能命中，若比照 ① 逐条入队，人审队列会被淹到不可用——
 //!    「记险不入队」保证留痕完整、队列可用，人审仍可从 risk_events 反查。
+//!
+//!    2b. `semantic`（子模块）：同一批运行时产出的 **§15 第 3 层**（语义分类）**异步**复核。
+//!    它与 ② 是**同一条运行时链路的两段**，不是第四个入口：② 在 tick 事务内同步跑纯本地词表，
+//!    `semantic` 在 **tick 提交之后、事务之外**跑网络调用 `check_text`，非 Approved 时把
+//!    `world_events.moderation` 从 `approved` **收紧**（正文一个字节不改，§0.3）。
+//!    留痕与入队一律复用本文件的 `record_risk` / `insert_runtime_audit`，**不另开写入路径**。
+//!    🔴 provider 目前是 Dev 桩，故第 3 层**接通了但拦不住任何东西**——见该模块头。
 //! 3. `queue_operator_recheck` / `queue_operator_recheck_image`：**已发布内容的运营再审**
 //!    （人工发起，非机器判定）。①② 都是「内容刚产生时」的闸；已过审内容事后被举报出问题时，
 //!    没有任何一条既有路径能把它送回人审队列——`admin_api::takedown` 需要的正是这条。
@@ -48,6 +55,9 @@ use crate::providers::ModerationVerdict;
 pub mod disposal;
 mod inject;
 mod lexicon;
+/// §15 **第 3 层**：语义分类异步复核（tick 提交后、事务之外）。见该模块头——
+/// 🔴 它交付的是**管线**，不是防线：`ModerationProvider` 当前是 Dev 桩，一次真实语义分类都没发生。
+pub mod semantic;
 pub use inject::{card_scan_text, detect_injection, InjectionHit};
 pub use lexicon::{mask, Severity};
 
@@ -307,14 +317,21 @@ fn runtime_audit_admits(sev: Severity) -> bool {
 ///
 /// 返回被拦下的事件条数（可观测/测试用）。
 ///
-/// ## 第 3 层（语义分类）的接口位——本轮**不实装**
-/// `state.moderation.check_text()`（`ModerationProvider`）就是第 3 层的现成接口，公开投影全量、
-/// 私有抽样。但它是**网络调用**，绝不能挪进这个事务：单连接池（测试/SQLite dev）下 tx 持有唯一连接，
-/// 调用期间任何再借连接的操作都会死锁 PoolTimedOut（同 `record_risk_tx` 的注释）；且 tick 事务的
-/// 持有时长会被外部 RTT 绑架。落地形态应为「事务外异步复核 + 命中后置 moderation」：
-/// TODO(§15-L3)：tick 提交后另起任务对本 tick 的 public 投影跑 `check_text`，Pending/Rejected 时
-/// UPDATE `world_events.moderation`（此为「未过审 → 不外发」的收紧方向，不改写已下发事实的内容），
-/// 配合 §15 第 4 层「直播场延迟 1-2 拍缓冲」给这条异步链留出拦截窗口。
+/// ## 第 3 层（语义分类）在哪 —— 已实装，但**在事务之外**
+///
+/// 原先此处挂着 `TODO(§15-L3)`，现由子模块 [`semantic`] 落地，形态与那条 TODO 逐字一致：
+/// **tick 提交后另起任务跑 `check_text`，非 Approved 时收紧 `world_events.moderation`**
+/// （公开投影全量、私有抽样，抽样率参数化且确定性），配合 §15 第 4 层「直播场延迟 1-2 拍缓冲」
+/// 给这条异步链留出拦截窗口。
+///
+/// 🔴 **它绝不能挪进这个事务**，理由不变：`check_text` 是网络调用，单连接池（测试/SQLite dev）下
+/// tx 持有唯一连接，调用期间任何再借连接的操作都会死锁 PoolTimedOut（同 `record_risk_tx` 的注释）；
+/// 且 tick 事务的持有时长会被外部 RTT 绑架，而 `world_event_seq` 的行级排他锁就在同一事务里。
+/// `semantic` 因此**从不 `begin()`**（源码级红线用例扫死），`runtime::commit_tick` 里也只在
+/// `tx.commit()` **之后**调一次 `semantic::enqueue_after_commit`（纯内存入队，无 IO）。
+///
+/// ⚠️ 第 3 层默认**关闭**（`MUSE_SAFETY_SEMANTIC_RECHECK`），且 provider 目前是 Dev 桩——
+/// 接通 ≠ 生效，详见 [`semantic`] 模块头。
 pub async fn moderate_runtime_projection(
     tx: &mut sqlx::Transaction<'_, sqlx::Any>,
     world_id: &str,
@@ -361,17 +378,12 @@ pub async fn moderate_runtime_projection(
         .await?;
 
         if runtime_audit_admits(severity) {
-            sqlx::query(
-                "INSERT INTO audit_queue (id, subject_kind, subject_id, machine_verdict, machine_hits, status, created_at) \
-                 VALUES ($1, $2, $3, $4, $5, 'open', $6)",
+            insert_runtime_audit(
+                &mut **tx,
+                &pe.domain_event_id,
+                RUNTIME_BLOCK_VERDICT,
+                &serde_json::to_string(&hits).unwrap_or_else(|_| "[]".into()),
             )
-            .bind(crate::db::new_id("aq"))
-            .bind("world_event")
-            .bind(&pe.domain_event_id)
-            .bind(verdict_str(RUNTIME_BLOCK_VERDICT))
-            .bind(serde_json::to_string(&hits).unwrap_or_else(|_| "[]".into()))
-            .bind(crate::db::now_ms())
-            .execute(&mut **tx)
             .await?;
         }
     }
@@ -379,6 +391,38 @@ pub async fn moderate_runtime_projection(
         tracing::warn!(world_id, blocked, "运行时投影命中敏感词库（§15 第 2 层），已打码并转人审");
     }
     Ok(blocked)
+}
+
+/// 运行时产出（§15 第 2 层词库闸 + 第 3 层语义复核）**共用的唯一一条 `audit_queue` 写入语句**。
+///
+/// 两层的入队理由不同（一个是词表命中、一个是语义分类/机器没能判定），但落进人审工作台的
+/// **字段口径必须只有一份**——否则 reviewer 会在同一个队列里看到两套 `subject_kind` /
+/// `machine_hits` 形状，而这种漂移只有在人审真的点开时才暴露。
+///
+/// 泛型于 `Executor` 是为了同时服务两个调用点：第 2 层在 tick 事务内（`&mut **tx`），
+/// 第 3 层在事务外（`&AnyPool`）。**能力边界不变**：写入仍然只发生在 `safety` 模块里。
+async fn insert_runtime_audit<'e, E>(
+    exec: E,
+    domain_event_id: &str,
+    verdict: ModerationVerdict,
+    machine_hits_json: &str,
+) -> Result<(), ApiError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Any>,
+{
+    sqlx::query(
+        "INSERT INTO audit_queue (id, subject_kind, subject_id, machine_verdict, machine_hits, status, created_at) \
+         VALUES ($1, $2, $3, $4, $5, 'open', $6)",
+    )
+    .bind(crate::db::new_id("aq"))
+    .bind("world_event")
+    .bind(domain_event_id)
+    .bind(verdict_str(verdict))
+    .bind(machine_hits_json)
+    .bind(crate::db::now_ms())
+    .execute(exec)
+    .await?;
+    Ok(())
 }
 
 pub async fn record_risk(

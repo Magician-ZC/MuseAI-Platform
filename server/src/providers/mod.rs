@@ -36,17 +36,36 @@ pub enum ModerationVerdict {
 
 #[async_trait]
 pub trait ModerationProvider: Send + Sync {
-    /// 文本机审。**这就是总规格 §15 五层漏斗第 3 层（小模型语义分类）的接口位**——
-    /// 现状只被静态内容路径（`safety::moderate_and_queue`：角色卡/世界模板/装配钩子/入站托梦）调用。
+    /// 文本机审。**这就是总规格 §15 五层漏斗第 3 层（小模型语义分类）的接口位**。
     ///
-    /// TODO(§15-L3)：接入运行时产出的语义复核——公开投影**全量**、私有投影**抽样**（抽样率是运营
-    /// 配置，禁止写死）。**约束：必须在 tick 事务之外异步执行**——本方法是网络调用，放进
+    /// 两类调用方：
+    /// - **静态内容**：`safety::moderate_and_queue`（角色卡/世界模板/装配钩子/入站托梦）+
+    ///   `safety::queue_operator_recheck`（已发布内容的运营再审）；
+    /// - **运行时产出**：`safety::semantic`（§15 第 3 层异步复核）——公开投影**全量**、
+    ///   私有投影**抽样**（抽样率是运营配置，且确定性，禁止写死）。
+    ///
+    /// 🔴 **约束：运行时复核必须在 tick 事务之外异步执行**。本方法是网络调用，放进
     /// `runtime::commit_tick` 的事务会（a）单连接池下再借连接死锁 PoolTimedOut，
-    /// （b）让 tick 事务的持有时长被外部 RTT 绑架。落地形态：tick 提交后另起任务复核本 tick 的
-    /// world_events，非 Approved 时收紧 `world_events.moderation`（不改写已下发内容，仅停止外发），
+    /// （b）让 tick 事务的持有时长被外部 RTT 绑架。`safety::semantic` 因此从不开事务，
+    /// `commit_tick` 只在 `tx.commit()` 之后入一次队。非 Approved 时它把
+    /// `world_events.moderation` 从 `approved` **收紧**（不改写已下发内容的正文，仅停止外发），
     /// 配合 §15 第 4 层「直播场延迟 1-2 拍缓冲」留出拦截窗口。
     /// 第 2 层（本地敏感词库，≈0 成本）已在事务内同步生效，见 `safety::lexicon`。
     async fn check_text(&self, text: &str) -> Result<ModerationVerdict, String>;
+
+    /// 这个实现是不是 **Dev 桩**（不做任何真实机审/语义分类）。
+    ///
+    /// 🔴 **默认 `true`，这个方向是刻意的**：把真实 provider 误标成桩，最坏结果是报告低估了防线强度；
+    /// 把桩误标成真实 provider，结果是**一条纯占位的链路被读成已生效的内容安全防线**——
+    /// 而内容安全是合规主体责任，后一种误读的代价远大于前者。
+    /// 因此接真实服务商时**必须显式覆写为 `false`**，覆写不了就说明还没接上。
+    /// （同 `slo::quality::QualitySource::Production` 的「构造不出来 = 没接上」。）
+    ///
+    /// 这个 bool 不是给日志看的：它随 `safety::semantic` 的每一条风控留痕、
+    /// `safety_recheck_runs` 的每一行、运营面 `GET /admin/safety/recheck` 的每一次响应一起走。
+    fn is_dev_stub(&self) -> bool {
+        true
+    }
 
     /// 图片机审（角色头像等二进制资产）。
     /// dev 默认实现直过（Approved 占位）；生产待接第三方图审（阿里云内容安全 / 网易易盾 图片检测），

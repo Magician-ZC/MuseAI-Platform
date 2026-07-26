@@ -111,6 +111,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 世界运行时：tick 调度器 + worker（后台任务）
     runtime::spawn_workers(state.clone());
+    // §15 第 3 层：语义分类异步复核的 worker 池。**与 tick worker 分池**——审核的排队时间
+    // 与世界推进的排队时间不得互相绑架（provider 慢一点不该让世界少跑几拍）。
+    // 默认关闭（`MUSE_SAFETY_SEMANTIC_RECHECK`），关着时队列里一个任务都不会有。
+    safety::semantic::spawn_workers(state.clone());
     // 通知 outbox 消费
     notifications::spawn_outbox_worker(state.clone());
 

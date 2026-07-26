@@ -239,14 +239,21 @@ fn red_line_only_safety_chain_defaults_on() {
     // （见 VALIDATION §3.1 的边界段）；本开关只决定「已经露在存量世界里的名字要不要换成中性占位」，
     // 那会改变运行中世界对玩家的显示，是产品决策，所以按 §0.1 默认关闭。
     //
+    // 15 → 16：`MUSE_SAFETY_SEMANTIC_RECHECK`（§15 第 3 层语义分类异步复核，migration 0046）。
+    // ⚠️ 它是**第二个属于 `safety` 的开关**，而与 `MUSE_SAFETY_LEXICON` 的默认值**相反**——
+    // 上面那个循环因此仍然只给词库闸开了口子。两者不矛盾：默认值一律指向「不改变现状」的那一侧，
+    // 词库闸已经在线上跑（关掉 = 现状被改），第 3 层从未生效过（开着 = 现状被改，且开始烧 token）。
+    // 🔴 它默认关闭还有第二重意义：provider 目前是 Dev 桩，开着也拦不住任何东西，
+    // 默认关闭避免了「链路开着」被误读成「防线生效」。
+    //
     // 这些都是登记表**新增了默认关闭的开关**，不是断言被放宽——上面那个循环仍逐条钉死
     // 「除审核链外默认值必须为 false」，新开关同样在其中。
     assert_eq!(
         KNOWN_FLAGS.len(),
-        15,
+        16,
         "登记表应覆盖 9 个存量 env 开关 + R3 新建的 MUSE_OOC_ANNOTATIONS / MUSE_IFLINE_PARALLEL / \
-         MUSE_SOCIAL_IDENTITY_UNLOCK / MUSE_LIVE_STAGE + MUSE_DISPOSAL_NAME_GATE，\
-         其中 MUSE_OFFPEAK_SCHEDULING 已由纯 env 迁入体系"
+         MUSE_SOCIAL_IDENTITY_UNLOCK / MUSE_LIVE_STAGE + MUSE_DISPOSAL_NAME_GATE + \
+         MUSE_SAFETY_SEMANTIC_RECHECK，其中 MUSE_OFFPEAK_SCHEDULING 已由纯 env 迁入体系"
     );
 }
 
@@ -913,9 +920,12 @@ async fn list_endpoint_reports_effective_global_state() {
     //   - `MUSE_OFFPEAK_SCHEDULING`：⚠️ **不同性质**——第一个从纯 env 迁进体系的**存量**开关。
     //     `runtime::offpeak::enabled_for_world` 早已写好「已登记走体系、未登记退 env」的分支，
     //     所以登记这一步不需要改 runtime 一行代码，世界级灰度即刻可用。
+    //   - `MUSE_SAFETY_SEMANTIC_RECHECK`：新建件，建成即接线（`safety::semantic::enabled`）。
+    //     ⚠️ 它是**审核链**上的开关，却默认关闭（与同属 safety 的 `MUSE_SAFETY_LEXICON` 相反）——
+    //     理由见 `red_line_only_safety_chain_defaults_on` 里那段：默认值指向「不改变现状」的一侧。
     //   - `MUSE_DISPOSAL_NAME_GATE`：新建件，建成即接线（`safety::disposal::NameGate::resolve`）。
     //     ⚠️ 它守的是**读取面显示**而不是一项功能的开合：关闭 = 各读取面逐字节维持今天的输出。
-    // 其余 7 个存量开关仍是纯 env，迁移清单见 `flags::MIGRATION_NOTES`。
+    // 其余存量开关仍是纯 env，迁移清单见 `flags::MIGRATION_NOTES`。
     let wired: Vec<&str> = arr
         .iter()
         .filter(|f| f["wired"] == json!(true))
@@ -930,10 +940,11 @@ async fn list_endpoint_reports_effective_global_state() {
             "MUSE_SOCIAL_IDENTITY_UNLOCK",
             "MUSE_LIVE_STAGE",
             "MUSE_OFFPEAK_SCHEDULING",
+            "MUSE_SAFETY_SEMANTIC_RECHECK",
             "MUSE_DISPOSAL_NAME_GATE"
         ],
         "已接线清单：0036 的参考接线 + R3 新建的 OOC 注解权 / if 线 / 真人社交解锁 / 直播场 + \
-         迁入体系的错峰调度 + 被处置内容的卡名读取面闸门"
+         迁入体系的错峰调度 + §15 第 3 层语义复核 + 被处置内容的卡名读取面闸门"
     );
     assert!(b["records"].as_array().unwrap().is_empty());
 }

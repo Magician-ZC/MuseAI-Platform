@@ -179,7 +179,7 @@
 | 成本仪表 | **Implemented** | `admin_api/dashboards.rs` `cost.*`（今日/趋势/每局/每玩家）；`/admin/worlds` 补 `participantCount`·`successRate`·`todayCostCny`；diagnostics 补金额与用量比。**分摊口径为人均等分**（world_ticks 是整拍口径，无 per-member 分解），局限已写进接口 `notes`。**2026-07-26 补记（R3 成本工程杠杆①）**：迁移 `0038` 给 `world_ticks` 加 `off_peak`·`price_ratio_pct`·`defer_ms` 三列，由 `runtime/mod.rs` 的错峰调度器逐拍写入——成本从此可按「折扣时段 / 原价时段」拆桶，「省了多少」= `Σ cost_tokens × (100-price_ratio_pct)/100 × 单价`，「错峰生效了多少」= `off_peak=1` 占比与 `Σ defer_ms`。**2026-07-26 再补记**：`dashboards.rs` **已接这三列**——`cost.offPeak`（拍/token 占比、估算折让、延后时长、按名义档位分桶）挂在成本趋势那条已有的窗口查询上，未新开路由、未新增迁移、未多发一次 SQL；`cost.trend[]` 逐日拆出 `offPeakTokens`。🔴 单位陷阱已锁进用例：`priceRatioPct` 是**百分数整数**（100=原价）、`priceRatio` 是 0..1 小数，两者同时下发且不得互串。**2026-07-27 补记（#54）**：**if 线开销已并入**——`cost.ifline`（`allTime` 与 `window` 两个口径 + 拍数）与 `cost.combined`（世界线 + if 线合计）。🔴 **`cost.total` 的语义刻意保持不变**（它一直是世界线口径，改写既有字段含义会让所有历史对账失效），要「平台一共花了多少」看 `combined`。⚠️ 两个口径**不可混加**：`total` 是全时段、`trend`/`offPeak` 是 `?costDays=` 窗口内，故 `ifline` 同时给出两者、`combined` 只用 `allTime`——有一条专门的用例（`cost_includes_ifline_without_rewriting_worldline_total`）钉住这一点，实测把 `combined` 改用 window 会立刻转红。漏记成本比记错更危险：它让单位经济学看起来比实际好，而 T3「ARPPU ≥ 3× 模型成本」与 T5「毛利为正」都直接建在这个数上。**2026-07-27 口径修正（#42）**：被内容安全闸/硬约束**阻断的那一拍此前记 `cost_tokens=0`**，而引擎当时已跑完整个回合（导演/决策/仲裁全部烧过 token）——成本因此系统性低估，且越是阻断多的世界低估越重，T3/T5 会在最危险的地方最乐观。现由 `runtime::finish_tick_blocked` 记实测 token 并累计进 `world_budgets`（口径与提交拍、if 线逐字一致）；一次模型都没调过的空转拍仍记 0。叙事 SLO 的拍域另加 `error IS NULL`（`slo::TICK_DOMAIN`）与成本口径分家，阻断拍进成本、不进「无戏份」分母 | 恒开（只读聚合）；错峰写入侧**默认关闭** |
 | 错峰调度（成本工程杠杆①） | **Implemented** | 总规格 §17【拍板 16】。`runtime/mod.rs` 的 `offpeak` 模块 + `schedule_due_ticks` 接入：连载/慢炖场的 tick 优先排进折扣时段，窗口内按窗口占全天比例**压缩间隔以保住每日拍数**（不是节奏降档）；🔴 直播场（`room_type='arena'` ∨ `tick_per_day ≥ MUSE_OFFPEAK_LIVE_TICK_PER_DAY`）永不延后；🔴 防饿死兜底 `interval + min(interval×200%, 6h)` 恒有限、首拍绝不延后；折扣时段内按「被压最久」优先入队。时区口径与 `dashboards::utc_day_start_ms` 同源（UTC，窗口字面量解析期一次性折算）。参数与列口径见 `docs/API.md` §3「错峰调度」 | **关闭**（`MUSE_OFFPEAK_SCHEDULING` 默认 0）。**2026-07-26 补记**：已登记进 `KNOWN_FLAGS`，成为**首个由纯 env 迁入开关体系的存量开关**——解析链升为 user > world > global > env > 默认，错峰从「全局一刀切」变为可按世界灰度。`runtime` 侧一行未改（`offpeak::enabled_for_world` 早已写好「已登记走体系、未登记退 env」的分支） |
 | Batch API（成本工程杠杆③） | **Specified（未实现）** | 约 5 折，但与现有同步 tick 管线结构性冲突：`run_round` 是**串行**五环节 + 同事务 `commit_tick`，而 Batch 是分钟~小时级异步；一拍需 5 次批往返、`CLAIM_STALE_MS=300000` 会把等批 worker 判成崩溃重排、中间态无持久化（批途中重启 = 半通管线，违反 §5「宁可停拍」）。改造路径：`crates/muse-engine` 把 `run_round` 改成可挂起/可恢复的分步状态机 + `ModelClient` 增 `submit_batch`/`poll_batch`（默认实现回落同步 `complete`，桌面轨零改动），server 侧加中间态表 + 批次协调器 + 降级回落。完整分析见 `server/src/runtime/mod.rs` 的 `offpeak` 模块头 | — （未实现，无开关） |
-| 运行时敏感词库 + 语义分类钩 | **第 2 层 Implemented / 第 3 层仅接口位** | `safety/lexicon.rs`（复用 `inject.rs` 归一化管线，零宽/同形/全角绕过均被拦）+ `runtime` commit 事务内闸 + `events`/`reports`/`clips`/`arena` 全部读取面过滤。**第 3 层语义分类未实装**（不能进事务，见 `safety/mod.rs` TODO） | 恒开（审核链） |
+| 运行时敏感词库 + 语义分类复核 | **第 2 层 Implemented / 第 3 层 Implemented（管线，非防线）** | `safety/lexicon.rs`（复用 `inject.rs` 归一化管线，零宽/同形/全角绕过均被拦）+ `runtime` commit 事务内闸 + `events`/`reports`/`clips`/`arena` 全部读取面过滤。**2026-07-27 补记（第 3 层落地）**：`safety/semantic/` + 迁移 `0046`。形态与原 `TODO(§15-L3)` 逐字一致——`commit_tick` 在 **`tx.commit()` 之后**入队（独立 topic + 独立 worker 池），事务外跑 `check_text`，非 Approved 时 `UPDATE world_events SET moderation` 从 `approved` **收紧**。🔴 `SET` 只有这一列、`WHERE` 钉着 `approved` ⇒ 正文逐字节不变（§0.3）+ 单向棘轮；🔴 provider 故障**先重试、到顶 fail-closed**（收紧为 pending + 无条件进人审），方向不参数化，与 `MUSE_SAFETY_LEXICON` 的 fail-safe「继续过滤」自洽；公开全量 + 私有确定性抽样（域常量 `0x5C`，禁三样）；留痕与入队一律复用 `safety` 既有入口。🔴 **交付的是管线不是防线**：`ModerationProvider` 唯一实现仍是 Dev 桩，真实语义分类一次都没发生，**不得表述为「五层漏斗已完整」/「内容安全已就绪」**。这个事实随数据走三处：`safety_recheck_runs.provider_stub` · 每条 `risk_events.detail_json` 的 `providerStub` · `GET /admin/safety/recheck` 的 `providerStub`/`source`/`honesty[]` | 第 2 层恒开（审核链）；**第 3 层默认关闭**（`MUSE_SAFETY_SEMANTIC_RECHECK`，按世界灰度）——它从未生效过，默认开启等于让「合并代码」直接改变线上行为并开始烧 token（§0.1）。两者默认值相反不矛盾：默认值一律指向「不改变现状」的那一侧 |
 | Saga 归组字段（saga_id + stage_no） | **Implemented** | 迁移 `0024`；`admin_api/worlds_ops.rs` 建模板成对校验 + `?sagaId=` 阶段列表（按 stage_no 升序、不分页） | 未启用（不填即独立模板） |
 
 **⚠️ 本表初版漏掉的一项（2026-07-26 补记）**：§0.1 原文写着「运行时开关体系**列入 R1 开发**」，
@@ -248,7 +248,12 @@
 > `red_line_disabled_gate_leaves_the_memorial_hall_byte_identical`），产品决定何时开。
 
 **仍缺的接线（不在上表，单独跟踪）**：生死契约 server 侧全部 · 身份池叙事回灌 ·
-第 3 层语义分类 · 机审耗时打点（`moderationLatency` 全仓无数据源，后台该列恒为 `—`）·
+~~第 3 层语义分类~~（2026-07-27 已实装管线，见上表；**真实 provider 仍缺** —— 现跑 Dev 桩，
+拦截能力为零，接线不等于生效）· 机审耗时打点（`moderationLatency` 全仓无数据源，后台该列恒为 `—`；
+⚠️ 第 3 层的 `safety_recheck_runs.latency_ms` **只是它自己那一层的耗时**，不是那一列的数据源）·
+**人审对 `world_event` 主体无回写路径**（`admin_api::audit::writeback_target` 返回 `None`）——
+第 2 层就存在的缺口，第 3 层的 fail-closed 让它更容易被触发；补它要在 `world_events` 上开一条
+**放宽**路径，属红线邻近改动，须单独评审 ·
 **其余 8 个 env 开关接入运行时开关体系**（清单与注意事项见上）·
 **处置申诉只覆盖 `character` / `character_avatar` 两类主体**（如实的范围，不是遗漏：
 `world_cover` 属于世界、`world_templates` 根本没有 owner 列，给它们开申诉入口只会得到一个
@@ -610,6 +615,17 @@ golden `14`，`runtime/simulation/baseline.json` 与 golden 基线**一个字节
 另有 `withheldPreemptiveRate`（撤下里播出前拦住的占比）直接作为「延迟拍数够不够」的判据 ——
 它 < 1 就是 T5 预案「上调延迟拍数」该被触发的信号，`danmakuBlocked/danmakuTotal` 则是
 「内容审核成本 ≤ 生成成本的 5%」那条门槛的一手输入。
+
+**2026-07-27 再补齐（第 3 层落地）**：那条成本门槛的**运行时侧**分子此前同样无数据源——
+审核链一次调用都没被计过数。现由 `safety_recheck_runs`（迁移 `0046`）逐次尝试记下
+送审条数 / 送审字符数 / 命中数 / 重试次数 / 耗时，读数在 `GET /admin/safety/recheck`；
+分母侧（生成成本）一直在 `world_ticks.cost_tokens` 里。
+🔴 但**比值本身仍算不出来，端点也不假装能算**（`cost.ratioAvailable` 恒为 `false`）：
+`ModerationProvider::check_text` 只回裁决、不回 token 也不回费用，而 Dev 桩的调用成本恒为 0。
+交付的是**调用量口径**，换算成钱要等真实 provider 的计价。
+⚠️ 同理，第 3 层的 `interceptedBeforeBroadcast`（收紧发生在播出水位线之前的条数）与
+`withheldPreemptiveRate` 是**同一个判据的两条独立证据**（一条来自自动链、一条来自人工撤下），
+两者都 < 1 才说明延迟拍数真的不够；只看其中一条会漏判。
 
 ### 3.5 社交举报队列的运营前端（真人社交解锁的治理闭环，**落地于 2026-07-27**）
 

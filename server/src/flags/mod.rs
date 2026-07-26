@@ -252,6 +252,25 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
         wired: true,
     },
     FlagDef {
+        name: "MUSE_SAFETY_SEMANTIC_RECHECK",
+        // 🔴 与下面的 `MUSE_SAFETY_LEXICON` 同属审核链，默认值却相反——不是矛盾，是同一条原则：
+        // **默认值指向「不改变现状」的那一侧**。词库闸**已经在线上跑着**，它的 default-on 保护的是
+        // 「别让一次配置失误把既有过滤悄悄关掉」；第 3 层**从未生效过**，把一条从未跑过的链路
+        // 默认开启，等于让「合并代码」直接改变线上行为并开始烧 token —— 那正是 §0.1 禁止的。
+        // ⚠️ 等它接了真实 provider 并验证过，这个默认值应当重新评审为开。
+        default_enabled: false,
+        owner: "safety",
+        desc: "语义分类异步复核（总规格 §15 运行时内容安全**第 3 层**）：tick 提交后、\
+               **事务之外**对本拍投影跑 `ModerationProvider::check_text`，非 Approved 时把 \
+               `world_events.moderation` 从 approved **收紧**（正文一个字节不改，§0.3）。\
+               公开投影全量 + 私有投影确定性抽样；配合 §15 第 4 层直播场延迟缓冲作为拦截窗口。\
+               🔴 **接通 ≠ 生效**：`ModerationProvider` 当前唯一实现是 Dev 桩，真实语义分类一次都没发生；\
+               「当前是桩」随 `safety_recheck_runs.provider_stub` / 每条 risk_events / \
+               `GET /admin/safety/recheck` 的 providerStub 一起走。不得据此表述为「五层漏斗已完整」",
+        // 🔵 新建件，没有需要保留的历史 env 语义，建成即接线（同 OOC 注解权 / if 线 / 直播场）。
+        wired: true,
+    },
+    FlagDef {
         name: "MUSE_SAFETY_LEXICON",
         // 🔴 唯一默认为「开」的开关：审核链。关掉它 = 放行敏感词，
         // 所以对它而言「安全的那一侧」是开着，fail-closed 返回 true 才是 fail-**safe**。

@@ -58,7 +58,7 @@ cd server && cargo run --features billing,arena # 含 P4b 计费 + P6 赛事房
 ```
 
 - 默认 dev 态:SQLite 内存库 + 内存队列 + Dev providers,**无需任何外部依赖**,监听 `127.0.0.1:8787`。
-- 迁移(`server/migrations/0001-0045`)启动时自动执行。
+- 迁移(`server/migrations/0001-0046`)启动时自动执行。
 - **状态诚实声明**:短信、内容审核(含图审)、实名、TTS、支付当前均为 **Dev 桩**(直过/回显),
   按七档状态语言属 `Implemented`,**不是 `Production-ready`**——上线需接真实 Provider、
   补实名闭环(当前接口存在请求方直提 verified 的 dev 口子)并完成"生成式 AI 服务 + 游戏监管"双轨合规评估。
@@ -142,7 +142,7 @@ cd server && MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo ru
 
 ## 5. 数据库与迁移
 
-- 迁移文件 `server/migrations/0001-0045`,启动自动按版本号顺序执行(sqlx migrate)。
+- 迁移文件 `server/migrations/0001-0046`,启动自动按版本号顺序执行(sqlx migrate)。
   ⚠️ 下表只列到 `0029`(历史遗留,`0030` 起未补);**迁移清单以目录为准**,取号看目录里的最大号。
 - 可移植 SQL 子集(TEXT id / BIGINT 毫秒 / TEXT JSON / INTEGER 布尔),SQLite 与 Postgres 双跑。
 - dev 内存库每次启动重建;需要持久化 dev 数据用文件库 `sqlite://muse-dev.db`(已 gitignore)。
@@ -204,8 +204,8 @@ cd server && MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo ru
 ```bash
 # 引擎 + 后端 + 桌面壳
 cargo test --manifest-path crates/muse-engine/Cargo.toml          # 291 passed
-(cd server && cargo test)                                          # 936 passed(default,含黄金世界回归)
-(cd server && cargo test --features billing,arena)                 # 1014 passed
+(cd server && cargo test)                                          # 963 passed(default,含黄金世界回归)
+(cd server && cargo test --features billing,arena)                 # 1041 passed
 (cd server && cargo test golden)                                   # 14 passed(12 项 runtime::golden::* + 2 项录放 round-trip)
 cargo test --manifest-path src-tauri/Cargo.toml                    # 216 passed
 # 前端 + 后台

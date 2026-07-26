@@ -28,6 +28,9 @@
 //!   运行时开关：GET/POST /admin/flags、GET /admin/flags/resolve（dry-run）、DELETE /admin/flags/{id}
 //!            （VALIDATION §0.1 的运营面：按用户/世界/全局三作用域灰度；**写 admin 专属**）
 //!   风控：    GET /admin/risk-events?kind=&cursor=
+//!   内容安全第 3 层：GET /admin/safety/recheck?since=&until=（语义分类异步复核的运行台账 +
+//!            成本读数；路由定义在 `safety::semantic`，此处聚合挂载）
+//!            🔴 响应里的 `providerStub` / `honesty[]` 会告诉你：这条链路当前跑的是 Dev 桩
 //!   工单：    GET /admin/data-requests?status=、POST /admin/data-requests/{id}/run
 
 use axum::extract::State;
@@ -151,6 +154,10 @@ pub fn router() -> Router<AppState> {
         // 客服与工单
         .route("/admin/data-requests", get(ops::list_data_requests))
         .route("/admin/data-requests/{id}/run", post(ops::run_data_request))
+        // §15 第 3 层语义复核的运营读数（GET /admin/safety/recheck）。
+        // 路由定义留在 `safety::semantic` 自己那边（与写台账的 SQL、诚实边界文案同处一个文件，
+        // 免得「数怎么来的」和「数怎么解释」分居两地），此处只做聚合挂载 —— 不动 `app.rs`。
+        .merge(crate::safety::semantic::admin_router())
 }
 
 // ---------------- 共享设施（子模块经 super:: 复用） ----------------

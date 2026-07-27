@@ -82,10 +82,32 @@ interface DiagnosticsBudget {
 }
 
 interface Diagnostics {
-  world: Record<string, unknown> & { id: string; title: string; status: string };
+  world: Record<string, unknown> & {
+    id: string;
+    title: string;
+    status: string;
+    /** 开始跑的时刻 = **首拍被排期**（server: `MIN(world_ticks.created_at)`）。
+     *  没排过拍 → null；**不回落 createdAt**：「还没开演」与「很早就开演了」必须分得开。
+     *
+     *  ⚠️ 类型是 `number | string`：正式模式来自接口，是毫秒时间戳；
+     *  设计预览模式喂的是**已格式化好的展示串**（预览数据不经接口，见 `previewDiag`）。
+     *  两种都要能渲染，故此处如实放宽，而不是在预览数据里硬凑一个假时间戳。 */
+    startedAt?: number | string | null;
+  };
   ticks: TickMeta[];
   budget: DiagnosticsBudget | null;
   riskEventCounts: { kind: string; count: number }[];
+  /** 风控日环比（UTC 日界，口径同成本看板）。
+   *  🔴 服务端**不给百分比**：昨日可能为 0，0 做分母不是「涨了无穷」是「没有可比基数」。 */
+  riskEventDaily?: { today: number; yesterday: number; delta: number } | null;
+  /** Prompt 版本治理留痕。⚠️ `activatedBy/At` 来自 audit_logs 的 prompt.activate，
+   *  不是 prompt_versions 上的列；从未经端点激活过 → null，**不猜**。 */
+  promptSet?: {
+    version?: string | null;
+    createdAt?: number | null;
+    activatedBy?: string | null;
+    activatedAt?: number | null;
+  } | null;
   eventStats: { total: number; byModeration: { moderation: string; count: number }[] };
   redactionNote: string;
 }
@@ -102,7 +124,7 @@ interface ConsoleWorld extends WorldApiRow {
   roomTypeLabel: string;
   /** 以下两项接口暂未提供，正式模式恒 null → 表格显示空态。 */
   moderationLatency: number | null;
-  /** 最后活动时间（毫秒）；接口暂未提供，正式模式恒 null。 */
+  /** 最后活动时间（毫秒）= 最后一拍**跑完**的时刻；从未跑完过任何一拍 → null（不是 0）。 */
   lastActivityAt: number | null;
 }
 
@@ -118,6 +140,10 @@ interface TimelineEvent {
 }
 
 const EMPTY = '—';
+
+/** 诊断一次拉多少拍。服务端另有 500 的硬顶（被轮询的端点必须封顶），此处取其一半留余量：
+ *  曲线与时间线都只做展示，200 个点已远超肉眼分辨率，再多只是白拉数据。 */
+const DIAG_TICK_LIMIT = 200;
 
 const ROOM_TYPE_TEXT: Record<string, string> = {
   idle: '开放世界',
@@ -377,13 +403,24 @@ function apiRowToConsole(row: WorldApiRow): ConsoleWorld {
     roomTypeLabel: ROOM_TYPE_TEXT[row.roomType] ?? row.roomType,
     // participantCount / successRate / todayTokens / todayCost* 由 /admin/worlds 直接下发（成本仪表），
     // 无需在此兜底：缺失（旧版 server）时为 undefined，各渲染点按 == null 走空态。
-    // TODO(接口缺字段): moderationLatency —— 全仓没有任何一处记录**机审调用耗时**：
-    // ModerationProvider 调用不打点，risk_events / world_events 无耗时列；audit_queue 的
-    // created_at/reviewed_at 是**人审周转**（小时/天量级），与此处按秒渲染、>3s 报警的语义完全不同，
-    // 不得拿来充数。补齐路径见 server/src/admin_api/worlds_ops.rs::list_worlds 同名注释。
+    // moderationLatency：**仍恒 null（显示 —）**，但理由已经和当初不一样了，故整条重写。
+    // 原文写「全仓没有任何一处记录机审调用耗时」——那句话已经不成立：server 侧
+    // migration 0049 加了 `safety_recheck_runs.provider_ms`（只累加 check_text 两端时钟差），
+    // 读取面在 `GET /admin/safety/recheck` 的 `providerLatency.avgMsPerCall`。
+    //
+    // 🔴 数有了仍不在本列下发，是因为另外三件事一件都没成立：
+    // ① provider 仍是 Dev 桩，耗时恒 ~0 —— 恒 0 的「审核延迟」在本列上与「审核非常快」长得一样；
+    // ② §15 第 3 层默认关闭，多数世界一行台账都没有 —— 按世界聚合会得到一片 null；
+    // ③ 该列只覆盖运行时投影这条链，静态审核（角色卡/模板/托梦信）不落那张表，
+    //    摆在世界列表里会被读成那个世界的机审总体 SLA。
+    // ⚠️ 另有两个**不得充数**的近似：audit_queue 的 created_at/reviewed_at 是人审周转
+    //（小时/天量级，一眼可辨）；同表的 latency_ms 是一次尝试全程（含 DB 与记账，
+    // 系统性偏大却看起来完全合理，更难识破）。逐条见 worlds_ops.rs::list_worlds 同名注释。
     moderationLatency: null,
-    // TODO(接口缺字段): lastActivityAt —— worlds.updated_at 已存在但未投影；createdAt ≠ 最后活动，不可顶替。
-    lastActivityAt: null,
+    // lastActivityAt 由 /admin/worlds 直接下发（= MAX(world_ticks.finished_at)，最后一拍**跑完**的时刻）。
+    // 🔴 服务端刻意不用 worlds.updated_at：那一列任何一次写世界行都会动（暂停、改预算……），
+    // 会把**运营自己的操作**记成世界活动。旧版 server 无此键 → undefined → 各渲染点按 == null 走空态。
+    lastActivityAt: (row as { lastActivityAt?: number | null }).lastActivityAt ?? null,
     // coverUrl 由 ...row 原样带入（后端只在机审 approved 时下发该键），取图统一走 coverSrc。
     status: deriveStatus(row),
   };
@@ -534,13 +571,21 @@ export default function WorldsMonitorConsole() {
     }
   }, [selectedId, worlds]);
 
-  // 正式模式：选中世界变化（含首次落位）即拉一次脱敏诊断；预览模式用样本诊断。
+  // 正式模式：选中世界变化（含首次落位）或**时间范围变化**即拉一次脱敏诊断；预览模式用样本诊断。
+  //
+  // 🔵 取数窗口**下推到服务端**（`?sinceMs=` + `?limit=`）。此前端点固定只回最近 10 拍，
+  // 前端只能在客户端按时间过滤——窗口一拉长就没数据了（曲线越选越长、点越选越少）。
+  // limit 取一个与窗口相称的上限：服务端另有 500 的硬顶（它是被轮询的端点，不封顶等于
+  // 留了一条「拉一个跑了半年的世界就把整张表扫回来」的路），这里不必也不该自己再猜一个更大的数。
   useEffect(() => {
     if (designPreview || !selectedId) return undefined;
     let cancelled = false;
     setDiagLoading(true);
     setDiagError(null);
-    adminFetch<Diagnostics>(`/admin/worlds/${selectedId}/diagnostics`)
+    const sinceMs = Date.now() - rangeOption.windowMs;
+    adminFetch<Diagnostics>(
+      `/admin/worlds/${selectedId}/diagnostics?sinceMs=${sinceMs}&limit=${DIAG_TICK_LIMIT}`,
+    )
       .then((result) => {
         if (!cancelled) setDiag(result);
       })
@@ -555,7 +600,7 @@ export default function WorldsMonitorConsole() {
     return () => {
       cancelled = true;
     };
-  }, [designPreview, selectedId, diagReloadKey]);
+  }, [designPreview, selectedId, rangeOption.windowMs, diagReloadKey]);
 
   // 平台成本仪表：健康指标条的「今日成本」与迷你趋势唯一数据源（近 7 日，末桶即今天）。
   // 取数失败不弹错、不阻断监控主流程——成本位退回空态即可，监控页的主职责是世界与 tick。
@@ -611,8 +656,9 @@ export default function WorldsMonitorConsole() {
   };
 
   // ---------- 时间范围驱动的取数窗口（设计文档 §6.2 / §7.2） ----------
-  // 注：/admin/worlds/{id}/diagnostics 只返回最近 10 个 tick 且不接受时间窗参数，
-  // TODO(接口缺字段): diagnostics 需支持 ?since=/?window= 与更大的 tick 采样，否则长窗口只能看到最近 10 次。
+  // 取数窗口已**下推到服务端**（上面的 `?sinceMs=&limit=`）。这里保留一次客户端过滤是因为
+  // ① 预览模式的样本诊断不经接口；② 用户改时间范围到请求回来之间，屏幕上还是上一批数据，
+  // 不过滤会看到窗口外的点。它是**二次收窄**，不再是唯一的收窄手段。
   const windowedTicks = useMemo(() => {
     const since = Date.now() - rangeOption.windowMs;
     return (diagnostics?.ticks ?? []).filter((tick) => (tick.finishedAt ?? tick.createdAt) >= since);
@@ -748,6 +794,14 @@ export default function WorldsMonitorConsole() {
   const riskTotal = diagnostics
     ? diagnostics.riskEventCounts.reduce((sum, item) => sum + item.count, 0)
     : null;
+  // 日环比：服务端只给 today / yesterday / delta（**不给百分比**，理由见 Diagnostics 类型注释）。
+  // 旧版 server 无此块 → 保持原来的空态文案，不假装有数。
+  const riskDailyText = (() => {
+    const d = diagnostics?.riskEventDaily;
+    if (!d) return `日环比 ${EMPTY}（接口未提供按日聚合）`;
+    const sign = d.delta > 0 ? '+' : '';
+    return `今日 ${d.today} 次 · 昨日 ${d.yesterday} 次 · 环比 ${sign}${d.delta}`;
+  })();
 
   const failedTicks = windowedTicks.filter((tick) => tick.status === 'failed').length;
   const tickFailureText = windowedTicks.length
@@ -759,7 +813,24 @@ export default function WorldsMonitorConsole() {
   const statDate = budget?.budgetDayIsToday
     ? budget.budgetDay
     : new Date().toLocaleDateString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' }).replace(/\//g, '-');
-  const startedAtText = diagnostics?.world.startedAt ? String(diagnostics.world.startedAt) : EMPTY;
+  // 启动时间 = 首拍被排期的时刻（server 口径）。设计模式下预览数据给的是已格式化的字符串，
+  // 正式模式给的是毫秒时间戳——两者都要能渲染，且**都不回落创建时间**（下面单独一行显示创建时间）。
+  const promptTraceText = (() => {
+    if (designPreview) {
+      return `激活人：${PREVIEW_PROMPT_EDITOR.editor}　激活时间：${PREVIEW_PROMPT_EDITOR.updatedAt}`;
+    }
+    const ps = diagnostics?.promptSet;
+    const by = ps?.activatedBy ?? EMPTY;
+    const at = ps?.activatedAt != null ? formatTime(ps.activatedAt) : EMPTY;
+    const created = ps?.createdAt != null ? formatTime(ps.createdAt) : EMPTY;
+    return `激活人：${by}　激活时间：${at}　版本创建：${created}`;
+  })();
+
+  const startedAtRaw = diagnostics?.world.startedAt;
+  const startedAtText =
+    typeof startedAtRaw === 'number' ? formatTime(startedAtRaw)
+    : typeof startedAtRaw === 'string' ? startedAtRaw
+    : EMPTY;
 
   return (
     <div className="world-console">
@@ -933,7 +1004,8 @@ export default function WorldsMonitorConsole() {
                 <div>
                   <div><h2>{selected.title}</h2><span className={`world-status ${statusClass(selected.status)}`}><i />{STATUS_TEXT[selected.status] ?? selected.status}</span></div>
                   <p>世界ID：{selected.id}　 房间类型：{selected.roomTypeLabel}</p>
-                  {/* TODO(接口缺字段): startedAt —— 世界启动时间未落库/未投影，正式模式只能给创建时间。 */}
+                  {/* 启动时间 = 首拍被排期的时刻（server: MIN(world_ticks.created_at)）。
+                      没排过拍 → —，**不拿创建时间冒充**（创建时间在下一行单独给）。 */}
                   <p>启动时间：{startedAtText}</p>
                   <p>创建时间：{formatTime(selected.createdAt)}</p>
                 </div>
@@ -973,8 +1045,9 @@ export default function WorldsMonitorConsole() {
                   {/* 接口按 kind 聚合全量风控事件，没有按日切分，故口径写"累计"而非"今日"。 */}
                   <span>风险命中（累计）</span>
                   <strong>{riskTotal == null ? EMPTY : riskTotal} <small>次</small></strong>
-                  {/* TODO(接口缺字段): riskEventCountsToday / 日环比 —— 需 risk_events 按日聚合。 */}
-                  <p>日环比 {EMPTY}（接口未提供按日聚合）</p>
+                  {/* 日环比（UTC 日界，口径同成本看板）。🔴 只给绝对差值，**不给百分比**：
+                      昨日可能为 0，而 0 做分母得到的不是「涨了无穷」，是「没有可比基数」。 */}
+                  <p>{riskDailyText}</p>
                 </div>
               </section>
 
@@ -1020,10 +1093,11 @@ export default function WorldsMonitorConsole() {
                   <strong>{String(diagnostics?.world.promptSetVersion ?? selected.promptSetVersion ?? EMPTY)}</strong>
                   <Tag color="green">已生效</Tag>
                 </div>
-                {/* TODO(接口缺字段): promptSetUpdatedBy / promptSetUpdatedAt —— Prompt 发布元数据未投影。 */}
-                <p>
-                  {`更新人：${designPreview ? PREVIEW_PROMPT_EDITOR.editor : EMPTY}　更新时间：${designPreview ? PREVIEW_PROMPT_EDITOR.updatedAt : EMPTY}`}
-                </p>
+                {/* 🔴 措辞是「激活人 / 激活时间」而不是「更新人 / 更新时间」：
+                    prompt_versions 表上**没有** updated_by 列，服务端给的是 audit_logs 里
+                    prompt.activate 的留痕。叫「更新人」会让人以为那张表上真有这么一列。
+                    从未经激活端点生效过（如直接播种进库）→ —，**不拿创建时间冒充**。 */}
+                <p>{promptTraceText}</p>
               </section>
 
               <div className="world-inspector__actions">

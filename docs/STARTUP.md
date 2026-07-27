@@ -291,6 +291,25 @@ MUSE_TEST_DATABASE_URL=postgres://$USER@localhost:5432/muse_test \
 > `syntax error`,中文 locale 的 PG 会输出「语法错误」导致该用例误红(CI 的 `postgres:16`
 > 镜像默认就是 C locale,所以 CI 上不会遇到)。
 
+后端进程端到端冒烟(dev)。⚠️ **这一步不可省，它验的是单元测试验不到的东西**:
+迁移在真实进程里跑通、三条 worker 循环真的起得来、路由装配没冲突、CORS 层挂上了。
+「cargo test 全绿」只说明代码逻辑对,不说明**这个二进制能起来**——本轮加了 3 个迁移
+(`0048`-`0050`)与 3 条 worker 循环,全靠单测验证,直到实际启动才算数(实测通过,
+运行期日志除「Dev 桩」那条预期 WARN 外零 error/panic)。
+
+冒烟时值得顺手确认的几处(都是「空值口径」,最容易在真实响应里退化成 `0`):
+
+```bash
+# 开关登记表:未接线数应为 0;审核链只解析 global
+curl -s :8787/api/admin/flags -H "Authorization: Bearer <admin>" | grep -o '"wired":false' | wc -l
+# 写一条该开关不解析的档 → 400(而不是写进去毫无效果)
+curl -sX POST :8787/api/admin/flags -H "Authorization: Bearer <admin>" -H 'Content-Type: application/json' \
+  -d '{"flag":"MUSE_SAFETY_LEXICON","scope":"world","targetId":"w1","enabled":false,"reason":"试"}'
+# 诊断三项的空值:都应是 null 而不是 0
+curl -s ":8787/api/admin/worlds/<id>/diagnostics" -H "Authorization: Bearer <admin>" \
+  | python3 -m json.tool | grep -E 'startedAt|activatedBy|lastActivityAt'
+```
+
 后端进程端到端冒烟(dev):
 
 ```bash

@@ -415,6 +415,10 @@ pub fn router() -> Router<AppState> {
         .route("/me/social/blocks/{id}", delete(remove_block))
         .route("/me/social/reports", post(create_report))
         // 运营面（reviewer/support 档：举报处置属内容风控 + 客服交叉领域）
+        // 🔴 解锁资格快照的**分布**读数。此前 `eligibility_json` 写了却**没有任何读取面**——
+        // 一份没人看得到的审计快照等于没写。做成聚合（不是逐条列表）是刻意的：
+        // 排查阈值配得对不对**不需要知道是谁**，而逐条列表会把真人 id 摆进一个只为调参存在的面。
+        .route("/admin/social/bond-distribution", get(bond_distribution_admin))
         .route("/admin/social/reports", get(list_reports_admin))
         .route("/admin/social/reports/summary", get(report_summary_admin))
         .route("/admin/social/reports/{id}/resolve", post(resolve_report_admin))
@@ -660,6 +664,129 @@ async fn grave_of(db: &AnyPool, character_id: &str) -> Result<Option<String>, Ap
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 运营读数：解锁资格的正向分分布
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 一次取多少条快照。**有上界**：这是被后台读的端点，且 `eligibility_json` 是 TEXT JSON，
+/// 可移植 SQL 子集里没有 JSON 函数，只能取回来在 Rust 侧聚合——不封顶就是把整张表拉回内存。
+const BOND_DIST_SAMPLE_CAP: i64 = 5_000;
+/// 直方图分桶数（0.0–1.0 均分）。10 桶 = 每桶 0.1，够看形状又不至于噪声。
+const BOND_DIST_BUCKETS: usize = 10;
+
+/// GET /admin/social/bond-distribution：解锁请求里**正向羁绊分**的分布。
+///
+/// ════════════════════════════════════════════════════════════════════════════
+/// 它补的是两个缺口，都不是产品决定
+/// ════════════════════════════════════════════════════════════════════════════
+///
+/// ① **审计快照此前没有读取面**：`social_unlock_requests.eligibility_json` 一直在写，
+///    而全仓没有任何地方读它。一份没人看得到的审计快照等于没写。
+/// ② **快照此前不记被比较的值**：只有 `thresholds.minBond`，没有 `bond` 本身
+///    （已在同一批补上，见 `Eligibility::to_audit_json`）。记了标尺没记读数，
+///    事后没法回答「我为什么解锁不了」。
+///
+/// ════════════════════════════════════════════════════════════════════════════
+/// 🔴 它同时是 `docs/build/open-decisions.md` §2 自己写的那个「settling 证据」
+/// ════════════════════════════════════════════════════════════════════════════
+///
+/// 那一节说：羁绊强度公式的真正验收是「按这个公式算出来的解锁人群，是不是产品想放行的那批」，
+/// 而那**需要真实世界跑出来的关系分布**。本端点就是那份分布。
+///
+/// ⚠️ 它**不替产品定任何东西**：公式没改（`bond_between` 一个字没动），阈值没改，
+/// 谁能解锁没改。它只是把「一直在决定事情、却从没有人看得见的那个数」露出来。
+///
+/// `wouldPassAt` 给的是「若把阈值挪到 X，有多少条会通过」——那正是调阈值时唯一想知道的事，
+/// 而它此前得靠人去猜。
+///
+/// 🔴 **不下发任何真人身份**（§14）：本端点只回计数与分布，逐条明细一律不给。
+/// 排查阈值配得对不对**不需要知道是谁**。
+async fn bond_distribution_admin(
+    State(state): State<AppState>,
+    admin: AdminUser,
+) -> Result<Json<Value>, ApiError> {
+    // operator 档：这是调参用的只读读数，不是审核动作。
+    let role = admin.0.role.as_str();
+    if role != "admin" && role != "operator" {
+        return Err(ApiError::Forbidden);
+    }
+
+    // ORDER BY 全序（`id` 是主键）：PG 对并列行不保证顺序，截断时取到哪一批必须确定。
+    let rows = sqlx::query(
+        "SELECT eligibility_json FROM social_unlock_requests \
+         ORDER BY created_at DESC, id DESC LIMIT $1",
+    )
+    .bind(BOND_DIST_SAMPLE_CAP)
+    .fetch_all(&state.db)
+    .await?;
+
+    let threshold = unlock_min_bond();
+    let mut buckets = vec![0i64; BOND_DIST_BUCKETS];
+    let mut values: Vec<f64> = Vec::with_capacity(rows.len());
+    // 🔴 旧快照（本批次之前落的）**没有 `bond` 字段**。单列一格如实报，
+    // 绝不按 0 计入分布——那会在直方图最左边堆出一座根本不存在的山。
+    let mut legacy_without_bond = 0i64;
+
+    for r in &rows {
+        let raw: String = r.try_get("eligibility_json").unwrap_or_default();
+        let Some(v) = serde_json::from_str::<Value>(&raw)
+            .ok()
+            .and_then(|j| j.get("bond").and_then(Value::as_f64))
+            .filter(|v| v.is_finite())
+        else {
+            legacy_without_bond += 1;
+            continue;
+        };
+        let clamped = v.clamp(0.0, 1.0);
+        let idx = ((clamped * BOND_DIST_BUCKETS as f64) as usize).min(BOND_DIST_BUCKETS - 1);
+        buckets[idx] += 1;
+        values.push(v);
+    }
+
+    let n = values.len() as i64;
+    let pass_now = values.iter().filter(|v| **v >= threshold).count() as i64;
+    // 「阈值挪到 X 会有多少条通过」——调阈值时唯一想知道的事。
+    let would_pass_at: Vec<Value> = (0..=10)
+        .map(|i| {
+            let t = i as f64 / 10.0;
+            json!({ "threshold": t, "wouldPass": values.iter().filter(|v| **v >= t).count() as i64 })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "sampled": rows.len() as i64,
+        "withBond": n,
+        "legacyWithoutBond": legacy_without_bond,
+        "truncated": rows.len() as i64 >= BOND_DIST_SAMPLE_CAP,
+        "sampleCap": BOND_DIST_SAMPLE_CAP,
+        "currentThreshold": threshold,
+        "currentThresholdEnv": ENV_UNLOCK_MIN_BOND,
+        "passingAtCurrentThreshold": pass_now,
+        "histogram": {
+            "buckets": BOND_DIST_BUCKETS,
+            "width": 1.0 / BOND_DIST_BUCKETS as f64,
+            "counts": buckets,
+            "note": "第 i 桶 = [i×width, (i+1)×width)，末桶含右端 1.0。",
+        },
+        "wouldPassAt": would_pass_at,
+        "formula": {
+            "positiveBond": "逐条关系边取 max(trust, affinity, debt, 0)，再**跨边取 min**（弱的那一向把关）。",
+            "whyMin": "「双向自愿」在数据层的前置：单方面的好感不构成羁绊线，一头热的人不该因为自己感觉好就够格要对方的真身。",
+            "fearExcluded": true,
+            "note": "🔴 本端点**不改公式**（`bond_between` 一个字没动），只是把一直在决定事情、\
+                     却从没有人看得见的那个数露出来。",
+        },
+        "honesty": [
+            "🔴 本端点不下发任何真人身份，也不给逐条明细（§14）——排查阈值配得对不对不需要知道是谁。",
+            "⚠️ 旧快照（本批次之前落的）没有 bond 字段，单列 legacyWithoutBond 如实报，\
+             **不按 0 计入分布**——那会在直方图最左边堆出一座不存在的山。",
+            "⚠️ 样本只含**发起过解锁请求**的关系对，不是全平台关系的分布：\
+             够不上阈值而没去点的人不在样本里，故这份分布**天然偏高**。",
+            "它是 docs/build/open-decisions.md §2 说的那个 settling 证据，不是那一节的答案。",
+        ],
+    })))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 资格判定
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -692,11 +819,23 @@ impl Eligibility {
     }
 
     /// 发起那一刻的资格快照（落 `eligibility_json`，**只作审计，不参与任何判定**）。
+    ///
+    /// 🔴 **必须记下被比较的那个值本身**，不只是门槛。此前这里只有 `thresholds.minBond`
+    /// 而没有 `bond`——一份**记了标尺、没记读数**的快照无法完成它自己声明的用途：
+    /// 事后有人问「我为什么解锁不了」/「他凭什么能解锁」，快照答不上来，
+    /// 因为当时那条关系的正向分**没有任何地方留下过**（叙事态是活的，早已变了）。
+    ///
+    /// ⚠️ 与自查视图（[`Self::to_self_json`]）的差别是**刻意的**，不是漏了：
+    /// 自查视图**不给分**，因为正向分由**双方**的边共同决定（跨边取 min），
+    /// 露给本人等于泄露对方对他的感受——那撞 §14 的信息边界。
+    /// 审计快照没有这个约束：它只进 admin 档的排查面，不回给任何一方。
     fn to_audit_json(&self) -> Value {
         json!({
             "eligible": self.eligible,
             "hostile": self.bond.hostile,
             "bondEdges": self.bond.edges,
+            // 🔴 被 `thresholds.minBond` 比较的就是这个数。见上方说明。
+            "bond": self.bond.positive,
             "sharedWorlds": self.shared_worlds,
             "paths": self.paths,
             "diedTogetherWorlds": self.credential.worlds.len(),

@@ -1464,3 +1464,135 @@ fn refusal_message_is_single_and_generic() {
     assert!(!REFUSE_GENERIC.contains("拉黑"));
     assert!(!REFUSE_GENERIC.contains("敌对"));
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 解锁资格快照：记下被比较的那个值 + 给它一个读取面
+//
+// 补的是两个**工程缺陷**（不是产品决定）：
+//   ① 快照只记 thresholds.minBond，不记被比较的 bond 本身——记了标尺没记读数；
+//   ② eligibility_json 一直在写，全仓**没有任何地方读它**——没人看得到的审计等于没写。
+// 顺带产出 open-decisions §2 自己写的那个 settling 证据（真实分布）。
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 直插一条带指定 bond 的快照（只为验读取面的聚合，不经资格判定）。
+/// ⚠️ 唯一键是 `(world_id, requester_character_id, target_character_id)`，
+/// 故每条用**不同的角色对**（拿 id 派生），否则第二条就撞键。
+async fn seed_snapshot(state: &AppState, id: &str, bond_json: Option<f64>) {
+    let elig = match bond_json {
+        Some(b) => json!({ "eligible": true, "bond": b, "thresholds": { "minBond": 0.6 } }),
+        // 旧快照形状：有门槛、没读数。
+        None => json!({ "eligible": true, "thresholds": { "minBond": 0.6 } }),
+    };
+    sqlx::query(
+        "INSERT INTO social_unlock_requests (id, world_id, requester_user_id, \
+         requester_character_id, target_user_id, target_character_id, status, eligibility_json, \
+         expires_at, responded_at, revoked_at, created_at) \
+         VALUES ($1, 'w1', 'u1', $2, 'u2', $3, 'pending', $4, 0, 0, 0, $5)",
+    )
+    .bind(id)
+    .bind(format!("c_req_{id}"))
+    .bind(format!("c_tgt_{id}"))
+    .bind(elig.to_string())
+    .bind(crate::db::now_ms())
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+/// 🔴 审计快照必须记下**被比较的那个值**，不只是门槛。
+///
+/// 一份记了标尺、没记读数的快照，答不上「我为什么解锁不了」——那条关系的正向分
+/// 没有任何地方留下过（叙事态是活的，早就变了）。
+#[tokio::test]
+async fn the_audit_snapshot_records_the_value_that_was_compared_not_only_the_threshold() {
+    let src = include_str!("mod.rs");
+    // 源码级：两者必须**同时**出现在审计快照里。
+    let i = src.find("fn to_audit_json").expect("审计快照函数应存在");
+    let j = src[i..].find("fn ").map(|k| i + k + 3).unwrap_or(src.len());
+    let body = &src[i..j.max(i + 800).min(src.len())];
+    assert!(
+        body.contains("\"bond\": self.bond.positive"),
+        "🔴 审计快照必须记下被比较的正向分本身；只记 thresholds.minBond 等于记了标尺没记读数"
+    );
+    assert!(body.contains("minBond"), "门槛也要一起记，否则事后不知道当时的标尺是多少");
+
+    // 🔴 而**自查视图仍然不给分**——那是刻意的：正向分由双方的边共同决定（跨边取 min），
+    // 露给本人等于泄露对方对他的感受（§14 信息边界）。
+    let k = src.find("fn to_self_json").expect("自查视图应存在");
+    let self_body = &src[k..(k + 700).min(src.len())];
+    assert!(
+        !self_body.contains("self.bond.positive"),
+        "🔴 自查视图不得下发原始羁绊分 —— 它由双方的边共同决定，露给本人就是泄露对方的感受"
+    );
+}
+
+/// 🔴 分布读数：旧快照（没有 `bond` 字段）**单列如实报，绝不按 0 计入直方图**。
+/// 按 0 计会在最左边堆出一座根本不存在的山，而那正是调阈值时最容易被误读的位置。
+#[tokio::test]
+async fn legacy_snapshots_without_a_bond_are_reported_separately_not_counted_as_zero() {
+    let state = test_state().await;
+    let tk = admin_token(&state, "operator");
+    seed_snapshot(&state, "ur_new1", Some(0.75)).await;
+    seed_snapshot(&state, "ur_new2", Some(0.25)).await;
+    seed_snapshot(&state, "ur_old1", None).await;
+    seed_snapshot(&state, "ur_old2", None).await;
+
+    let (st, b) = send(&state, "GET", "/api/admin/social/bond-distribution", &tk, None).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["sampled"], json!(4));
+    assert_eq!(b["withBond"], json!(2));
+    assert_eq!(b["legacyWithoutBond"], json!(2), "🔴 旧快照要单列: {b}");
+    let counts = b["histogram"]["counts"].as_array().unwrap();
+    assert_eq!(counts[0], json!(0), "🔴 最左桶必须是 0 —— 旧快照按 0 计会堆出一座不存在的山: {b}");
+    assert_eq!(counts[2], json!(1), "0.25 落第 3 桶");
+    assert_eq!(counts[7], json!(1), "0.75 落第 8 桶");
+}
+
+/// `wouldPassAt` 回答的是调阈值时唯一想知道的事：挪到 X 会有多少条通过。
+#[tokio::test]
+async fn would_pass_at_answers_the_only_question_you_have_when_tuning_the_threshold() {
+    let state = test_state().await;
+    let tk = admin_token(&state, "operator");
+    for (i, v) in [0.1, 0.5, 0.7, 0.9].iter().enumerate() {
+        seed_snapshot(&state, &format!("ur_{i}"), Some(*v)).await;
+    }
+    let (_st, b) = send(&state, "GET", "/api/admin/social/bond-distribution", &tk, None).await;
+
+    let at = |t: f64| -> i64 {
+        b["wouldPassAt"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| (x["threshold"].as_f64().unwrap() - t).abs() < 1e-9)
+            .unwrap()["wouldPass"]
+            .as_i64()
+            .unwrap()
+    };
+    assert_eq!(at(0.0), 4, "阈值 0 → 全过");
+    assert_eq!(at(0.5), 3);
+    assert_eq!(at(0.7), 2);
+    assert_eq!(at(1.0), 0);
+    // 当前阈值 0.6（默认）下应当是 2 条。
+    assert_eq!(b["passingAtCurrentThreshold"], json!(2), "{b}");
+
+    // 🔴 诚实边界必须随数据走：这份分布**天然偏高**（够不上阈值而没去点的人不在样本里）。
+    let honesty = b["honesty"].as_array().unwrap();
+    assert!(
+        honesty.iter().any(|h| h.as_str().unwrap_or("").contains("天然偏高")),
+        "🔴 样本偏差必须写在响应里，否则会被当成全平台关系分布读: {b}"
+    );
+}
+
+/// 🔴 只回聚合，**绝不下发真人身份或逐条明细**（§14）——排查阈值不需要知道是谁。
+#[tokio::test]
+async fn the_distribution_never_leaks_who() {
+    let state = test_state().await;
+    let tk = admin_token(&state, "operator");
+    seed_snapshot(&state, "ur_x", Some(0.8)).await;
+    let (_st, b) = send(&state, "GET", "/api/admin/social/bond-distribution", &tk, None).await;
+    let raw = b.to_string();
+    for leak in ["u1", "u2", "c1", "c2", "ur_x", "requester"] {
+        assert!(!raw.contains(leak), "🔴 分布读数泄露了「{leak}」——它只该回计数与分布: {raw}");
+    }
+    assert!(b.get("items").is_none() && b.get("requests").is_none(), "不得有逐条明细");
+}

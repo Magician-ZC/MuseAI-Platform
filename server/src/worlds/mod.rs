@@ -1904,7 +1904,9 @@ async fn world_biography(
     user: AuthUser,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    if !crate::progression::be_biography_enabled() {
+    // ctx 按**世界**（与封卷侧同档）：传记是公共事实，不是个人资产——
+    // 按人灰度会出现「同一份封卷 A 看得见 B 看不见」。理由见 `be_biography_enabled`。
+    if !crate::progression::be_biography_enabled(&state.db, Some(&id)).await {
         return Err(ApiError::NotFound);
     }
     let world = load_world(&state.db, &id).await?;

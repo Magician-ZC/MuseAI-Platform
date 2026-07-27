@@ -249,8 +249,18 @@
   把 `flags.subplot_cards` 误接到自动封卷上照样编译、且在两个开关取值相同的用例里照样绿。
   已补 `settlement_flag_fields_are_not_crosswired`——故意让两者取值相反，走真实结算入口验。
   下一个往这个结构体加字段的人，请一并扩这条用例。
-- 未迁：`MUSE_CONTAINER_ASSEMBLY` ·
-  `MUSE_WORLD_SERIES_AUTOSCALE` · `MUSE_WORLD_BE_BIOGRAPHY` ·
+- ~~`MUSE_WORLD_BE_BIOGRAPHY`~~ —— **已迁（2026-07-27）**。`SettlementFlags` 的第三个字段。
+  🔵 它是这批里唯一**两侧 ctx 同档**（都按 world）的：传记是**公共事实**（§0.3）不是个人资产，
+  按人灰度会出现「同一份封卷 A 看得见 B 看不见」。于是它没有副本卡/传世卡那种
+  「产出了但看不见」的不对称。⚠️「关阀期间崩塌的世界不产传记、再打开也不追溯补写」
+  这条语义一个字没变——传记是封卷那一刻的快照。
+  🔵 迁它时故障注入连抓出**我自己三条假绿的用例**，都是同一个病根——**用例绕过了真正的
+  接线点**：① 按世界灰度那条走 `seal()` 辅助函数，验不到 `settle_idle_world_ending_tx`
+  里那一行接的是哪个字段；② 读取侧直接调 `be_biography_enabled(..., Some(id))`，
+  对「端点里传的是 world 还是 global」完全无感；③ 字段接串那条用 `collapsed = false`，
+  BE 传记那一行根本没被走到。全部改成走真实入口（真实结算函数 / 真实 HTTP 端点 /
+  `collapsed = true`）后三处注入才红。**教训：验开关接线，必须从接线点的上游进去。**
+- 未迁：`MUSE_CONTAINER_ASSEMBLY` · `MUSE_WORLD_SERIES_AUTOSCALE` ·
   `MUSE_SAFETY_LEXICON`（🔴 最后迁或不迁）。
 
 共同的坑：**多数消费点在事务内**（结算铸卡 / 封卷 / 扩容判定），`is_enabled` 会查库，
@@ -297,7 +307,7 @@
 `admin_api::audit::writeback_target` 现在返回回写坐标，`world_events` 上因此有了全仓
 **唯一一条放宽语句**（`SET` 只有 `moderation` 一列、按主键点名、CAS、起点白名单写死在 SQL 里），
 权限分 reviewer / admin 两档，三条写入路径由源码级红线用例全仓盘点 ·
-**其余存量 env 开关接入运行时开关体系**（副本卡 / 生死状档 / 房间邀请 / 传世卡已迁，清单与注意事项见上）·
+**其余存量 env 开关接入运行时开关体系**（副本卡 / 生死状档 / 房间邀请 / 传世卡 / BE 传记已迁，清单与注意事项见上）·
 **处置申诉只覆盖 `character` / `character_avatar` 两类主体**（如实的范围，不是遗漏：
 `world_cover` 属于世界、`world_templates` 根本没有 owner 列，给它们开申诉入口只会得到一个
 没人有资格提交的端点；要覆盖需先定义"世界封面 / 模板的作者是谁"这条产品口径）。

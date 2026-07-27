@@ -710,8 +710,13 @@ async fn seed_world_ended_audit(state: &AppState, world_id: &str, reason: &str, 
 /// 走一次封卷（独立事务，模拟结算事务内的调用）。
 async fn seal(state: &AppState, world_id: &str, collapsed: bool) {
     let ctx = payout_context_from_wrapper(None);
+    // 🔴 开关**在进事务之前**解析（事务里解析 = 单连接池自锁，见
+    // `subplot::tests::resolving_flags_inside_the_transaction_deadlocks_and_fails_closed`）。
+    let flags = SettlementFlags::resolve(&state.db, world_id).await;
     let mut tx = state.db.begin().await.unwrap();
-    seal_be_biography_tx(&mut tx, world_id, collapsed, &ctx).await.expect("seal");
+    seal_be_biography_tx(&mut tx, world_id, collapsed, &ctx, flags.be_biography)
+        .await
+        .expect("seal");
     tx.commit().await.unwrap();
 }
 
@@ -1058,6 +1063,57 @@ async fn settlement_path_seals_biography_only_on_collapse() {
     settle_idle_world_ending_tx(&mut tx, &normal_world, &participants, false, f).await.unwrap();
     tx.commit().await.unwrap();
     assert!(biography_rows(&state, &normal_world).await.is_empty(), "正常终局不产出 BE 传记");
+}
+
+/// 🔴 **按世界灰度真的生效**（接入 `flags` 体系的行为增量）。
+/// 同时钉住「封卷侧与读取侧**同档**」——本开关两侧都按 world，没有 user 那一档，
+/// 于是不存在副本卡/传世卡那种「产出了但看不见」的不对称（传记是公共事实，不是个人资产）。
+#[tokio::test]
+async fn be_biography_grayscale_is_per_world_on_both_sides() {
+    let _sw = BiographySwitch::set(false); // 全局关（env 层）
+    let state = test_state().await;
+    let opened = seed_played_world(&state).await;
+    seed_world_ended_audit(&state, &opened, "key_character_exit", "ending_dark").await;
+    sqlx::query(
+        "INSERT INTO runtime_flags (id, flag, scope, target_id, enabled, starts_at, ends_at, \
+         updated_by, updated_at, reason, created_at) \
+         VALUES ($1, 'MUSE_WORLD_BE_BIOGRAPHY', 'world', $2, 1, 0, 0, 'test', $3, 'test', $4)",
+    )
+    .bind(crate::db::new_id("rf"))
+    .bind(&opened)
+    .bind(now_ms())
+    .bind(now_ms())
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    // 封卷侧：被灰度选中的世界照常封卷。
+    seal(&state, &opened, true).await;
+    assert_eq!(biography_rows(&state, &opened).await.len(), 1, "🔴 被选中的世界应当封卷");
+    // 读取侧：走**真实端点**（不是直接调 `be_biography_enabled`——那样只验到函数本身，
+    // 验不到 `worlds::world_biography` 那一行传的是 world 还是 global；
+    // 故障注入实测过：直接调的写法对「读取侧退回全局档」完全无感）。
+    seed_user(&state.db, "u_bio").await;
+    let (st, _) = send(&state, "GET", &format!("/api/worlds/{opened}/biography"), "u_bio", None).await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "🔴 读取侧必须与封卷侧同档：传记是公共事实，不该出现「封了却读不到」"
+    );
+
+    // 另一个没被选中的世界：两侧都关。
+    // （复用同一个模板建第二个世界——`seed_played_world` 会重播模板，调两次撞唯一键。）
+    let other = crate::worlds::create_world(
+        &state.db,
+        crate::worlds::CreateWorldParams::official("tpl_be", 3, "另一个崩塌世界"),
+    )
+    .await
+    .unwrap();
+    seed_world_ended_audit(&state, &other, "key_character_exit", "ending_dark").await;
+    seal(&state, &other, true).await;
+    assert!(biography_rows(&state, &other).await.is_empty(), "🔴 没被选中的世界不得跟着封卷");
+    let (st, _) = send(&state, "GET", &format!("/api/worlds/{other}/biography"), "u_bio", None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "没被选中的世界读取侧也应当关着");
 }
 
 /// 与结算同事务：结算回滚则传记同滚——绝不出现「奖罚没落地但墓志铭已刻好」。

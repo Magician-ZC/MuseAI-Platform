@@ -209,7 +209,10 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
         default_enabled: false,
         owner: "progression",
         desc: "BE 结局传记（世界线崩塌后的封卷）",
-        wired: false,
+        // 🔵 已接线。🔴 与副本卡/传世卡不同：**两侧 ctx 都是 world**，没有 user 那一档——
+        // 传记是公共事实（§0.3）不是个人资产，按人灰度会出现「同一份封卷 A 看得见 B 看不见」。
+        // 于是它没有那两个开关的「产出了但看不见」不对称。封卷侧经 `SettlementFlags`。
+        wired: true,
     },
     FlagDef {
         name: "MUSE_OOC_ANNOTATIONS",
@@ -412,7 +415,12 @@ pub const fn declared_default(name: &str) -> bool {
 /// - `MUSE_WORLD_SERIES_AUTOSCALE`：扩容判定在 join 的事务路径上，事务边界注意事项同上。
 ///   它已有**逐系列**的 `world_series.status` 急停阀，与本体系的 world 作用域**语义重叠**：
 ///   迁移时要明确「两道闸都开才扩容」，不要让 `runtime_flags` 变成第三道容易被忘记的闸。
-/// - `MUSE_WORLD_BE_BIOGRAPHY`：封卷路径，事务边界注意事项同上。
+/// - ~~`MUSE_WORLD_BE_BIOGRAPHY`~~ —— **已迁（2026-07-27）**。封卷路径的事务边界注意事项同上，
+///   经 [`crate::progression::SettlementFlags`] 传入（第三个字段）。
+///   🔵 它是这批里唯一**两侧 ctx 同档**（都按 world）的：传记是公共事实不是个人资产，
+///   于是没有副本卡/传世卡那种「产出了但看不见」的不对称。
+///   ⚠️ 「关阀期间崩塌的世界不产传记，再打开也不追溯补写」这条语义**一个字没变**——
+///   传记是封卷那一刻的快照，补写会把「当时的事实」换成「今天重算的事实」。
 /// - `MUSE_SAFETY_LEXICON`：🔴 **最后迁，或者干脆不迁**。它是审核链、默认开启，
 ///   且消费点在 `runtime` commit **事务内的闸**上——事务内查库风险最大，收益最小
 ///   （审核链本就该恒开，「按世界灰度关掉敏感词过滤」不是一个合理的运营动作）。

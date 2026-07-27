@@ -1063,17 +1063,46 @@ async fn settlement_flag_fields_are_not_crosswired() {
     .execute(&state.db)
     .await
     .unwrap();
+    sqlx::query(
+        "INSERT INTO runtime_flags (id, flag, scope, target_id, enabled, starts_at, ends_at, \
+         updated_by, updated_at, reason, created_at) \
+         VALUES ($1, 'MUSE_WORLD_BE_BIOGRAPHY', 'world', 'w1', 1, 0, 0, 'test', $2, 'test', $3)",
+    )
+    .bind(crate::db::new_id("rf"))
+    .bind(crate::db::now_ms())
+    .bind(crate::db::now_ms())
+    .execute(&state.db)
+    .await
+    .unwrap();
 
     let flags = crate::progression::SettlementFlags::resolve(&state.db, "w1").await;
-    assert!(flags.subplot_cards && !flags.memorial, "夹具前提：两个字段取值必须相反");
+    // 🔴 前提：**本字段与其余每一个字段取值都不同**。新增字段的人请把它加进这个断言——
+    // 只要有一个字段与 memorial 同值，接串了也验不出来（VALIDATION §3 有同样的提醒）。
+    assert!(
+        !flags.memorial && flags.subplot_cards && flags.be_biography,
+        "夹具前提：memorial 必须与其余字段取值相反，否则接串了也验不出来: {flags:?}"
+    );
 
-    // 走**真实结算入口**（而不是直接调 auto_seal）：要验的正是 progression 里那一行接的是哪个字段。
+    // 走**真实结算入口**（而不是直接调 auto_seal / seal_be_biography）：要验的正是
+    // `settle_idle_world_ending_tx` 里那几行各自接的是哪个字段。
+    // 🔴 `collapsed = true`：否则 BE 传记那一行根本不会被走到，接串了也验不出来
+    //（故障注入实测：`collapsed=false` 时把 `flags.be_biography` 换成 `flags.memorial` 全绿）。
+    sqlx::query(
+        "INSERT INTO audit_logs (id, actor_id, actor_role, action, subject, reason, created_at) \
+         VALUES ($1, 'system', 'system', 'world.ended', 'w1', 'key_character_exit|ending=none', $2)",
+    )
+    .bind(crate::db::new_id("aud"))
+    .bind(crate::db::now_ms())
+    .execute(&state.db)
+    .await
+    .unwrap();
+
     let mut tx = state.db.begin().await.unwrap();
     crate::progression::settle_idle_world_ending_tx(
         &mut tx,
         "w1",
         &[("chA".into(), "u1".into())],
-        false,
+        true,
         flags,
     )
     .await
@@ -1083,9 +1112,14 @@ async fn settlement_flag_fields_are_not_crosswired() {
     assert_eq!(
         memorial_status_of(&state, "chA").await,
         "living",
-        "🔴 传世卡开关是**关**的，不得因为副本卡开着就把死者封卷 —— 那说明字段接串了"
+        "🔴 传世卡开关是**关**的，不得因为别的开关开着就把死者封卷 —— 那说明字段接串了"
     );
     assert_eq!(withdrawn_of(&state, "chA").await, 0, "🔴 更不得因此下架卡");
+    assert_eq!(
+        count(&state, "SELECT COUNT(*) FROM world_biographies WHERE world_id='w1'").await,
+        1,
+        "🔴 BE 传记开关是**开**的，必须封出传记 —— 封不出说明它被接到了某个关着的字段上"
+    );
 }
 
 /// 开关关闭时整段短路：一张卡都不封，状态一点没动。

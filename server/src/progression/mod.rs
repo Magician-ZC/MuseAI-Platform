@@ -371,6 +371,9 @@ pub(crate) struct SettlementFlags {
     /// 死者自动封卷为传世卡（`MUSE_MEMORIAL`）。关 = 整段短路，**不报错**
     /// （封卷是纪念不是账目；玩家还可用主动认领入口补上）。
     pub(crate) memorial: bool,
+    /// 崩塌世界的 BE 结局传记（`MUSE_WORLD_BE_BIOGRAPHY`）。关 = 不封卷，
+    /// 且**再打开也不追溯补写**（传记是封卷那一刻的快照）。
+    pub(crate) be_biography: bool,
 }
 
 impl SettlementFlags {
@@ -387,6 +390,7 @@ impl SettlementFlags {
                 crate::flags::FlagCtx::world(world_id),
             )
             .await,
+            be_biography: be_biography_enabled(db, Some(world_id)).await,
         }
     }
 }
@@ -558,7 +562,7 @@ pub(crate) async fn settle_idle_world_ending_tx(
 
     // 崩塌 → 封卷出一份「BE 结局传记」（§9「坏结局也是内容，封卷收藏」）。与结算同事务：
     // 结算回滚则传记同滚，绝不出现"奖罚没落地但墓志铭已刻好"。正常终局不产出（有输才有痛）。
-    seal_be_biography_tx(tx, world_id, collapsed, &ctx).await?;
+    seal_be_biography_tx(tx, world_id, collapsed, &ctx, flags.be_biography).await?;
 
     // 自动封卷（§12【拍板 23】「死亡 = 传记封卷，不是资产清零」）：本世界里已死的卡转传世卡。
     //
@@ -647,17 +651,39 @@ const BIOGRAPHY_KIND_BE: &str = "be";
 /// 摘要结构版本（结构演进时 +1，读取面据此兼容旧封卷）。
 const BIOGRAPHY_SCHEMA_VERSION: i64 = 1;
 
-/// BE 结局传记是否已由运营开启（env 覆盖 + 默认常量，范式同 `worlds::deathmatch_enabled`）。
-pub fn be_biography_enabled() -> bool {
-    match std::env::var(ENV_BE_BIOGRAPHY) {
-        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "on" | "yes" => true,
-            "0" | "false" | "off" | "no" => false,
-            // 配错不静默开启：回落默认（关闭）。
-            _ => DEFAULT_BE_BIOGRAPHY_ENABLED,
-        },
-        Err(_) => DEFAULT_BE_BIOGRAPHY_ENABLED,
-    }
+/// 🔴 **编译期钉死默认值的两个事实源**（本常量 + `flags::KNOWN_FLAGS`）。
+const _: () = assert!(
+    crate::flags::declared_default(ENV_BE_BIOGRAPHY) == DEFAULT_BE_BIOGRAPHY_ENABLED,
+    "flags::KNOWN_FLAGS 中 MUSE_WORLD_BE_BIOGRAPHY 的默认值必须与 DEFAULT_BE_BIOGRAPHY_ENABLED 一致"
+);
+
+/// BE 结局传记是否已由运营开启。
+///
+/// ════════════════════════════════════════════════════════════════════════════
+/// 🔴 已接入运行时开关体系（`crate::flags`）—— 两处 ctx **都是 world**
+/// ════════════════════════════════════════════════════════════════════════════
+///
+/// 与副本卡 / 传世卡不同：本开关的两个消费点**都天然按世界**，没有 user 那一档。
+///
+/// | 消费点 | ctx | 为什么 |
+/// |---|---|---|
+/// | 封卷侧（结算事务内） | **world + global** | 传记是**一个世界**的墓志铭 |
+/// | 读取侧（`GET /worlds/{id}/biography`） | **world + global** | 读的就是那个世界的传记；按人灰度会出现「同一份封卷 A 看得见 B 看不见」，而它是**公共事实**（§0.3），不是个人资产 |
+///
+/// 🔵 两侧同档，于是没有副本卡那种「产出了但看不见」的不对称——这不是运气，
+/// 是因为这块内容本来就只有世界这一个维度。
+///
+/// ⚠️ 可逆急停阀，但**不追溯补写**：关阀期间崩塌的世界不产传记，再打开也不会补——
+/// 传记是**封卷那一刻**的快照，补写会把「当时的事实」换成「今天重算的事实」，
+/// 那才是真的改写历史。这条语义在接入开关体系后**一个字没变**。
+///
+/// 🔴 封卷侧收 bool、不在事务里查库，经 [`SettlementFlags`] 传入（理由同副本卡）。
+pub async fn be_biography_enabled(db: &AnyPool, world_id: Option<&str>) -> bool {
+    let ctx = match world_id {
+        Some(w) => crate::flags::FlagCtx::world(w),
+        None => crate::flags::FlagCtx::global(),
+    };
+    crate::flags::is_enabled(db, ENV_BE_BIOGRAPHY, ctx).await
 }
 
 /// 测试专用：BE 传记相关 env 的 RAII 夹具（范式同 `worlds::DeathmatchSwitch` / `subplot::SubplotSwitch`）。
@@ -785,8 +811,11 @@ async fn seal_be_biography_tx(
     world_id: &str,
     collapsed: bool,
     ctx: &PayoutContext,
+    // 由 `SettlementFlags` 在**进事务之前**解析好传入（本函数在结算事务内，
+    // 自己查库就是单连接池自锁）。
+    biography_on: bool,
 ) -> Result<(), ApiError> {
-    if !collapsed || !be_biography_enabled() {
+    if !collapsed || !biography_on {
         return Ok(());
     }
     // 幂等①：已封卷 → 不重复产出（重复触发不重复产传记）。

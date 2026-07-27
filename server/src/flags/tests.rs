@@ -965,6 +965,10 @@ async fn list_endpoint_reports_effective_global_state() {
             // 结构体加了一个字段，没有给结算函数新增 bool 参数。那正是上一条迁移时
             // 建这个结构体的理由。
             "MUSE_MEMORIAL",
+            // 🔵 `MUSE_WORLD_BE_BIOGRAPHY` 是 `SettlementFlags` 的第三个字段。它也是这批里
+            // 唯一**两侧 ctx 同档**（都按 world）的——传记是公共事实不是个人资产，
+            // 按人灰度会出现「同一份封卷 A 看得见 B 看不见」。
+            "MUSE_WORLD_BE_BIOGRAPHY",
             "MUSE_OOC_ANNOTATIONS",
             "MUSE_IFLINE_PARALLEL",
             "MUSE_SOCIAL_IDENTITY_UNLOCK",

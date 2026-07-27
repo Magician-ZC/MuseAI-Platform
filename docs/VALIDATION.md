@@ -958,23 +958,51 @@ camelCase 与 snake_case 同形。`known_to` 才受影响，而那一处是类�
 `let (Some(id), Some(expr)) = … else { continue }` ⇒ **整条禁止谓词被丢弃**，世界照常开，
 那条内容约束从来没生效过，且没有任何日志。
 
-清单分别是 `assembly::MAINLINE_NODE_KEYS`（8 个 = 两个读者的并集）与 `FORBIDDEN_PREDICATE_KEYS`（3 个）；
-**「哪些层已被覆盖」本身也只有一处** —— `SKELETON_NESTED_KEY_SETS`，建模板期校验与运营台发现面都遍历它。
-各抄一份的话，加一层就得记得改两处，而漏改的表现是「运营台说这个模板没问题」——那正是本节在修的缺陷，
-不能在修它的提交里再造一个。（故障注入实测：从该表摘掉 `forbiddenPredicates`，**校验与运营台同时失灵**。）
+**最后收成一张表：`assembly::SKELETON_KEY_SETS`（按路径索引，覆盖全部 32 层）。**
+路径语法 `""` = 顶层、`a.b` = 对象字段、`a[]` = 数组元素，例如 `payoutTable.worldlineTiers[].item.origin`。
+建模板期校验（`unknown_skeleton_keys` 取第一条拒请求）与运营台发现面（取全部给运营看）
+**共用同一份遍历实现**。各抄一份的话，加一层就得记得改两处，而漏改的表现是
+「运营台说这个模板没问题」——那正是本节在修的缺陷，不能在修它的提交里再造一个。
 
-三层的未知键校验共用一份实现（`reject_unknown_keys`）。报错点名到具体那一条
-（有 `id` 报 id，无 `id` 报序号——否则运营不知道该改哪一行）。
+**未登记的路径不校验，不是拒绝。** 这是一道会拒请求的闸，对着看不懂的结构乱拒是生产事故；
+漏检一层只是维持现状、不构成回归。漏登记改由**源码层**变响，见下。
+
+登记时又撞见同一形状两次，一并收进并集：
+- `sampling`：装配层 `SamplingSpec` 认五个「每副本抽多少」，创作者发布端
+  `assets::worlds::SamplingView` 认 `redundancyRatio`（超集冗余门），两边都不知道并集
+  ——这条是**上线注册表时被仓库里的真实测试骨架当场打出来的**，不是看出来的。
+- `storylines[].summary`：`StorylineSpec` 里根本没有这个字段，只有 `world_scan_text` 读它。
 
 「是不是想写 X？」的建议**用编辑距离**（阈值 `max(1, len/4)`），不只归一化：`constrait`
 （漏一个 `n`）归一化后仍不等于 `constraint`，而漏 / 多 / 错一个字母恰是最常见的拼法错误。
 没有这个提示，报错就只是「这个键没人读」，运营还得自己猜正确写法。
 
-⚠️ **边界（别把这条读成"拼错已经不会发生了"）**：只覆盖了**顶层** + `mainlineNodes[]` + `forbiddenPredicates[]` 三层。
-其余嵌套类型（结局池 / 内容池 / 地点 / 身份池 / 产出表 / storylines……）同样是手读与类型化混用，**未覆盖**。
-选这三层先做的理由是失败方向：约束降级、谓词丢弃、整块功能消失，都朝坏的一边且无日志。
-其余各类要一一登记键集（`SKELETON_NESTED_KEY_SETS` 加一行 + 一份键集常量 + 源码层红线），
-改动面另论，本批次**未做**，如实记在此。
+**两条源码层红线是这套东西的护栏**——没有它们，`SKELETON_KEY_SETS` 就是「靠人记得更新」的表，
+而「记得更新」这个假设正是它下面每一层缺陷的共同成因：
+
+| 红线 | 防什么 | 故障注入实测 |
+|---|---|---|
+| `registered_key_sets_cover_every_struct_field` | 给结构体加字段忘了加注册表 → 用了新字段的**合法模板会被拒** | 给 `SamplingSpec` 加一个字段 → 红 |
+| `every_skeleton_struct_is_registered` | 加了一层嵌套结构体忘了登记 → 那层**不被校验、拼错继续静默且无征兆** | 给 `Skeleton` 加一个新结构体字段 → 红 |
+
+红线的 schema 源码取自**三处**：`assembly/mod.rs`、`admission/mod.rs`、
+以及 `crates/muse-engine/src/narrative/types.rs`（`include_str!` 跨 crate 读）。
+后两处是跨模块 / **跨 crate** 契约——正是 §3.7 那一类「引擎侧改个字段名，server 只表现为读不到值」。
+实测：把 `requiredEffectTags` 从注册表摘掉，红线点名 `LocationGate` 的这个字段，
+证明跨 crate 那一路是真的在读引擎源码。
+
+解析器**不假设**「线上名 = 字段名的 camelCase」：显式 `#[serde(rename = "X")]` 优先
+（引擎里已有一处这样的字段，当前从 `Skeleton` 不可达）。实测给可达结构体加 `rename` → 红线报的是
+重命名后的名字。
+
+⚠️ **仍存的边界（别读成"拼错已经不会发生了"）**：
+- **存量模板不会被回头校验**，闸只在写入路径上。存量的发现面是运营台的
+  `shape.unknownTopLevelKeys` / `shape.unknownNestedKeys` 两栏——**看得见，但不会自动修**。
+- `worldCharacters[].card` 刻意**不下钻**（`SKELETON_OPAQUE_PATHS`）：它的 schema 是引擎的
+  `CharacterCardV2`，拿骨架这一侧的键集去校验只会把合法角色卡拒掉。
+- 红线读的是**源码文本**，不是类型系统。它挡得住加字段 / 加结构体 / 显式 rename，
+  挡不住把 schema 挪进一个它没读的文件——那种情况下 `struct_fields` 找不到该结构体会直接 panic 报名，
+  也是响的，但要靠人看懂那句提示。
 
 ⚠️ 另一条边界：**存量模板不会被回头校验**，闸只在写入路径上。存量的发现面是运营台的
 `shape.unknownTopLevelKeys` / `shape.unknownNestedKeys` 两栏——**看得见，但不会自动修**。

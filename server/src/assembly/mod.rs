@@ -2568,7 +2568,7 @@ fn distribute_resident_items(
 ///
 /// ⚠️ 加了新的手读键（`sk.get("xxx")`）而忘了往这张表里加，后果是**合法模板被拒**——响亮而不是静默，
 /// 这个方向安全。反方向（往 `Skeleton` 加字段忘了加这里）由
-/// `skeleton_top_level_keys_covers_every_skeleton_field` 在源码层钉住。
+/// `registered_key_sets_cover_every_struct_field` 在源码层钉住。
 pub(crate) const SKELETON_TOP_LEVEL_KEYS: &[&str] = &[
     // ---- `struct Skeleton` 的字段（camelCase）----
     "sourceWork",
@@ -2636,34 +2636,162 @@ pub(crate) const MAINLINE_NODE_KEYS: &[&str] = &[
 /// 世界照常开，只是那条内容约束从来没生效过，且没有任何日志。
 pub(crate) const FORBIDDEN_PREDICATE_KEYS: &[&str] = &["id", "expression", "reason"];
 
-/// 已登记键集的**嵌套数组**：`(顶层字段名, 该数组元素的合法键集)`。
+/// **骨架每一层的合法键集，按路径索引** —— 全仓唯一一处知道 `skeleton_json` 的形状。
 ///
-/// 🔴 唯一一处知道「哪些嵌套层已被覆盖」——`validate_skeleton_refs`（建模板期拦）与
-/// `admin_api::calibration::skeleton_shape`（存量模板的发现面）都遍历它。
-/// 各抄一份的话，加一层就得记得改两处，而漏改的表现是「运营台说这个模板没问题」——
-/// 那正是本批次在修的那类缺陷，不能在修它的提交里再造一个。
+/// 路径语法：`""` = 顶层；`a.b` = 对象字段；`a[]` = 数组元素。
+/// 例：`locations[].gate` = `locations` 数组里每个元素的 `gate` 对象。
 ///
-/// ⚠️ 表外的嵌套类型（结局池 / 内容池 / 地点 / 身份池 / 产出表……）**尚未覆盖**，
-/// 见 `docs/VALIDATION.md` §3.8 的边界段。
-pub(crate) const SKELETON_NESTED_KEY_SETS: &[(&str, &[&str])] =
-    &[("mainlineNodes", MAINLINE_NODE_KEYS), ("forbiddenPredicates", FORBIDDEN_PREDICATE_KEYS)];
+/// 🔴 `validate_skeleton_refs`（建模板期拦）与 `admin_api::calibration::skeleton_shape`
+/// （存量模板的发现面）**都遍历这一张表**。各抄一份的话，加一层就得记得改两处，
+/// 而漏改的表现是「运营台说这个模板没问题」——那正是这套校验在修的缺陷本身。
+///
+/// **未登记的路径不校验**（不是「拒绝」）。这个方向是刻意的：这是一道**会拒请求**的闸，
+/// 对着看不懂的结构乱拒是生产事故，而漏检一层只是维持现状、不构成回归。
+/// 漏登记由 `every_skeleton_struct_is_registered` 在**源码层**变响——它从 `struct Skeleton`
+/// 出发做可达性闭包，任何新结构体没进这张表即 CI 红。
+///
+/// 各条目末尾注明键的来源：`Skeleton` 侧的结构体名，或「手读」及其读者。
+pub(crate) const SKELETON_KEY_SETS: &[(&str, &str, &[&str])] = &[
+    ("", "Skeleton", SKELETON_TOP_LEVEL_KEYS),                          // Skeleton + runtime 手读
+    ("sourceWork", "SkeletonSource", &["sourceId", "title"]),                 // SkeletonSource
+    ("mainlineNodes[]", "MainlineNode", MAINLINE_NODE_KEYS),                // MainlineNode + runtime 手读
+    ("forbiddenPredicates[]", "", FORBIDDEN_PREDICATE_KEYS),    // 无结构体，全靠 runtime 手读
+    ("endgame", "", ENDGAME_KEYS),                              // 无结构体，全靠 runtime 手读
+    ("endingPool[]", "EndingCandidate", &["id", "affinity", "baseWeight", "variantGroup", "arcTags"]), // EndingCandidate
+    ("hiddenContentPool[]", "PoolItem", POOL_ITEM_KEYS),                // PoolItem
+    ("hiddenContentPool[].rewardItem", "ItemDefinition", ITEM_DEFINITION_KEYS),
+    ("hiddenContentPool[].rewardItem.origin", "ItemOrigin", ITEM_ORIGIN_KEYS),
+    ("sideHookPool[]", "PoolItem", POOL_ITEM_KEYS),                     // PoolItem（与上面同型）
+    ("sideHookPool[].rewardItem", "ItemDefinition", ITEM_DEFINITION_KEYS),
+    ("sideHookPool[].rewardItem.origin", "ItemOrigin", ITEM_ORIGIN_KEYS),
+    ("worldItems[]", "ItemDefinition", ITEM_DEFINITION_KEYS),                 // ItemDefinition（admission，跨模块）
+    ("worldItems[].origin", "ItemOrigin", ITEM_ORIGIN_KEYS),              // ItemOrigin（admission，跨模块）
+    ("worldCharacters[]", "WorldCharacter", &["card", "homeLocation", "carriedItemIds", "agendaNodes"]), // WorldCharacter
+    ("locations[]", "LocationSpec", &["id", "name", "connections", "isSecretRealm", "gate", "residentItemIds"]), // LocationSpec
+    // LocationGate 属 muse-engine（跨 crate 契约，§3.7 那一类）
+    ("locations[].gate", "LocationGate", &["requiredItemIds", "requiredEffectTags", "requiredCosmologies", "maxPowerTier"]),
+    ("assemblyRules", "AssemblyRules", &["hiddenPerCharacter", "endingWeightThreshold"]), // AssemblyRules
+    // StorylineSpec + `assets::worlds::world_scan_text` 手读的 `summary`（结构体里没有这个字段）
+    ("storylines[]", "StorylineSpec", &["id", "mainlineNodeIds", "hiddenPoolIds", "endingIds", "affinity", "summary"]),
+    ("identityPool[]", "IdentitySpec", &["id", "label", "quota", "themes", "hookAffinity", "isLead"]), // IdentitySpec
+    ("payoutTable", "PayoutTable", &["worldlineTiers", "contributionWeights", "collapse"]), // PayoutTable
+    ("payoutTable.worldlineTiers[]", "PayoutTier", &["label", "minScore", "item", "mileage"]), // PayoutTier
+    ("payoutTable.worldlineTiers[].item", "ItemDefinition", ITEM_DEFINITION_KEYS),
+    ("payoutTable.worldlineTiers[].item.origin", "ItemOrigin", ITEM_ORIGIN_KEYS),
+    // IntensityWeights 属 muse-engine（跨 crate）
+    ("payoutTable.contributionWeights", "IntensityWeights", &["success", "partial", "failure", "speak"]),
+    ("payoutTable.collapse", "CollapsePolicy", &["baselineFactor", "worldlineFactor"]), // CollapsePolicy
+    ("realmTier", "RealmTier", REALM_TIER_KEYS),                         // RealmTier
+    // ⚠️ `sampling` 有**两个读者**，各认各的：装配层 `SamplingSpec` 认前五个（每副本抽多少），
+    // 创作者发布端 `assets::worlds::SamplingView` 认 `redundancyRatio`（超集冗余门，§防刷 ①）。
+    // 两边都不知道并集——这正是本套校验反复撞见的形状，故并集只在这里写一次。
+    ("sampling", "SamplingSpec", &[
+        "instanceStorylineCount",
+        "instanceMainlineCount",
+        "instanceHiddenCount",
+        "instanceNpcCount",
+        "instanceLocationCount",
+        "redundancyRatio",
+    ]),
+    ("subplotCardRefs[]", "SubplotCardRef", &["cardId", "cardVersion", "weight"]), // SubplotCardRef
+    ("seams[]", "Seam", &["from", "to"]),                            // Seam
+    ("nexus", "NexusSpec", &["name"]),                                    // NexusSpec
+    ("container", "ContainerPlan", &["fingerprint", "weights", "pinnedLocations", "cardIds"]), // ContainerPlan
+];
 
-/// 未知键校验（三层共用一份实现——每层各写一遍正是本次要修的那类问题）。
-/// `__` 前缀豁免（注释键）。返回首个冒犯者的中文说明。
-fn reject_unknown_keys(v: &Value, allowed: &[&str], whose: &str) -> Result<(), String> {
-    let Some(obj) = v.as_object() else { return Ok(()) };
-    for key in obj.keys() {
-        if key.starts_with("__") || allowed.contains(&key.as_str()) {
-            continue;
-        }
-        let hint = nearest_key(key, allowed)
-            .map(|k| format!("（是不是想写 `{k}`？）"))
-            .unwrap_or_default();
-        return Err(format!(
-            "{whose}出现无人读取的键 `{key}`{hint}——它不会报错，只会让对应功能静默退化到默认值"
-        ));
+/// 不下钻的子树：schema 归别人所有，键集不在本仓库这一侧维护。
+///
+/// `worldCharacters[].card` 是 `muse_engine::character::types::CharacterCardV2`——
+/// 拿骨架这一侧的键集去校验它，只会把合法的角色卡拒掉。它的送审同样另走
+/// `safety::card_scan_text` 的语义口径。
+pub(crate) const SKELETON_OPAQUE_PATHS: &[&str] = &["worldCharacters[].card"];
+
+/// `endgame`（放置房终局策略）。**无结构体**，`runtime` 全靠字符串键手读。
+pub(crate) const ENDGAME_KEYS: &[&str] =
+    &["minWorldTicks", "maxWorldTicks", "worldTimeLimit", "keyCharacterIds"];
+
+/// `PoolItem`（隐藏内容池 / 支线钩子池的元素）。
+pub(crate) const POOL_ITEM_KEYS: &[&str] = &[
+    "id",
+    "themes",
+    "template",
+    "difficultyBase",
+    "rewardItemRef",
+    "rewardItem",
+    "variantGroup",
+    "arcTags",
+];
+
+/// `admission::ItemDefinition` / `ItemOrigin`：道具目录与内联奖励共用同一形状
+/// （目录里那份与内联那份是同一类型，这也是它们的送审必须一视同仁的原因，见 VALIDATION §3.9）。
+pub(crate) const ITEM_DEFINITION_KEYS: &[&str] = &["id", "narrative", "effectTags", "origin"];
+pub(crate) const ITEM_ORIGIN_KEYS: &[&str] = &["worldTemplateId", "cosmology", "powerTier"];
+
+/// `RealmTier`（境界档，总规格 §6「戏服」）。
+pub(crate) const REALM_TIER_KEYS: &[&str] =
+    &["id", "label", "cosmology", "genre", "conflictIntensity", "briefing", "flavorNotes"];
+
+/// 一处「无人读取的键」。
+pub(crate) struct UnknownKey {
+    /// 人读路径，形如 `mainlineNodes[mn-1].constrait`（数组元素有 `id` 报 id，无则报 `#序号`）。
+    pub(crate) display: String,
+    /// 编辑距离最近的合法键；无近似项则 `None`（不硬凑建议）。
+    pub(crate) hint: Option<&'static str>,
+}
+
+/// 逐层扫出骨架里**一切无人读取的键**（`SKELETON_KEY_SETS` 之外的）。
+///
+/// 两个消费方共用这一份实现：`validate_skeleton_refs` 取第一条拒请求，
+/// `admin_api::calibration::skeleton_shape` 取全部给运营看。各写一遍就会漂。
+///
+/// 未登记路径不检查（理由见 `SKELETON_KEY_SETS`）；`SKELETON_OPAQUE_PATHS` 的子树不下钻；
+/// `__` 前缀（注释键）豁免。
+pub(crate) fn unknown_skeleton_keys(skeleton: &Value) -> Vec<UnknownKey> {
+    let mut out = Vec::new();
+    walk_unknown_keys(skeleton, "", String::new(), &mut out);
+    out
+}
+
+fn walk_unknown_keys(v: &Value, path: &str, display: String, out: &mut Vec<UnknownKey>) {
+    if SKELETON_OPAQUE_PATHS.contains(&path) {
+        return;
     }
-    Ok(())
+    match v {
+        Value::Array(arr) => {
+            let child_path = format!("{path}[]");
+            for (i, item) in arr.iter().enumerate() {
+                // 点名到具体那一条：有 `id` 报 id，无 `id` 报序号——否则运营不知道该改哪一行。
+                let who = item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("#{}", i + 1));
+                walk_unknown_keys(item, &child_path, format!("{display}[{who}]"), out);
+            }
+        }
+        Value::Object(map) => {
+            let allowed = SKELETON_KEY_SETS.iter().find(|(p, _, _)| *p == path).map(|(_, _, k)| *k);
+            for (k, child) in map {
+                if k.starts_with("__") {
+                    continue;
+                }
+                let child_display =
+                    if display.is_empty() { k.clone() } else { format!("{display}.{k}") };
+                if let Some(allowed) = allowed {
+                    if !allowed.contains(&k.as_str()) {
+                        out.push(UnknownKey {
+                            display: child_display,
+                            hint: nearest_key(k, allowed),
+                        });
+                        continue; // 键本身就不认识，再往下钻没有意义。
+                    }
+                }
+                let child_path = if path.is_empty() { k.clone() } else { format!("{path}.{k}") };
+                walk_unknown_keys(child, &child_path, child_display, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// 键名归一化：去掉大小写与非字母数字，于是 `mainLineNodes` / `mainline_nodes` / `MainlineNodes`
@@ -2715,20 +2843,16 @@ fn edit_distance(a: &str, b: &str) -> usize {
 /// 宽松边界：解析失败（类型不符）→ Ok（沿用 load_skeleton 的防御式 unwrap_or_default 语义，不因无关字段拦截合法模板）；
 /// 只在结构成立时对「明确写了引用」的字段判悬空，避免误伤退化路径（空目录 / 无地点的老模板全部放行）。
 pub(crate) fn validate_skeleton_refs(skeleton: &Value, container_on: bool) -> Result<(), String> {
-    // 0) 未知键（顶层见 `SKELETON_TOP_LEVEL_KEYS`，节点级见 `MAINLINE_NODE_KEYS`）。
-    //    **必须在下面那句防御式解析之前**——它正是这一段要拦的东西：拼错的键不会让
-    //    `from_value::<Skeleton>` 失败，只会让对应字段静默取默认值。
-    reject_unknown_keys(skeleton, SKELETON_TOP_LEVEL_KEYS, "skeleton_json 顶层")?;
-    for (field, allowed) in SKELETON_NESTED_KEY_SETS {
-        let Some(items) = skeleton.get(field).and_then(Value::as_array) else { continue };
-        for (i, item) in items.iter().enumerate() {
-            // 点名到具体那一条：有 `id` 报 id，无 `id` 报序号——否则运营不知道该改哪一行。
-            let whose = match item.get("id").and_then(Value::as_str) {
-                Some(id) => format!("{field} 里的 `{id}` 这一条"),
-                None => format!("{field} 里的第 {} 条", i + 1),
-            };
-            reject_unknown_keys(item, allowed, &whose)?;
-        }
+    // 0) 未知键（逐层，见 `SKELETON_KEY_SETS`）。**必须在下面那句防御式解析之前**——
+    //    它正是这一段要拦的东西：拼错的键不会让 `from_value::<Skeleton>` 失败，
+    //    只会让对应字段静默取默认值。
+    if let Some(u) = unknown_skeleton_keys(skeleton).into_iter().next() {
+        // 与本函数其余各段一致，只报**第一个**冒犯者（键序由 serde_json 的有序 map 决定）。
+        let hint = u.hint.map(|k| format!("（是不是想写 `{k}`？）")).unwrap_or_default();
+        return Err(format!(
+            "skeleton_json 的 `{}` 是无人读取的键{hint}——它不会报错，只会让对应功能静默退化到默认值",
+            u.display
+        ));
     }
 
     let Ok(sk) = serde_json::from_value::<Skeleton>(skeleton.clone()) else {
@@ -4113,51 +4237,6 @@ mod sampling_tests {
         assert!(validate_skeleton_refs(&json!({ "__doc": "本骨架用于回归", "__note": 1 }), false).is_ok());
     }
 
-    /// 源码层红线：`struct Skeleton` 的每个字段都必须在 `SKELETON_TOP_LEVEL_KEYS` 里。
-    /// 往结构体加字段而忘了加清单 → 用了新字段的合法模板被拒，本例先一步指出漏了哪个。
-    #[test]
-    fn skeleton_top_level_keys_covers_every_skeleton_field() {
-        let src = include_str!("mod.rs");
-        let start = src.find("struct Skeleton {").expect("找不到 struct Skeleton");
-        let body = &src[start..start + src[start..].find("\n}").expect("找不到结构体结尾")];
-
-        let mut fields = Vec::new();
-        for line in body.lines() {
-            // 只取本结构体的一级字段：恰好 4 空格缩进、非属性/注释、形如 `name: Type,`。
-            if !line.starts_with("    ") || line.starts_with("     ") {
-                continue;
-            }
-            let t = line.trim();
-            if t.starts_with('#') || t.starts_with("//") {
-                continue;
-            }
-            let Some((name, _)) = t.split_once(':') else { continue };
-            if !name.chars().all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit()) {
-                continue;
-            }
-            let mut camel = String::new();
-            let mut up = false;
-            for c in name.chars() {
-                match c {
-                    '_' => up = true,
-                    _ if up => {
-                        camel.extend(c.to_uppercase());
-                        up = false;
-                    }
-                    _ => camel.push(c),
-                }
-            }
-            fields.push(camel);
-        }
-
-        assert!(fields.len() >= 20, "字段解析疑似失效，只解出 {}: {fields:?}", fields.len());
-        for f in &fields {
-            assert!(
-                SKELETON_TOP_LEVEL_KEYS.contains(&f.as_str()),
-                "`Skeleton` 的字段 `{f}` 不在 SKELETON_TOP_LEVEL_KEYS 里——用到它的模板会被建模板期校验拒掉"
-            );
-        }
-    }
 
     // ---------- 建模板期校验：`mainlineNodes[]` 的节点级键 ----------
 
@@ -4175,7 +4254,7 @@ mod sampling_tests {
     fn validate_names_node_by_index_when_id_missing() {
         let v = json!({ "mainlineNodes": [ { "id": "mn-1" }, { "summry": "缺 id 的节点" } ] });
         let err = validate_skeleton_refs(&v, false).unwrap_err();
-        assert!(err.contains("第 2 条"), "无 id 时须给序号，否则运营找不到是哪一条: {err}");
+        assert!(err.contains("mainlineNodes[#2].summry"), "无 id 时须给序号，否则运营找不到是哪一条: {err}");
     }
 
     /// 🔴 三层里失败方向最坏的一层：`expression` 拼错 → runtime 那里直接 `continue`，
@@ -4203,44 +4282,144 @@ mod sampling_tests {
         assert!(validate_skeleton_refs(&v, false).is_ok(), "{:?}", validate_skeleton_refs(&v, false));
     }
 
-    /// 源码层红线：`struct MainlineNode` 的每个字段都必须在 `MAINLINE_NODE_KEYS` 里。
-    #[test]
-    fn mainline_node_keys_covers_every_mainline_node_field() {
-        let src = include_str!("mod.rs");
-        let start = src.find("struct MainlineNode {").expect("找不到 struct MainlineNode");
-        let body = &src[start..start + src[start..].find("\n}").expect("找不到结构体结尾")];
-        let mut n = 0;
-        for line in body.lines() {
-            if !line.starts_with("    ") || line.starts_with("     ") {
-                continue;
-            }
-            let t = line.trim();
-            if t.starts_with('#') || t.starts_with("//") {
-                continue;
-            }
-            let Some((name, _)) = t.split_once(':') else { continue };
-            if !name.chars().all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit()) {
-                continue;
-            }
-            let mut camel = String::new();
-            let mut up = false;
-            for c in name.chars() {
-                match c {
-                    '_' => up = true,
-                    _ if up => {
-                        camel.extend(c.to_uppercase());
-                        up = false;
-                    }
-                    _ => camel.push(c),
+
+    // ---------- 源码层红线：注册表 vs 结构体定义 ----------
+    //
+    // 这两条是整套逐层校验的护栏。没有它们，`SKELETON_KEY_SETS` 就是"靠人记得更新"的表——
+    // 而"记得更新"这个假设，正是它下面每一层缺陷的共同成因。
+
+    /// 三份源码：骨架的类型分散在这三处（后两处是**跨模块 / 跨 crate**契约，
+    /// 引擎侧改一个字段名，server 这边只会表现为"读不到值"）。
+    /// 路径写死是刻意的：布局变了就编译不过，响亮，好修。
+    const SCHEMA_SOURCES: &[&str] = &[
+        include_str!("mod.rs"),
+        include_str!("../admission/mod.rs"),
+        include_str!("../../../crates/muse-engine/src/narrative/types.rs"),
+    ];
+
+    fn camel_case(snake: &str) -> String {
+        let mut out = String::new();
+        let mut up = false;
+        for c in snake.chars() {
+            match c {
+                '_' => up = true,
+                _ if up => {
+                    out.extend(c.to_uppercase());
+                    up = false;
                 }
+                _ => out.push(c),
+            }
+        }
+        out
+    }
+
+    /// 从三份源码里找 `struct <name> { .. }`，返回 `(camelCase 字段名, 类型文本)`。
+    /// 找不到 → `None`（外部类型，如引擎的 `CharacterCardV2`）。
+    fn struct_fields(name: &str) -> Option<Vec<(String, String)>> {
+        for src in SCHEMA_SOURCES {
+            let needle = format!("struct {name} {{");
+            let Some(i) = src.find(&needle) else { continue };
+            let body_start = i + needle.len();
+            let body = &src[body_start..body_start + src[body_start..].find("\n}")?];
+            let mut fields = Vec::new();
+            // 显式 `#[serde(rename = "X")]` 优先于 snake→camel 推导。
+            // 🔴 不能假设「线上名一定是字段名的 camelCase」——这套红线的意义正是不靠假设。
+            // 引擎里已有一处这样的字段（`DomainEvent.event_type` → `"type"`，当前从 `Skeleton` 不可达）。
+            let mut pending_rename: Option<String> = None;
+            for line in body.lines() {
+                // 只取一级字段：恰好 4 空格缩进、非属性/注释、形如 `name: Type,`。
+                if !line.starts_with("    ") || line.starts_with("     ") {
+                    continue;
+                }
+                let t = line.trim();
+                if t.starts_with('#') {
+                    if let Some(r) = t.split("rename = \"").nth(1).and_then(|s| s.split('"').next()) {
+                        if !t.contains("rename_all") {
+                            pending_rename = Some(r.to_string());
+                        }
+                    }
+                    continue;
+                }
+                if t.starts_with("//") {
+                    continue;
+                }
+                let Some((n, ty)) = t.split_once(':') else { continue };
+                let n = n.trim().trim_start_matches("pub(crate) ").trim_start_matches("pub ");
+                if n.is_empty()
+                    || !n.chars().all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit())
+                {
+                    continue;
+                }
+                let wire = pending_rename.take().unwrap_or_else(|| camel_case(n));
+                fields.push((wire, ty.trim().trim_end_matches(',').to_string()));
+            }
+            return Some(fields);
+        }
+        None
+    }
+
+    /// 已登记的每一条，其结构体字段都必须在该条的键集里。
+    /// 往结构体加字段而忘了加注册表 → 用了新字段的合法模板会被建模板期校验拒掉，本例先一步指出漏了哪个。
+    #[test]
+    fn registered_key_sets_cover_every_struct_field() {
+        let mut checked = 0;
+        for (path, struct_name, keys) in SKELETON_KEY_SETS {
+            if struct_name.is_empty() {
+                continue; // 无结构体（全靠手读），键集本身就是唯一定义。
+            }
+            let Some(fields) = struct_fields(struct_name) else {
+                panic!("`{struct_name}`（路径 `{path}`）在三份 schema 源码里都找不到——是不是挪了文件/改了名？");
+            };
+            assert!(!fields.is_empty(), "`{struct_name}` 解析出 0 个字段，解析器疑似失效");
+            for (f, _) in &fields {
+                assert!(
+                    keys.contains(&f.as_str()),
+                    "`{struct_name}` 的字段 `{f}` 不在路径 `{path}` 的键集里——用到它的模板会被建模板期校验拒掉"
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked >= 25, "只校到 {checked} 条，注册表疑似被削了");
+    }
+
+    /// 🔴 可达性红线：从 `struct Skeleton` 出发的**每一个**结构体都必须在注册表里。
+    ///
+    /// 这条防的是「加了一层嵌套结构体但忘了登记」——那种情况下新那层不会被校验，
+    /// 拼错继续静默，而且**没有任何征兆**（未登记路径按设计不检查）。
+    /// 有了它，忘记登记会在 CI 上变红，而不是在某个模板上悄悄生效。
+    #[test]
+    fn every_skeleton_struct_is_registered() {
+        // 不下钻：`worldCharacters[].card` 的 schema 归引擎所有（见 SKELETON_OPAQUE_PATHS）。
+        const EXTERNAL_OPAQUE: &[&str] = &["CharacterCardV2", "Value"];
+
+        let registered: std::collections::BTreeSet<&str> =
+            SKELETON_KEY_SETS.iter().map(|(_, s, _)| *s).filter(|s| !s.is_empty()).collect();
+
+        let mut seen = std::collections::BTreeSet::new();
+        let mut queue = vec!["Skeleton".to_string()];
+        while let Some(name) = queue.pop() {
+            if !seen.insert(name.clone()) || EXTERNAL_OPAQUE.contains(&name.as_str()) {
+                continue;
             }
             assert!(
-                MAINLINE_NODE_KEYS.contains(&camel.as_str()),
-                "`MainlineNode` 的字段 `{camel}` 不在 MAINLINE_NODE_KEYS 里——用到它的模板会被建模板期校验拒掉"
+                registered.contains(name.as_str()),
+                "结构体 `{name}` 从 `Skeleton` 可达，却不在 SKELETON_KEY_SETS 里——\
+                 它那一层的键不会被校验，拼错会继续静默。给它登记一条路径，或（若确属外部 schema）\
+                 加进 SKELETON_OPAQUE_PATHS + EXTERNAL_OPAQUE 并说明理由。"
             );
-            n += 1;
+            let Some(fields) = struct_fields(&name) else { continue };
+            for (_, ty) in fields {
+                // 从 `Vec<Option<Foo>>` / `Vec<(String, f32)>` 里挑出大写开头的类型名。
+                for tok in ty.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                    if tok.chars().next().is_some_and(char::is_uppercase)
+                        && !matches!(tok, "String" | "Vec" | "Option" | "BTreeMap" | "BTreeSet")
+                    {
+                        queue.push(tok.to_string());
+                    }
+                }
+            }
         }
-        assert!(n >= 4, "字段解析疑似失效，只解出 {n} 个");
+        assert!(seen.len() >= 20, "只走到 {} 个结构体，可达性遍历疑似失效", seen.len());
     }
 
     /// 端到端：黄金世界的真实骨架必须通过这道新校验。

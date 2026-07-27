@@ -292,32 +292,15 @@ fn skeleton_shape(raw: &str) -> Value {
     };
     let pool = parse_identity_pool(raw);
     let realm = parse_realm_tier(raw);
-    // 嵌套层无人读取的键，形如 `mainlineNodes[mn-1].constrait`（无 `id` 的元素报 `#序号`）。
-    // 覆盖哪些层由 `assembly::SKELETON_NESTED_KEY_SETS` 单点决定（不在此处另抄一份）。
-    let unknown_nested: Vec<String> = crate::assembly::SKELETON_NESTED_KEY_SETS
-        .iter()
-        .flat_map(|(field, allowed)| {
-            v.get(field)
-                .and_then(Value::as_array)
-                .map(Vec::as_slice)
-                .unwrap_or_default()
-                .iter()
-                .enumerate()
-                .filter_map(|(i, item)| item.as_object().map(|o| (i, o)))
-                .flat_map(move |(i, o)| {
-                    let who = o
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                        .unwrap_or_else(|| format!("#{}", i + 1));
-                    o.keys()
-                        .filter(|k| !k.starts_with("__") && !allowed.contains(&k.as_str()))
-                        .map(move |k| format!("{field}[{who}].{k}"))
-                        .collect::<Vec<_>>()
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect();
+    // 无人读取的键，逐层扫。**与建模板期那道闸共用 `assembly::unknown_skeleton_keys`**——
+    // 各写一遍就会漂，而漂掉的表现是「运营台说这个模板没问题」。
+    // 顶层与嵌套分两栏下发（顶层的路径不含 `.` 与 `[`）：前者意味着整块功能消失，
+    // 后者更隐蔽（计数依旧是对的，只是约束降级 / 谓词丢弃）。
+    let (unknown_top, unknown_nested): (Vec<String>, Vec<String>) =
+        crate::assembly::unknown_skeleton_keys(&v)
+            .into_iter()
+            .map(|u| u.display)
+            .partition(|d| !d.contains('.') && !d.contains('['));
     json!({
         "parsed": true,
         "skeletonBytes": raw.len() as i64,
@@ -343,17 +326,7 @@ fn skeleton_shape(raw: &str) -> Value {
         // 但**存量模板是在那道闸之前建的**——那些行至今没人回头看过。而这类错的表现形式恰恰是
         // 「上面那些计数全是 0，却没有任何报错」，运营看到只会以为模板就是这么写的。
         // 故在同一张形状表里点名，让「空」与「拼错了所以空」在同一屏上可分辨。
-        "unknownTopLevelKeys": v.as_object().map(|o| {
-            o.keys()
-                .filter(|k| !k.starts_with("__"))
-                .filter(|k| !crate::assembly::SKELETON_TOP_LEVEL_KEYS.contains(&k.as_str()))
-                .cloned()
-                .collect::<Vec<_>>()
-        }).unwrap_or_default(),
-        // 同上，但**嵌套层**：形如 `mainlineNodes[mn-1].constrait`（无 `id` 的元素报 `#序号`）。
-        // 这一层的静默后果比顶层更隐蔽——`constraint` 拼错不会让节点消失，只会让**硬约束降级成 Soft**；
-        // `forbiddenPredicates[].expression` 拼错则让整条禁止谓词被丢弃。两种情况下上面那排计数都是对的，
-        // 光看计数根本发现不了。覆盖哪些层由 `assembly::SKELETON_NESTED_KEY_SETS` 单点决定（不在此处另抄一份）。
+        "unknownTopLevelKeys": unknown_top,
         "unknownNestedKeys": unknown_nested,
     })
 }
@@ -1466,10 +1439,11 @@ mod tests {
         let bad: Vec<String> = serde_json::from_value(sk["unknownNestedKeys"].clone()).unwrap();
         assert_eq!(
             bad,
+            // 顺序 = 遍历序（`serde_json::Map` 有序），确定性，故可直接比数组。
             vec![
+                "forbiddenPredicates[fp-1].expresion".to_string(),
                 "mainlineNodes[mn-1].constrait".to_string(),
                 "mainlineNodes[#2].summry".to_string(),
-                "forbiddenPredicates[fp-1].expresion".to_string(),
             ],
             "{bad:?}"
         );

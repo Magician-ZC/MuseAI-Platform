@@ -64,19 +64,58 @@ const ENV_INVITATIONS_ENABLED: &str = "MUSE_ROOM_INVITATIONS";
 /// T2「小群体」之后才验证的范围；代码合并不等于对用户开放，必须运营显式打开。
 const DEFAULT_INVITATIONS_ENABLED: bool = false;
 
-/// 邀请功能是否已由运营开启（env 覆盖 + 默认常量，范式同 `worlds::deathmatch_enabled`
-/// 与 `interventions::dream_quota_per_stage`——本仓库尚无配置表，env 是当前唯一的运营开关形态；
-/// 将来配置表落地后只改本函数内部，调用点与降级语义不变）。
-pub fn invitations_enabled() -> bool {
-    match std::env::var(ENV_INVITATIONS_ENABLED) {
-        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "on" | "yes" => true,
-            "0" | "false" | "off" | "no" => false,
-            // 配错不静默开启社交通道：回落默认（关闭）。
-            _ => DEFAULT_INVITATIONS_ENABLED,
-        },
-        Err(_) => DEFAULT_INVITATIONS_ENABLED,
-    }
+/// 🔴 **编译期钉死默认值的两个事实源**（本常量 + `flags::KNOWN_FLAGS`），范式同
+/// `semantic` / `livestage` / `social`：改一处不改另一处直接编不过。
+const _: () = assert!(
+    crate::flags::declared_default(ENV_INVITATIONS_ENABLED) == DEFAULT_INVITATIONS_ENABLED,
+    "flags::KNOWN_FLAGS 中 MUSE_ROOM_INVITATIONS 的默认值必须与 DEFAULT_INVITATIONS_ENABLED 一致"
+);
+
+/// 邀请功能是否已由运营开启。
+///
+/// ════════════════════════════════════════════════════════════════════════════
+/// 🔴 已接入运行时开关体系（`crate::flags`，范式抄 `onboarding::onboarding_enabled`）
+/// ════════════════════════════════════════════════════════════════════════════
+///
+/// 本函数曾经只读 env。现在经统一入口解析，回落链：
+///
+/// ```text
+///   runtime_flags(user=<本人>) → runtime_flags(global) → env MUSE_ROOM_INVITATIONS → false
+/// ```
+///
+/// 🔴 **行为零变化**：`runtime_flags` 为空时（迁移 0036 不插种子数据）必然落到 env 分支，
+/// 而 `flags::parse_env_bool` 与本函数原实现逐字同构（`1/true/on/yes` 开、`0/false/off/no` 关、
+/// 其余回落默认）。本模块既有用例（全在空表上跑）一行不改即为回归保护。
+///
+/// ════════════════════════════════════════════════════════════════════════════
+/// 🔴 灰度粒度只取 **user / global，刻意不用 world**
+/// ════════════════════════════════════════════════════════════════════════════
+///
+/// 这一条与 `MUSE_LETHALITY_DEATHMATCH` 的注意事项（「两处口径不同要写清楚」）是同一类坑，
+/// 但结论相反：那个开关**能**按世界灰度，这个**不能**——原因是结构性的，不是偏好。
+///
+/// 邀请有两侧：发件侧（`POST|GET /worlds/{id}/invitations`，路径里**有** world）与
+/// 收件侧（`GET /me/invitations`、`POST /me/invitations/{iid}/respond`，**跨世界**，
+/// 结构上没有 world 可传）。若允许 world 作用域，运营给世界 W 单独开闸就会得到：
+/// 发件侧（world ctx 命中 → 开）能建邀请，收件侧（无 world → 落到 global → 关）读不出也答不了——
+/// **一封谁都答不了的邀请**。开关的作用是「开/关一块能力」，不该能把一块能力开成半截。
+///
+/// 于是四个端点一律传**动作发起人**的 user（发件侧是邀请人，收件侧是被邀请人），
+/// 无用户上下文的场合走 global。要整块开就写 global，要灰度就按人写。
+///
+/// ⚠️ 由此产生的一个**如实边界**：运营只给 A 开、没给 B 开时，A 能发出 B 永远看不到的邀请。
+/// 不加防的理由是它已有正确归宿——邀请本就有 TTL（`MUSE_INVITE_TTL_MS`，默认 7 天）会自然过期，
+/// 与「邀请了一个再也不登录的人」是同一种结局。反过来若在发件侧校验收件人的开关，
+/// 就等于让 A 能探测到「B 有没有被灰度选中」，那是拿运营配置去泄露他人状态。
+///
+/// 保留 `ENV_INVITATIONS_ENABLED` / `DEFAULT_INVITATIONS_ENABLED` 与下方 RAII 夹具：
+/// env 仍是兜底层第 ④ 级，不是被删掉的旧路径。
+pub async fn invitations_enabled(db: &AnyPool, user_id: Option<&str>) -> bool {
+    let ctx = match user_id {
+        Some(u) => crate::flags::FlagCtx::user(u),
+        None => crate::flags::FlagCtx::global(),
+    };
+    crate::flags::is_enabled(db, ENV_INVITATIONS_ENABLED, ctx).await
 }
 
 /// 测试专用：邀请功能相关 env 的 RAII 夹具（开关 + 可选的其它参数化 env）。
@@ -129,8 +168,11 @@ impl Drop for InvitationSwitch {
 
 /// 开关门：关闭时整块能力**不存在**（404，而非 403）——不向外泄露"平台有这个未开放功能"。
 /// 每个端点的第一行都调它，读端点同样调（读取侧降级：开关关掉后历史邀请立即读不出、响应不了）。
-fn ensure_enabled() -> Result<(), ApiError> {
-    if invitations_enabled() {
+///
+/// `user_id` 传**动作发起人**（发件侧 = 邀请人，收件侧 = 被邀请人），使按人灰度生效；
+/// 为什么不传 world 见 [`invitations_enabled`] 的「灰度粒度」一节。
+async fn ensure_enabled(db: &AnyPool, user_id: Option<&str>) -> Result<(), ApiError> {
+    if invitations_enabled(db, user_id).await {
         Ok(())
     } else {
         Err(ApiError::NotFound)
@@ -311,7 +353,7 @@ async fn create_invitation(
     headers: HeaderMap,
     Json(body): Json<CreateInvitationReq>,
 ) -> Result<Json<Value>, ApiError> {
-    ensure_enabled()?;
+    ensure_enabled(&state.db, Some(&user.user_id)).await?;
 
     let idem_key = headers.get("Idempotency-Key").and_then(|v| v.to_str().ok());
     let payload_hash = idempotency::hash_payload(
@@ -512,7 +554,7 @@ async fn list_sent(
     Path(world_id): Path<String>,
     Query(q): Query<StatusQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    ensure_enabled()?;
+    ensure_enabled(&state.db, Some(&user.user_id)).await?;
     expire_stale_invitations(&state.db).await?;
 
     let filter = q.status.unwrap_or_else(|| STATUS_PENDING.to_string());
@@ -552,7 +594,7 @@ async fn list_received(
     user: AuthUser,
     Query(q): Query<StatusQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    ensure_enabled()?;
+    ensure_enabled(&state.db, Some(&user.user_id)).await?;
     expire_stale_invitations(&state.db).await?;
 
     let filter = q.status.unwrap_or_else(|| STATUS_PENDING.to_string());
@@ -600,7 +642,7 @@ async fn respond(
     headers: HeaderMap,
     Json(body): Json<RespondReq>,
 ) -> Result<Json<Value>, ApiError> {
-    ensure_enabled()?;
+    ensure_enabled(&state.db, Some(&user.user_id)).await?;
 
     let idem_key = headers.get("Idempotency-Key").and_then(|v| v.to_str().ok());
     let payload_hash = idempotency::hash_payload(

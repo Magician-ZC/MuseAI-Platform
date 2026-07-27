@@ -213,14 +213,23 @@
 > 独立行 + 唯一索引。本批次**不改 `prompt_versions`**（给它接消费方会改变引擎选 prompt 的行为，
 > 属另一件事）；将来接线时应复用 `runtime_flags` 而不是再造第三套灰度。
 
-**其余 8 个 env 开关的迁移清单**（尚未接线，`wired=false`；逐条注意事项见
-`server/src/flags/mod.rs` 的 `MIGRATION_NOTES` 文档注释）：
-`MUSE_SUBPLOT_CARDS` · `MUSE_LETHALITY_DEATHMATCH` · `MUSE_ROOM_INVITATIONS` ·
-`MUSE_CONTAINER_ASSEMBLY` · `MUSE_MEMORIAL` · `MUSE_WORLD_SERIES_AUTOSCALE` ·
-`MUSE_WORLD_BE_BIOGRAPHY` · `MUSE_SAFETY_LEXICON`（🔴 最后迁或不迁）。
+**存量 env 开关的迁移清单**（尚未接线的仍是 `wired=false`；逐条注意事项见
+`server/src/flags/mod.rs` 的 `MIGRATION_NOTES` 文档注释。⚠️ 此处**刻意不写个数**——
+它属于本仓库反复栽跟头的那类计数，权威是 `KNOWN_FLAGS` 里 `wired` 的取值）：
+
+- ~~`MUSE_ROOM_INVITATIONS`~~ —— **已迁（2026-07-27）**。当初判断的「第二容易」成立：四个端点
+  统一 404、无事务边界问题。🔵 但迁的时候发现原注漏了一条约束：这个开关**不能有 world
+  作用域**。原注只说「ctx 用受邀人的 user_id」，而发件侧路径里是有 world 的，照着写很自然会
+  顺手传上——那样运营给某个世界单独开闸就会产出**一封谁都答不了的邀请**（发件侧命中 world
+  记录而开，收件侧 `/me/invitations` 跨世界、结构上没有 world，落到 global 而关）。
+  两条新用例钉住：按人灰度真的生效 · 写 world 记录时两侧**都不开**（不是开一半）。
+- 未迁：`MUSE_SUBPLOT_CARDS` · `MUSE_LETHALITY_DEATHMATCH` · `MUSE_CONTAINER_ASSEMBLY` ·
+  `MUSE_MEMORIAL` · `MUSE_WORLD_SERIES_AUTOSCALE` · `MUSE_WORLD_BE_BIOGRAPHY` ·
+  `MUSE_SAFETY_LEXICON`（🔴 最后迁或不迁）。
+
 共同的坑：**多数消费点在事务内**（结算铸卡 / 封卷 / 扩容判定），`is_enabled` 会查库，
 须在进事务前解析一次再把 bool 传进去，否则 SQLite 单连接池自锁。
-**一次只迁一个、各自带回归用例**——批量改必然出错，这也是本批次只接一条线的原因。
+**一次只迁一个、各自带回归用例**——批量改必然出错。
 
 > 🔴 **合规设施不进开关体系**（§0.1 的边界，不是它的例外）。§0.1 管的是「**未验证的产品功能**
 > 不得随代码合并自动对用户开放」；**内容安全的处置能力不是产品功能**，它是主体责任要求平台
@@ -262,7 +271,7 @@
 `admin_api::audit::writeback_target` 现在返回回写坐标，`world_events` 上因此有了全仓
 **唯一一条放宽语句**（`SET` 只有 `moderation` 一列、按主键点名、CAS、起点白名单写死在 SQL 里），
 权限分 reviewer / admin 两档，三条写入路径由源码级红线用例全仓盘点 ·
-**其余 8 个 env 开关接入运行时开关体系**（清单与注意事项见上）·
+**其余存量 env 开关接入运行时开关体系**（房间邀请已迁，清单与注意事项见上）·
 **处置申诉只覆盖 `character` / `character_avatar` 两类主体**（如实的范围，不是遗漏：
 `world_cover` 属于世界、`world_templates` 根本没有 owner 列，给它们开申诉入口只会得到一个
 没人有资格提交的端点；要覆盖需先定义"世界封面 / 模板的作者是谁"这条产品口径）。

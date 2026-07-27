@@ -168,7 +168,11 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
         default_enabled: false,
         owner: "invitations",
         desc: "房间邀请（接受邀请只点亮引导入口，入场仍走 join 全部校验）",
-        wired: false,
+        // 🔵 已接线（范式抄 MUSE_ONBOARDING）。🔴 作用域只取 **user / global，刻意不含 world**：
+        // 收件侧（`GET /me/invitations`）是跨世界的、结构上没有 world 可传，允许 world 作用域
+        // 会让「给某个世界单独开闸」产出**一封谁都答不了的邀请**（发件侧开、收件侧关）。
+        // 理由全文见 `invitations::invitations_enabled` 的「灰度粒度」一节。
+        wired: true,
     },
     FlagDef {
         name: "MUSE_CONTAINER_ASSEMBLY",
@@ -376,8 +380,13 @@ pub const fn declared_default(name: &str) -> bool {
 ///   立即降级为同意制。天然适合**按世界**作用域。但它同时被 `admin_api/worlds_ops.rs` 的建房
 ///   前门校验读到——建房时世界还不存在，**那一处只能用 global 作用域**（ctx 无 world_id）。
 ///   两处口径不同要写清楚，否则会出现「全局关但某世界开，却建不出那个世界」的困惑。
-/// - `MUSE_ROOM_INVITATIONS`：四个端点统一 404，语义与 onboarding 同构，是**第二容易**迁的一个。
-///   注意它的读取侧降级要求「已发出的邀请在关闭后也读不出」，ctx 用受邀人的 user_id。
+/// - ~~`MUSE_ROOM_INVITATIONS`~~ —— **已迁**（2026-07-27）。当初判断的「第二容易」成立：
+///   四个端点统一 404，无事务边界问题，改动就是 `ensure_enabled` 变 async + 四个调用点传
+///   发起人的 user_id。🔵 但迁的时候多发现一条当初没写到的约束：这个开关**不能有 world 作用域**。
+///   原注只说了「ctx 用受邀人的 user_id」，而发件侧（`/worlds/{id}/invitations`）路径里是有
+///   world 的，照着写很自然会顺手把 world 也传上——那样运营给某个世界单独开闸就会产出
+///   **一封谁都答不了的邀请**：发件侧命中 world 记录（开），收件侧（`/me/invitations` 跨世界、
+///   结构上没有 world）落到 global（关）。理由全文见 `invitations::invitations_enabled`。
 /// - `MUSE_CONTAINER_ASSEMBLY`：**无独立端点**，消费点在建模板期（拒绝声明 `subplotCardRefs`）
 ///   与装配期（忽略容器字段走原路径）。装配期在 `assembly::assemble_instance` 内，同样要注意
 ///   事务边界。建模板期无 world_id/user_id 语义，实际只用 global。

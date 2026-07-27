@@ -948,6 +948,10 @@ async fn list_endpoint_reports_effective_global_state() {
         wired,
         vec![
             F,
+            // 🔵 `MUSE_ROOM_INVITATIONS` 是 `MIGRATION_NOTES` 清单上迁走的第一个
+            // （0036 参考接线之后）。它排在这里而不是队尾，是因为登记表按**归属模块**分组、
+            // 不按接线时间排——本断言比的是 `KNOWN_FLAGS` 的声明顺序。
+            "MUSE_ROOM_INVITATIONS",
             "MUSE_OOC_ANNOTATIONS",
             "MUSE_IFLINE_PARALLEL",
             "MUSE_SOCIAL_IDENTITY_UNLOCK",

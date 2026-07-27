@@ -114,7 +114,7 @@
 
 | 项 | 取值 |
 |---|---|
-| 运营开关 | `MUSE_ROOM_INVITATIONS`，**默认关闭**（VALIDATION.md §0.1）。关闭时四个端点全 404，且**已存在的邀请也读不出、响应不了**（读取侧降级，可逆急停阀，范式同 `MUSE_LETHALITY_DEATHMATCH`） |
+| 运营开关 | `MUSE_ROOM_INVITATIONS`，**默认关闭**（VALIDATION.md §0.1）。关闭时四个端点全 404，且**已存在的邀请也读不出、响应不了**（读取侧降级，可逆急停阀）。✅ 已接入运行时开关体系（`flags`）：解析链 `runtime_flags(user=动作发起人) → global → env → false`，支持**按人灰度**。🔴 **刻意不支持按世界灰度**——收件侧 `/me/invitations` 跨世界、结构上没有 world 可传，允许 world 作用域会产出一封发得出、答不了的邀请 |
 | 有效期 | `MUSE_INVITE_TTL_MS`，默认 7 天（惰性过期） |
 | 防骚扰 | 无自由文本字段（结构化邀请，不是私信）· 拒绝即终局（同邀请人不得重邀同角色进同世界）· 同 (世界,邀请人,被邀角色) 至多一条 pending（重复邀请幂等复用、不重复通知）· 每人每日发出上限 `MUSE_INVITE_DAILY_LIMIT`（默认 20，跨世界合计）· 通知 kind `room_invitation` 非 essential，可被用户通知偏好静默 |
 | 社交防火墙（§14） | 被邀请者由**角色 id** 寻址，邀请人只以**角色面具名**示人；`invitee_user_id` 仅服务端内部使用，**任何响应体/通知 payload 都不下发**真人身份 |

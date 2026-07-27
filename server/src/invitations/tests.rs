@@ -145,15 +145,81 @@ async fn scene(lethality: &str, guest_age: i64) -> (AppState, axum::Router, Stri
 
 // ==================== ③ 未验证功能默认关闭（VALIDATION.md §0.1）====================
 
-#[test]
-fn switch_defaults_to_off() {
+/// env 语义（解析链第 ④ 层）。接入 `flags` 体系后**这三条一字未改**——
+/// 空 `runtime_flags` 表上解析必然落到 env，这正是「行为零变化」的回归保护。
+#[tokio::test]
+async fn switch_defaults_to_off() {
+    let state = test_state().await;
     let _sw = InvitationSwitch::set(false);
     std::env::remove_var(ENV_INVITATIONS_ENABLED);
-    assert!(!invitations_enabled(), "房间邀请必须默认关闭（未验证功能默认关闭）");
+    assert!(!invitations_enabled(&state.db, None).await, "房间邀请必须默认关闭（未验证功能默认关闭）");
     std::env::set_var(ENV_INVITATIONS_ENABLED, "maybe");
-    assert!(!invitations_enabled(), "非法开关值须回落关闭，不得静默开启社交通道");
+    assert!(!invitations_enabled(&state.db, None).await, "非法开关值须回落关闭，不得静默开启社交通道");
     std::env::set_var(ENV_INVITATIONS_ENABLED, "on");
-    assert!(invitations_enabled(), "显式 on 应开启");
+    assert!(invitations_enabled(&state.db, None).await, "显式 on 应开启");
+}
+
+/// 声明默认值与模块内常量同源（编译期已由 `const _: () = assert!(...)` 钉死，此处运行期复述）。
+#[test]
+fn flag_default_is_declared_consistently() {
+    assert!(!super::DEFAULT_INVITATIONS_ENABLED, "🔴 §0.1：未验证功能默认关闭");
+    assert_eq!(
+        crate::flags::declared_default(ENV_INVITATIONS_ENABLED),
+        super::DEFAULT_INVITATIONS_ENABLED
+    );
+}
+
+/// 🔴 **按用户灰度真的生效，且窄的赢**：全局关 + 给某人单开 ⇒ 只有那个人能用。
+/// 这是接入 `flags` 体系的**唯一**行为增量（env 时代做不到）。
+#[tokio::test]
+async fn per_user_grayscale_opens_it_for_one_person_only() {
+    let _sw = InvitationSwitch::set(false);
+    let (state, app, wid) = scene(LETHALITY_CONSENT, 1).await;
+    write_flag(&state.db, crate::flags::SCOPE_USER, "usrHost").await;
+
+    // 发件侧：被灰度选中的邀请人可用。
+    let (st, _) = get(&app, &format!("/api/worlds/{wid}/invitations"), &token(&state, "usrHost")).await;
+    assert_eq!(st, StatusCode::OK, "被灰度选中的用户应当可用");
+    // 收件侧：没被选中的人仍然 404（读取侧降级按**动作发起人**解析）。
+    let (st, _) = get(&app, "/api/me/invitations", &token(&state, "usrGuest")).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "🔴 没被灰度选中的人不得因为别人开了就能用");
+}
+
+/// 🔴 **world 作用域刻意无效**（不是漏了，是设计）：收件侧跨世界、结构上没有 world 可传，
+/// 若允许 world 作用域，「给某个世界单独开闸」就会产出一封**谁都答不了**的邀请。
+/// 本用例钉住「写 world 记录 ⇒ 两侧都不开」，而不是「写了只开一半」。
+#[tokio::test]
+async fn world_scope_does_not_half_open_the_feature() {
+    let _sw = InvitationSwitch::set(false);
+    let (state, app, wid) = scene(LETHALITY_CONSENT, 1).await;
+    write_flag(&state.db, crate::flags::SCOPE_WORLD, &wid).await;
+
+    let (st, _) = get(&app, &format!("/api/worlds/{wid}/invitations"), &token(&state, "usrHost")).await;
+    assert_eq!(
+        st,
+        StatusCode::NOT_FOUND,
+        "🔴 发件侧不得被 world 记录单独打开 —— 那会造出一封收件侧永远读不到的邀请"
+    );
+    let (st, _) = get(&app, "/api/me/invitations", &token(&state, "usrGuest")).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "收件侧本就没有 world 可解析");
+}
+
+/// 往 `runtime_flags` 写一条 enabled=1（测试用；不设 env，避免与并发用例互踩）。
+async fn write_flag(db: &sqlx::AnyPool, scope: &str, target: &str) {
+    sqlx::query(
+        "INSERT INTO runtime_flags (id, flag, scope, target_id, enabled, starts_at, ends_at, \
+         updated_by, updated_at, reason, created_at) \
+         VALUES ($1, $2, $3, $4, 1, 0, 0, 'test', $5, 'test', $6)",
+    )
+    .bind(crate::db::new_id("rf"))
+    .bind(ENV_INVITATIONS_ENABLED)
+    .bind(scope)
+    .bind(target)
+    .bind(crate::db::now_ms())
+    .bind(crate::db::now_ms())
+    .execute(db)
+    .await
+    .expect("write flag");
 }
 
 #[tokio::test]

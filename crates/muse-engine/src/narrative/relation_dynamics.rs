@@ -92,6 +92,8 @@ struct RelationRules {
 }
 
 impl RelationRules {
+    // pattern 全为字面量、不含运行期输入（模型文本只进 `classify` 的 `is_match`），
+    // `Regex::new` 的唯一失败因是模式非法 → unwrap 静态安全，改坏即在 CI 首次构造时炸。
     fn new() -> Self {
         Self {
             rupture: Regex::new(r"(背叛|叛变|叛逃|反目成仇|反目|决裂|绝交|断绝)").unwrap(),

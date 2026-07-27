@@ -505,6 +505,18 @@ struct Pending {
     outcome: RecordedOutcome,
 }
 
+/// 录制 / 回放两个 client 内部累加器的锁中毒诊断语。
+///
+/// 这些锁护的都是**进程内累加器**（pending / warnings / cursors / misses），临界区只做
+/// `Vec`/`BTreeMap`/`BTreeSet` 的增删与克隆——没有能失败的语句。中毒因此不是数据问题
+///（录制文件内容、模型返回都走 `Result` 传播，见 `Recording::load` 与 `complete`），
+/// 而是「此前某个持锁线程在别处 panic」的次生现象，属内部不变量被破坏，保留 panic。
+macro_rules! poisoned {
+    ($what:literal) => {
+        concat!("BUG: ", $what, " 锁中毒——真正的故障是此前某个持锁线程的 panic，请回溯更早的 panic 日志；本处临界区只做容器增删/克隆，自身不会失败")
+    };
+}
+
 /// 包装任意 `ModelClient`：调用透传给内层，入参与出参落进录制。
 ///
 /// 用法与 golden 的 `ScriptedModel` 同构（都是 `ModelClient` 实现、都有 `set_beat`/`set_tick`
@@ -559,7 +571,7 @@ impl RecordingClient {
     }
 
     pub fn call_count(&self) -> usize {
-        self.pending.lock().unwrap().len()
+        self.pending.lock().expect(poisoned!("RecordingClient.pending")).len()
     }
 
     /// 生成录制快照（可多次调用，不清空内部状态）。
@@ -567,7 +579,7 @@ impl RecordingClient {
     /// 排序在这里发生：按 (拍, 角色, 环节, 槽内序号) 排规范序，`seq` = 规范序位置。
     /// 槽内序号按到达序编 —— 同槽调用在引擎里恒串行，故可复现；跨槽的并发到达序**不入产物**。
     pub fn finish(&self) -> Recording {
-        let pending = self.pending.lock().unwrap();
+        let pending = self.pending.lock().expect(poisoned!("RecordingClient.pending"));
 
         // ① 按到达序编槽内序号（同槽串行 ⇒ 可复现）。
         let mut order: Vec<&Pending> = pending.iter().collect();
@@ -627,7 +639,13 @@ impl RecordingClient {
                 prompt_versions,
                 labels: self.labels.clone(),
                 recorded_at_ms: self.recorded_at_ms,
-                warnings: self.warnings.lock().unwrap().iter().cloned().collect(),
+                warnings: self
+                    .warnings
+                    .lock()
+                    .expect(poisoned!("RecordingClient.warnings"))
+                    .iter()
+                    .cloned()
+                    .collect(),
             },
             calls,
         }
@@ -642,7 +660,7 @@ impl ModelClient for RecordingClient {
         let character = (self.labeler)(spec);
         if spec.agent == "roleDecide" && character.is_empty() {
             // 静默退化会让整份录制的角色维度失效（所有决策挤进同一个槽），必须让人看见。
-            self.warnings.lock().unwrap().insert(
+            self.warnings.lock().expect(poisoned!("RecordingClient.warnings")).insert(
                 "roleDecide 调用未能解析角色 id（decide 的 prompt 包裹变了？）——本次录制的角色维度不完整"
                     .to_string(),
             );
@@ -652,7 +670,7 @@ impl ModelClient for RecordingClient {
         let result = self.inner.complete(spec, cancel).await;
 
         let secret = spec.profile.api_key.as_str();
-        self.pending.lock().unwrap().push(Pending {
+        self.pending.lock().expect(poisoned!("RecordingClient.pending")).push(Pending {
             arrival,
             beat,
             character,
@@ -807,7 +825,7 @@ impl ReplayClient {
     }
 
     pub fn report(&self) -> ReplayReport {
-        let cursors = self.cursors.lock().unwrap();
+        let cursors = self.cursors.lock().expect(poisoned!("ReplayClient.cursors"));
         let mut consumed: BTreeSet<usize> = BTreeSet::new();
         for (key, used) in cursors.iter() {
             if let Some(idxs) = self.index.get(key) {
@@ -822,21 +840,21 @@ impl ReplayClient {
             .filter(|(i, _)| !consumed.contains(i))
             .map(|(_, c)| SlotKey::of(c).label())
             .collect();
-        let misses = self.misses.lock().unwrap().clone();
+        let misses = self.misses.lock().expect(poisoned!("ReplayClient.misses")).clone();
         ReplayReport {
             recording_id: self.recording.meta.recording_id.clone(),
             recorded_calls: self.recording.calls.len(),
             served: self.served.load(Ordering::SeqCst) as usize,
             missed: misses.len(),
             misses,
-            warnings: self.warnings.lock().unwrap().clone(),
+            warnings: self.warnings.lock().expect(poisoned!("ReplayClient.warnings")).clone(),
             unused,
         }
     }
 
     fn note_drift(&self, slot: &str, field: &str, recorded: &str, requested: &str) {
         if recorded != requested {
-            self.warnings.lock().unwrap().push(ReplayWarning {
+            self.warnings.lock().expect(poisoned!("ReplayClient.warnings")).push(ReplayWarning {
                 slot: slot.to_string(),
                 field: field.to_string(),
                 recorded: recorded.to_string(),
@@ -859,7 +877,7 @@ impl ModelClient for ReplayClient {
         };
 
         let idx = {
-            let mut cursors = self.cursors.lock().unwrap();
+            let mut cursors = self.cursors.lock().expect(poisoned!("ReplayClient.cursors"));
             let used = cursors.entry(key.clone()).or_insert(0);
             match self.index.get(&key) {
                 Some(idxs) if *used < idxs.len() => {
@@ -888,7 +906,7 @@ impl ModelClient for ReplayClient {
                 if miss.character.is_empty() { "-" } else { &miss.character },
                 miss.agent
             );
-            self.misses.lock().unwrap().push(miss);
+            self.misses.lock().expect(poisoned!("ReplayClient.misses")).push(miss);
             // 🔴 明确失败，绝不回落。NotFound 既非 retryable 也非 ModelOutput ⇒
             // `json_call` 会**早退**，不会把重试次数烧光后给出一个误导性的「模型输出错误」。
             return Err(EngineError::NotFound(format!(

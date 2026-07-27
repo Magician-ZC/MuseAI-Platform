@@ -34,6 +34,38 @@ impl AppState {
             ws_hub: Arc::new(crate::events::WsHub::default()),
         }
     }
+
+    /// **生产装配**：在 [`Self::new`] 之上按环境变量替换真实外部 provider。
+    ///
+    /// 目前只有一路：内容审核（[`crate::providers::HttpModerationProvider`]）。
+    ///
+    /// 🔴 三种结果，方向都是刻意的：
+    /// - **未配置** → 保留 `DevModeration`，行为与接线前**逐字节一致**。dev 与 CI 都是零配置
+    ///   环境，所以这是默认路径（§0.1 未验证功能默认关闭）。此时打一条 warn，因为
+    ///   「审核是个桩」这件事在生产里必须一眼可见。
+    /// - **配置完整** → 换上真实 provider，`is_dev_stub()` 随之翻成 `false`
+    ///   （见 `safety::semantic` 模块头「当前是桩」那张表：三处载体自动翻面）。
+    /// - **配错** → 返回 `Err`，`main` 据此**让进程起不来**。方向抄 [`cors_layer`] 对
+    ///   `MUSE_CORS_ORIGINS` 的处理：宁可立刻、显式地起不来，也不静默降级——一个配错的审核
+    ///   provider 与没有审核，在看板上是看不出区别的（`providerStub` 仍会显示 `false`）。
+    ///
+    /// ⚠️ 刻意**不写进 [`Self::new`]**：`new` 是全部用例的入口（`safety::testkit::test_state`
+    /// 等），把读进程 env 塞进去会让「设了这组变量的开发机」跑出与 CI 不同的测试结果。
+    pub fn from_env(db: AnyPool, config: ServerConfig) -> Result<Self, String> {
+        let mut state = Self::new(db, config);
+        match crate::providers::HttpModerationProvider::from_env()? {
+            Some(p) => {
+                tracing::info!("{}", p.config().describe());
+                state.moderation = Arc::new(p);
+            }
+            None => tracing::warn!(
+                env = crate::providers::http_moderation::ENV_ENDPOINT,
+                "内容审核使用 Dev 桩（DevModeration）：只匹配一张小关键词表，不做任何语义分类。\
+                 §15 五层漏斗的第 3 层因此拦不住任何东西——面向公众上线前必须配置真实服务商。"
+            ),
+        }
+        Ok(state)
+    }
 }
 
 pub fn build_router(state: AppState) -> Router {

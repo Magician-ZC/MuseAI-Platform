@@ -48,7 +48,13 @@ pub struct WsMessage {
 
 impl WsHub {
     pub fn sender(&self, world_id: &str) -> broadcast::Sender<WsMessage> {
-        let mut lock = self.channels.lock().unwrap();
+        // 临界区只做 HashMap entry + 建通道 + 克隆，自身无失败路径：中毒只可能是此前持锁线程
+        // 在别处 panic 的次生现象。这把锁在**全世界的 WS 下发路径**上（publish → sender），
+        // 一旦中毒即全站推流停摆，故消息要能一眼指回真正的故障点，而不是停在这一行。
+        let mut lock = self
+            .channels
+            .lock()
+            .expect("BUG: WsHub.channels 锁中毒——真正的故障是此前某个持锁线程的 panic，请回溯更早的 panic 日志");
         lock.entry(world_id.to_string())
             .or_insert_with(|| broadcast::channel(256).0)
             .clone()

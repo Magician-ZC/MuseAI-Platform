@@ -1133,6 +1133,7 @@ dependencies = [
  "jsonwebtoken",
  "muse-engine",
  "rand 0.8.7",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",

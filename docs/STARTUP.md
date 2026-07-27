@@ -106,6 +106,7 @@ cd server && MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo ru
 | `MUSE_TICK_INTERVAL_MS` / `MUSE_TICK_POLL_MS` | 内置 | tick 调度间隔 / 轮询间隔 |
 | `MUSE_OUTBOX_RESCAN_MS` | `60000` | 通知 outbox 恢复重扫间隔 |
 | `MUSE_LIVEGATE_SECRET` | 未配置=fail-closed | 赛事房礼物 webhook 验签(生产必配) |
+| `MUSE_MODERATION_HTTP_ENDPOINT` | 未配置=用 Dev 桩 | 真实内容审核服务商的 HTTP 端点。🔴 **生产必配**——不配则 `ModerationProvider` 仍是 `DevModeration`(只匹配一张小关键词表),§15 五层漏斗的第 3 层**拦不住任何东西**;内容安全是合规主体责任。配了它就要一并配同组的认证/请求体/响应映射变量,**配错即启动失败**(fail-closed,同 `MUSE_CORS_ORIGINS` 的取向)。同组变量与逐条含义见 `server/src/providers/http_moderation.rs` 模块头,那里是唯一权威登记处 |
 | `MUSE_TOKEN_CNY_CENTS_PER_1K` | 内置(`runtime/mod.rs:66`) | 每 1K token 折算人民币分。**成本仪表定价基准**(总规格 §17),`world_ticks.cost_tokens` 逐拍记账按此换算 |
 | `MUSE_DREAM_QUOTA_PER_STAGE` | `3` | 托梦配额:每卡每阶段条数(总规格 §8)。非正整数/垃圾值一律回落默认——防运营误配把托梦通道锁死 |
 | `MUSE_SAFETY_LEXICON` | **开启** | 运行时敏感词库总开关(§15 第 2 层)。**默认开启且应保持开启**——内容安全是合规主体责任下的恒开设施,此开关定位是误伤应急阀,不是灰度位 |
@@ -113,6 +114,18 @@ cd server && MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo ru
 | `MUSE_SAFETY_RUNTIME_AUDIT` | `high` | 运行时命中入人审队列的策略:`high`(仅高危)/`all`/`none`。**命中一律记 risk_events**,本开关只管是否额外入 `audit_queue`(每 tick 每事件都入队会淹掉人审)。配错值回落 `high`,不静默放宽或收紧 |
 | `MUSE_CORS_ORIGINS` | 本地开发六项(见下) | 跨源白名单(逗号分隔)。**三个前端都与 server 不同源**:玩家端 Vite `:1420`、运营后台 Vite `:1430`、Tauri webview(`tauri://localhost` / `https://tauri.localhost`),而 server 在 `:8787`。🔴 **生产必配**——不配则只放行本地开发来源,线上域名会被拦。非法条目跳过并告警,全部非法则退化为「不放行任何跨源」(fail-closed:配错了宁可前端连不上、立刻可见,也不静默放宽成通配)。**刻意不提供通配选项**:这些接口虽有 JWT 鉴权,放开任意源仍是无谓攻击面 |
 
+> 🔴 **配上 `MUSE_MODERATION_HTTP_ENDPOINT` 的那一刻,一件事当场生效、另一件不会——两者极易混淆。**
+>
+> | 什么 | 由谁控制 | 配了 endpoint 之后 |
+> |---|---|---|
+> | **静态内容审核**(角色卡 / 世界模板 / 装配钩子 / 入站托梦信) | **没有独立开关**——`safety::moderate_and_queue` 无条件调 `check_text` | **当场切到真实厂商。** 厂商挂了 → 这些上传返回 500 而不是被放行(fail-closed,方向正确,但这是配置当天就能看见的行为变化,不该事后才发现) |
+> | **第 3 层运行时语义复核** | `MUSE_SAFETY_SEMANTIC_RECHECK`,**默认关** | **不会自己开始。** 配好 provider ≠ 开始复核,两个开关是分离的 |
+>
+> ⚠️ 本 provider 是**文本**审核。它刻意**不继承** trait 的 `check_image` 直过默认——那会造出一个
+> 自称「已接真实服务」(`is_dev_stub() == false`)却放行每一张图的 provider,正是 `is_dev_stub`
+> 这个方法存在要防的假防线。图片默认转**人审**(`Pending`),所以配置当天人审队列会开始积压图片;
+> `MUSE_MODERATION_HTTP_IMAGE_FALLBACK=approved` 可以关掉,但那等于显式声明「图片没有机器审核」。
+>
 > 🔴 **上表不是全部——它是「部署时必须关心」的那些。** 此处原先写着「上表即全部」,
 > 而 2026-07-27 用它自己给的校验命令清点:代码里 **105 个** `MUSE_*`,表里 **21 个**,
 > 差着 84 个。那句话从写下之后的每一批开发都在让它更不成立。
@@ -204,8 +217,8 @@ cd server && MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo ru
 ```bash
 # 引擎 + 后端 + 桌面壳
 cargo test --manifest-path crates/muse-engine/Cargo.toml          # 291 passed
-(cd server && cargo test)                                          # 970 passed(default,含黄金世界回归)
-(cd server && cargo test --features billing,arena)                 # 1048 passed
+(cd server && cargo test)                                          # 995 passed(default,含黄金世界回归)
+(cd server && cargo test --features billing,arena)                 # 1073 passed
 (cd server && cargo test golden)                                   # 14 passed(12 项 runtime::golden::* + 2 项录放 round-trip)
 cargo test --manifest-path src-tauri/Cargo.toml                    # 216 passed
 # 前端 + 后台
@@ -300,7 +313,16 @@ curl -sX POST 127.0.0.1:8787/api/auth/challenge -H 'Content-Type: application/js
 | 拟人化互动服务管理办法评估 | 平台世界公测 |
 | 直播平台玩法审核 + 主播协议 | P6 赛事房礼物 |
 
-真实外部服务接入位(替换 Dev 实现):短信(`providers::SmsProvider`)、内容审核(`ModerationProvider`)、支付(`PaymentProvider`)、TTS(`TtsProvider`)、直播礼物网关(`livegate`)。
+真实外部服务接入位(替换 Dev 实现):短信(`providers::SmsProvider`)、支付(`PaymentProvider`)、TTS(`TtsProvider`)、直播礼物网关(`livegate`)。
+
+**内容审核(`ModerationProvider`)已不再需要写代码**:`providers::http_moderation::HttpModerationProvider`
+把 endpoint / 认证 / 请求体 / 响应字段映射全部做成了环境变量,填配置即可适配阿里云内容安全 /
+腾讯云 / 百度 / 自建服务等任意 HTTP JSON 审核 API。
+
+> 🔴 **但「provider 写好了」不等于「内容安全已就绪」。** 截至本次交付,它**没有被任何真实
+> 服务商账号验证过**(状态语言七档:`Implemented`,未到 `Validated`)。未配置时装配侧仍保留
+> Dev 桩,`is_dev_stub()` 为 `true`,运营面 `GET /admin/safety/recheck` 的 `honesty[]` 会明说
+> 这条链拦不住任何东西。配上真实服务商后这些字段自动翻面——**以那组字段为准,不以文档为准**。
 
 ---
 

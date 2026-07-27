@@ -121,6 +121,11 @@ struct HeadingDetector {
 impl HeadingDetector {
     fn new() -> Self {
         // 数字部分允许中文数字与阿拉伯数字；末尾锚定明确的章节量词，规避「第一次/第三部分」误判。
+        //
+        // 四个 unwrap 均静态安全：`num` 是**字面量常量**，`format!` 只是把两个字面量拼起来，
+        // 拼出的 pattern 在编译期即完全确定——**用户上传的小说正文进的是 `is_heading`
+        // 的 `is_match`，绝不进 `Regex::new`**。故脏文本不可能让这里 panic；
+        // 唯一失败因是有人改坏了 pattern，那会在本 crate 首个用例构造 HeadingDetector 时炸。
         let num = "[〇零一二三四五六七八九十百千两0-9]";
         Self {
             cn_chapter: regex::Regex::new(&format!("^第{num}{{1,9}}[章回卷节篇]")).unwrap(),

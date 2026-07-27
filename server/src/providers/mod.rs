@@ -1,9 +1,17 @@
 //! 外部服务 provider 层：短信 / 内容安全 / 支付 / TTS / 对象存储。
 //! 全部 trait + Dev 实现（日志态/内存态/本地盘）；真实服务商接入 = 新增实现 + 配置切换，
 //! 领域代码只依赖 trait（BUILD-STATUS 约定 8）。
+//!
+//! 内容安全这一路已经有了第二个实现：[`http_moderation::HttpModerationProvider`]，
+//! endpoint / 认证 / 请求体 / 响应字段映射全部走环境变量，接真实审核服务商**不需要写代码**。
+//! **未配置时不启用**，装配侧保留 [`DevModeration`]（`app::AppState::from_env`）。
 
 use async_trait::async_trait;
 use std::path::PathBuf;
+
+pub mod http_moderation;
+
+pub use http_moderation::HttpModerationProvider;
 
 // ---------- 短信 ----------
 
@@ -65,6 +73,20 @@ pub trait ModerationProvider: Send + Sync {
     /// `safety_recheck_runs` 的每一行、运营面 `GET /admin/safety/recheck` 的每一次响应一起走。
     fn is_dev_stub(&self) -> bool {
         true
+    }
+
+    /// 单次机审调用的**合同单价**（分 / 1000 次调用）；`None` = 不知道。
+    ///
+    /// 为什么是「配置的合同单价」而不是「响应里回报的实测计费」：`check_text` 只回裁决，
+    /// 而**主流厂商的文本审核响应里根本没有计费字段**（阿里云 / 腾讯云 / 百度都按调用次数
+    /// 离线结算）。去响应里抠一个不存在的字段只会得到 `None`；把运营手上真实的合同单价
+    /// 变成一个配置项，才真的能把 VALIDATION §2 T5 门槛「审核成本 ≤ 生成成本 5%」算出来。
+    ///
+    /// 🔴 **默认 `None` 的方向是刻意的**，同 [`Self::is_dev_stub`]：不知道单价时
+    /// `GET /admin/safety/recheck` 的 `cost.ratioAvailable` 保持 `false` 并说明缺哪一半，
+    /// **绝不摆一个用代码内默认估算算出来的、看起来精确的 5%**。
+    fn call_price_cents_per_1k(&self) -> Option<i64> {
+        None
     }
 
     /// 图片机审（角色头像等二进制资产）。

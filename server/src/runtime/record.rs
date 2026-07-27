@@ -293,6 +293,18 @@ fn warn_env_notes_once(notes: &[String]) {
     }
 }
 
+/// 锁中毒诊断语（`overrides` / `sessions` / `SwapModel.current` 共用一套口径）。
+///
+/// 这三把锁的临界区都只做 `BTreeMap` 增删查或 `Arc` 克隆——**本身没有能 panic 的语句**，
+/// 故中毒只可能是「此前某个持锁线程在别处 panic」的**次生现象**，不是数据问题：
+/// 用户请求体 / DB 内容 / 模型返回都进不来这里。因此保留 panic（内部不变量），
+/// 但把消息写成能直接定位到「去查更早那条 panic」而不是在这里空转。
+macro_rules! poisoned {
+    ($what:literal) => {
+        concat!("BUG: ", $what, " 锁中毒——真正的故障是此前某个持锁线程的 panic，请回溯更早的 panic 日志；本处临界区只做 map 增删/Arc 克隆，自身不会失败")
+    };
+}
+
 fn overrides() -> &'static Mutex<BTreeMap<String, TickCapture>> {
     static M: OnceLock<Mutex<BTreeMap<String, TickCapture>>> = OnceLock::new();
     M.get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -301,19 +313,19 @@ fn overrides() -> &'static Mutex<BTreeMap<String, TickCapture>> {
 /// 进程内按 world 显式接线（测试与录制入口用）。优先级高于 env。
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn set_world_capture(world_id: &str, capture: TickCapture) {
-    overrides().lock().unwrap().insert(world_id.to_string(), capture);
+    overrides().lock().expect(poisoned!("record::overrides")).insert(world_id.to_string(), capture);
 }
 
 /// 收摊：撤掉覆盖并丢弃该世界的会话（录制内容此前每拍已落盘，丢的只是内存态）。
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn end_world_capture(world_id: &str) {
-    overrides().lock().unwrap().remove(world_id);
-    sessions().lock().unwrap().remove(world_id);
+    overrides().lock().expect(poisoned!("record::overrides")).remove(world_id);
+    sessions().lock().expect(poisoned!("record::sessions")).remove(world_id);
 }
 
 /// 当前生效配置：按 world 覆盖 → env → Off。
 pub(crate) fn resolve_capture(world_id: &str) -> TickCapture {
-    if let Some(c) = overrides().lock().unwrap().get(world_id) {
+    if let Some(c) = overrides().lock().expect(poisoned!("record::overrides")).get(world_id) {
         return c.clone();
     }
     let env = env_raw();
@@ -344,7 +356,7 @@ impl SwapModel {
         Self { current: Mutex::new(inner) }
     }
     fn set(&self, inner: Arc<dyn ModelClient>) {
-        *self.current.lock().unwrap() = inner;
+        *self.current.lock().expect(poisoned!("SwapModel.current")) = inner;
     }
 }
 
@@ -352,7 +364,7 @@ impl SwapModel {
 impl ModelClient for SwapModel {
     async fn complete(&self, spec: &ModelCallSpec, cancel: &CancelFlag) -> Result<ModelOutput, EngineError> {
         // 🔴 锁**不得**跨 await：这里先把 Arc 克隆出来，guard 在本语句结束即释放。
-        let inner = self.current.lock().unwrap().clone();
+        let inner = self.current.lock().expect(poisoned!("SwapModel.current")).clone();
         inner.complete(spec, cancel).await
     }
 }
@@ -382,7 +394,7 @@ fn sessions() -> &'static Mutex<BTreeMap<String, Session>> {
 /// 已录条数（无录制会话 → `None`）。
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn recorded_call_count(world_id: &str) -> Option<usize> {
-    match sessions().lock().unwrap().get(world_id)? {
+    match sessions().lock().expect(poisoned!("record::sessions")).get(world_id)? {
         Session::Record(s) => Some(s.client.call_count()),
         Session::Replay(_) => None,
     }
@@ -394,7 +406,7 @@ pub(crate) fn recorded_call_count(world_id: &str) -> Option<usize> {
 /// **不是**任何内容质量结论。
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn replay_report(world_id: &str) -> Option<ReplayReport> {
-    match sessions().lock().unwrap().get(world_id)? {
+    match sessions().lock().expect(poisoned!("record::sessions")).get(world_id)? {
         Session::Replay(s) => Some(s.client.report()),
         Session::Record(_) => None,
     }
@@ -403,7 +415,7 @@ pub(crate) fn replay_report(world_id: &str) -> Option<ReplayReport> {
 /// 取录制快照（无录制会话 → `None`）。落盘的就是它。
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn recording_snapshot(world_id: &str) -> Option<Recording> {
-    match sessions().lock().unwrap().get(world_id)? {
+    match sessions().lock().expect(poisoned!("record::sessions")).get(world_id)? {
         Session::Record(s) => Some(s.client.finish()),
         Session::Replay(_) => None,
     }
@@ -471,7 +483,7 @@ impl Drop for TickCaptureGuard {
 /// 把当前录制整份写到 `<root>/recordings/<id>.json`（每拍覆写，故文件恒是最新全量）。
 /// 返回写入的绝对路径；无录制会话 → `Ok(None)`。
 pub(crate) fn flush_recording(world_id: &str) -> Result<Option<PathBuf>, EngineError> {
-    let guard = sessions().lock().unwrap();
+    let guard = sessions().lock().expect(poisoned!("record::sessions"));
     let Some(Session::Record(s)) = guard.get(world_id) else {
         return Ok(None);
     };
@@ -548,7 +560,7 @@ fn attach_record(
     labels: &[(&str, &str)],
 ) -> Result<Option<Arc<dyn ModelClient>>, EngineError> {
     validate_recording_id(recording_id)?;
-    let mut map = sessions().lock().unwrap();
+    let mut map = sessions().lock().expect(poisoned!("record::sessions"));
     // 先只做"要不要建"的判断（各分支都不产出借用），建完再取——否则 `map.get()` 的借用会活到
     // 匹配结果被用完，与同一分支里的 `map.insert()` 打架。
     match map.get(world_id) {
@@ -607,7 +619,7 @@ fn attach_replay(
     match_mode: MatchMode,
 ) -> Result<Arc<dyn ModelClient>, EngineError> {
     validate_recording_id(recording_id)?;
-    let mut map = sessions().lock().unwrap();
+    let mut map = sessions().lock().expect(poisoned!("record::sessions"));
     match map.get(world_id) {
         Some(Session::Replay(_)) => {}
         Some(Session::Record(_)) => {

@@ -107,7 +107,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = config::ServerConfig::from_env();
     let pool = db::connect(&config.database_url).await?;
-    let state = app::AppState::new(pool, config.clone());
+    // 🔴 `from_env` 而不是 `new`：真实外部 provider（当前只有内容审核）按环境变量装配，
+    // **配错即启动失败**（理由见 `app::AppState::from_env`）。未配置时保留 Dev 桩，行为不变。
+    let state = app::AppState::from_env(pool, config.clone())?;
 
     // 世界运行时：tick 调度器 + worker（后台任务）
     runtime::spawn_workers(state.clone());

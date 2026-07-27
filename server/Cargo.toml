@@ -30,6 +30,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"
 base64 = "0.22"
+# 可配置 HTTP 内容审核 provider（providers::http_moderation）。版本与 feature 与
+# muse-engine 的模型客户端一致，故不引入任何新的传递依赖。
+reqwest = { version = "0.12", features = ["json"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

@@ -1672,6 +1672,9 @@ struct IrreversibleRules {
 }
 
 impl IrreversibleRules {
+    // 四个 pattern 都是**字面量**，编译期即固定：`Regex::new` 只会因模式非法而失败，
+    // 而模式不含任何运行期输入（模型文本只进 `is_match`，不进 `new`）。故 unwrap 是
+    // 静态安全的——若有人改坏了 pattern，本 crate 任一条用例首次构造即 panic，在 CI 上暴露。
     fn new() -> Self {
         Self {
             death: Regex::new(r"(杀死|杀掉|杀了|杀害|处死|赐死|斩杀|毒死|勒死|绞死|自尽|自刎|殉|同归于尽)").unwrap(),

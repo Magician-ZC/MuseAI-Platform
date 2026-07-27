@@ -321,6 +321,58 @@ async fn manifest_endpoint_owner_scoped() {
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
 
+/// 库里存着**非法 JSON** 时，manifest 端点降级为 `null` 而**不是 panic**。
+///
+/// 为什么值得单独锁一条：该端点的收尾是 `serde_json::to_string(&manifest).unwrap()`，
+/// 读代码时最像"外部输入驱动的 unwrap"。实际不是——脏数据在更早的
+/// `from_str::<Value>(..).ok()` 就被吃掉并降级成 `Value::Null`，`unwrap` 拿到的恒是
+/// 一个 `Value`（其 `Serialize` 无失败分支）。本用例把这条**降级路径**钉死：
+/// 若日后有人把 `.ok()` 改成 `.unwrap()`／让原始字符串直通序列化，
+/// axum handler 会在此 panic、请求直接断连，而这条用例会先一步变红。
+///
+/// 历史脏行同理（迁移遗留、手工改库、早期版本写坏的 manifest）——它们都走这条路。
+#[tokio::test]
+async fn manifest_with_corrupt_json_in_db_degrades_to_null() {
+    let (app, state) = build_app().await;
+    let (access, _r, _u) = login_new_user(&app, "13900000077").await;
+    let (_st, v) = send(
+        &app,
+        "POST",
+        "/api/assets/characters",
+        Some(&access),
+        Some("man-corrupt"),
+        Some(publish_body("card-corrupt", "脏行")),
+    )
+    .await;
+    let id = v["id"].as_str().unwrap().to_string();
+
+    // 直接把库里的 manifest_json 改成解析不了的字节（模拟历史脏数据 / 手工改库）。
+    sqlx::query("UPDATE cloud_characters SET manifest_json = $1 WHERE id = $2")
+        .bind("{这不是 JSON，缺右括号")
+        .bind(&id)
+        .execute(&state.db)
+        .await
+        .expect("seed corrupt manifest_json");
+
+    // 不 panic、不 500：200 + JSON null。
+    let (st, m) =
+        send(&app, "GET", &format!("/api/assets/characters/{id}/manifest"), Some(&access), None, None).await;
+    assert_eq!(st, StatusCode::OK, "脏 manifest 应降级而非报错");
+    assert!(m.is_null(), "解析不了的 manifest 降级为 null，实际: {m:?}");
+
+    // 合法但非对象的 JSON 标量同样只是原样回显，不触发 panic。
+    sqlx::query("UPDATE cloud_characters SET manifest_json = $1 WHERE id = $2")
+        .bind("123")
+        .bind(&id)
+        .execute(&state.db)
+        .await
+        .expect("seed scalar manifest_json");
+    let (st, m) =
+        send(&app, "GET", &format!("/api/assets/characters/{id}/manifest"), Some(&access), None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(m, serde_json::json!(123));
+}
+
 // ---------------- 角色头像上传（Phase A） ----------------
 
 /// owner 上传头像 → 过审回传 avatarUrl → GET /assets/objects 回读得到原始字节。

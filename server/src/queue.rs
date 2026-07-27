@@ -84,7 +84,13 @@ impl Queue for MemQueue {
                 let state = topics.entry(topic.to_string()).or_default();
                 match state.heap.peek() {
                     Some(item) if item.due_ms <= now => {
-                        return state.heap.pop().expect("peeked").payload;
+                        // peek() 刚返回 Some，且 `topics` 锁自那时起未释放（本 match 全程持锁、
+                        // 中间无 await）→ 堆不可能被并发取空，pop() 必为 Some。
+                        return state
+                            .heap
+                            .pop()
+                            .expect("BUG: peek() 已确认非空且期间未放锁，pop() 必有值")
+                            .payload;
                     }
                     Some(item) => (item.due_ms - now).clamp(10, 5_000) as u64,
                     None => 5_000,

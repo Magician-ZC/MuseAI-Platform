@@ -202,6 +202,10 @@ fn idem_key(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// 本模块的应答走 `json_response(serde_json::to_string(&resp).unwrap())`；那个 `unwrap`
+/// 静态安全：`resp` 恒为 `json!` 产出的 `serde_json::Value`，其 `Serialize` 无失败分支
+///（serde_json 仅有的两个报错来源——非字符串 map 键、NaN/Inf——`json!` 都构造不出来），
+/// 写入目标是内存 `String` 而非 IO。故请求体再脏也炸不到这里。
 fn json_response(body: String) -> Response {
     ([(axum::http::header::CONTENT_TYPE, "application/json")], body).into_response()
 }

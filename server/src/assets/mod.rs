@@ -139,6 +139,15 @@ fn is_safe_object_key(key: &str) -> bool {
 
 // ---------------- 辅助 ----------------
 
+/// 本模块（及 `assets::worlds`）的应答统一走 `json_response(serde_json::to_string(&resp).unwrap())`。
+///
+/// 那个 `unwrap` 是**静态安全**的，不是漏网之鱼：`resp` 一律是 `serde_json::Value`
+///（`json!` 宏产物，或从库里读出后 `from_str::<Value>` 成功的那份）。`Value` 的 `Serialize`
+/// 实现没有失败分支——非字符串 map 键与 NaN/Inf 这两个 serde_json 仅有的报错来源都构造不出来
+///（`json!` 对 NaN 走 `Number::from_f64` → `None` → `Value::Null`），写入目标又是内存 `String`
+/// 而非 IO。故**任何脏数据都无法让它 panic**：DB 里存着非法 JSON 时，失败发生在更早的
+/// `from_str` 那一步，且那里已用 `.ok()` 降级为 `Value::Null`（见 `manifest` 端点，
+/// 由 `tests::manifest_with_corrupt_json_in_db_degrades_to_null` 锁住）。
 fn json_response(body: String) -> Response {
     ([(axum::http::header::CONTENT_TYPE, "application/json")], body).into_response()
 }

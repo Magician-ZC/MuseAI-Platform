@@ -552,7 +552,12 @@ where
             let mut still: Vec<usize> = Vec::with_capacity(in_flight.len());
             for idx in std::mem::take(&mut in_flight) {
                 let poll_res = {
-                    let fut = slots[idx].as_mut().expect("slot live");
+                    // in_flight 的不变量：只装「尚未 Ready」的下标。slot 置 None 只发生在
+                    // Ready 分支，而该分支不会把 idx 放回 still（下一轮 in_flight），
+                    // 故 in_flight 里的下标必然仍持有活着的 future。
+                    let fut = slots[idx]
+                        .as_mut()
+                        .expect("BUG: in_flight 只含未完成下标，其 slot 必非 None（置 None 的 Ready 分支不回填 still）");
                     fut.as_mut().poll(cx)
                 };
                 match poll_res {

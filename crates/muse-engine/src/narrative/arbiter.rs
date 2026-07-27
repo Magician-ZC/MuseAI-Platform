@@ -118,6 +118,8 @@ pub fn rule_arbitrate(
     active_character_ids: &[String],
     locations: &BTreeMap<String, LocationDef>,
 ) -> (Vec<ArbiterOutcome>, Vec<RoleDecision>) {
+    // 本函数内 4 个 `Regex::new(...).unwrap()` 的 pattern 全是字面量、不含任何运行期输入
+    //（决策文本只进 `is_match`/`captures`）→ 失败仅可能是模式写错，属编译期可知，unwrap 静态安全。
     let res_re = Regex::new(r"(动用|消耗|花费|拿出|掏出|支付)([^\s，。、；：！？…,.!?（）()]{1,8})").unwrap();
     let coerce_re = Regex::new(
         r"(让|命令|迫使|逼迫|逼|强迫|胁迫).{0,12}(说出|交出|供出|坦白|招供|吐露).{0,8}(秘密|真相|心里|心事|底细|隐私|下落)",

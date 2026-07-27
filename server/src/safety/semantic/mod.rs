@@ -205,6 +205,8 @@ use crate::providers::ModerationVerdict;
 use super::{record_risk, verdict_str, Severity};
 
 #[cfg(test)]
+pub(crate) mod testkit;
+#[cfg(test)]
 mod tests;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -270,6 +272,31 @@ const LAYER: i64 = 3;
 
 /// 抽样子流域常量。**已登记进 `assembly` 的唯一清单**（那里的「下一个可用」已续到 `0x5D`）。
 const DOMAIN_L3_SAMPLE: u64 = 0x5C;
+
+/// 生成侧单价（分 / 1K token）的 env 名。**本模块只读它、绝不给它兜默认值**——见
+/// [`explicit_token_price_cents_per_1k`]。（`runtime` 另有一份带默认值的读法，那是给逐拍记账
+/// 用的估算；成本比值这条路上不能用估算。）
+const ENV_TOKEN_PRICE: &str = "MUSE_TOKEN_CNY_CENTS_PER_1K";
+
+/// VALIDATION §2 T5 门槛「内容审核成本 ≤ 生成成本的 5%」，写成万分比整数（禁浮点）。
+const COST_THRESHOLD_BP: i64 = 500;
+
+/// 万分比换算基数。
+const BP_BASE: i64 = 10_000;
+
+/// 生成侧单价，**只认显式配置**（未设 / 非正整数 → `None`）。
+///
+/// 🔴 为什么不回落 `runtime` 的代码内默认估算：T5 是一条**门槛**。拿一个估算单价去算门槛，
+/// 得到的是「估算的估算」，而它在看板上和真值长得一模一样——那正是「摆一个假的 5%」。
+/// 缺任何一半，`cost.ratioAvailable` 就保持 `false` 并说明缺的是哪一半。
+fn explicit_token_price_cents_per_1k() -> Option<i64> {
+    std::env::var(ENV_TOKEN_PRICE).ok()?.trim().parse::<i64>().ok().filter(|v| *v > 0)
+}
+
+/// 「每 1000 单位 × 单价（分）」→ 分。整数运算（禁浮点：金额与门槛判定都必须可复现）。
+fn cost_cents(units: i64, price_per_1k: i64) -> i64 {
+    units.saturating_mul(price_per_1k) / 1000
+}
 
 fn env_i64(name: &str, default: i64) -> i64 {
     std::env::var(name).ok().and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(default)
@@ -889,6 +916,105 @@ fn honesty(stub: bool) -> Vec<&'static str> {
     }
 }
 
+/// 成本口径。
+///
+/// ## 🔴 `ratioAvailable` 现在**可以**翻成 true 了，但只在两侧单价都被显式配置时
+///
+/// VALIDATION §2 T5 有一条门槛「内容审核成本 ≤ 生成成本的 5%」。此前这里恒为 `false`，
+/// 理由是「`check_text` 只回裁决、不回 token 也不回费用」。那句话对**响应体**依然成立——
+/// 阿里云 / 腾讯云 / 百度的文本审核响应里根本没有计费字段，它们按调用次数离线结算。
+/// 所以补法不是去响应里抠一个不存在的字段，而是把缺的那一半变成显式配置：
+///
+/// | 侧 | 用量（已有） | 单价（新增，须显式配置） |
+/// |---|---|---|
+/// | 分子 · 审核 | `moderationCallsInWindow`（含重试——重试是真实开销） | `ModerationProvider::call_price_cents_per_1k`（`MUSE_MODERATION_HTTP_PRICE_CENTS_PER_1K_CALLS`） |
+/// | 分母 · 生成 | `world_ticks.cost_tokens` | `MUSE_TOKEN_CNY_CENTS_PER_1K` |
+///
+/// **任一半缺失 → 仍是 `false`**，且 `why` 明说缺的是哪一半：
+/// - Dev 桩的 `call_price_cents_per_1k()` 默认 `None`（桩的调用成本恒为 0，算出来的比值毫无意义）；
+/// - 生成侧单价**不回落代码内默认估算**——见 [`explicit_token_price_cents_per_1k`]。
+///
+/// 比值用**万分比整数**给（`ratioBp`），不给浮点：金额与门槛判定必须逐位可复现。
+fn cost_block(state: &AppState, checks: i64, chars: i64, gen_tokens: i64) -> Value {
+    let mod_unit = state.moderation.call_price_cents_per_1k();
+    let gen_unit = explicit_token_price_cents_per_1k();
+
+    let mut v = json!({
+        "generationTokensInWindow": gen_tokens,
+        "moderationCallsInWindow": checks,
+        "moderationCharsInWindow": chars,
+        "moderationUnitPriceCentsPer1kCalls": mod_unit,
+        "generationUnitPriceCentsPer1kTokens": gen_unit,
+        "thresholdBp": COST_THRESHOLD_BP,
+        "unit": "金额一律「分」；比值一律万分比整数（500 = 5%），禁浮点。",
+        "levers": [
+            "MUSE_SAFETY_L3_PUBLIC_SAMPLE_BP / MUSE_SAFETY_L3_PRIVATE_SAMPLE_BP（降档抽样）",
+            "MUSE_SAFETY_L3_MAX_EVENTS_PER_TICK（单拍送审条数上限）",
+            "MUSE_SAFETY_L3_MAX_ATTEMPTS（重试预算 —— 重试是真实开销，不是免费的）",
+            "MUSE_LIVE_DELAY_TICKS（T5 预案「审核成本失控 → 直播延迟拍数上调」的那一个旋钮）",
+        ],
+    });
+    let o = v.as_object_mut().expect("json! 造的是对象");
+
+    let missing = match (mod_unit, gen_unit) {
+        (None, None) => Some(format!(
+            "两侧单价都缺：审核侧要么用的是 Dev 桩（调用成本恒为 0），要么真实 provider 没配\
+             {}；生成侧 {ENV_TOKEN_PRICE} 也未显式配置。",
+            crate::providers::http_moderation::ENV_PRICE_CENTS_PER_1K_CALLS
+        )),
+        (None, Some(_)) => Some(format!(
+            "缺**审核侧**单价：ModerationProvider::call_price_cents_per_1k() 返回 None。\
+             厂商响应里没有计费字段（按调用次数离线结算），故请把合同单价配进 {}。",
+            crate::providers::http_moderation::ENV_PRICE_CENTS_PER_1K_CALLS
+        )),
+        (Some(_), None) => Some(format!(
+            "缺**生成侧**单价：{ENV_TOKEN_PRICE} 未显式配置。🔴 本端点刻意不回落代码内的默认\
+             估算——拿估算算 T5 门槛得到的是「估算的估算」，而它在看板上和真值长得一样。"
+        )),
+        (Some(_), Some(_)) => None,
+    };
+
+    match (missing, mod_unit, gen_unit) {
+        (Some(why), ..) => {
+            o.insert("ratioAvailable".into(), json!(false));
+            o.insert(
+                "why".into(),
+                json!(format!(
+                    "VALIDATION §2 T5 门槛「内容审核成本 ≤ 生成成本的 5%」需要**两侧单价**。{why} \
+                     用量侧两边都已可查（调用量含重试、送审字符数、生成 token）。"
+                )),
+            );
+        }
+        (None, Some(mu), Some(gu)) => {
+            let mod_cents = cost_cents(checks, mu);
+            let gen_cents = cost_cents(gen_tokens, gu);
+            o.insert("moderationCostCents".into(), json!(mod_cents));
+            o.insert("generationCostCents".into(), json!(gen_cents));
+            if gen_cents > 0 {
+                let ratio_bp = mod_cents.saturating_mul(BP_BASE) / gen_cents;
+                o.insert("ratioAvailable".into(), json!(true));
+                o.insert("ratioBp".into(), json!(ratio_bp));
+                o.insert("withinThreshold".into(), json!(ratio_bp <= COST_THRESHOLD_BP));
+                o.insert(
+                    "why".into(),
+                    json!("两侧单价均已显式配置，比值可算。⚠️ 单价是**运营填的合同价**，\
+                          不是厂商响应回报的实测计费（文本审核响应里没有计费字段），\
+                          故它的准确度等于那两个配置值的准确度。"),
+                );
+            } else {
+                o.insert("ratioAvailable".into(), json!(false));
+                o.insert(
+                    "why".into(),
+                    json!("两侧单价都有，但窗口内生成成本为 0（分母为 0），比值无定义——\
+                          不是缺配置，是这段窗口里没有世界推进过。"),
+                );
+            }
+        }
+        _ => unreachable!("missing 为 None 时两侧单价必然都是 Some"),
+    }
+    v
+}
+
 async fn recheck_overview(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -939,6 +1065,7 @@ async fn recheck_overview(
     let stub = state.moderation.is_dev_stub();
     let runs = n("runs");
     let checks = n("pub_chk") + n("priv_chk");
+    let cost = cost_block(&state, checks, n("chars"), gen_tokens);
 
     Ok(Json(json!({
         "layer": LAYER,
@@ -997,22 +1124,7 @@ async fn recheck_overview(
                           已经返回给客户端的字节收不回，平台也不会为此另发撤回通知（越描越黑）。",
         },
         // ── 成本 ───────────────────────────────────────────────────────────
-        "cost": {
-            "generationTokensInWindow": gen_tokens,
-            "moderationCallsInWindow": checks,
-            "moderationCharsInWindow": n("chars"),
-            "ratioAvailable": false,
-            "why": "VALIDATION §2 T5 门槛「内容审核成本 ≤ 生成成本的 5%」需要审核侧的**计价口径**，\
-                    而 ModerationProvider::check_text 只回裁决、不回 token 也不回费用；Dev 桩的调用成本更是恒为 0。\
-                    本端点先把分子侧的**调用量与送审字符数**变成可查的数（此前一次调用都没被计过数），\
-                    分母侧 generationTokensInWindow 已可得；比值待真实 provider 的计价补齐。",
-            "levers": [
-                "MUSE_SAFETY_L3_PUBLIC_SAMPLE_BP / MUSE_SAFETY_L3_PRIVATE_SAMPLE_BP（降档抽样）",
-                "MUSE_SAFETY_L3_MAX_EVENTS_PER_TICK（单拍送审条数上限）",
-                "MUSE_SAFETY_L3_MAX_ATTEMPTS（重试预算 —— 重试是真实开销，不是免费的）",
-                "MUSE_LIVE_DELAY_TICKS（T5 预案「审核成本失控 → 直播延迟拍数上调」的那一个旋钮）",
-            ],
-        },
+        "cost": cost,
         "dashboardIntegration": {
             "mainDashboardIncludesL3": false,
             "where": "GET /api/admin/safety/recheck（本端点）。主看板 /admin/metrics/overview 尚未并入本项。",

@@ -158,7 +158,7 @@
 | 界面位置 | 现状 | 需要的后端字段（建议端点） |
 |---|---|---|
 | 健康指标条 运行中/需关注/已熔断 | 按“已加载世界”本地统计，翻页未完时标注“未加载完” | 平台级汇总（`GET /admin/worlds/summary`）。`metrics/overview` 的 `worlds.active/fused` 是另一套口径（无“需关注”档、与本页派生态不一致），不能顶替 |
-| 表格 风控延迟 | `—` | `moderationLatency`（`GET /admin/worlds`）。全仓无任何一处记录**机审调用耗时**；`audit_queue.created_at/reviewed_at` 是**人审周转**（小时/天量级），与本列按秒渲染的语义不同，**不得充数**。补齐路径：safety 侧在 `moderate_*` 两端取时钟差落表后按 world 聚合 |
+| 表格 风控延迟 | `—` | `moderationLatency`（`GET /admin/worlds`）。~~全仓无任何一处记录机审调用耗时~~ —— **数据源已于 2026-07-27 补上**（migration `0049`：`safety_recheck_runs.provider_ms`，只累加 `check_text` 两端时钟差，超时/报错照算；读取面 `GET /admin/safety/recheck` 的 `providerLatency`）。🔴 **本列仍应保持 `—`**：provider 是 Dev 桩（恒 0 的延迟与「非常快」在本列上长得一样）· 第 3 层默认关（多数世界一片 null）· 该列只覆盖运行时投影这条链，静态审核不落本表，摆在世界列表里会被读成该世界的机审总体 SLA。⚠️ 两个**不得充数**的近似：`audit_queue.created_at/reviewed_at` 是人审周转（小时/天量级，一眼可辨）；同表 `latency_ms` 是一次尝试全程（含 DB 与记账，系统性偏大却看起来完全合理，更难识破） |
 | 表格 最后活动 | `—` | `lastActivityAt`（`GET /admin/worlds`）。`worlds.updated_at` 已存在但未投影；`createdAt` ≠ 最后活动 |
 | 诊断栏 启动时间 | `—`，另显示真实创建时间 | `startedAt`（diagnostics.world） |
 | 诊断栏 风险命中 | 口径改为“累计”，日环比 `—` | 按日聚合的 `riskEventCountsToday` 与昨日值 |

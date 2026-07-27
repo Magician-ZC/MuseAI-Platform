@@ -78,17 +78,18 @@
 //! `progression::settle_idle_world_ending_tx` → `grant_mileage_tx`（历练唯一写入路径）。
 //! 将来礼包若要带道具，必须走 `backpack::grant_item_tx`，不得在此直插。
 //!
-//! ## 规格里本次**未实现**的一项（TODO）
+//! ## 礼包里那两项规格内容，各自落在哪
 //!
-//! 礼包的「**1 张低星副本卡**」已于副本卡资产层（迁移 0032）落地后接上：领取事务内调
-//! `subplot::grant_card_tx`，`grant_key = starter:{user_id}`，固定 1★。
-//! ⚠️ 两个开关是**正交**的——副本卡开关（`MUSE_SUBPLOT_CARDS`）关闭时**跳过发卡而非报错**，
-//! 玩家仍拿到预制卡与微本。一块未开放的经济模块不该有能力打死整条新手动线。
-//! 「3 条托梦」不单独发放：配额已是 `MUSE_DREAM_QUOTA_PER_STAGE` 全局参数，
-//! 在此复述数字只会制造第二个事实源。
-//! 「3 条托梦」**不需要单独发放**：托梦配额已是每卡每阶段的全局参数
-//! （`interventions::dream_quota_per_stage`，`MUSE_DREAM_QUOTA_PER_STAGE` 默认 3），
-//! 新卡自动享有，另造一套发放逻辑只会出现两个事实源。
+//! ⚠️ 本节标题原为「规格里本次**未实现**的一项（TODO）」，而正文早已改成「已经接上了」——
+//! 标题与正文互相矛盾（同一节里还留着「3 条托梦」那段的两版措辞）。两处一并订正。
+//!
+//! - **1 张低星副本卡**：已接。副本卡资产层（迁移 `0032`）落地后，领取事务内调
+//!   `subplot::grant_card_tx`，`grant_key = starter:{user_id}`，固定 1★。
+//!   ⚠️ 两个开关**正交**——副本卡开关（`MUSE_SUBPLOT_CARDS`）关闭时**跳过发卡而非报错**，
+//!   玩家仍拿到预制卡与微本。一块未开放的经济模块不该有能力打死整条新手动线。
+//! - **3 条托梦**：**刻意不单独发放**，这不是缺口。托梦配额本就是每卡每阶段的全局参数
+//!   （`interventions::dream_quota_per_stage`，`MUSE_DREAM_QUOTA_PER_STAGE` 默认 3），
+//!   新卡自动享有；在这里再发一次、或把「3」这个数字复述一遍，都只会制造第二个事实源。
 
 use axum::extract::State;
 use axum::http::HeaderMap;

@@ -410,3 +410,66 @@ async fn no_withdraw_or_payout_endpoints() {
         assert_eq!(s, StatusCode::NOT_FOUND, "提现出口必须不存在：{uri}");
     }
 }
+
+// ---------- 分成比例的可见性（创作者有权知道自己被按什么条件付酬） ----------
+
+/// 🔴 **创作者必须看得到自己被按什么比例结算**。
+///
+/// 此前 `/me/earnings` 只给余额与流水。而 `revenue_share_bps` 是**按模板可覆盖**的，
+/// 于是创作者拿着自己模板挣的钱，却看不到自己的比例——他连「我这 700 分是不是算对了」
+/// 都无从验证。告诉某人他正被按什么条件付酬不是新政策，**不说才是异常**。
+#[tokio::test]
+async fn a_creator_can_see_the_rate_they_are_being_paid_at() {
+    let state = test_state().await;
+    seed_user(&state.db, "creator").await;
+    seed_template(&state.db, "tpl_default", "creator").await; // 未单独配 → 用平台默认
+    // 另一个模板单独配 55%。
+    seed_template(&state.db, "tpl_custom", "creator").await;
+    sqlx::query("UPDATE world_templates SET revenue_share_bps = 5500 WHERE id = 'tpl_custom'")
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    let (s, v) = get_json(&state, "/api/me/earnings", Some(&token(&state, "creator"))).await;
+    assert_eq!(s, StatusCode::OK, "body={v}");
+    let rs = &v["revenueShare"];
+    assert_eq!(
+        rs["platformDefaultBps"].as_i64().unwrap(),
+        crate::ledger::DEFAULT_REVENUE_SHARE_BPS,
+        "平台默认必须与 ledger 同源: {rs}"
+    );
+
+    let tpls = rs["myTemplates"].as_array().expect("myTemplates");
+    let by = |id: &str| tpls.iter().find(|t| t["templateId"] == id).unwrap_or_else(|| panic!("缺 {id}: {rs}"));
+
+    // 🔴 「随平台默认浮动」与「给我单独定死」是两件不同的信息，必须分得开——
+    // 合并成一个数，创作者就不知道自己的比例稳不稳。
+    assert_eq!(by("tpl_default")["shareBps"], json!(crate::ledger::DEFAULT_REVENUE_SHARE_BPS));
+    assert_eq!(by("tpl_default")["isPlatformDefault"], json!(true), "{rs}");
+    assert_eq!(by("tpl_custom")["shareBps"], json!(5500), "{rs}");
+    assert_eq!(by("tpl_custom")["isPlatformDefault"], json!(false), "🔴 单独配的不得被标成默认: {rs}");
+
+    // ⚠️ 如实说明这是**当前**比例，不是历史流水各自结算时用的那个。
+    assert!(
+        rs["caveat"].as_str().unwrap_or("").contains("不是历史流水"),
+        "比例改过之后旧流水仍按当时的比例结算过，这点必须说清: {rs}"
+    );
+}
+
+/// 🔴 只列**本人拥有**的模板：他人的分成比例与他无关，露出来既无用又是信息泄露。
+#[tokio::test]
+async fn the_rate_list_never_shows_someone_elses_templates() {
+    let state = test_state().await;
+    seed_user(&state.db, "creator").await;
+    seed_user(&state.db, "other").await;
+    seed_template(&state.db, "tpl_mine", "creator").await;
+    seed_template(&state.db, "tpl_theirs", "other").await;
+
+    let (_s, v) = get_json(&state, "/api/me/earnings", Some(&token(&state, "creator"))).await;
+    let raw = v["revenueShare"].to_string();
+    assert!(raw.contains("tpl_mine"), "自己的要在: {raw}");
+    assert!(
+        !raw.contains("tpl_theirs") && !raw.contains("other"),
+        "🔴 不得列出他人的模板或比例 —— 既无用又是信息泄露: {raw}"
+    );
+}

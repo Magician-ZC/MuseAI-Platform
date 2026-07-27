@@ -616,7 +616,7 @@ if 线：   从终局那一拍岔出去的、只属于你的一条平行线   �
 | POST | `/api/billing/orders` | JWT | `billing` | 下单充值。**PaymentProvider 当前为 Dev 桩** |
 | GET | `/api/billing/balance` | JWT | `billing` | 余额 |
 | POST | `/api/billing/refunds` | JWT | `billing` | 退款 |
-| GET | `/api/me/earnings` | JWT | `billing`\|`arena` | 创作者收益查询。**平台内权益，无提现（红线）** |
+| GET | `/api/me/earnings` | JWT | `billing`\|`arena` | 创作者收益查询。**平台内权益，无提现（红线）**。**2026-07-27 新增** `revenueShare`：`platformDefaultBps`（与 `ledger` 同源）+ `myTemplates[].{shareBps, isPlatformDefault}`。🔴 此前只给余额与流水，**不给分成比例**——而 `revenue_share_bps` 按**模板**可覆盖，于是创作者拿着自己模板挣的钱，看不到自己被按什么比例结算，连「这 700 分算得对不对」都无从验证。🔴 「随平台默认浮动」与「给我单独定死」必须分得开（`isPlatformDefault`），合并成一个数创作者就不知道自己的比例稳不稳。🔴 只列**本人拥有**的模板。⚠️ 回的是**当前**比例，不是历史流水各自结算时用的那个 |
 | POST | `/api/me/cloud-growth` | JWT | `billing`\|`arena` | 云成长购买 |
 | POST | `/api/shop/items/{sku}/purchase` | JWT | `billing`\|`arena` | 平台道具售卖。**永不加战力（红线）** |
 

@@ -81,8 +81,55 @@ async fn my_earnings(State(state): State<AppState>, user: AuthUser) -> Result<Js
         }));
     }
 
+    // ── 我被按什么比例结算（本人自己的模板） ────────────────────────────────
+    //
+    // 🔴 此前这个端点只给余额与流水，**不给分成比例**。而 `revenue_share_bps` 是
+    // **按模板可覆盖**的（`world_templates.revenue_share_bps`，NULL 时用平台默认）——
+    // 于是创作者拿着自己模板挣的钱，却看不到自己被按什么比例结算。
+    //
+    // 这跟礼物目录是同一个形状：**决定早就做了（就在那一列里），只是没人看得见**。
+    // 而这一处更要紧——它决定的是**一个人拿多少钱**。告诉某人他正被按什么条件付酬，
+    // 不是新政策，是把他本来就该知道的事说出来；不说才是异常。
+    //
+    // ⚠️ 只列**本人拥有**的模板（`owner_id = 本人`）：他人的分成比例与他无关，
+    // 露出来既无用又是信息泄露。
+    // ORDER BY 全序（`id` 是主键）：列表顺序确定。
+    let tpl_rows = sqlx::query(
+        "SELECT id, title, revenue_share_bps FROM world_templates \
+         WHERE owner_id = $1 AND COALESCE(withdrawn, 0) = 0 ORDER BY id ASC",
+    )
+    .bind(&user.user_id)
+    .fetch_all(&state.db)
+    .await?;
+    let mut my_templates = Vec::with_capacity(tpl_rows.len());
+    for r in &tpl_rows {
+        let raw: Option<i64> = r.try_get("revenue_share_bps").unwrap_or(None);
+        // 与 `ledger::resolve_share` 的口径**逐字相同**：NULL → 平台默认，且一律 clamp 到 [0,10000]。
+        // 两处一旦漂移，创作者看到的比例就与实际结算的比例对不上——那种 bug 只有他会遇到，
+        // 而且是在对账时才发现。
+        let effective = raw.unwrap_or(crate::ledger::DEFAULT_REVENUE_SHARE_BPS).clamp(0, 10_000);
+        my_templates.push(json!({
+            "templateId": r.try_get::<String, _>("id")?,
+            "title": r.try_get::<String, _>("title")?,
+            "shareBps": effective,
+            // 「这是平台默认值」与「这是给我单独配的」是两件不同的信息：
+            // 前者会随平台默认调整而变，后者不会。合并成一个数，创作者就分不清自己的比例稳不稳。
+            "isPlatformDefault": raw.is_none(),
+        }));
+    }
+
     Ok(Json(json!({
         "balanceCents": balance_cents,
+        // 🔴 我被按什么比例结算。见上方注释：这不是新政策，是把他本来就该知道的条件说出来。
+        "revenueShare": {
+            "platformDefaultBps": crate::ledger::DEFAULT_REVENUE_SHARE_BPS,
+            "myTemplates": my_templates,
+            "unit": "万分比整数（7000 = 70% 归创作者）。金额与比例一律整数，禁浮点——对账必须逐位可复现。",
+            "note": "比例按**模板**生效：某个模板单独配了就用它的，没配则用平台默认。\
+                     `isPlatformDefault` 区分两者——「随平台默认浮动」与「给我单独定死」不是一回事。",
+            "caveat": "⚠️ 本节回的是**当前**比例，不是历史流水各自结算时用的比例。\
+                       比例改过之后，旧流水仍按当时的比例结算过——要逐笔核对请看 `entries` 的 refId 溯源。",
+        },
         // 红线：站内可消费权益，不可提现。withdrawable 恒 false（首版无任何 payout）。
         "withdrawable": withdrawable_flag,
         "note": "创作者收益为站内可消费权益，不可提现（对齐资金红线：无提现/转账出口）。",

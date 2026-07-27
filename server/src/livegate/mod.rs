@@ -34,8 +34,88 @@ use crate::idempotency;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/livegate/webhook", post(webhook))
+        // 🔴 礼物目录。此前**没有任何读取面**：观众发 gift 会被按 price_cents × count 扣钱，
+        // 却无从事先知道有哪些 SKU、各卖多少、买到什么。见 `gift_sku_catalog` 的文档。
+        .route("/arena/gift-skus", get(gift_sku_catalog))
         .route("/arena/{worldId}/gift", post(spectator_gift))
         .route("/arena/{worldId}/clips", get(list_clips))
+}
+
+/// GET /arena/gift-skus：可打赏的礼物目录（**价格 + 买到什么**）。
+///
+/// ════════════════════════════════════════════════════════════════════════════
+/// 🔴 补的是「在卖一件价格与内容都查不到的东西」
+/// ════════════════════════════════════════════════════════════════════════════
+///
+/// `gift_sku_map`（SKU → `price_cents` + `boon_json` + `label`）此前**没有任何读取面**——
+/// 玩家侧没有，运营侧也没有。而 `POST /arena/{worldId}/gift` 会照
+/// `price_cents × count` **真扣钱包**（`ledger::charge`）。
+///
+/// 也就是说：观众要先付钱，才知道这个 SKU 多少钱、是什么。前端连一个礼物面板都拼不出来
+/// （它没有目录可渲染），而唯一能得知价格的方式是**发起一次真实扣费**。
+///
+/// ⚠️ 这不是产品待决定项：**目录的内容早就定好了**（就在那张表里，运营配的），
+/// 缺的只是把它露出来。与 open-decisions §1/§2/§3 同一形状——
+/// 决定已经做了，只是没人看得见。
+///
+/// ════════════════════════════════════════════════════════════════════════════
+/// 露什么、不露什么
+/// ════════════════════════════════════════════════════════════════════════════
+///
+/// - **露** `sku` / `label` / `priceCents`：这三样是「我在买什么、多少钱」的最小集合。
+/// - **露** `boon.kind` 与 `effectTag`：观众有权知道它作用在哪一类事情上。
+/// - **不露** `boon_json` 原文：里面是引擎侧的模板结构，随实现变动；把它当契约下发，
+///   等于让前端与运营配置的内部形状耦合。
+/// - **只出 `enabled = 1`**：与扣费路径的查表条件**逐字相同**。若目录列出一个停用的 SKU，
+///   观众点了会被 400，而他看到的目录说它可买——那比不列出来更糟。
+///
+/// 🔴 响应恒带 §2.5 那条红线的原文（**买过程不买结果**）。礼物是观众花钱买的东西，
+/// 它买到什么必须写在**付钱之前看得到的地方**，而不是只写在代码注释与战报里。
+async fn gift_sku_catalog(
+    State(state): State<AppState>,
+    _user: AuthUser,
+) -> Result<Json<Value>, ApiError> {
+    // ORDER BY 全序（`sku` 是主键）：目录顺序必须确定，否则前端每次刷新礼物面板都在跳。
+    let rows = sqlx::query(
+        "SELECT sku, label, price_cents, boon_json FROM gift_sku_map \
+         WHERE enabled = 1 ORDER BY price_cents ASC, sku ASC",
+    )
+    .fetch_all(&state.db)
+    .await?;
+
+    let mut items = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let boon_raw: String = r.try_get("boon_json").unwrap_or_default();
+        let boon: Value = serde_json::from_str(&boon_raw).unwrap_or(Value::Null);
+        items.push(json!({
+            "sku": r.try_get::<String, _>("sku")?,
+            "label": r.try_get::<String, _>("label")?,
+            "priceCents": r.try_get::<i64, _>("price_cents")?,
+            // 只出两个语义字段，不出 boon_json 原文（见文档）。
+            "boon": {
+                "kind": boon.get("kind").and_then(Value::as_str),
+                "effectTag": boon.get("effectTag").and_then(Value::as_str),
+            },
+        }));
+    }
+
+    Ok(Json(json!({
+        "skus": items,
+        "priceNote": "priceCents 是**单价**（分）；一次打赏总价 = priceCents × count。\
+                      站内打赏走钱包扣费；外部直播平台的礼物**不在此处二次扣费**（观众已在那边付过）。",
+        "🔴 redLine": "§2.5：礼物是**系统代投的环境/过程增益**——买过程，不买结果。\
+                       它不改判定、不改胜负、不发产出、不进任何成长数值；\
+                       落地形态是 arena_env_events(kind='gift_boon')，并如实进战报。",
+        "honesty": [
+            "🔴 只列 enabled=1 的 SKU，与扣费路径的查表条件**逐字相同**——\
+             列出一个停用的 SKU 会让观众点了被 400，而目录说它可买，比不列出来更糟。",
+            "⚠️ boon 只出 kind / effectTag 两个语义字段，不出模板原文：\
+             那是引擎侧结构，随实现变动，当契约下发会让前端与内部形状耦合。",
+            "⚠️ 礼物**是否真的影响引擎回合**目前是**否**：boon 已记账并进战报，\
+             但不进 RoundInput（见 docs/build/open-decisions.md §5，卡在平权红线评审）。\
+             故此刻它买到的是「被看见」与战报里的一条记录，不是回合内的实际增益。",
+        ],
+    })))
 }
 
 #[derive(Debug, Deserialize)]

@@ -630,6 +630,7 @@ if 线：   从终局那一拍岔出去的、只属于你的一条平行线   �
 | POST | `/api/arena/{world_id}/revive-match` | JWT | 复活。**实际扣费待接 billing（已知 seam）** |
 | POST | `/api/arena/{world_id}/eliminate` | JWT + host | 淘汰（已补同意门控） |
 | POST | `/api/arena/{world_id}/settle` | JWT + host | 结算 |
+| GET | `/api/arena/gift-skus` | AuthUser | 🔴 **礼物目录**（2026-07-27）：`sku` / `label` / `priceCents` / `boon.{kind,effectTag}`。补的是「在卖一件价格与内容都查不到的东西」——`gift_sku_map` 此前**没有任何读取面**，而站内打赏会照 `priceCents × count` 真扣钱包，观众要**先付钱才知道多少钱**。🔴 只列 `enabled=1`，与扣费路径查表条件逐字相同（列出停用 SKU = 点了被拒而目录说可买）。🔴 §2.5 红线「买过程不买结果」写进响应——买到什么必须写在**付钱之前看得到的地方**。⚠️ 并如实说明礼物**现在不进引擎回合**（open-decisions §5 未拍板），此刻买到的是「被看见」与战报里的一条记录 |
 | POST | `/api/arena/{worldId}/gift` | JWT | 礼物投递。boon 记入 `arena_env_events`，**注入引擎回合待 `RoundInput` 扩展（已知 seam）** |
 | GET | `/api/arena/{worldId}/clips` | JWT | 高光切片（TtsProvider/切片为 Dev 桩） |
 | POST | `/api/livegate/webhook` | 验签 | 直播平台礼物回调。`MUSE_LIVEGATE_SECRET` 未配置时 **fail-closed** |

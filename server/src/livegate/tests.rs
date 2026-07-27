@@ -533,3 +533,96 @@ async fn webhook_external_records_no_charge() {
     // gift 副作用照旧（env 事件）。
     assert_eq!(count(&state.db, "SELECT COUNT(*) FROM arena_env_events WHERE world_id='we' AND kind='gift_boon'").await, 1);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 礼物目录（GET /arena/gift-skus）
+//
+// 补的是「在卖一件价格与内容都查不到的东西」：`gift_sku_map` 此前**没有任何读取面**，
+// 而站内打赏会照 price_cents × count 真扣钱包。观众要先付钱，才知道这个 SKU 多少钱。
+// ⚠️ 目录内容早就定好了（就在那张表里），缺的只是把它露出来——与 open-decisions
+// §1/§2/§3 同一形状：决定已经做了，只是没人看得见。
+// ═══════════════════════════════════════════════════════════════════════════
+
+async fn get_catalog(state: &AppState, tk: &str) -> (StatusCode, Value) {
+    let resp = crate::app::build_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/arena/gift-skus")
+                .header("authorization", format!("Bearer {tk}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+/// 🔴 目录必须给**价格**——那是「付钱之前得知道」的最小集合里最要紧的一项。
+#[tokio::test]
+async fn the_gift_catalog_publishes_the_price_you_will_be_charged() {
+    let state = arena_state().await;
+    seed_user(&state.db, "u1").await;
+    // 给两个 SKU 定不同的价，验价格真的来自表、且按价升序（面板顺序不能每次刷新都跳）。
+    sqlx::query("UPDATE gift_sku_map SET price_cents = 500 WHERE sku = 'rose'")
+        .execute(&state.db).await.unwrap();
+    sqlx::query("UPDATE gift_sku_map SET price_cents = 100 WHERE sku = 'shield'")
+        .execute(&state.db).await.unwrap();
+
+    let (st, b) = get_catalog(&state, &token(&state, "u1")).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    let skus = b["skus"].as_array().expect("skus");
+    assert!(!skus.is_empty(), "dev 播种了 4 个 SKU，目录不该是空的: {b}");
+
+    let rose = skus.iter().find(|s| s["sku"] == "rose").expect("rose 应在目录里");
+    assert_eq!(rose["priceCents"], json!(500), "🔴 价格必须是**将被扣的那个数**: {rose}");
+    assert!(rose["label"].as_str().unwrap_or("").contains("玫瑰"), "{rose}");
+    assert!(rose["boon"]["effectTag"].is_string(), "观众有权知道它作用在哪一类事情上: {rose}");
+    // 不出模板原文：那是引擎侧结构，当契约下发会让前端与内部形状耦合。
+    assert!(rose.get("boonJson").is_none() && rose["boon"].get("magnitude").is_none(), "{rose}");
+
+    // 按价升序（次级键 sku）——顺序确定，面板不跳。
+    let prices: Vec<i64> = skus.iter().map(|s| s["priceCents"].as_i64().unwrap()).collect();
+    let mut sorted = prices.clone();
+    sorted.sort();
+    assert_eq!(prices, sorted, "目录顺序必须确定: {b}");
+
+    // 🔴 §2.5 红线写在**付钱之前看得到的地方**，不只写在代码注释与战报里。
+    assert!(
+        b["🔴 redLine"].as_str().unwrap_or("").contains("买过程"),
+        "礼物买到什么必须写在观众付钱前看得到的地方: {b}"
+    );
+}
+
+/// 🔴 只列 `enabled = 1`，与扣费路径的查表条件**逐字相同**。
+/// 列出一个停用的 SKU，观众点了会被拒，而目录说它可买——那比不列出来更糟。
+#[tokio::test]
+async fn a_disabled_sku_never_appears_in_the_catalog() {
+    let state = arena_state().await;
+    seed_user(&state.db, "u1").await;
+    sqlx::query("UPDATE gift_sku_map SET enabled = 0 WHERE sku = 'rocket'")
+        .execute(&state.db).await.unwrap();
+
+    let (_st, b) = get_catalog(&state, &token(&state, "u1")).await;
+    let skus = b["skus"].as_array().unwrap();
+    assert!(
+        !skus.iter().any(|s| s["sku"] == "rocket"),
+        "🔴 停用的 SKU 不得出现在目录里 —— 点了被拒而目录说可买，比不列出来更糟: {b}"
+    );
+    assert!(skus.iter().any(|s| s["sku"] == "rose"), "其余仍在: {b}");
+}
+
+/// ⚠️ 目录必须如实说明「礼物现在**不进引擎回合**」——否则观众会以为自己买到了回合内的增益。
+#[tokio::test]
+async fn the_catalog_says_gifts_do_not_yet_reach_the_engine() {
+    let state = arena_state().await;
+    seed_user(&state.db, "u1").await;
+    let (_st, b) = get_catalog(&state, &token(&state, "u1")).await;
+    let honesty = b["honesty"].as_array().expect("honesty");
+    assert!(
+        honesty.iter().any(|h| h.as_str().unwrap_or("").contains("不进 RoundInput")),
+        "🔴 买到的是「被看见」与战报里的一条记录，不是回合内的实际增益 —— 这必须说清: {b}"
+    );
+}

@@ -67,12 +67,14 @@
 //! - `ifline_worlds.cost_tokens_total` —— 该实例累计，同事务累加，按实例查无需扫明细。
 //! - 运营读取面：`GET /api/admin/iflines/cost`（本批次新增，按时间窗聚合）。
 //!
-//! ⚠️ **现状必须说清，不许静默漏掉**：`admin_api::dashboards` 的成本看板目前只 SUM
-//! `world_ticks.cost_tokens`，**尚未并入 if 线开销** —— 即主看板当前会系统性漏掉这部分。
-//! 本批次不动 `dashboards.rs`（并行批次正在改那个文件，跨批次抢改会把两边的账都搅乱）。
-//! 接入是一句 SQL，索引已建好（`idx_ifline_beats_created`）：
-//! `SELECT SUM(cost_tokens) FROM ifline_beats WHERE created_at >= ? AND created_at < ?`。
-//! 这条待办同时写进 `docs/API.md` 与 `docs/VALIDATION.md`，不靠人记。
+//! ✅ **已并入主看板（原登记为遗留）**：此处曾写着「`admin_api::dashboards` 只 SUM
+//! `world_ticks.cost_tokens`，尚未并入 if 线开销 —— 主看板会系统性漏掉这部分」。
+//! 那条已经补上：`GET /api/admin/metrics/overview` 现有 `cost.ifline`（allTime 与 window
+//! 两个口径）与 `cost.combined`（世界线 + if 线合计）。
+//!
+//! 🔴 但 **`cost.total` 的语义一个字没改**，仍是**世界线**口径。这是刻意的：那个字段的历史
+//! 对账全都建立在旧语义上，把 if 线悄悄加进去 = 让所有历史数字在同一个字段名下变了含义，
+//! 而看板上完全看不出发生过这件事。要平台总开销请读 `cost.combined`。
 //!
 //! ### 成本闸（付费内容不能有无限算力）
 //!

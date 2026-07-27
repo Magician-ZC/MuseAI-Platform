@@ -411,11 +411,11 @@
 - **成本记在哪**：if 线跑拍烧 token 但**不能写 `world_ticks`**（写进去就等于接回那条自动结算链路）。
   故 `ifline_beats.cost_tokens`（逐拍实测，共用 `runtime::TokenMeter`，与 `world_ticks.cost_tokens`
   口径逐字一致故可比）+ `ifline_worlds.cost_tokens_total`（实例累计，两处互为对账）+ 运营端点
-  `GET /api/admin/iflines/cost`。⚠️ **现状**：`admin_api::dashboards` 的主成本看板**尚未并入 if 线开销**
-  （只 SUM `world_ticks.cost_tokens`）——本批次未动 `dashboards.rs`（并行批次在改）。
-  接入是一句 SQL（索引 `idx_ifline_beats_created` 已建好）：
-  `SELECT SUM(cost_tokens) FROM ifline_beats WHERE created_at >= ? AND created_at < ?`。
-  这件事同时写在 `/api/admin/iflines/cost` 响应的 `dashboardIntegration` 字段里，不靠人记。
+  `GET /api/admin/iflines/cost`。✅ **已并入主看板**（此条原登记为遗留，2026-07-27 补上）：
+  `/admin/metrics/overview` 现有 `cost.ifline`（allTime / window）+ `cost.combined`（世界线 + if 线合计）。
+  🔴 但 `cost.total` 的语义**一个字没改**，仍是世界线口径——把 if 线悄悄加进去，等于让所有历史
+  对账在同一个字段名下换了含义，而看板上完全看不出发生过这件事。平台总开销读 `cost.combined`。
+  这件事写在 `/api/admin/iflines/cost` 响应的 `dashboardIntegration` 字段里，不靠人记。
 - **SLO 归属：不并入世界线 SLO**。五项指标度量的是**多人世界线**：基尼（单人样本恒为满分 →
   **稀释真实的多人不公平，让指标失去报警能力**）/ 无戏份率（单人线结构上不可能有人没戏份）/
   二次入世率（if 线没有「入世」这件事）/ 收尾率（if 线常由拍数上限强制收尾，与「叙事弧完成」
@@ -434,7 +434,8 @@
 1. **推进端点在请求内同步调用模型**，长回合 = 长连接请求。生产化应改为「入队 + 后台 worker +
    轮询/推送」（`queue` 模块已具备该能力）。本批次未做的原因：if 线默认关闭、状态只标到
    `Implemented`，加一条独立 worker 循环会显著放大改动面且需单独评审。
-2. **主成本看板未并入 if 线开销**（见上，接入方式与索引均已就绪）。
+2. ~~**主成本看板未并入 if 线开销**~~ —— **已闭合**（见上）。保留条目而不是删掉：
+   遗留清单上「一条曾经在过」本身是有信息的，直接抹掉会让后来人以为这里从没漏过账。
 3. **分叉点仍只支持终局**（0039 的诚实降级，未变；补齐路径见上）。
 
 if 线现在是「可开、可跑、可读、可审、可查成本」，但仍**不是「可上线」**——

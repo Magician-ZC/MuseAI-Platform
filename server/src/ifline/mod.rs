@@ -1224,8 +1224,9 @@ async fn list_iflines_admin(
 /// 写进去就等于把 if 线接回会自动结算的那条链路）。于是它的开销不在主成本看板的 SUM 里——
 /// 付费功能的成本失真是最不该有的失真，所以宁可多一个端点，也不让这笔钱在任何地方都查不到。
 ///
-/// ⚠️ **现状（写在响应里，不靠人记）**：`admin_api::dashboards` 的主看板尚未并入本项开销。
-/// 接入是一句 SQL（索引 `idx_ifline_beats_created` 已建好），见响应的 `dashboardIntegration`。
+/// ✅ 主看板**已并入**本项开销（`cost.ifline` + `cost.combined`），本端点保留用于按时间窗细查。
+/// 🔴 主看板的 `cost.total` 仍是**世界线**口径且不打算改——历史对账建立在旧语义上。
+/// 这两件事都写在响应的 `dashboardIntegration` 里，不靠人记。
 async fn ifline_cost_admin(
     State(state): State<AppState>,
     admin: AdminUser,

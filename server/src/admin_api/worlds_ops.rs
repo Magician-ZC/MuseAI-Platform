@@ -203,13 +203,26 @@ pub(super) async fn list_worlds(
             "todayTokens": today_tokens,
             "todayCostCents": today_cents,
             "todayCostCny": cents_to_cny(today_cents),
-            // TODO(数据源缺失): moderationLatency —— 需要**每次机审调用的耗时**（provider 请求毫秒数），
-            // 全仓无任何一处记录它：ModerationProvider 调用不打点、risk_events/world_events 无耗时列、
-            // audit_queue 只有 created_at/reviewed_at（那是**人审周转**，量级为小时/天，与前端按秒渲染、
-            // >3s 报警的语义完全不是一回事，拿来充数会得到一个假指标）。
-            // 补齐路径：safety 侧在 moderate_* 调用两端取时钟差 → 落一张 moderation_calls(world_id, latency_ms,…)
-            // 或复用 risk_events.detail_json 增列，再在此按 world_id 聚合 avg/p95。属 safety 模块职责，不在本项范围。
-            // 在此之前**不下发该字段**（前端 null 判定 → 显示 —），诚实空缺胜过假数字（VALIDATION §0.3）。
+            // moderationLatency —— **仍不下发**，但理由已经和当初不一样了，故整条重写。
+            //
+            // 此处原文是 `TODO(数据源缺失)`：「需要每次机审调用的耗时，**全仓无任何一处记录它**」。
+            // 那句话在写下时成立，**现在不成立了**：migration 0049 给 `safety_recheck_runs` 加了
+            // `provider_ms` 列，只累加 `check_text` 两端的时钟差（超时/报错的调用照算），
+            // 读取面是 `GET /api/admin/safety/recheck` 的 `providerLatency.avgMsPerCall`。
+            // ⚠️ 顺带说清一个容易被误用的近似：同表的 `latency_ms` 是**一次尝试全程**
+            //（含候选装载、收紧 UPDATE、记险、入队），拿它除以调用数得到的数混着 DB 往返——
+            // 系统性偏大，却**看起来完全合理**，比 audit_queue 那种一眼假的数更难识破。
+            //
+            // 🔴 数有了仍不下发，是因为下发的前提是**另外三件事**，一件都还没成立：
+            // ① provider 仍是 Dev 桩（本地关键词匹配），耗时恒为 ~0 —— 一个恒 0 的「审核延迟」
+            //    在看板上与「审核非常快」长得一模一样，而真相是一次真实审核都没发生过；
+            // ② 第 3 层默认关闭，多数世界一行台账都不会有 —— 按世界聚合会得到一片 null，
+            //    在前端与「这个世界审核很快」难以区分；
+            // ③ 该列只覆盖**运行时投影**这条链，静态内容审核（角色卡 / 世界模板 / 装配钩子 /
+            //    入站托梦信，走 `safety::moderate_and_queue`）不落这张表，也不挂在某个世界上——
+            //    把只覆盖一条链的数摆进世界列表，读者会当成那个世界的机审总体 SLA。
+            // 三条任一成立，本字段就该继续空缺（前端 null 判定 → 显示 —）：
+            // 诚实空缺胜过假数字（VALIDATION §0.3）。
         });
         // 🔴 封面：复用 worlds 侧那一个 approved 闸门（不在此另写判断），未过审等同没有封面。
         let cover_moderation: Option<String> = row.try_get("cover_moderation")?;

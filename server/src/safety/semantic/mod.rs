@@ -447,6 +447,16 @@ pub(crate) struct RunReport {
     pub(crate) provider_errors: i64,
     pub(crate) failed_closed: i64,
     pub(crate) intercepted_before_broadcast: i64,
+    /// 🔴 **纯 provider 侧耗时**（毫秒）：只累加 [`check_with_timeout`] 两端的时钟差。
+    ///
+    /// 与台账另一列 `latency_ms`（**一次尝试的全程**：开关解析 + 候选装载 + N 次调用 +
+    /// 收紧 UPDATE + 记险 + 入队）刻意分开。`moderationLatency` 那个字段要报警的是
+    /// **provider RTT**，而全程数里混着数据库往返——那个混合数不像人审周转那样一眼能看出
+    /// 不对（量级差几个数量级），它**看起来完全合理，只是系统性偏大**，是更难识破的假指标。
+    ///
+    /// 🔴 超时/报错的那次调用**照算**：失败的调用一样占用了 RTT 与配额，把它们排除掉会让
+    /// 「provider 开始抖动」在延迟曲线上反而变好看——那是最坏的一种失真。
+    pub(crate) provider_ms: i64,
     pub(crate) outcome: &'static str,
 }
 
@@ -529,7 +539,9 @@ pub(crate) async fn run_recheck(state: &AppState, job: &RecheckJob) -> Result<Ru
         }
         r.chars_checked += c.text.chars().count() as i64;
 
-        match check_with_timeout(state, &c.text).await {
+        let (verdict, call_ms) = check_with_timeout(state, &c.text).await;
+        r.provider_ms += call_ms;
+        match verdict {
             Ok(ModerationVerdict::Approved) => {}
             Ok(verdict) => {
                 // 🔴 收紧：只动 moderation 一列，且 WHERE 钉着 approved（单向棘轮）。
@@ -643,8 +655,17 @@ pub(crate) async fn run_recheck(state: &AppState, job: &RecheckJob) -> Result<Ru
 /// fail-closed 留痕里的原因标记：区分「机器判定可疑」与「机器没能判定」。
 const REASON_PROVIDER_UNAVAILABLE: &str = "provider_unavailable";
 
-async fn check_with_timeout(state: &AppState, text: &str) -> Result<ModerationVerdict, String> {
-    match tokio::time::timeout(
+/// 调一次 `check_text`，并回报**这一次调用花掉的毫秒数**。
+///
+/// 耗时随裁决一起返回（而不是让调用方自己在外面掐表），是为了让「计时范围 = provider 调用」
+/// 这件事由函数签名保证：外面掐表的写法，日后有人往两条 `now_ms()` 之间插一句 DB 操作，
+/// 编译器不会说什么，而延迟曲线会悄悄开始偏大。
+async fn check_with_timeout(
+    state: &AppState,
+    text: &str,
+) -> (Result<ModerationVerdict, String>, i64) {
+    let t0 = now_ms();
+    let verdict = match tokio::time::timeout(
         Duration::from_millis(timeout_ms()),
         state.moderation.check_text(text),
     )
@@ -652,7 +673,9 @@ async fn check_with_timeout(state: &AppState, text: &str) -> Result<ModerationVe
     {
         Ok(inner) => inner,
         Err(_) => Err(format!("check_text 超时（>{}ms）", timeout_ms())),
-    }
+    };
+    // 🔴 报错/超时也计时：失败的调用一样占了 RTT（见 `RunReport::provider_ms`）。
+    (verdict, (now_ms() - t0).max(0))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -871,8 +894,8 @@ async fn persist_run(
         "INSERT INTO safety_recheck_runs (id, world_id, tick_no, attempt, public_candidates, \
          public_checked, private_candidates, private_checked, public_sample_bp, private_sample_bp, \
          chars_checked, tightened, provider_errors, failed_closed, intercepted_before_broadcast, \
-         latency_ms, provider_stub, outcome, created_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19) \
+         latency_ms, provider_ms, provider_stub, outcome, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20) \
          ON CONFLICT(world_id, tick_no, attempt) DO NOTHING",
     )
     .bind(new_id("srr"))
@@ -891,6 +914,7 @@ async fn persist_run(
     .bind(r.failed_closed)
     .bind(r.intercepted_before_broadcast)
     .bind(latency_ms)
+    .bind(r.provider_ms)
     // 布尔一律 INTEGER 0/1（双库可移植），绑定用 i64 —— 与仓库既有写法一致
     // （PG 在 INSERT 目标上对 int8→int4 做赋值转换，SQLite 无类型之分）。
     .bind(if stub { 1_i64 } else { 0 })
@@ -1055,6 +1079,52 @@ fn cost_block(state: &AppState, checks: i64, chars: i64, gen_tokens: i64) -> Val
     v
 }
 
+/// provider 侧耗时读数（migration 0049）。
+///
+/// 🔴 这里给的是 **`worlds_ops::list` 上那个不下发的 `moderationLatency` 的数据源**。
+/// 数采准了，但**仍然只在本端点露出**，因为本端点每个数字旁边都带着 `honesty[]`
+/// 说明「当前是桩」；摆进世界列表就会被读成那个世界的机审总体 SLA（理由见 migration 0049 文件头）。
+///
+/// 两个数刻意并列：
+/// - `avgMsPerCall` = `SUM(provider_ms) / checks` —— **纯 provider RTT**，报警看它；
+/// - `maxAttemptLatencyMs` = `MAX(latency_ms)` —— **一次尝试全程**（含 DB 往返与记账）。
+///
+/// 拿后者当前者用会得到一个系统性偏大、却**看起来完全合理**的数——那比一个一眼假的数更危险。
+fn provider_latency_block(provider_ms: i64, max_attempt_ms: i64, checks: i64, stub: bool) -> Value {
+    let mut v = json!({
+        "totalProviderMs": provider_ms,
+        "checks": checks,
+        // checks == 0 时给 null 而不是 0：「没调用过」与「调用极快」必须分得开。
+        "avgMsPerCall": if checks > 0 { json!(provider_ms / checks) } else { Value::Null },
+        "maxAttemptLatencyMs": max_attempt_ms,
+        "meaning": "totalProviderMs 只累加 check_text 两端的时钟差（超时/报错的调用照算——\
+                    失败的调用一样占 RTT 与配额，剔掉会让「provider 开始抖动」在曲线上反而变好看）。\
+                    maxAttemptLatencyMs 是**一次尝试全程**，含候选装载、收紧 UPDATE、记险与入队。\
+                    两者之差 = 本层自己的 DB 与记账开销。",
+        "notShippedIn": "GET /api/admin/worlds 的 moderationLatency（仍不下发）",
+    });
+    let o = v.as_object_mut().expect("json! 造的是对象");
+    o.insert(
+        "usableForAlerting".into(),
+        json!(!stub && checks > 0),
+    );
+    o.insert(
+        "why".into(),
+        json!(if stub {
+            "🔴 当前是 Dev 桩（本地关键词匹配），耗时恒为 ~0。一个恒 0 的「审核延迟」在看板上\
+             与「审核非常快」长得一模一样，而真相是一次真实审核都没发生过——故本数**不可用于报警**。"
+        } else if checks == 0 {
+            "窗口内一次调用都没有（第 3 层默认关闭，或这段时间没有世界推进过）。\
+             checks = 0 时 avgMsPerCall 给 null 而不是 0：「没调用过」与「调用极快」必须分得开。"
+        } else {
+            "已接真实 provider 且窗口内有调用，本数可用于 RTT 报警。⚠️ 它只覆盖**运行时投影**\
+             这条链；静态内容审核（角色卡 / 世界模板 / 装配钩子 / 入站托梦信）走 \
+             safety::moderate_and_queue，不落本表。"
+        }),
+    );
+    v
+}
+
 async fn recheck_overview(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -1080,6 +1150,7 @@ async fn recheck_overview(
          CAST(COALESCE(SUM(failed_closed), 0) AS BIGINT) AS failed_closed, \
          CAST(COALESCE(SUM(intercepted_before_broadcast), 0) AS BIGINT) AS preemptive, \
          CAST(COALESCE(SUM(provider_stub), 0) AS BIGINT) AS stub_runs, \
+         CAST(COALESCE(SUM(provider_ms), 0) AS BIGINT) AS provider_ms, \
          CAST(COALESCE(MAX(latency_ms), 0) AS BIGINT) AS max_latency \
          FROM safety_recheck_runs WHERE created_at >= $1 AND created_at < $2",
     )
@@ -1154,6 +1225,8 @@ async fn recheck_overview(
             "envs": [ENV_MAX_ATTEMPTS, ENV_TIMEOUT_MS, ENV_BACKOFF_MS],
         },
         "maxLatencyMs": n("max_latency"),
+        // ── 🔴 provider 侧真实耗时（`worlds_ops` 那个 moderationLatency 的数据源） ──
+        "providerLatency": provider_latency_block(n("provider_ms"), n("max_latency"), checks, stub),
         // ── 与 §15 第 4 层（直播场延迟缓冲）的配合 ───────────────────────────
         "interceptedBeforeBroadcast": n("preemptive"),
         "broadcastWindow": {

@@ -38,11 +38,24 @@ struct ScriptedModeration {
     fail: bool,
     stub: bool,
     calls: AtomicUsize,
+    /// 每次 `check_text` 固定睡这么久（0 = 不睡）。
+    delay_ms: u64,
 }
 
 impl ScriptedModeration {
     fn verdict(v: ModerationVerdict) -> Arc<Self> {
-        Arc::new(Self { verdict: v, fail: false, stub: true, calls: AtomicUsize::new(0) })
+        Arc::new(Self { verdict: v, fail: false, stub: true, calls: AtomicUsize::new(0), delay_ms: 0 })
+    }
+    /// 每次调用**慢且失败**。用来断言「报错的调用照算耗时」——
+    /// 用不慢的失败 provider 是断言不出来的（耗时本就 ~0，算不算都一样）。
+    fn failing_slow(delay_ms: u64) -> Arc<Self> {
+        Arc::new(Self {
+            verdict: ModerationVerdict::Approved,
+            fail: true,
+            stub: false,
+            calls: AtomicUsize::new(0),
+            delay_ms,
+        })
     }
     fn failing() -> Arc<Self> {
         Arc::new(Self {
@@ -50,11 +63,23 @@ impl ScriptedModeration {
             fail: true,
             stub: true,
             calls: AtomicUsize::new(0),
+            delay_ms: 0,
         })
     }
     /// 「已接真实服务商」的形状：唯一区别是显式覆写 `is_dev_stub() == false`。
     fn production(v: ModerationVerdict) -> Arc<Self> {
-        Arc::new(Self { verdict: v, fail: false, stub: false, calls: AtomicUsize::new(0) })
+        Arc::new(Self { verdict: v, fail: false, stub: false, calls: AtomicUsize::new(0), delay_ms: 0 })
+    }
+    /// 每次调用固定慢 `delay_ms`。用来断言 `provider_ms` 量的确实是 **provider 那段**——
+    /// 桩的耗时恒为 ~0，用它是断言不出「计时范围对不对」的。
+    fn slow(delay_ms: u64) -> Arc<Self> {
+        Arc::new(Self {
+            verdict: ModerationVerdict::Approved,
+            fail: false,
+            stub: false,
+            calls: AtomicUsize::new(0),
+            delay_ms,
+        })
     }
     fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
@@ -65,6 +90,9 @@ impl ScriptedModeration {
 impl ModerationProvider for ScriptedModeration {
     async fn check_text(&self, _text: &str) -> Result<ModerationVerdict, String> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+        }
         if self.fail {
             Err("provider 不可用（用例注入）".into())
         } else {
@@ -1476,4 +1504,144 @@ fn red_line_sweep_only_reads_the_world_tables() {
             );
         }
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 🔴 ⑪ provider 侧真实耗时（migration 0049）
+//
+// 补的是 `admin_api::worlds_ops` 那条 `TODO(数据源缺失)` 的数据源。要点不在"记了一个数"，
+// 而在**记的是哪一段**：混进 DB 往返的近似值系统性偏大，却看起来完全合理——
+// 比 `audit_queue.reviewed_at`（人审周转，量级差几个数量级）那种一眼假的数更难识破。
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// `provider_ms` 量的是 **provider 那一段**，不是整次尝试。
+#[tokio::test]
+async fn provider_ms_measures_the_provider_call_not_the_whole_attempt() {
+    const DELAY: i64 = 40;
+    let mut state = test_state().await;
+    let provider = ScriptedModeration::slow(DELAY as u64);
+    state.moderation = provider.clone();
+    seed_running_world(&state).await;
+    enable_l3(&state.db, crate::flags::SCOPE_GLOBAL, "").await;
+    seed_tick(&state, "w1", 0, &[pe("de-1", "甲", true), pe("de-2", "乙", true)]).await;
+
+    let r = run_recheck(&state, &job("w1", 0, 1)).await.unwrap();
+    assert_eq!(provider.calls(), 2);
+    assert!(
+        r.provider_ms >= 2 * DELAY - 10,
+        "🔴 两次各慢 {DELAY}ms 的调用必须被计进去，实测 {}ms",
+        r.provider_ms
+    );
+
+    let (total, prov): (i64, i64) = sqlx::query(
+        "SELECT latency_ms, provider_ms FROM safety_recheck_runs WHERE world_id='w1' AND tick_no=0",
+    )
+    .fetch_one(&state.db)
+    .await
+    .map(|row| (row.try_get("latency_ms").unwrap(), row.try_get("provider_ms").unwrap()))
+    .unwrap();
+    assert_eq!(prov, r.provider_ms, "台账落的就是报告里的那个数");
+    assert!(
+        prov <= total,
+        "🔴 provider 段不可能超过全程：provider={prov}ms total={total}ms —— 超了说明计时范围写错了"
+    );
+}
+
+/// 🔴 **报错与超时的调用照算**。剔掉它们会让「provider 开始抖动」在延迟曲线上反而变好看，
+/// 而那正是最该被曲线报出来的时刻。
+#[tokio::test]
+async fn failing_calls_still_count_toward_provider_latency() {
+    const DELAY: i64 = 40;
+    let mut state = test_state().await;
+    // 🔴 必须用**慢且失败**的 provider：不慢的失败 provider 耗时本就 ~0，
+    // 「算不算它」两种实现给出的数一样，用例会假绿（这条是故障注入实测出来的：
+    // 注入「只给成功的调用计时」后，原先写成 `provider_ms >= 0` 的断言照样过）。
+    let provider = ScriptedModeration::failing_slow(DELAY as u64);
+    state.moderation = provider.clone();
+    seed_running_world(&state).await;
+    enable_l3(&state.db, crate::flags::SCOPE_GLOBAL, "").await;
+    seed_tick(&state, "w1", 0, &[pe("de-1", "甲", true), pe("de-2", "乙", true)]).await;
+
+    let r = run_recheck(&state, &job("w1", 0, 1)).await.unwrap();
+    assert_eq!((r.provider_errors, provider.calls()), (2, 2));
+    assert!(
+        r.provider_ms >= 2 * DELAY - 10,
+        "🔴 两次各慢 {DELAY}ms 的**失败**调用必须照计，实测 {}ms —— 把失败调用剔出延迟统计，\
+         会让「provider 开始抖动」在曲线上反而变好看，而那正是最该被曲线报出来的时刻",
+        r.provider_ms
+    );
+
+    // ── 源码级不变式：计时范围由**类型**保证，不由纪律保证 ──────────────────
+    //
+    // ⚠️ 为什么这里必须补一条源码断言，而不是再写一个行为用例：把 `provider_ms` 写成
+    // 「整次尝试的耗时」——最容易犯、也最像对的那种错——在**内存 SQLite** 上与正确实现
+    // 差不到 1ms，任何基于时间的断言都分不开。（这条是故障注入实测出来的：注入该错误后，
+    // 上面那个 `provider_ms_measures_...` 照样绿。）真正能分开它们的是范围本身。
+    let code = strip_comments(include_str!("mod.rs"));
+    assert!(
+        code.contains("async fn check_with_timeout(") && code.contains(") -> (Result<ModerationVerdict, String>, i64)"),
+        "🔴 耗时必须**随裁决一起**从 check_with_timeout 返回。在调用点外面掐表的写法，\
+         日后有人往两条 now_ms() 之间插一句 DB 操作时，编译器不会说什么，而延迟曲线会悄悄偏大"
+    );
+    assert!(
+        code.contains("r.provider_ms += call_ms;"),
+        "🔴 provider_ms 只能从 check_with_timeout 回报的那个值累加"
+    );
+    assert!(
+        !code.contains("r.provider_ms ="),
+        "🔴 provider_ms 只许 `+=`，不许赋值。一旦出现赋值，最可能的形态就是\
+         `r.provider_ms = now_ms() - started`（拿整次尝试冒充 provider 段）—— 那个数\
+         系统性偏大却看起来完全合理，比一眼假的数更难识破"
+    );
+}
+
+/// 运营面：桩的时候明说这个数**不可用于报警**；没调用过时给 `null` 而不是 `0`。
+#[tokio::test]
+async fn provider_latency_readout_refuses_to_look_like_a_fast_provider() {
+    // ① 桩 + 有调用 —— 数出得来，但 usableForAlerting = false。
+    let mut state = test_state().await;
+    state.moderation = ScriptedModeration::verdict(ModerationVerdict::Approved);
+    seed_running_world(&state).await;
+    enable_l3(&state.db, crate::flags::SCOPE_GLOBAL, "").await;
+    seed_tick(&state, "w1", 0, &[pe("de-1", "甲", true)]).await;
+    run_recheck(&state, &job("w1", 0, 1)).await.unwrap();
+
+    let body = crate::safety::semantic::testkit::admin_recheck(&state).await;
+    let pl = &body["providerLatency"];
+    assert_eq!(pl["checks"], 1);
+    assert_eq!(pl["usableForAlerting"], false, "🔴 桩下的耗时不得被当成可报警的 SLA：{pl}");
+    assert!(
+        pl["why"].as_str().unwrap_or("").contains("恒为 ~0"),
+        "🔴 必须说清「恒 0」与「非常快」在看板上长得一样：{pl}"
+    );
+
+    // ② 一次调用都没有 —— avgMsPerCall 必须是 null，不是 0。
+    let empty = test_state().await;
+    let pl2 = crate::safety::semantic::testkit::admin_recheck(&empty).await;
+    let pl2 = &pl2["providerLatency"];
+    assert_eq!(pl2["checks"], 0);
+    assert!(
+        pl2["avgMsPerCall"].is_null(),
+        "🔴 「没调用过」与「调用极快」必须分得开，给 0 就把两者混了：{pl2}"
+    );
+}
+
+/// 真实 provider（`is_dev_stub() == false`）+ 有调用 ⇒ 这个数才开始可用于报警。
+#[tokio::test]
+async fn provider_latency_becomes_usable_once_the_stub_is_replaced() {
+    let mut state = test_state().await;
+    state.moderation = ScriptedModeration::slow(15);
+    seed_running_world(&state).await;
+    enable_l3(&state.db, crate::flags::SCOPE_GLOBAL, "").await;
+    seed_tick(&state, "w1", 0, &[pe("de-1", "甲", true)]).await;
+    run_recheck(&state, &job("w1", 0, 1)).await.unwrap();
+
+    let body = crate::safety::semantic::testkit::admin_recheck(&state).await;
+    let pl = &body["providerLatency"];
+    assert_eq!(pl["usableForAlerting"], true, "{pl}");
+    assert!(pl["avgMsPerCall"].as_i64().unwrap_or(0) >= 5, "{pl}");
+    assert!(
+        pl["why"].as_str().unwrap_or("").contains("只覆盖"),
+        "🔴 就算可报警了，也要说清它只覆盖运行时投影这条链（静态审核不落本表）：{pl}"
+    );
 }

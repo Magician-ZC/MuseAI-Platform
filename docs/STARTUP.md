@@ -425,11 +425,25 @@ curl -H "Authorization: Bearer <admin>" localhost:8787/api/admin/safety/recheck 
 
 ## 9. 已知 seam(明确标注,待接)
 
-- **礼物→LLM 回合真实注入**:gift boon 记入 `arena_env_events` + 进战报,注入引擎回合需 `RoundInput` 扩展。
-- **复活/礼物实际扣费**:记账已在,实际扣费经 billing 集成(跨 feature)。
-- **placement 房同意触发源**:赛事房淘汰处已补同意门控;placement 房的死亡/永久关系触发待叙事迭代。
-- **L2/L3 视觉呈现**:当前 L0 文字流 + L1 结构化卡片(事件卡/关系图谱/状态面板);立绘/切片为 DevProvider 占位。
-- **创作者结算**:与用户钱包是两套账,本期只做用户侧。
+> 📄 **每一条的选项、代价与建议见 `docs/build/open-decisions.md`**。那份文档做的事是
+> 「让决定变得可以做」——本节只登记**有哪些**,不复述怎么权衡(复述必然与那边漂移)。
+
+- **礼物→LLM 回合真实注入**:gift boon 已记入 `arena_env_events` + 进战报 + **已扣费**,
+  唯独不进引擎回合——`RoundInput` 现有字段里没有环境事件位。🔴 难点不是工程是**平权红线**
+  (「不卖胜负与数值平权」),见 open-decisions §5。
+- ~~**复活/礼物实际扣费**~~ —— **早已接完,本条是过期声明**(2026-07-27 核准订正)。
+  复活走 `arena::revive` 的 `ledger::charge`(P2 就做了,与写 grant 同一事务原子,
+  余额不足 409 零副作用);站内打赏走 `livegate` 的 `ledger::charge`(world→模板作者分成、
+  自打赏防刷);外部 webhook **刻意不站内二次扣费**(观众已在直播平台付过,那是红线)。
+- **placement 房同意触发源**:赛事房淘汰处已补同意门控;placement 房的死亡/永久关系
+  **没有触发源**——不是门控缺失,是引擎侧还没有产生这类事件的叙事条件。待叙事迭代。
+- **L2/L3 视觉呈现**:当前 L0 文字流 + L1 结构化卡片(事件卡/关系图谱/状态面板);
+  立绘/切片为 DevProvider 占位。⚠️ 它**等的是凭据不是决定**,同真实审核服务商。
+- **创作者结算**:与用户钱包是两套账,本期只做用户侧。🔴 若涉及真实提现,
+  它本身就是对「无提现」这条**平台红线的修改**,必须走显式评审。
+- **模型备用路由**:`model_routes.routes_json` 里没有这个概念。它不是「缺数据源」而是
+  **缺语义定义**(形状 / 回退触发条件 / 成本口径三件),见 open-decisions §4——
+  那是本清单里最接近「可以直接做」的一项。
 
 ---
 
@@ -438,6 +452,7 @@ curl -H "Authorization: Bearer <admin>" localhost:8787/api/admin/safety/recheck 
 - `PRODUCT.md` — 产品定位一页纸(指向总规格)
 - `docs/API.md` — **平台后端 API 清单**(鉴权级别、feature 门控、admin 角色矩阵。此处曾写「84 条路由」,是本仓库第六处过期计数——路由数以 `app.rs` 为准,本文不复述)
 - `docs/design/README.md` — **客户端与管理后台界面设计索引**(设计决策、页面规格、实现映射、验收图)
+- `docs/build/open-decisions.md` — **待拍板清单**(每项:现状/缺什么/选项与代价/建议/什么证据能 settle 它)。🔴 它记的是「等决定」不是「等做」——一项定了就该从那里消失、在别处成为规则
 - `docs/VALIDATION.md` — **商业验证分阶段计划**(T0-T5、双坐标功能台账、工程三约束、七档状态语言)
 - `docs/build/spec-world-ecosystem.md` — **世界生态总规格 v2**(24 条拍板,产品宪法+系统设计+衔接表+路线图,唯一权威产品文档)
 - `docs/build/rules-anti-farming.md` — 防刷/反重复收益规则(有效规则)

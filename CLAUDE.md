@@ -24,6 +24,8 @@ cd admin && npm run build                                       # admin 类型�
 > 需要当前值时直接跑一遍。同理见 `flags::KNOWN_FLAGS`（开关数）与 `docs/API.md`（路由数）——
 > 三处都已按此原则去掉硬编码计数。
 
+待拍板清单见 `docs/build/open-decisions.md`(工程侧遗留清完之后,剩下的每一项都卡在「该写成什么」而不是「怎么写」)。
+
 接口清单见 `docs/API.md`（路由 / 鉴权级别 / feature 门控 / admin 角色矩阵；改路由必须同步改它）。
 
 R1 批次（总规格 §19 地基批）后新增的 server 模块：

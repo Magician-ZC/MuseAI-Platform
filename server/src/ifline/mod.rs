@@ -156,13 +156,18 @@
 //! 没有「跑但不结算」的开关可拨。宁可在 `runner.rs` 重写一遍「组装 → 跑 → 提交」，
 //! 也不共用那条会自动结算的路径：重复的代价是几百行，复用的代价是这个功能的合规性。
 
+use std::sync::Arc;
+
 use axum::extract::{Path, Query, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{AnyPool, Row};
+
+use muse_engine::model::ModelClient;
 
 use crate::app::AppState;
 use crate::auth::{AdminUser, AuthUser};
@@ -1001,16 +1006,45 @@ async fn my_ifline_detail(
 ///    （`runtime::scheduler_loop` 只扫 `worlds`）；
 /// ② 付费内容的消耗节奏由付费的人掌握，不会在他没看的时候自己烧完。
 ///
-/// ⚠️ **遗留（本批次未做）**：本端点在请求内同步调用模型，长回合会是一个长连接请求。
-/// 生产化应改为「入队 + 后台 worker + 轮询/推送」（`queue` 模块已具备该能力）。
-/// 之所以本批次不做：if 线默认关闭、状态只标到 `Implemented`，而加一条独立的
-/// worker 循环会把改动面显著放大且需要单独评审。已写进 `docs/VALIDATION.md` 的遗留栏。
+/// ✅ **已改为异步（原登记为遗留，migration `0050`）**。此处曾写着：
+///
+/// > 本端点在请求内同步调用模型，长回合会是一个长连接请求……本批次不做，因为加一条独立的
+/// > worker 循环会把改动面显著放大且需要单独评审。
+///
+/// 那条理由已经不成立：同一套形态（独立 topic + 独立 worker 池 + **池大小即成本闸**）
+/// 在 §15 第 3 层与它的补偿轮询上已经跑了两遍，改动面是已知的。而问题本身是真的：
+/// 一次引擎回合几十秒起步，中间占着一个 HTTP 连接——反向代理超时、客户端重试、
+/// 移动网络切换，每一样都会把「已经烧掉的 token」变成「玩家看到失败」。
+/// if 线是**付费**内容（一张副本卡换一条线），这种失配最不该出现在这里。
+///
+/// ════════════════════════════════════════════════════════════════════════════
+/// 🔴 「玩家拉动」这条设计**没有变**
+/// ════════════════════════════════════════════════════════════════════════════
+///
+/// 异步化只是把**模型调用**挪出请求，入队的动作仍然**只由玩家点击触发**。
+/// 没有任何调度器会去扫 `ifline_worlds`（`runtime::scheduler_loop` 只扫 `worlds`），
+/// 付费内容的消耗节奏依旧由付费的人掌握。worker 是「代他跑」，不是「替他决定跑」。
+///
+/// ════════════════════════════════════════════════════════════════════════════
+/// 🔴 契约改了：202 + 轮询，而不是同步回这一拍
+/// ════════════════════════════════════════════════════════════════════════════
+///
+/// 本端点现在回 **202 Accepted**，玩家端改为轮询 `GET /me/iflines/{id}`（拿 `advancePending`
+/// 与 `lastError`）与 `GET /me/iflines/{id}/beats`（拿落定的拍）。
+/// 之所以敢直接翻契约而不是加开关并存两条路：if 线**默认关闭**、状态只到 `Implemented`，
+/// 且玩家端**一行都还没接**（全仓 `src/` 搜不到 `iflines`）。要改契约，此刻是代价最低的时刻；
+/// 同一个端点维持两种返回形态才是真正的债。
+///
+/// ⚠️ **同步版本当场返回的那些拒绝理由不能就此消失**——那正是异步化最容易制造的静默失败。
+/// 便宜且确定的几条仍**留在请求内**（开关关、越权、这条线已收尾）；
+/// 发生在 worker 里的（模型路由没配、主角卡不可读、没有可上场的 NPC……）落进
+/// `ifline_worlds.last_error`，随读取面下发。理由与形态见 migration `0050` 文件头。
 async fn advance_ifline(
     State(state): State<AppState>,
     user: AuthUser,
     Path(ifline_id): Path<String>,
     headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<axum::response::Response, ApiError> {
     ensure_enabled(&state.db, Some(&user.user_id), None).await?;
     let row = fetch_ifline(&state.db, &ifline_id).await?.ok_or(ApiError::NotFound)?;
     // 🔴 越权一律 404（信息边界，§14）：不确认「这条 if 线存在」这件事本身。
@@ -1027,14 +1061,196 @@ async fn advance_ifline(
     let guard =
         idempotency::guard(&state.db, &user.user_id, endpoint, idem_key, &payload_hash).await?;
     if let Some(cached) = &guard.cached_response {
-        return Ok(Json(serde_json::from_str(cached).unwrap_or_else(|_| json!({}))));
+        // 幂等命中：回同一份 202 载荷（同一次点击的 HTTP 重试不该看起来像一次新的受理）。
+        let cached: Value = serde_json::from_str(cached).unwrap_or_else(|_| json!({}));
+        return Ok((StatusCode::ACCEPTED, Json(cached)).into_response());
     }
 
-    let outcome = runner::advance_one_beat(&state, &row, None).await?;
-    let fresh = fetch_ifline(&state.db, &ifline_id).await?.ok_or(ApiError::NotFound)?;
-    let resp = beat_response(&outcome, &fresh);
+    // 🔴 便宜且确定的拒绝**留在请求内**：异步化不该把「这条线已经收尾了」这种一眼可判的事
+    // 变成「点一下、等半天、再去别处查为什么没动」。（拍数到顶那一条不在此列——它会触发收尾，
+    // 是一次真正的状态变更，仍归 worker 走 `advance_one_beat` 的既有路径。）
+    if row.status == runner::STATUS_ENDED {
+        return Err(ApiError::Conflict(format!(
+            "这条 if 线已收尾（{}），不可再推进。终局产物是内容（传记 + 结局名），不是资产——\
+             重开一条 if 线需要另烧副本卡。",
+            if row.ending_reason.is_empty() { "已结束" } else { &row.ending_reason }
+        )));
+    }
+
+    // 🔴 请求层闸（0050）：CAS 抢 `advance_requested_at`，抢不到即 409。
+    // 它挡的是**同一个人连点**——异步之后第二次点击会在第一份任务还没被 worker 取走时就入队，
+    // 排两份、烧两遍。它与 `(ifline_id, beat_no)` 唯一键是两层不同的闸：
+    // 少了唯一键不安全（任务真被投两次时会双跑），少了这一层则要白烧一次调用。
+    //
+    // 🔴 CAS 恒带「或者它已经陈旧」这一支，不可省：`MemQueue` 不持久，进程重启会把在飞的任务
+    // 带走，而这一列已经写下——只认 `= 0` 的话，这条**付费**的 if 线就永久推不动了。
+    let now = now_ms();
+    let stale_before = now - advance_stale_ms();
+    let claimed = sqlx::query(
+        "UPDATE ifline_worlds SET advance_requested_at = $1 \
+         WHERE id = $2 AND (advance_requested_at = 0 OR advance_requested_at < $3)",
+    )
+    .bind(now)
+    .bind(&ifline_id)
+    .bind(stale_before)
+    .execute(&state.db)
+    .await?;
+    if claimed.rows_affected() == 0 {
+        return Err(ApiError::Conflict(
+            "上一次推进还在进行中。等它落定后再点（进度看 GET /me/iflines/{id} 的 advancePending）。\
+             ——这条闸只挡重复点击，不会让你少推一拍。"
+                .into(),
+        ));
+    }
+
+    crate::queue::push_json(
+        &*state.queue,
+        ADVANCE_TOPIC,
+        &AdvanceJob { ifline_id: ifline_id.clone() },
+        now,
+    )
+    .await;
+
+    // 202：**已受理**，不是「已推进」。玩家端轮询 `GET /me/iflines/{id}`。
+    let resp = json!({
+        "accepted": true,
+        "iflineId": ifline_id,
+        "expectedBeatNo": row.beat_count,
+        "advancePending": true,
+        "poll": {
+            "ifline": "GET /api/me/iflines/{id}（advancePending / lastError / beatCount）",
+            "beats": "GET /api/me/iflines/{id}/beats（落定的拍）",
+        },
+        "why": "推进在后台跑：一次引擎回合几十秒起步，占着 HTTP 连接会让代理超时/客户端重试\
+                把已经烧掉的 token 变成「看到失败」。**玩家拉动**这条设计没变——\
+                入队只由你的这次点击触发，没有任何调度器会自己推进 if 线。",
+    });
     guard.store_response(&state.db, &resp.to_string()).await?;
-    Ok(Json(resp))
+    Ok((StatusCode::ACCEPTED, Json(resp)).into_response())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 推进 worker（异步化的执行侧，migration 0050）
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 推进任务队列 topic。与 tick 队列、§15 第 3 层队列**物理隔开**：
+/// 三者的背压不得互相绑架（if 线慢不该让世界少跑拍，反之亦然）。
+const ADVANCE_TOPIC: &str = "ifline_advance";
+
+/// 推进任务载荷。**只带坐标**，不带任何算好的中间态——worker 从库里现读，
+/// 于是任务天然幂等可重放（同 §15 第 3 层的 `RecheckJob`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdvanceJob {
+    ifline_id: String,
+}
+
+/// 在飞请求的陈旧线（§0.2 参数化）。默认 10 分钟——远大于一次回合的耗时，
+/// 又不至于让「进程重启丢了任务」的玩家等太久才能重点。
+const ENV_ADVANCE_STALE_MS: &str = "MUSE_IFLINE_ADVANCE_STALE_MS";
+const DEFAULT_ADVANCE_STALE_MS: i64 = 10 * 60 * 1000;
+
+fn advance_stale_ms() -> i64 {
+    std::env::var(ENV_ADVANCE_STALE_MS)
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_ADVANCE_STALE_MS)
+}
+
+/// worker 并发度（§0.2）。默认 1：**池大小就是成本闸**——if 线烧的是模型 token，
+/// 一批玩家同时点，同时发出的模型调用数就等于这个值。口径同 `MUSE_SAFETY_L3_WORKERS`。
+const ENV_ADVANCE_WORKERS: &str = "MUSE_IFLINE_WORKERS";
+const DEFAULT_ADVANCE_WORKERS: i64 = 1;
+
+/// 启动推进 worker 池（`main` 调用）。
+///
+/// 🔴 与 tick worker、§15 第 3 层 worker **分池**：三者的排队时间互不绑架。
+/// 开关关闭时队列里一个任务都不会有（入队在端点内，端点第一行就是 `ensure_enabled`）。
+pub fn spawn_workers(state: AppState) {
+    let n = std::env::var(ENV_ADVANCE_WORKERS)
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_ADVANCE_WORKERS)
+        .clamp(1, 64) as usize;
+    for _ in 0..n {
+        tokio::spawn(advance_worker_loop(state.clone()));
+    }
+    tracing::info!(
+        workers = n,
+        "if 线推进 worker 已启动（默认关闭，开关 MUSE_IFLINE_PARALLEL；池大小即成本闸）"
+    );
+}
+
+async fn advance_worker_loop(state: AppState) {
+    loop {
+        let Some(job) = crate::queue::pop_json::<AdvanceJob>(&*state.queue, ADVANCE_TOPIC).await
+        else {
+            continue;
+        };
+        // 生产恒传 `None`（用真实模型客户端）。注入位沿用 `advance_one_beat` 既有的那一个——
+        // 不新造 test-only 通路：**成功路径**必须能被用例走到，否则「成功后忘了清在飞标记」
+        // 这类错误只有线上才会显形（实测：故障注入时它确实从所有用例底下溜过去了）。
+        run_advance_job(&state, &job.ifline_id, None).await;
+    }
+}
+
+/// 跑一个推进任务。**任何出口都必须清掉 `advance_requested_at`**，否则玩家再也点不动
+/// （陈旧线兜得住，但那要等 10 分钟——对付费内容来说那已经是事故）。
+async fn run_advance_job(
+    state: &AppState,
+    ifline_id: &str,
+    model_override: Option<Arc<dyn ModelClient>>,
+) {
+    let row = match fetch_ifline(&state.db, ifline_id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            tracing::warn!(ifline = %ifline_id, "if 线推进任务指向的行已不存在，丢弃");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(ifline = %ifline_id, error = %e, "if 线推进任务读行失败");
+            // 读不到行就清不掉标记（连读都失败，写多半也失败）——交给陈旧线兜。
+            return;
+        }
+    };
+    match runner::advance_one_beat(state, &row, model_override).await {
+        Ok(o) => {
+            tracing::info!(
+                ifline = %ifline_id, beat_no = o.beat_no, status = o.status,
+                cost_tokens = o.cost_tokens, "if 线推进落定"
+            );
+            finish_advance(&state.db, ifline_id, None).await;
+        }
+        Err(e) => {
+            // 🔴 原因必须落库：异步化之后这句话没有别的去处，不落就是静默失败。
+            let msg = e.to_string();
+            tracing::warn!(ifline = %ifline_id, error = %msg, "if 线推进失败");
+            finish_advance(&state.db, ifline_id, Some(&msg)).await;
+        }
+    }
+}
+
+/// 清掉在飞标记；失败时同时写下原因，成功时清空原因。
+async fn finish_advance(db: &AnyPool, ifline_id: &str, error: Option<&str>) {
+    let (msg, at) = match error {
+        Some(m) => (m.to_string(), now_ms()),
+        None => (String::new(), 0),
+    };
+    if let Err(e) = sqlx::query(
+        "UPDATE ifline_worlds SET advance_requested_at = 0, last_error = $1, last_error_at = $2 \
+         WHERE id = $3",
+    )
+    .bind(&msg)
+    .bind(at)
+    .bind(ifline_id)
+    .execute(db)
+    .await
+    {
+        // 清不掉标记不是致命的（陈旧线兜得住），但必须留下日志——
+        // 否则「玩家 10 分钟内点不动」会变成一个查不出来源的投诉。
+        tracing::error!(ifline = %ifline_id, error = %e, "if 线推进收尾写库失败（陈旧线将兜底）");
+    }
 }
 
 /// 一拍的响应体。恒带层次标签 —— 与 if 线的其它读取面同口径。
@@ -1302,7 +1518,8 @@ const IFLINE_COLUMNS: &str = "id, owner_id, character_id, origin_world_id, origi
      origin_template_version, fork_point, fork_tick_no, fork_state_revision, state_fidelity, \
      snapshot_json, redaction_json, protagonist_in_snapshot, premise, premise_moderation, \
      cost_card_ids_json, status, fork_key, created_at, run_seed, live_state_json, live_revision, \
-     beat_count, cast_json, cost_tokens_total, ending_reason, ending_label, ended_at";
+     beat_count, cast_json, cost_tokens_total, ending_reason, ending_label, ended_at, \
+     advance_requested_at, last_error, last_error_at";
 
 #[derive(Debug, Clone)]
 struct IflineRow {
@@ -1333,6 +1550,12 @@ struct IflineRow {
     /// 活态修订号（推进的 CAS 令牌）。
     live_revision: i64,
     beat_count: i64,
+    /// 「已请求推进、尚未落定」的时刻（0 = 当前没有在飞的请求）。0050 加，异步推进的请求层闸。
+    advance_requested_at: i64,
+    /// 上一次推进失败的原因（面向玩家；异步化之后它是这句话唯一的去处）。成功即清空。
+    last_error: String,
+    /// 上一次推进失败的时刻（0 = 从未失败 / 已被成功清空）。
+    last_error_at: i64,
     /// 阵容与场景（首次推进时从原世界装配复制一次后钉死）。
     cast_json: String,
     /// 🔴 累计 token 开销。**花出去的成本，不是发下来的收益**——本表唯一的数字列，方向与产出相反。
@@ -1372,6 +1595,9 @@ impl IflineRow {
             ending_reason: r.try_get("ending_reason").unwrap_or_default(),
             ending_label: r.try_get("ending_label").unwrap_or_default(),
             ended_at: r.try_get("ended_at").unwrap_or(None),
+            advance_requested_at: r.try_get("advance_requested_at").unwrap_or(0),
+            last_error: r.try_get("last_error").unwrap_or_default(),
+            last_error_at: r.try_get("last_error_at").unwrap_or(0),
         })
     }
 }
@@ -1443,6 +1669,22 @@ fn ifline_response(row: &IflineRow, created: bool, include_snapshot: bool) -> Va
         },
         // ── 推进（0041） ──
         "progress": runner::progress_json(row),
+        // ── 异步推进的可观测面（0050）：POST 回 202 之后，玩家端靠这两项知道进展 ──
+        //
+        // 🔴 `lastError` 是异步化的**必要配套**，不是附赠：同步版本里「为什么没推进」是当场
+        // 返回的那句话，改成异步后它没有别的去处，不落库就是静默失败（玩家点一下、
+        // 什么都没发生、也没有解释）。成功一次即清空。
+        "advance": {
+            "pending": row.advance_requested_at > 0,
+            "requestedAt": if row.advance_requested_at > 0 { json!(row.advance_requested_at) } else { Value::Null },
+            "lastError": if row.last_error.is_empty() { Value::Null } else { json!(row.last_error) },
+            "lastErrorAt": if row.last_error_at > 0 { json!(row.last_error_at) } else { Value::Null },
+            "staleAfterMs": advance_stale_ms(),
+            "note": "POST /me/iflines/{id}/beats 回 202（已受理，非已推进），模型调用在后台 worker 里跑。\
+                     pending 为 true 时重复点击会被 409 挡掉（只挡重复点击，不会让你少推一拍）。\
+                     ⚠️ 队列不持久：进程重启会带走在飞的任务，届时 pending 会挂到 staleAfterMs 才自动解除\
+                     ——那是**让你能再点一次**，不是自动把丢掉的那次补上。",
+        },
         // 🔴 终局投影恒带 `grantedAssets: []`：对客户端和玩家直说「你读到的是内容，账户里什么都没多」。
         "ending": runner::ending_json(row),
         "redaction": parse_json_col(&row.redaction_json),

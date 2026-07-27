@@ -112,6 +112,7 @@ cd server && MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo ru
 | `MUSE_SAFETY_LEXICON` | **开启** | 运行时敏感词库总开关(§15 第 2 层)。**默认开启且应保持开启**——内容安全是合规主体责任下的恒开设施,此开关定位是误伤应急阀,不是灰度位 |
 | `MUSE_SAFETY_LEXICON_EXTRA` | 空 | 运营补充敏感词(逗号/分号/换行分隔),归类 `custom`、低危 |
 | `MUSE_SAFETY_RUNTIME_AUDIT` | `high` | 运行时命中入人审队列的策略:`high`(仅高危)/`all`/`none`。**命中一律记 risk_events**,本开关只管是否额外入 `audit_queue`(每 tick 每事件都入队会淹掉人审)。配错值回落 `high`,不静默放宽或收紧 |
+| `MUSE_IFLINE_ADVANCE_STALE_MS` | `600000`(10min) | if 线推进「在飞」标记的陈旧线(migration 0050)。推进已改异步:端点回 202、模型调用在后台 worker 跑,在飞期间重复点击 409。🔴 **这一列不可省**:`MemQueue` 不持久,进程重启会带走在飞任务而标记已写下——没有陈旧线,这条**付费**的 if 线就永久推不动了(玩家已烧掉副本卡)。⚠️ 陈旧线只是**让玩家能再点一次**,不是自动补上丢掉的那次。同组 `MUSE_IFLINE_WORKERS`(默认 1,**池大小即成本闸**) |
 | `MUSE_SAFETY_RECHECK_SWEEP` | **关闭** | 第 3 层复核的**补偿轮询**(扫尾未复核拍)。内存队列不持久,进程重启会把在飞的复核任务带走;另有一类拍(tick 走 blocked / cas_conflict 收尾)压根没经过入队那一行。开着它才会按 `world_ticks ⋈ safety_recheck_runs` 对账补投。🔴 **有真实覆盖上限**:只回看 `MUSE_SAFETY_L3_SWEEP_LOOKBACK_MS`(默认 24h),挂机超过这段的拍**永远补不回来**——`GET /api/admin/safety/recheck` 的 `durability.justOutsideWindow` 就是量它的。🔴 **单实例**:多实例同开会重复补投(重复的 provider 调用是真烧的),同 `world_events.sequence` 那条,属发布纪律。调参前缀 `MUSE_SAFETY_L3_SWEEP_*`(间隔 / 宽限 / 回看 / 批量) |
 | `MUSE_CORS_ORIGINS` | 本地开发六项(见下) | 跨源白名单(逗号分隔)。**三个前端都与 server 不同源**:玩家端 Vite `:1420`、运营后台 Vite `:1430`、Tauri webview(`tauri://localhost` / `https://tauri.localhost`),而 server 在 `:8787`。🔴 **生产必配**——不配则只放行本地开发来源,线上域名会被拦。非法条目跳过并告警,全部非法则退化为「不放行任何跨源」(fail-closed:配错了宁可前端连不上、立刻可见,也不静默放宽成通配)。**刻意不提供通配选项**:这些接口虽有 JWT 鉴权,放开任意源仍是无谓攻击面 |
 
@@ -222,8 +223,8 @@ cd server && MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo ru
 ```bash
 # 引擎 + 后端 + 桌面壳
 cargo test --manifest-path crates/muse-engine/Cargo.toml          # 291 passed
-(cd server && cargo test)                                          # 1035 passed(default,含黄金世界回归)
-(cd server && cargo test --features billing,arena)                 # 1113 passed
+(cd server && cargo test)                                          # 1041 passed(default,含黄金世界回归)
+(cd server && cargo test --features billing,arena)                 # 1119 passed
 (cd server && cargo test golden)                                   # 14 passed(12 项 runtime::golden::* + 2 项录放 round-trip)
 cargo test --manifest-path src-tauri/Cargo.toml                    # 216 passed
 # 前端 + 后台

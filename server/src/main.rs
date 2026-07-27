@@ -122,6 +122,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `world_ticks ⋈ safety_recheck_runs` 对账，把没有终局复核行的拍补投回去。
     // 默认关闭（`MUSE_SAFETY_RECHECK_SWEEP`），关着时这条循环只做一次开关解析。
     safety::semantic::sweep::spawn_sweeper(state.clone());
+    // if 线推进 worker（0050）：把模型调用挪出 HTTP 请求。**与 tick / 第 3 层分池**——
+    // 三者的排队时间互不绑架。🔴「玩家拉动」这条设计没变：入队只由玩家点击触发，
+    // 没有任何调度器会自己推进 if 线。默认关闭（`MUSE_IFLINE_PARALLEL`）。
+    ifline::spawn_workers(state.clone());
     // 通知 outbox 消费
     notifications::spawn_outbox_worker(state.clone());
 

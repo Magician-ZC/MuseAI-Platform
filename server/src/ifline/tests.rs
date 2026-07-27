@@ -1830,3 +1830,232 @@ async fn failed_beat_still_advances_the_counter_so_the_line_never_deadlocks() {
     .unwrap();
     assert_eq!(cost, 0, "失败拍不该计成本");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 🔴 异步推进（migration 0050）：契约从「同步回这一拍」翻成「202 + 轮询」
+//
+// 这一节存在的直接原因：改契约时发现**端点这一层几乎没有覆盖**——既有用例全是直接调
+// `runner::advance_one_beat`，于是把同步契约整个翻掉，一条用例都没红。
+// 下面这几条钉的正是异步化**新引入**的那些失败形态，而不是重复验证 runner 已经验过的东西。
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 直接读库里那三列（0050），不经读取面——要验的是落库本身。
+async fn advance_latch(state: &AppState, id: &str) -> (i64, String, i64) {
+    let r = sqlx::query(
+        "SELECT advance_requested_at, last_error, last_error_at FROM ifline_worlds WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    (
+        r.try_get("advance_requested_at").unwrap(),
+        r.try_get("last_error").unwrap(),
+        r.try_get("last_error_at").unwrap(),
+    )
+}
+
+/// 🔴 POST 回 **202「已受理」**而不是「已推进」，且请求内**一次模型都不调**。
+#[tokio::test]
+async fn advance_returns_202_and_never_calls_the_model_in_request() {
+    let state = test_state().await;
+    let id = seed_open_ifline(&state).await;
+    let tk = token(&state, "u1");
+
+    let (st, body) =
+        send(&state, "POST", &format!("/api/me/iflines/{id}/beats"), &tk, Some(json!({})), None).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "🔴 契约是「已受理」，不是「已推进」: {body}");
+    assert_eq!(body["accepted"], true);
+    assert_eq!(body["advancePending"], true);
+    assert_eq!(body["expectedBeatNo"], 0);
+    assert!(body.get("beat").is_none(), "202 不该回一拍的内容 —— 它还没跑");
+
+    // 在飞标记已落库；玩家端从读取面也看得见。
+    let (at, err, _) = advance_latch(&state, &id).await;
+    assert!(at > 0, "🔴 请求层闸必须落库，否则重复点击挡不住");
+    assert!(err.is_empty());
+    let (_st, v) = send(&state, "GET", &format!("/api/me/iflines/{id}"), &tk, None, None).await;
+    assert_eq!(v["advance"]["pending"], true, "{v}");
+    assert!(v["advance"]["lastError"].is_null());
+
+    // 队列里确实有那份任务（否则就是「受理了但没人干」）。
+    let job: super::AdvanceJob = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        crate::queue::pop_json(&*state.queue, super::ADVANCE_TOPIC),
+    )
+    .await
+    .expect("应当已入队")
+    .expect("载荷可解析");
+    assert_eq!(job.ifline_id, id);
+}
+
+/// 🔴 **重复点击被请求层挡下**。异步之前这件事由 `(ifline_id, beat_no)` 唯一键天然承担
+/// （请求还没回来，第二次点击必撞）；异步之后第二次点击会在第一份任务还没被取走时就入队，
+/// 排两份、**烧两遍**。故必须在请求这一层再加一道闸。
+#[tokio::test]
+async fn a_second_click_is_rejected_while_one_advance_is_in_flight() {
+    let state = test_state().await;
+    let id = seed_open_ifline(&state).await;
+    let tk = token(&state, "u1");
+    let path = format!("/api/me/iflines/{id}/beats");
+
+    let (st, _) = send(&state, "POST", &path, &tk, Some(json!({})), None).await;
+    assert_eq!(st, StatusCode::ACCEPTED);
+    let (st, body) = send(&state, "POST", &path, &tk, Some(json!({})), None).await;
+    assert_eq!(st, StatusCode::CONFLICT, "🔴 在飞期间不得再受理: {body}");
+    assert!(
+        body["error"]["message"].as_str().unwrap_or("").contains("不会让你少推一拍"),
+        "拒绝文案要说清这只挡重复点击，别让玩家以为丢了一拍: {body}"
+    );
+
+    // 队列里**只有一份**。
+    assert!(pop_advance(&state).await.is_some());
+    assert!(pop_advance(&state).await.is_none(), "🔴 第二次点击不得入队 —— 那是白烧一次模型调用");
+}
+
+async fn pop_advance(state: &AppState) -> Option<super::AdvanceJob> {
+    tokio::time::timeout(
+        std::time::Duration::from_millis(150),
+        crate::queue::pop_json(&*state.queue, super::ADVANCE_TOPIC),
+    )
+    .await
+    .ok()
+    .flatten()
+}
+
+/// 🔴 **失败原因必须落库**——异步化最容易制造的静默失败就在这里。
+///
+/// 同步版本里「原世界模型路由未配置」是当场返回给玩家的那句话；改成异步后它发生在 worker 里，
+/// 不落库就彻底消失：玩家点一下、什么都没发生、也没有任何解释。
+/// 本用例走 dev 态（没有模型路由），让 worker 真的失败一次。
+#[tokio::test]
+async fn worker_failure_is_recorded_not_swallowed() {
+    let state = test_state().await;
+    let id = seed_open_ifline(&state).await;
+    let tk = token(&state, "u1");
+    // 制造一个**与同步版本逐字相同**的拒绝理由：原世界钉住的模型路由不可解析。
+    sqlx::query("DELETE FROM model_routes").execute(&state.db).await.unwrap();
+    send(&state, "POST", &format!("/api/me/iflines/{id}/beats"), &tk, Some(json!({})), None).await;
+
+    super::run_advance_job(&state, &id, None).await;
+
+    let (at, err, err_at) = advance_latch(&state, &id).await;
+    assert_eq!(at, 0, "🔴 任何出口都必须清掉在飞标记，否则玩家要等到陈旧线才能再点");
+    assert!(!err.is_empty(), "🔴 失败原因必须留下来，否则就是静默失败");
+    assert!(err.contains("模型路由"), "留下的应当是**给玩家看的那句话**，不是内部码: {err}");
+    assert!(err_at > 0);
+
+    // 读取面下发它。
+    let (_st, v) = send(&state, "GET", &format!("/api/me/iflines/{id}"), &tk, None, None).await;
+    assert_eq!(v["advance"]["pending"], false);
+    assert!(v["advance"]["lastError"].as_str().unwrap_or("").contains("模型路由"), "{v}");
+
+    // 清掉标记之后可以再点（失败不该把这条付费的线锁死）。
+    let (st, _) = send(&state, "POST", &format!("/api/me/iflines/{id}/beats"), &tk, Some(json!({})), None).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "🔴 上一次失败不得挡住下一次尝试");
+}
+
+/// 🔴 **成功之后必须清掉在飞标记**。忘了清，玩家要等到陈旧线（默认 10 分钟）才能推下一拍——
+/// 对付费内容来说那已经是事故。
+///
+/// ⚠️ 这条是**故障注入补出来的**：只覆盖失败路径时，「成功后不清标记」这个注入从所有用例底下
+/// 溜了过去。走成功路径需要注入模型，故 `run_advance_job` 沿用 `advance_one_beat` 既有的
+/// `model_override` 位（生产恒传 `None`），而不是新造一条 test-only 通路。
+#[tokio::test]
+async fn a_successful_advance_clears_the_in_flight_latch() {
+    let state = test_state().await;
+    let id = seed_open_ifline(&state).await;
+    let tk = token(&state, "u1");
+    send(&state, "POST", &format!("/api/me/iflines/{id}/beats"), &tk, Some(json!({})), None).await;
+    let (at, _, _) = advance_latch(&state, &id).await;
+    assert!(at > 0, "前提：受理后标记是立着的");
+
+    // 🔴 先造一条**上一次的失败原因**：不这么做，下面「成功要清空它」那条断言恒真——
+    // 故障注入实测过，「清了标记但没清错误」的写法能从它底下溜过去。
+    sqlx::query("UPDATE ifline_worlds SET last_error = $1, last_error_at = $2 WHERE id = $3")
+        .bind("上一次的旧错误")
+        .bind(crate::db::now_ms() - 60_000)
+        .bind(&id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    let model = ScriptedModel::new();
+    let mc: Arc<dyn TestModelClient> = model.clone();
+    super::run_advance_job(&state, &id, Some(mc)).await;
+
+    let (at, err, err_at) = advance_latch(&state, &id).await;
+    assert_eq!(at, 0, "🔴 成功之后必须清掉在飞标记，否则玩家 10 分钟内点不动下一拍");
+    assert!(
+        err.is_empty(),
+        "🔴 成功还必须清掉上一次的失败原因，否则一条早已解决的旧错误会一直挂在读取面上，\
+         玩家/运营会照着它去查一个不存在的问题。实得：{err}"
+    );
+    assert_eq!(err_at, 0, "🔴 时刻也要一起清");
+
+    // 真的推进了一拍，且可以立刻点下一拍。
+    let (_st, beats) = send(&state, "GET", &format!("/api/me/iflines/{id}/beats"), &tk, None, None).await;
+    assert_eq!(beats["items"].as_array().map(|a| a.len()).unwrap_or(0), 1, "{beats}");
+    let (st, _) = send(&state, "POST", &format!("/api/me/iflines/{id}/beats"), &tk, Some(json!({})), None).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "🔴 上一拍落定后应当能立刻推下一拍");
+}
+
+/// 🔴 **陈旧线兜住「队列把任务弄丢了」**——这是异步化引入的、比原问题更糟的死锁风险。
+///
+/// `MemQueue` 不持久：进程重启会带走在飞的任务，而 `advance_requested_at` 已经写下。
+/// 若 CAS 只认 `= 0`，这条**付费**的 if 线就永久推不动，而玩家已经烧掉了副本卡。
+#[tokio::test]
+async fn a_stale_in_flight_latch_does_not_lock_the_paid_line_forever() {
+    let state = test_state().await;
+    let id = seed_open_ifline(&state).await;
+    let tk = token(&state, "u1");
+    let path = format!("/api/me/iflines/{id}/beats");
+
+    // 模拟「入队后进程重启，任务丢了」：标记留在库里，队列里什么都没有。
+    let long_ago = crate::db::now_ms() - super::advance_stale_ms() - 1_000;
+    sqlx::query("UPDATE ifline_worlds SET advance_requested_at = $1 WHERE id = $2")
+        .bind(long_ago)
+        .bind(&id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    let (st, body) = send(&state, "POST", &path, &tk, Some(json!({})), None).await;
+    assert_eq!(
+        st,
+        StatusCode::ACCEPTED,
+        "🔴 陈旧的在飞标记必须能被重新抢占 —— 否则丢一次任务 = 这条付费的线永久报废: {body}"
+    );
+
+    // 而**没到**陈旧线的标记仍然挡得住（这一支不能因为上面那支而失效）。
+    let recent = crate::db::now_ms() - 1_000;
+    sqlx::query("UPDATE ifline_worlds SET advance_requested_at = $1 WHERE id = $2")
+        .bind(recent)
+        .bind(&id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let (st, _) = send(&state, "POST", &path, &tk, Some(json!({})), None).await;
+    assert_eq!(st, StatusCode::CONFLICT, "🔴 新鲜的在飞标记必须照常挡住重复点击");
+}
+
+/// 🔴 「玩家拉动」这条设计**没有因为异步化而改变**：没有任何调度器会去碰 `ifline_worlds`。
+/// 源码级断言——它一旦被改成「调度器扫 ifline」，付费内容就会在玩家没看的时候自己烧完。
+#[test]
+fn red_line_no_scheduler_ever_touches_iflines() {
+    let runtime_src = include_str!("../runtime/mod.rs");
+    for forbidden in ["ifline_worlds", "ifline_beats", "ifline::spawn_workers"] {
+        assert!(
+            !runtime_src.contains(forbidden),
+            "🔴 runtime（世界调度器）出现了「{forbidden}」——if 线必须由玩家一拍一拍拉动，\
+             不是被调度器推动。付费内容的消耗节奏必须由付费的人掌握。"
+        );
+    }
+    // 入队只在端点里发生（玩家点击触发），worker 只负责「代他跑」。
+    let ifline_src = include_str!("mod.rs");
+    assert_eq!(
+        ifline_src.matches("push_json(").count(),
+        1,
+        "🔴 推进任务的入队点必须只有一处（端点内）——多一处就可能是「有人替玩家决定推进」"
+    );
+}

@@ -743,11 +743,13 @@ impl HttpModerationConfig {
     /// 把裁决标签映射成 [`ModerationVerdict`]。未映射到任何一张表 → `Err`（见模块头）。
     fn map_label(&self, label: &str) -> Result<ModerationVerdict, String> {
         let k = label.trim().to_ascii_lowercase();
-        if self.approved.iter().any(|v| *v == k) {
+        // `contains` 而不是 `iter().any(|v| *v == k)`：等价但少一层闭包，且意图更直白
+        // （clippy::perf 的 `manual_contains`）。三张表都是小 Vec<String>，语义不变。
+        if self.approved.contains(&k) {
             Ok(ModerationVerdict::Approved)
-        } else if self.rejected.iter().any(|v| *v == k) {
+        } else if self.rejected.contains(&k) {
             Ok(ModerationVerdict::Rejected)
-        } else if self.pending.iter().any(|v| *v == k) {
+        } else if self.pending.contains(&k) {
             Ok(ModerationVerdict::Pending)
         } else {
             Err(format!(

@@ -41,13 +41,27 @@ npm run test -- src/__tests__/settings-store.test.ts   # 跑单个前端测试�
 npx vitest run -t "测试名"                              # 按测试名过滤
 cargo test --manifest-path src-tauri/Cargo.toml         # Rust 测试
 cargo test --manifest-path src-tauri/Cargo.toml tool_read_returns_line_numbers  # 单个 Rust 测试
-npm run build            # tsc 类型检查 + vite build（没有配置 ESLint，tsc 就是唯一静态检查）
+npm run build            # tsc 类型检查 + vite build（前端没有配置 ESLint，tsc 就是唯一静态检查；Rust 侧见下方 clippy）
 npm run tauri build      # 打生产安装包
 ```
 
 CI（`.github/workflows/test.yml`）在 push/PR 时跑三个 job：`frontend-test`（`npm run test` + `npm run build`）、
-`rust-test`（桌面轨 `src-tauri` cargo test）、`platform-test`（`muse-engine` + `server` 双 feature 组合 + `admin` 构建）。
-改动前本地先过对应那几样。基线数字见 `docs/STARTUP.md` §7。
+`rust-test`（桌面轨 `src-tauri` cargo test + clippy）、`platform-test`（`muse-engine` + `server` 双 feature 组合
++ Postgres 那遍 + clippy + `admin` 构建）。改动前本地先过对应那几样。基线数字见 `docs/STARTUP.md` §7。
+
+**Rust 静态检查**（2026-07-27 接入，此前一个都没有）：三个 crate 各跑一道 clippy，
+**范围刻意收窄**为 `correctness` / `suspicious` / `perf` 三类，其余（style / pedantic /
+complexity / 文档排版）一律关掉。不是「先松后紧」——前者指向「这段代码在某些输入下会做错事」，
+后者指向「换个写法更好看」；塞进同一道门，几十条排版噪声会淹掉一条真问题，然后所有人学会
+忽略这道门，那比没有门更糟。本地复现：
+
+```bash
+cargo clippy --manifest-path server/Cargo.toml --all-targets -- \
+  -A clippy::all -D clippy::correctness -D clippy::suspicious -D clippy::perf
+```
+
+这道门的用法是**「要么修，要么带理由 `#[allow]`」**——例：`interventions::tests` 上那条
+`await_holding_lock` 是有意的（测试用的进程级 env 串行化锁，不跨 await 持有等于没锁）。
 
 发布：推 `v*` tag 触发 `release.yml` 三平台打包。发版需同步改三处版本号：`package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`（提交习惯为 `release: vX.Y.Z`）。
 

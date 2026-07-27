@@ -97,7 +97,7 @@ pub fn rule_merge(discoveries: &[ChapterDiscovery]) -> (Vec<RosterEntry>, Vec<Ve
             if let Some(cluster) = ambiguous_cluster(s, &surfaces) {
                 unresolved.push(cluster);
             } else {
-                resolved.push(make_entry(&[s.clone()], &freq));
+                resolved.push(make_entry(std::slice::from_ref(s), &freq));
             }
         }
     }

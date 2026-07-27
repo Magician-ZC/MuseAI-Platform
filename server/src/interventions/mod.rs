@@ -300,6 +300,15 @@ async fn my_interventions(
 }
 
 #[cfg(test)]
+// 🔴 `await_holding_lock`：本模块用例经 `quota_guard()` 拿一把**进程级 env 锁**，
+// 并**刻意跨 await 持有**——`MUSE_DREAM_QUOTA_PER_STAGE` 是进程级的，而用例与其它模块
+// 同属一个测试二进制、默认并发跑；不跨 await 持有，锁就只覆盖到第一个 `.await` 之前，
+// 等于没锁（症状是单跑必绿、全跑偶发红，本轮在 `ContainerSwitch` 上实际踩过一次）。
+//
+// 安全性：`#[tokio::test]` 默认 current_thread 运行时，一个用例一个运行时，
+// 不存在「同一线程上另一个任务来抢同一把 std::sync::Mutex」这个死锁前提；
+// 跨线程的并发用例由这把锁**正确串行化**，那正是它存在的理由。
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use crate::safety::testkit::*;

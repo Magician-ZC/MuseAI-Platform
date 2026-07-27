@@ -51,6 +51,12 @@ jobs:
       - name: Run Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
+      # 范围与 platform-test 里那道完全一致（理由见那里的长注释）。
+      - name: Clippy (correctness / suspicious / perf)
+        run: |
+          cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- \
+            -A clippy::all -D clippy::correctness -D clippy::suspicious -D clippy::perf
+
   # 平台轨（muse-engine + server + admin）。桌面轨的系统依赖（webkit 等）在此不需要，
   # 两个 crate 均为纯 Rust，且各自独立成包——仓库根没有 workspace Cargo.toml。
   platform-test:
@@ -135,6 +141,32 @@ jobs:
         env:
           MUSE_TEST_DATABASE_URL: postgres://muse:muse@localhost:5432/muse_test
           MUSE_TEST_SCHEMA_PREFIX: muse_full_ba
+
+
+      # ---- Rust 静态检查（本仓库此前**一个都没有**） ----
+      #
+      # 🔴 **范围是刻意收窄的**：只 deny `correctness` / `suspicious` / `perf` 三类，
+      # 其余（style / pedantic / complexity / doc 排版）一律 `-A clippy::all` 关掉。
+      #
+      # 不是「先松后紧」，是**这三类和其余几类不是一回事**：前者指向「这段代码在某些
+      # 输入下会做错事 / 会白花开销」，后者指向「换个写法更好看」。把两者塞进同一道门，
+      # 结果必然是几十条排版噪声淹掉一条真问题，然后所有人学会忽略这道门——
+      # 那比没有门更糟（一道被无视的门会让人以为已经检查过了）。
+      #
+      # 首次接入时实际扫出的东西也印证了这个取舍：三个 crate 一共 17 处，
+      # 全部落在这三类里（`.expect(&format!(..))` 无条件分配 ×7、`&[x.clone()]` 可换
+      # `slice::from_ref` ×3、`contains` ×3、跨 await 持锁 ×7），
+      # 而被关掉的那几类有 26 条纯文档排版。
+      #
+      # ⚠️ 跨 await 持锁那 7 处经审查是**有意的**（测试用的进程级 env 串行化锁，
+      # 不跨 await 持有等于没锁），故在 `interventions::tests` 上带理由 `#[allow]`，
+      # 而不是改行为——这道门的用法是「要么修，要么写清楚为什么不修」。
+      - name: Clippy (correctness / suspicious / perf)
+        run: |
+          for m in crates/muse-engine/Cargo.toml server/Cargo.toml; do
+            cargo clippy --manifest-path "$m" --all-targets -- \
+              -A clippy::all -D clippy::correctness -D clippy::suspicious -D clippy::perf
+          done
 
       - name: Setup Node
         uses: actions/setup-node@v4

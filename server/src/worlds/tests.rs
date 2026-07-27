@@ -2751,7 +2751,7 @@ mod series_autoscale {
         assert_eq!(join(&app, &state, &wid, "uA", "cA").await.0, StatusCode::OK);
         let (st, body) = join(&app, &state, &wid, "uB", "cB").await;
         assert_eq!(st, StatusCode::CONFLICT, "满员仍是 409（扩容不改变「这一号进不去」的事实）: {body}");
-        let next = next_world_id(&body).expect(&format!("应指路下一号实例: {body}"));
+        let next = next_world_id(&body).unwrap_or_else(|| panic!("应指路下一号实例: {body}"));
         assert_ne!(next, wid);
 
         // 2 号真的落库并登记为第 2 号。
@@ -2794,7 +2794,7 @@ mod series_autoscale {
 
         assert_eq!(join(&app, &state, &wid, "uA", "cA").await.0, StatusCode::OK);
         let (_st, body) = join(&app, &state, &wid, "uB", "cB").await;
-        let next = next_world_id(&body).expect(&format!("{body}"));
+        let next = next_world_id(&body).unwrap_or_else(|| panic!("{body}"));
 
         let a = load_world(&state.db, &wid).await.unwrap();
         let b = load_world(&state.db, &next).await.unwrap();
@@ -2844,7 +2844,7 @@ mod series_autoscale {
 
         assert_eq!(join(&app, &state, &wid, "uA", "cA").await.0, StatusCode::OK);
         let (_st, body) = join(&app, &state, &wid, "uB", "cB").await;
-        let next = next_world_id(&body).expect(&format!("{body}"));
+        let next = next_world_id(&body).unwrap_or_else(|| panic!("{body}"));
 
         // ① 扩容没有替任何人占座。
         let seated: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_members WHERE world_id = $1")
@@ -2883,7 +2883,7 @@ mod series_autoscale {
 
         assert_eq!(join(&app, &state, &wid, "u1", "c1").await.0, StatusCode::OK);
         let (_s, body) = join(&app, &state, &wid, "u2", "c2").await;
-        let second = next_world_id(&body).expect(&format!("{body}"));
+        let second = next_world_id(&body).unwrap_or_else(|| panic!("{body}"));
         assert_eq!(join(&app, &state, &second, "u2", "c2").await.0, StatusCode::OK);
 
         // 两号都满 → 第三个玩家撞满员：仍是 409，但**没有指路**，也没有第 3 个世界。
@@ -2927,9 +2927,9 @@ mod series_autoscale {
         let (_s2, b2) = join(&app, &state, &wid, "u2", "c2").await;
         let (_s3, b3) = join(&app, &state, &wid, "u3", "c3").await;
         let (_s4, b4) = join(&app, &state, &wid, "u4", "c4").await;
-        let n2 = next_world_id(&b2).expect(&format!("{b2}"));
-        let n3 = next_world_id(&b3).expect(&format!("{b3}"));
-        let n4 = next_world_id(&b4).expect(&format!("{b4}"));
+        let n2 = next_world_id(&b2).unwrap_or_else(|| panic!("{b2}"));
+        let n3 = next_world_id(&b3).unwrap_or_else(|| panic!("{b3}"));
+        let n4 = next_world_id(&b4).unwrap_or_else(|| panic!("{b4}"));
         assert_eq!(n2, n3, "第二、三个撞满员的玩家应被指向同一号");
         assert_eq!(n3, n4, "第四个同理");
         assert_eq!(count_sql(&state, "SELECT COUNT(*) FROM worlds").await, 2, "重复触发不得重复建世界");

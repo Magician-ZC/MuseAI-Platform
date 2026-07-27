@@ -745,7 +745,7 @@ mod tests {
         // 使用日志中该包引用清空（该条仅含 A → 整条移除）
         assert!(ks.get_usage("run-1").unwrap().is_empty());
         // 检索入口不可再访问
-        assert!(ks.search(&[a.id.clone()], "战术", 5).unwrap().is_empty());
+        assert!(ks.search(std::slice::from_ref(&a.id), "战术", 5).unwrap().is_empty());
         // 仅保留 {packId, deletedAt} 审计
         let audit: Vec<DeletedRecord> = read_json(host.fs.as_ref(), &deleted_path()).unwrap();
         assert!(audit.iter().any(|r| r.pack_id == a.id && r.deleted_at == 1_000));

@@ -1354,7 +1354,8 @@ async fn single_world_runs_full_lifecycle_and_reports_structured_result() {
     }
 
     // 单世界也能直接出三指标（口径与批量完全一致，只是分母是 1）。
-    let q = WorldQualityReport::of(&[record.facts.clone()]);
+    // `from_ref` 而不是 `&[x.clone()]`：借一片长度为 1 的切片，不必克隆整个 facts。
+    let q = WorldQualityReport::of(std::slice::from_ref(&record.facts));
     assert_eq!(q.completion.worlds, 1);
     assert_eq!(q.completion.natural, 1);
     assert!((q.completion.completion_rate() - 1.0).abs() < 1e-9);

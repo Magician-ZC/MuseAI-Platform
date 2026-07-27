@@ -988,11 +988,8 @@ async fn join_world(
         // 用 403（而非本端点资格类拒绝惯用的 409）：这是永久禁入而非可解冲突，重试不可能通过；
         // 语义与既有红线先例（billing 拒充）逐字一致。前端已从世界详情拿到 deathContractRequired，
         // 可在投放前就把「未成年不可进入生死状世界」讲清楚，不必依赖本响应体文案。
-        let age: Option<(i64,)> = sqlx::query_as("SELECT age_declared FROM users WHERE id = $1")
-            .bind(&user.user_id)
-            .fetch_optional(&state.db)
-            .await?;
-        if !matches!(age, Some((1,))) {
+        // 🔴 全仓唯一的「已声明成年」判定（真红线 §0.4），见 `auth::is_declared_adult`。
+        if !crate::auth::is_declared_adult(&state.db, &user.user_id).await {
             return Err(ApiError::Forbidden);
         }
         // 入场即签：明示在前（详情页 lethality/deathContractRequired），确认在此。

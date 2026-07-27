@@ -283,3 +283,116 @@ async fn login_idempotency_key_returns_cached() {
     // 同键同载荷 → 返回同一缓存响应（同一 refresh，不重复消费/签发）。
     assert_eq!(a["refreshToken"], b["refreshToken"]);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 🔴 未成年人保护（真红线 §0.4）：判据只能有一份
+// ═══════════════════════════════════════════════════════════════════════════
+
+async fn seed_user_age(db: &sqlx::AnyPool, id: &str, age: i64) {
+    sqlx::query(
+        "INSERT INTO users (id, nickname, age_declared, status, created_at, updated_at) \
+         VALUES ($1, '', $2, 'active', 1, 1)",
+    )
+    .bind(id)
+    .bind(age)
+    .execute(db)
+    .await
+    .unwrap();
+}
+
+/// 🔴 **年龄未知一律按未成年处理**：未声明(0) / 未成年(2) / 用户行缺失 / 将来新增的取值，
+/// 一律不放行。只有精确的 `age_declared == 1` 才是成年。
+#[tokio::test]
+async fn only_an_explicit_adult_declaration_passes() {
+    let db = crate::testkit::test_pool().await;
+    seed_user_age(&db, "u_adult", crate::auth::AGE_DECLARED_ADULT).await;
+    seed_user_age(&db, "u_undeclared", 0).await;
+    seed_user_age(&db, "u_minor", 2).await;
+    seed_user_age(&db, "u_future", 7).await; // 将来若枚举扩容
+
+    assert!(crate::auth::is_declared_adult(&db, "u_adult").await);
+    assert!(
+        !crate::auth::is_declared_adult(&db, "u_undeclared").await,
+        "🔴 未声明 ≠ 成年。写成 `!= 2`（不是未成年就放行）会让所有未声明账号立刻变成成年"
+    );
+    assert!(!crate::auth::is_declared_adult(&db, "u_minor").await);
+    assert!(
+        !crate::auth::is_declared_adult(&db, "u_future").await,
+        "🔴 未知取值必须不放行 —— 白名单，不是黑名单"
+    );
+    assert!(
+        !crate::auth::is_declared_adult(&db, "u_missing").await,
+        "🔴 查不到用户行 = 年龄未知 = 按未成年处理，绝不 fail-open"
+    );
+}
+
+/// 🔴 查库失败也必须 fail-closed（把表删掉模拟）。
+#[tokio::test]
+async fn a_database_failure_is_treated_as_not_adult() {
+    let db = crate::testkit::test_pool().await;
+    seed_user_age(&db, "u1", crate::auth::AGE_DECLARED_ADULT).await;
+    assert!(crate::auth::is_declared_adult(&db, "u1").await, "前提：正常时放行");
+    sqlx::query("DROP TABLE users").execute(&db).await.unwrap();
+    assert!(
+        !crate::auth::is_declared_adult(&db, "u1").await,
+        "🔴 查库失败必须按未成年处理 —— 一次数据库抖动不该把未成年保护整个关掉"
+    );
+}
+
+/// 🔴 **全仓只许有一处读 `users.age_declared`**。
+///
+/// 这条判定此前在 5 个模块里各写了一遍（生死状入场 / 未成年不收生死状邀请 /
+/// 青少年模式限真人社交 / 弹幕成年门 / 未成年创作者不分账）。五处**行为恰好一致**，
+/// 但那是巧合维持的：三处硬编码字面量 `1`，两处各自定义了一份 `AGE_DECLARED_ADULT`。
+///
+/// 一条**真红线**靠五份手抄保持一致，只要有一处被改成 `!= 2`（看起来更"直觉"），
+/// **未声明年龄的账号立刻全部变成成年**——而那个模块自己的用例照样绿。
+///
+/// 故本条扫全仓生产代码：`age_declared` 的读取只允许出现在 `auth::is_declared_adult` 里。
+#[test]
+fn red_line_only_one_place_reads_the_age_declaration() {
+    let mut offenders: Vec<String> = Vec::new();
+    fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<String>) {
+        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("读目录 {dir:?}：{e}"))
+            .map(|e| e.expect("目录项").path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                walk(&path, root, out);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            if name == "tests.rs" || name == "testkit.rs" {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).unwrap_or_default();
+            // 内联 `mod tests {` 处截断（外置 `mod tests;` 声明不截）。
+            let src = match src.find("\nmod tests {") {
+                Some(i) => src[..i].to_string(),
+                None => src,
+            };
+            let rel = path.strip_prefix(root).expect("相对路径").to_string_lossy().to_string();
+            // 唯一豁免：判据本身所在的文件。
+            if rel.replace('\\', "/") == "auth/mod.rs" {
+                continue;
+            }
+            if src.contains("age_declared FROM users") || src.contains("AGE_DECLARED_ADULT: i64") {
+                out.push(rel);
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    walk(&root, &root, &mut offenders);
+    assert!(
+        offenders.is_empty(),
+        "🔴 未成年保护（真红线 §0.4）的判定必须只有一处（`auth::is_declared_adult`）。\
+         这些文件又自己读了一遍年龄声明：{offenders:?}。\
+         五份手抄靠巧合保持一致，只要有一处写成 `!= 2`，未声明账号立刻全部变成成年，\
+         而那个模块自己的用例照样绿。"
+    );
+}

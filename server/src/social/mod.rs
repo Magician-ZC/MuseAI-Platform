@@ -197,19 +197,17 @@ async fn ensure_ops_enabled(db: &AnyPool) -> Result<(), ApiError> {
 // 🔴 未成年门（真红线 §0.4）——服务端拒绝，不是前端隐藏
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// 「已声明成年」的落库值（`users.age_declared`：0 未声明 / 1 成年 / 2 未成年）。
-const AGE_DECLARED_ADULT: i64 = 1;
+// 「已声明成年」的落库值与判定已**收归 `auth::is_declared_adult`**：
+// 一条真红线（§0.4 未成年保护）不该有两份常量、更不该有六份手抄判据。
+// 源码级红线用例 `auth::tests::red_line_only_one_place_reads_the_age_declaration` 扫死。
 
 /// 该用户是否**已声明成年**。fail-closed：未声明(0)、未成年(2)、用户行缺失一律 false。
 ///
 /// 口径与 `worlds::join_world` 的生死状门、`invitations::deathmatch_age_gate_ok` **逐字一致**——
 /// 三处口径必须同源，否则「未成年保护」会有三种不同的含义，其中至少两种是错的。
 async fn is_adult(db: &AnyPool, user_id: &str) -> Result<bool, ApiError> {
-    let age: Option<(i64,)> = sqlx::query_as("SELECT age_declared FROM users WHERE id = $1")
-        .bind(user_id)
-        .fetch_optional(db)
-        .await?;
-    Ok(matches!(age, Some((AGE_DECLARED_ADULT,))))
+    // 🔴 全仓唯一的「已声明成年」判定（真红线 §0.4），见 `auth::is_declared_adult`。
+    Ok(crate::auth::is_declared_adult(db, user_id).await)
 }
 
 /// 🔴 **青少年模式限真人社交的唯一落点**：调用者本人必须已声明成年，否则 403。

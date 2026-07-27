@@ -338,11 +338,9 @@ async fn deathmatch_age_gate_ok(
     if effective_lethality(&world.lethality, dm) != Lethality::Deathmatch {
         return Ok(true);
     }
-    let age: Option<(i64,)> = sqlx::query_as("SELECT age_declared FROM users WHERE id = $1")
-        .bind(user_id)
-        .fetch_optional(db)
-        .await?;
-    Ok(matches!(age, Some((1,))))
+    // 🔴 全仓唯一的「已声明成年」判定（真红线 §0.4）。此前这里手抄了一份，
+    // 与另外四处靠巧合保持一致——见 `auth::is_declared_adult` 的说明。
+    Ok(crate::auth::is_declared_adult(db, user_id).await)
 }
 
 // ---------------- POST /worlds/{id}/invitations ----------------

@@ -118,11 +118,10 @@ async fn create_order(
     // 红线：保守拒充（规格 §2.2 未成年人默认保护）。仅"已声明成年"（age_declared==1）放行；
     // 未声明(0)、未成年(2)、用户行缺失一律 403——无法可靠判断年龄前保守限制付费（堵住"仅拦 2"的空防）。
     // 置于履约前：被拒请求零账务副作用（无 order / 无 ledger / 无 balance）。声明入口：POST /auth/age-declaration。
-    let age: Option<(i64,)> = sqlx::query_as("SELECT age_declared FROM users WHERE id = $1")
-        .bind(&user.user_id)
-        .fetch_optional(&state.db)
-        .await?;
-    if !matches!(age, Some((1,))) {
+    // 🔴 全仓唯一的「已声明成年」判定（真红线 §0.4），见 `auth::is_declared_adult`。
+    // 此前这里是第 6 份手抄——它是被那条源码级红线用例当场抓出来的，我自己扫的时候漏了
+    //（SQL 文本略有不同，按字面量扫的那一遍没命中它）。
+    if !crate::auth::is_declared_adult(&state.db, &user.user_id).await {
         return Err(ApiError::Forbidden);
     }
 

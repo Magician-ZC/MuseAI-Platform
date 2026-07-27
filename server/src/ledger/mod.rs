@@ -229,11 +229,9 @@ async fn resolve_share(
     let creator_cut = (price_cents as i128 * bps as i128 / 10_000) as i64;
     // 红线：未成年不得作创作者收款方 —— owner age_declared != 1（未声明/未成年/无行）→ 分成挂平台。
     // 记录本应分给创作者的额度（held_cents）供留痕，便于成年补实名后核查/追溯。
-    let owner_age: Option<(i64,)> = sqlx::query_as("SELECT age_declared FROM users WHERE id = $1")
-        .bind(&owner_id)
-        .fetch_optional(&mut **tx)
-        .await?;
-    if !matches!(owner_age, Some((1,))) {
+    // 🔴 与其余四处共用**同一个**判据（真红线 §0.4）。注意后果不同：这里不是拒绝交易，
+    // 而是把创作者分成全额留在平台——判据只能有一份，后果各归各的调用点。
+    if !crate::auth::is_declared_adult(&mut **tx, &owner_id).await {
         return Ok(ShareOutcome::AllPlatform(NoShareReason::MinorOwner {
             owner_id,
             held_cents: creator_cut,

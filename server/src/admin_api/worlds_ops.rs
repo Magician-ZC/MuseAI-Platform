@@ -315,7 +315,6 @@ pub(super) async fn worlds_summary(
 ) -> Result<Json<Value>, ApiError> {
     require_role(&admin, &["operator"])?;
     let bp = attention_budget_bp();
-    let today = utc_day_start_ms(now_ms());
     let day = crate::runtime::day_string(now_ms());
 
     // 一条 SQL 出全部分档。**绝不逐世界发查询**：这是被运营后台轮询的端点。

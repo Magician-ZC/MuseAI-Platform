@@ -89,29 +89,42 @@ const ENV_MEMORIAL_ENABLED: &str = "MUSE_MEMORIAL";
 /// T0-T2 明写「暂不验证：死亡」）。代码合并不等于对用户开放——必须运营显式打开本开关。
 const DEFAULT_MEMORIAL_ENABLED: bool = false;
 
-/// 传世卡能力是否已由运营开启（env 覆盖 + 默认常量，范式同 `worlds::deathmatch_enabled`
-/// 与 `subplot::subplot_cards_enabled`——本仓库尚无配置表，env 是当前唯一的运营开关形态；
-/// 将来配置表落地后只改本函数内部，调用点与降级语义不变）。
+/// 🔴 **编译期钉死默认值的两个事实源**（本常量 + `flags::KNOWN_FLAGS`）。
+const _: () = assert!(
+    crate::flags::declared_default(ENV_MEMORIAL_ENABLED) == DEFAULT_MEMORIAL_ENABLED,
+    "flags::KNOWN_FLAGS 中 MUSE_MEMORIAL 的默认值必须与 DEFAULT_MEMORIAL_ENABLED 一致"
+);
+
+/// 传世卡能力是否已由运营开启。
 ///
-/// 开关是**全局急停阀**，作用在读取侧与封卷侧：关掉之后不再发生任何封卷、遗作馆读不出；
+/// 开关是**急停阀**，作用在读取侧与封卷侧：关掉之后不再发生任何封卷、遗作馆读不出；
 /// 再打开则原样恢复。**已封卷的卡不因关阀而回到在世**——封卷是状态转换（且是单向的），
 /// 不是可开可关的功能；关阀只让它暂时不可见。
-pub fn memorial_enabled() -> bool {
-    match std::env::var(ENV_MEMORIAL_ENABLED) {
-        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "on" | "yes" => true,
-            "0" | "false" | "off" | "no" => false,
-            // 配错不静默开启未验证的死亡机制：回落默认（关闭）。
-            _ => DEFAULT_MEMORIAL_ENABLED,
-        },
-        Err(_) => DEFAULT_MEMORIAL_ENABLED,
-    }
+///
+/// ════════════════════════════════════════════════════════════════════════════
+/// 🔴 已接入运行时开关体系（`crate::flags`）—— ctx 口径两处不同
+/// ════════════════════════════════════════════════════════════════════════════
+///
+/// | 消费点 | ctx | 为什么 |
+/// |---|---|---|
+/// | 端点侧（主动认领封卷 / 遗作馆 / 传记详情 / 我的悼念） | **user + global** | 动作发起人；按人灰度即「先给这批人开死亡与纪念这条线」 |
+/// | 自动封卷（世界结算内） | **world + global** | 结算是一个世界事件、多个卡主；按人解析要在事务里逐 owner 查库，正是自锁的来源 |
+///
+/// ⚠️ 由此产生的不对称与 `subplot` 那条同形（世界开着而卡主关着 ⇒ 卡被封卷但本人暂时看不到
+/// 遗作馆），但**理由更强一层**：自动封卷记录的是**一个已经发生的死亡**（两条证据齐备才封，
+/// 见 `auto_seal_dead_participants_tx`），不是新造出一件资产。开关关着只是「纪念这个功能还没开」，
+/// 死亡本身由生死契约与同意门管，与本开关无关。而且玩家随时可以用主动认领入口补上。
+///
+/// 🔴 自动封卷侧收 bool、不在事务里查库，理由与副本卡铸卡完全一致，
+/// 统一经 [`crate::progression::SettlementFlags`] 传入。
+pub async fn memorial_enabled(db: &AnyPool, ctx: crate::flags::FlagCtx<'_>) -> bool {
+    crate::flags::is_enabled(db, ENV_MEMORIAL_ENABLED, ctx).await
 }
 
 /// 开关门：关闭时整块能力**不存在**（404，而非 403）——不向外泄露「平台有这个未开放功能」。
-/// 每个端点第一行都调它，读端点同样调（读取侧降级）。
-fn ensure_enabled() -> Result<(), ApiError> {
-    if memorial_enabled() {
+/// 每个端点第一行都调它，读端点同样调（读取侧降级）。ctx 取**动作发起人**。
+async fn ensure_enabled(db: &AnyPool, user_id: &str) -> Result<(), ApiError> {
+    if memorial_enabled(db, crate::flags::FlagCtx::user(user_id)).await {
         Ok(())
     } else {
         Err(ApiError::NotFound)
@@ -501,7 +514,7 @@ async fn seal_memorial(
     Path(character_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    ensure_enabled()?;
+    ensure_enabled(&state.db, &user.user_id).await?;
     let idem_key = headers.get("Idempotency-Key").and_then(|v| v.to_str().ok());
     let payload_hash =
         idempotency::hash_payload(&serde_json::to_vec(&json!({ "characterId": &character_id })).unwrap_or_default());
@@ -614,10 +627,10 @@ struct HallQuery {
 /// **不出 `owner_id`/昵称/任何真人身份**。遗作馆是角色的墓园，不是玩家名录。
 async fn memorial_hall(
     State(state): State<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     Query(q): Query<HallQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    ensure_enabled()?;
+    ensure_enabled(&state.db, &user.user_id).await?;
     let limit = q.limit.unwrap_or_else(hall_page_size).clamp(MIN_HALL_PAGE_SIZE, MAX_HALL_PAGE_SIZE);
     let offset = q.offset.unwrap_or(0).max(0);
 
@@ -644,7 +657,7 @@ async fn memorial_hall(
     .await?;
 
     // 🔴 循环外解析一次（`is_enabled` 会查库）。遗作馆无世界维度，按查看者解析。
-    let gate = NameGate::resolve(&state.db, crate::flags::FlagCtx::user(&_user.user_id)).await;
+    let gate = NameGate::resolve(&state.db, crate::flags::FlagCtx::user(&user.user_id)).await;
     let mut characters = Vec::with_capacity(rows.len());
     for r in &rows {
         let card_json: String = r.try_get("card_json")?;
@@ -686,10 +699,10 @@ async fn memorial_hall(
 /// 在世的卡在这里查不到（404）——遗作馆只陈列传世卡。
 async fn memorial_detail(
     State(state): State<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     Path(character_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    ensure_enabled()?;
+    ensure_enabled(&state.db, &user.user_id).await?;
     let row = sqlx::query(
         "SELECT cc.card_json AS card_json, cc.mileage AS mileage, cc.avatar_url AS avatar_url, \
                 cc.moderation AS moderation, cc.avatar_moderation AS avatar_moderation, \
@@ -706,7 +719,7 @@ async fn memorial_detail(
     let card_json: String = row.try_get("card_json")?;
     let moderation: Option<String> = row.try_get("moderation")?;
     let avatar_moderation: Option<String> = row.try_get("avatar_moderation")?;
-    let gate = NameGate::resolve(&state.db, crate::flags::FlagCtx::user(&_user.user_id)).await;
+    let gate = NameGate::resolve(&state.db, crate::flags::FlagCtx::user(&user.user_id)).await;
 
     // 足迹：这张卡走过的世界（含已退场的——**足迹是履历，不因死亡消失**）。
     let foot_rows = sqlx::query(
@@ -796,7 +809,7 @@ async fn memorial_detail(
 /// 只到 `character_id` 不够——同一角色在一次结算里可同时获得多枚不同逝者的印记（`granted_at` 共用
 /// 同一个 `now_ms()`），并列在 PG 上不定序。
 async fn my_marks(State(state): State<AppState>, user: AuthUser) -> Result<Json<Value>, ApiError> {
-    ensure_enabled()?;
+    ensure_enabled(&state.db, &user.user_id).await?;
     let rows = sqlx::query(
         "SELECT mm.character_id AS character_id, mm.deceased_character_id AS deceased_id, \
                 mm.world_id AS world_id, mm.kind AS kind, mm.granted_at AS granted_at, \
@@ -876,8 +889,12 @@ pub(crate) async fn auto_seal_dead_participants_tx(
     tx: &mut Transaction<'_, Any>,
     world_id: &str,
     participants: &[(String, String)],
+    memorial_on: bool,
 ) -> Result<u64, ApiError> {
-    if !memorial_enabled() {
+    // `memorial_on` 由 `progression::SettlementFlags` 在**进事务之前**解析好传入——
+    // 本函数在结算事务内，自己查库就是单连接池自锁（用例
+    // `subplot::tests::resolving_flags_inside_the_transaction_deadlocks_and_fails_closed` 量过）。
+    if !memorial_on {
         return Ok(0);
     }
     let mut sealed = 0u64;

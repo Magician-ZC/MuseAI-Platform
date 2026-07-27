@@ -197,7 +197,10 @@ async fn switch_defaults_off_and_gates_all_endpoints() {
 
     {
         let _sw = MemorialSwitch::cleared();
-        assert!(!memorial_enabled(), "传世卡默认必须关闭（死亡属 T5 才验证的范围）");
+        assert!(
+            !memorial_enabled(&state.db, crate::flags::FlagCtx::global()).await,
+            "传世卡默认必须关闭（死亡属 T5 才验证的范围）"
+        );
 
         for (method, path) in [
             ("GET", "/api/memorial/characters"),
@@ -216,7 +219,10 @@ async fn switch_defaults_off_and_gates_all_endpoints() {
 
     {
         let _sw = MemorialSwitch::raw("maybe");
-        assert!(!memorial_enabled(), "非法值必须回落默认（关闭），不得静默开启");
+        assert!(
+            !memorial_enabled(&state.db, crate::flags::FlagCtx::global()).await,
+            "非法值必须回落默认（关闭），不得静默开启"
+        );
     }
 }
 
@@ -937,6 +943,7 @@ async fn auto_seal_at_settlement_matches_manual_claim_criteria() {
         &mut tx,
         "w1",
         &[("chA".into(), "u1".into()), ("chB".into(), "u2".into())],
+        true,
     )
     .await
     .unwrap();
@@ -961,9 +968,10 @@ async fn auto_seal_respects_the_not_yet_landed_guard() {
     set_narrative_state(&state, "w1", narrative_with(json!([]), Some("chA"))).await;
 
     let mut tx = state.db.begin().await.unwrap();
-    let sealed = super::auto_seal_dead_participants_tx(&mut tx, "w1", &[("chA".into(), "u1".into())])
-        .await
-        .unwrap();
+    let sealed =
+        super::auto_seal_dead_participants_tx(&mut tx, "w1", &[("chA".into(), "u1".into())], true)
+            .await
+            .unwrap();
     tx.commit().await.unwrap();
 
     assert_eq!(sealed, 0, "同意已获批但引擎尚未落定 → 不得自动封卷");
@@ -979,15 +987,105 @@ async fn auto_seal_is_idempotent_across_repeated_settlements() {
 
     let run = |db: sqlx::AnyPool| async move {
         let mut tx = db.begin().await.unwrap();
-        let n = super::auto_seal_dead_participants_tx(&mut tx, "w1", &[("chA".into(), "u1".into())])
-            .await
-            .unwrap();
+        let n =
+            super::auto_seal_dead_participants_tx(&mut tx, "w1", &[("chA".into(), "u1".into())], true)
+                .await
+                .unwrap();
         tx.commit().await.unwrap();
         n
     };
     assert_eq!(run(state.db.clone()).await, 1, "首次封卷");
     assert_eq!(run(state.db.clone()).await, 0, "重复结算不得二次封卷（CAS 短路）");
     assert_eq!(memorial_status_of(&state, "chA").await, "sealed");
+}
+
+/// 🔴 **按世界灰度真的生效**（接入 `flags` 体系的行为增量：env 时代只能全局一刀切）。
+/// 同时钉住「自动封卷按世界、端点按人」这对**故意不同**的口径。
+#[tokio::test]
+async fn memorial_grayscale_is_per_world_on_the_sealing_side() {
+    let state = test_state().await;
+    let _sw = MemorialSwitch::set(false); // 全局关（env 层）
+    seed_landed_death(&state).await;
+    sqlx::query(
+        "INSERT INTO runtime_flags (id, flag, scope, target_id, enabled, starts_at, ends_at, \
+         updated_by, updated_at, reason, created_at) \
+         VALUES ($1, 'MUSE_MEMORIAL', 'world', 'w1', 1, 0, 0, 'test', $2, 'test', $3)",
+    )
+    .bind(crate::db::new_id("rf"))
+    .bind(crate::db::now_ms())
+    .bind(crate::db::now_ms())
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    let flags = crate::progression::SettlementFlags::resolve(&state.db, "w1").await;
+    assert!(flags.memorial, "🔴 被灰度选中的世界应当命中 world 记录，全局关着也一样");
+    let mut tx = state.db.begin().await.unwrap();
+    let sealed = super::auto_seal_dead_participants_tx(
+        &mut tx,
+        "w1",
+        &[("chA".into(), "u1".into())],
+        flags.memorial,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(sealed, 1, "该世界的死者应当被自动封卷");
+
+    // 端点侧按**人**解析：卡主没被单独开 ⇒ 遗作馆仍 404。
+    // 这与副本卡那条同形，但理由更强：封卷记录的是**已经发生的死亡**，不是新造一件资产。
+    let (st, _) = send(&state, "GET", "/api/memorial/characters", "u1", None, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "🔴 「状态已落定、界面后可见」是本模块既有口径");
+}
+
+/// 🔴 **`SettlementFlags` 的字段不能接串**。
+///
+/// 这条不是形式主义：结构体里全是 `bool`，把 `flags.subplot_cards` 误接到自动封卷上
+/// **照样编译**，而在两个开关取值相同的用例里也**照样绿**。故意让两者取值相反，
+/// 才验得出接的是哪一个。
+///
+/// （实测确有必要：给这次迁移做故障注入时，把 `flags.memorial` 换成 `flags.subplot_cards`
+/// 后，当时的全部用例仍然全绿——本用例就是为堵那个洞补的。）
+#[tokio::test]
+async fn settlement_flag_fields_are_not_crosswired() {
+    let state = test_state().await;
+    let _sw = MemorialSwitch::set(false); // 传世卡：全局**关**
+    seed_landed_death(&state).await;
+    // 副本卡：给这个世界单独**开**（与传世卡取值相反）。
+    sqlx::query(
+        "INSERT INTO runtime_flags (id, flag, scope, target_id, enabled, starts_at, ends_at, \
+         updated_by, updated_at, reason, created_at) \
+         VALUES ($1, 'MUSE_SUBPLOT_CARDS', 'world', 'w1', 1, 0, 0, 'test', $2, 'test', $3)",
+    )
+    .bind(crate::db::new_id("rf"))
+    .bind(crate::db::now_ms())
+    .bind(crate::db::now_ms())
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    let flags = crate::progression::SettlementFlags::resolve(&state.db, "w1").await;
+    assert!(flags.subplot_cards && !flags.memorial, "夹具前提：两个字段取值必须相反");
+
+    // 走**真实结算入口**（而不是直接调 auto_seal）：要验的正是 progression 里那一行接的是哪个字段。
+    let mut tx = state.db.begin().await.unwrap();
+    crate::progression::settle_idle_world_ending_tx(
+        &mut tx,
+        "w1",
+        &[("chA".into(), "u1".into())],
+        false,
+        flags,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    assert_eq!(
+        memorial_status_of(&state, "chA").await,
+        "living",
+        "🔴 传世卡开关是**关**的，不得因为副本卡开着就把死者封卷 —— 那说明字段接串了"
+    );
+    assert_eq!(withdrawn_of(&state, "chA").await, 0, "🔴 更不得因此下架卡");
 }
 
 /// 开关关闭时整段短路：一张卡都不封，状态一点没动。
@@ -997,10 +1095,19 @@ async fn auto_seal_is_disabled_with_the_switch_off() {
     seed_landed_death(&state).await;
     let _sw = MemorialSwitch::set(false);
 
+    // 🔴 开关状态经 `SettlementFlags` 在**进事务之前**解析（事务里解析 = 单连接池自锁，
+    // 见 `subplot::tests::resolving_flags_inside_the_transaction_deadlocks_and_fails_closed`）。
+    let flags = crate::progression::SettlementFlags::resolve(&state.db, "w1").await;
+    assert!(!flags.memorial, "开关关着 ⇒ 解析结果就是关");
     let mut tx = state.db.begin().await.unwrap();
-    let sealed = super::auto_seal_dead_participants_tx(&mut tx, "w1", &[("chA".into(), "u1".into())])
-        .await
-        .unwrap();
+    let sealed = super::auto_seal_dead_participants_tx(
+        &mut tx,
+        "w1",
+        &[("chA".into(), "u1".into())],
+        flags.memorial,
+    )
+    .await
+    .unwrap();
     tx.commit().await.unwrap();
 
     assert_eq!(sealed, 0);

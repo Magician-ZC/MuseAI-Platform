@@ -961,6 +961,10 @@ async fn list_endpoint_reports_effective_global_state() {
             // （0036 参考接线之后）。它排在这里而不是队尾，是因为登记表按**归属模块**分组、
             // 不按接线时间排——本断言比的是 `KNOWN_FLAGS` 的声明顺序。
             "MUSE_ROOM_INVITATIONS",
+            // 🔵 `MUSE_MEMORIAL` 与副本卡共用 `progression::SettlementFlags`——迁它只往那个
+            // 结构体加了一个字段，没有给结算函数新增 bool 参数。那正是上一条迁移时
+            // 建这个结构体的理由。
+            "MUSE_MEMORIAL",
             "MUSE_OOC_ANNOTATIONS",
             "MUSE_IFLINE_PARALLEL",
             "MUSE_SOCIAL_IDENTITY_UNLOCK",

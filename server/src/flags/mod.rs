@@ -193,7 +193,9 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
         default_enabled: false,
         owner: "memorial",
         desc: "传世卡 · 遗作馆（关闭时端点 404 且不发生任何封卷）",
-        wired: false,
+        // 🔵 已接线。ctx 口径同副本卡：端点侧按 **user**，结算内自动封卷按 **world**
+        // （经 `progression::SettlementFlags`）。口径表见 `memorial::memorial_enabled`。
+        wired: true,
     },
     FlagDef {
         name: "MUSE_WORLD_SERIES_AUTOSCALE",
@@ -402,9 +404,11 @@ pub const fn declared_default(name: &str) -> bool {
 /// - `MUSE_CONTAINER_ASSEMBLY`：**无独立端点**，消费点在建模板期（拒绝声明 `subplotCardRefs`）
 ///   与装配期（忽略容器字段走原路径）。装配期在 `assembly::assemble_instance` 内，同样要注意
 ///   事务边界。建模板期无 world_id/user_id 语义，实际只用 global。
-/// - `MUSE_MEMORIAL`：端点 404 **且封卷本身不发生**。封卷在结算事务内，事务边界注意事项同副本卡。
-///   另有 `MUSE_MEMORIAL_BOND_MIN` / `MUSE_MEMORIAL_PAGE_SIZE` 两个**参数化 env（非布尔）**，
-///   本体系只管布尔开关，参数化配置是另一件事（§0.2），不要顺手塞进 `runtime_flags`。
+/// - ~~`MUSE_MEMORIAL`~~ —— **已迁（2026-07-27）**。端点 404 且封卷本身不发生；封卷在结算事务内，
+///   故与副本卡共用 [`crate::progression::SettlementFlags`]（往里加一个字段，没有新增 bool 参数）。
+///   ⚠️ 原注那条提醒仍然有效且**依然没被违反**：`MUSE_MEMORIAL_BOND_MIN` /
+///   `MUSE_MEMORIAL_PAGE_SIZE` 是**参数化 env（非布尔）**，本体系只管布尔开关，
+///   参数化配置是另一件事（§0.2），迁移时一个都没往 `runtime_flags` 里塞。
 /// - `MUSE_WORLD_SERIES_AUTOSCALE`：扩容判定在 join 的事务路径上，事务边界注意事项同上。
 ///   它已有**逐系列**的 `world_series.status` 急停阀，与本体系的 world 作用域**语义重叠**：
 ///   迁移时要明确「两道闸都开才扩容」，不要让 `runtime_flags` 变成第三道容易被忘记的闸。

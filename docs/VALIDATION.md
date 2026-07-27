@@ -241,8 +241,16 @@
   故意把解析放进事务，量出「挂满连接获取超时 → fail-closed 回落默认（关）→ 一张卡不铸、
   且不报错」。这不是推演——迁移时我就写错过一次，四个用例同时变红且各跑 30 秒才定位到。
   用例走 `testkit::test_pool_short_acquire(300)`，现象不变而耗时从 30s 降到 0.4s。
+- ~~`MUSE_MEMORIAL`~~ —— **已迁（2026-07-27）**。端点 404 且封卷本身不发生；封卷在结算事务内，
+  与副本卡共用 `SettlementFlags`——**只往结构体加了一个字段**，没有给结算函数新增 bool 参数，
+  这正是上一条建那个结构体的目的。⚠️ 原注那条提醒依然没被违反：`MUSE_MEMORIAL_BOND_MIN` /
+  `MUSE_MEMORIAL_PAGE_SIZE` 是参数化 env（非布尔），一个都没往 `runtime_flags` 里塞（§0.2）。
+  🔵 迁它时故障注入暴露了 `SettlementFlags` 的一个**结构性弱点**：字段全是 `bool`，
+  把 `flags.subplot_cards` 误接到自动封卷上照样编译、且在两个开关取值相同的用例里照样绿。
+  已补 `settlement_flag_fields_are_not_crosswired`——故意让两者取值相反，走真实结算入口验。
+  下一个往这个结构体加字段的人，请一并扩这条用例。
 - 未迁：`MUSE_CONTAINER_ASSEMBLY` ·
-  `MUSE_MEMORIAL` · `MUSE_WORLD_SERIES_AUTOSCALE` · `MUSE_WORLD_BE_BIOGRAPHY` ·
+  `MUSE_WORLD_SERIES_AUTOSCALE` · `MUSE_WORLD_BE_BIOGRAPHY` ·
   `MUSE_SAFETY_LEXICON`（🔴 最后迁或不迁）。
 
 共同的坑：**多数消费点在事务内**（结算铸卡 / 封卷 / 扩容判定），`is_enabled` 会查库，
@@ -289,7 +297,7 @@
 `admin_api::audit::writeback_target` 现在返回回写坐标，`world_events` 上因此有了全仓
 **唯一一条放宽语句**（`SET` 只有 `moderation` 一列、按主键点名、CAS、起点白名单写死在 SQL 里），
 权限分 reviewer / admin 两档，三条写入路径由源码级红线用例全仓盘点 ·
-**其余存量 env 开关接入运行时开关体系**（副本卡 / 生死状档 / 房间邀请已迁，清单与注意事项见上）·
+**其余存量 env 开关接入运行时开关体系**（副本卡 / 生死状档 / 房间邀请 / 传世卡已迁，清单与注意事项见上）·
 **处置申诉只覆盖 `character` / `character_avatar` 两类主体**（如实的范围，不是遗漏：
 `world_cover` 属于世界、`world_templates` 根本没有 owner 列，给它们开申诉入口只会得到一个
 没人有资格提交的端点；要覆盖需先定义"世界封面 / 模板的作者是谁"这条产品口径）。

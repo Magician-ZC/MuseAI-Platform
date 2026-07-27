@@ -368,6 +368,9 @@ pub(crate) fn resolve_payout_tier(table: &PayoutTable, score: f64) -> Option<&Pa
 pub(crate) struct SettlementFlags {
     /// 副本卡铸卡（`MUSE_SUBPLOT_CARDS`）。关 = 结算一张不铸，**不报错**。
     pub(crate) subplot_cards: bool,
+    /// 死者自动封卷为传世卡（`MUSE_MEMORIAL`）。关 = 整段短路，**不报错**
+    /// （封卷是纪念不是账目；玩家还可用主动认领入口补上）。
+    pub(crate) memorial: bool,
 }
 
 impl SettlementFlags {
@@ -375,6 +378,11 @@ impl SettlementFlags {
     pub(crate) async fn resolve(db: &AnyPool, world_id: &str) -> Self {
         Self {
             subplot_cards: crate::subplot::subplot_cards_enabled(
+                db,
+                crate::flags::FlagCtx::world(world_id),
+            )
+            .await,
+            memorial: crate::memorial::memorial_enabled(
                 db,
                 crate::flags::FlagCtx::world(world_id),
             )
@@ -563,7 +571,10 @@ pub(crate) async fn settle_idle_world_ending_tx(
     //
     // 幂等由 seal_character_tx 的 CAS 承担；开关关闭时整段短路。失败不阻断结算——
     // 封卷是纪念不是账目，玩家还可随时用主动认领入口补上。
-    if let Err(e) = crate::memorial::auto_seal_dead_participants_tx(tx, world_id, participants).await {
+    if let Err(e) =
+        crate::memorial::auto_seal_dead_participants_tx(tx, world_id, participants, flags.memorial)
+            .await
+    {
         tracing::warn!(world_id, error = %e, "自动封卷失败（结算照常落定，玩家可主动认领）");
     }
     Ok(())

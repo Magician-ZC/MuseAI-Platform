@@ -48,13 +48,30 @@ pub struct WsMessage {
 
 impl WsHub {
     pub fn sender(&self, world_id: &str) -> broadcast::Sender<WsMessage> {
-        // 临界区只做 HashMap entry + 建通道 + 克隆，自身无失败路径：中毒只可能是此前持锁线程
-        // 在别处 panic 的次生现象。这把锁在**全世界的 WS 下发路径**上（publish → sender），
-        // 一旦中毒即全站推流停摆，故消息要能一眼指回真正的故障点，而不是停在这一行。
-        let mut lock = self
-            .channels
-            .lock()
-            .expect("BUG: WsHub.channels 锁中毒——真正的故障是此前某个持锁线程的 panic，请回溯更早的 panic 日志");
+        // 🔴 **中毒后恢复而不是 panic**，这是本仓库唯一一处这么做的锁，理由要写清楚。
+        //
+        // 这把锁在**全世界的 WS 下发路径**上（`publish` → `sender`）。若沿用 `unwrap()`/`expect()`，
+        // 一次中毒 = **全站实时推送永久停摆且无法自愈，只能重启进程**——而中毒的定义仅仅是
+        // 「此前某个持锁线程在别处 panic 过」，它本身并不意味着这里的数据坏了。
+        //
+        // 恢复安全的依据是**临界区的形状**，不是「大概没事」：
+        // 里面只做 `HashMap::entry` + 建通道 + `clone`，三步都是要么完成要么不发生的原子操作，
+        // 不存在「写了一半的 HashMap」这种中间态；且 `channels` 是纯注册表
+        // （`world_id → broadcast::Sender`），键与键之间没有任何跨条目不变量可被破坏。
+        // 换言之：中毒后这张表**仍然是一张完好的表**。
+        //
+        // ⚠️ 这条推理不可无脑套用到别的锁上。承载跨字段不变量的状态（例如「计数器与集合必须同步」）
+        // 中毒后确实可能处于自相矛盾的中间态，那里 panic 才是对的——中毒恰恰是不变量可能已破的信号。
+        //
+        // 真正的故障（那次 panic）不会因此被吞掉：它有自己的 panic 日志，且下面这行 warn
+        // 会在每次撞上中毒锁时留痕，指回去找它。
+        let mut lock = self.channels.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!(
+                "WsHub.channels 锁曾中毒（此前有持锁线程 panic）——已恢复继续推送。\
+                 真正的故障在更早的 panic 日志里，请回溯；本行只是它的次生现象。"
+            );
+            poisoned.into_inner()
+        });
         lock.entry(world_id.to_string())
             .or_insert_with(|| broadcast::channel(256).0)
             .clone()
@@ -787,6 +804,58 @@ pub fn router() -> Router<AppState> {
         .route("/worlds/{id}/events", get(list_events))
         .route("/worlds/{id}/stream", get(stream))
         .route("/worlds/{id}/state-summary", get(world_state_summary))
+}
+
+#[cfg(test)]
+mod ws_hub_poison_tests {
+    use super::*;
+
+    /// 🔴 **一次锁中毒不得让全站 WS 推送永久停摆。**
+    ///
+    /// 用例的形状就是那个故障场景本身：先让一个线程在**持锁期间** panic（这是「中毒」的
+    /// 唯一成因），再证明后续调用照常拿到通道。若哪天有人把 `unwrap_or_else` 改回
+    /// `unwrap()`/`expect()`，这里会立刻 panic 而不是返回——测试红得很直接。
+    ///
+    /// 注意这**不是**在纵容 panic：那次 panic 有它自己的日志，本用例只断言它的次生影响
+    /// 被限制在「那一次」，而不是扩散成「这个进程从此再也推不了消息」。
+    #[test]
+    fn a_poisoned_lock_does_not_kill_ws_delivery_forever() {
+        let hub = std::sync::Arc::new(WsHub::default());
+
+        // 中毒前：正常可用，且拿到的是同一个世界的同一条通道。
+        let before = hub.sender("w1");
+        assert_eq!(before.receiver_count(), 0);
+
+        // 制造中毒：持锁线程 panic。std::sync::Mutex 只有这一种中毒途径。
+        let h = std::sync::Arc::clone(&hub);
+        let joined = std::thread::spawn(move || {
+            let _guard = h.channels.lock().expect("首次上锁必然成功");
+            panic!("刻意 panic：模拟持锁线程在别处崩溃");
+        })
+        .join();
+        assert!(joined.is_err(), "该线程必须真的 panic，否则锁没中毒，本用例就是空跑");
+        assert!(hub.channels.is_poisoned(), "锁必须真的处于中毒态，否则后面的断言没有意义");
+
+        // 🔴 中毒之后：推送链路仍然活着。
+        let after = hub.sender("w1");
+        assert!(
+            after.same_channel(&before),
+            "中毒后应当拿回同一条通道——注册表内容完好，这正是可以恢复的依据"
+        );
+
+        // 新世界照样能建通道（不只是老键还能读）。
+        let fresh = hub.sender("w2");
+        assert!(!fresh.same_channel(&before), "不同世界必须是不同通道");
+
+        // publish 走的就是 sender，一并证明它没被中毒卡死。
+        let mut rx = after.subscribe();
+        hub.publish(WsMessage {
+            world_id: "w1".into(),
+            audience_user_ids: None,
+            payload_json: "{}".into(),
+        });
+        assert!(rx.try_recv().is_ok(), "中毒后 publish 必须仍能送达订阅者");
+    }
 }
 
 #[cfg(test)]

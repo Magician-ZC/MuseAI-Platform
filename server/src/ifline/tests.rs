@@ -2051,11 +2051,225 @@ fn red_line_no_scheduler_ever_touches_iflines() {
              不是被调度器推动。付费内容的消耗节奏必须由付费的人掌握。"
         );
     }
-    // 入队只在端点里发生（玩家点击触发），worker 只负责「代他跑」。
+    // 入队点是**可数的、且每一处都要说得出理由**——多一处就可能是「有人替玩家决定推进」。
+    //
+    // 端点（玩家点击触发）：1 处。
     let ifline_src = include_str!("mod.rs");
     assert_eq!(
         ifline_src.matches("push_json(").count(),
         1,
-        "🔴 推进任务的入队点必须只有一处（端点内）——多一处就可能是「有人替玩家决定推进」"
+        "🔴 `ifline/mod.rs` 的入队点必须只有端点那一处"
     );
+    // 对账补投（0052）：1 处，在 `sweep.rs`。
+    //
+    // 🔴 它**不违反**「玩家拉动」，理由必须站得住，否则这道红线就白开了口子：
+    // 它的判据恒为 `advance_requested_at > 0`——那一列**只由玩家点击写下**（端点的 CAS）。
+    // 也就是说 sweep 补投的永远是「玩家已经点过、但那次任务丢了」的那一拍，
+    // 不会凭空发起任何一拍。故下面两条一起钉：入队只有一处，且该处的取数判据带着这个条件。
+    let sweep_src = include_str!("sweep.rs");
+    assert_eq!(
+        sweep_src.matches("push_json(").count(),
+        1,
+        "🔴 对账补投的入队点必须只有一处"
+    );
+    assert!(
+        sweep_src.contains("advance_requested_at > 0"),
+        "🔴 补投的取数判据必须钉着「玩家已经点过」（`advance_requested_at > 0`）——\
+         去掉这个条件，这条循环立刻变成一个替玩家烧副本卡的调度器"
+    );
+}
+
+// ============================================================================
+// 对账式补偿（0052 · `ifline::sweep`）
+// ============================================================================
+//
+// 补的是 0050 落地时**自己登记**的那条遗留：陈旧线只让玩家「能再点一次」，
+// 不把丢掉的那次补上。下面这组钉的是补投的判据、封顶、以及封顶时不静默。
+
+/// 进程级 env 锁 + 原值恢复（范式同 `SubplotSwitch` / `ContainerSwitch`）。
+struct SweepEnv {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    prev: Vec<(&'static str, Option<String>)>,
+}
+
+impl SweepEnv {
+    fn set(pairs: &[(&'static str, &str)]) -> Self {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = [
+            "MUSE_IFLINE_SWEEP_AFTER_MS",
+            "MUSE_IFLINE_SWEEP_MAX_REDELIVERIES",
+            "MUSE_IFLINE_ADVANCE_STALE_MS",
+        ];
+        let prev = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        for (k, v) in pairs {
+            std::env::set_var(k, v);
+        }
+        Self { _guard: guard, prev }
+    }
+}
+
+impl Drop for SweepEnv {
+    fn drop(&mut self) {
+        for (k, v) in &self.prev {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+}
+
+/// 把在飞标记设成「久到已过补投窗口」。
+async fn strand(state: &AppState, id: &str, sweep_count: i64) -> i64 {
+    let long_ago = now_ms() - super::sweep::sweep_after_ms() - 1_000;
+    sqlx::query(
+        "UPDATE ifline_worlds SET advance_requested_at = $1, advance_sweep_count = $2 WHERE id = $3",
+    )
+    .bind(long_ago)
+    .bind(sweep_count)
+    .bind(id)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    long_ago
+}
+
+async fn ifline_row(state: &AppState, id: &str) -> (i64, i64, String) {
+    let r = sqlx::query(
+        "SELECT advance_requested_at, advance_sweep_count, last_error FROM ifline_worlds WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    (
+        r.try_get("advance_requested_at").unwrap(),
+        r.try_get("advance_sweep_count").unwrap(),
+        r.try_get("last_error").unwrap(),
+    )
+}
+
+/// 队列里现在有没有这条线的推进任务（取走一份）。
+///
+/// ⚠️ **必须带超时**：`MemQueue::pop` 在空队列上是**无限等待**的（它是给 worker 循环用的）。
+/// 直接 `pop_json().await` 去断言「没有入队」会把用例挂死——这里就先挂过一次。
+async fn popped_advance(state: &AppState) -> Option<String> {
+    tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        crate::queue::pop_json::<super::AdvanceJob>(&*state.queue, super::ADVANCE_TOPIC),
+    )
+    .await
+    .ok()
+    .flatten()
+    .map(|j| j.ifline_id)
+}
+
+/// 丢掉的任务被补投回队列，且计数 +1、在飞窗口重新计时。
+#[tokio::test]
+async fn sweep_redelivers_a_lost_in_flight_task() {
+    let state = test_state().await;
+    let id = seed_open_ifline(&state).await;
+    strand(&state, &id, 0).await;
+
+    let now = now_ms();
+    assert_eq!(super::sweep::sweep_once(&state, now).await, 1, "陈旧的在飞标记应被补投");
+    assert_eq!(popped_advance(&state).await.as_deref(), Some(id.as_str()), "任务必须真的进队列");
+
+    let (req_at, count, _) = ifline_row(&state, &id).await;
+    assert_eq!(req_at, now, "补投后在飞窗口重新计时，否则下一轮对账会立刻再投一次");
+    assert_eq!(count, 1, "补投次数必须记账——不记账就没法封顶");
+}
+
+/// 🔴 **不是调度器**：玩家没点过的线，无论多久都不补投。
+///
+/// `advance_requested_at` 只由端点的 CAS 写下。这一条与源码级红线
+/// `red_line_no_scheduler_ever_touches_iflines` 是同一件事的两个面：那边钉判据文本，
+/// 这边钉真实行为。少了它，补投循环就会变成一个替玩家烧副本卡的调度器。
+#[tokio::test]
+async fn sweep_never_touches_a_line_the_player_never_clicked() {
+    let state = test_state().await;
+    let id = seed_open_ifline(&state).await;
+    // 从未点过（标记为 0），且这条线本身建得很久了。
+    sqlx::query("UPDATE ifline_worlds SET advance_requested_at = 0, created_at = 1 WHERE id = $1")
+        .bind(&id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    assert_eq!(super::sweep::sweep_once(&state, now_ms()).await, 0, "🔴 玩家没点过就绝不推进");
+    assert!(popped_advance(&state).await.is_none(), "🔴 队列里不该出现任何任务");
+}
+
+/// 还在补投窗口内的在飞标记不动它——那可能是一个仍在跑的任务，补投会白烧一次模型调用。
+#[tokio::test]
+async fn sweep_leaves_a_fresh_in_flight_task_alone() {
+    let state = test_state().await;
+    let id = seed_open_ifline(&state).await;
+    sqlx::query("UPDATE ifline_worlds SET advance_requested_at = $1 WHERE id = $2")
+        .bind(now_ms() - 1_000)
+        .bind(&id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    assert_eq!(super::sweep::sweep_once(&state, now_ms()).await, 0);
+    assert!(popped_advance(&state).await.is_none());
+}
+
+/// 🔴 补投到顶后**停手，但不静默**：清标记（玩家立刻能再点）+ 把原因写进 `last_error`。
+///
+/// 没有封顶的话，一个每次都在清标记前就死掉的 worker 会把这条循环变成无限烧钱；
+/// 而封顶后若静默放弃，「补偿机制」就变成了一个更难查的静默失败。
+#[tokio::test]
+async fn sweep_stops_at_the_cap_and_says_why() {
+    let state = test_state().await;
+    let id = seed_open_ifline(&state).await;
+    let _env = SweepEnv::set(&[("MUSE_IFLINE_SWEEP_MAX_REDELIVERIES", "2")]);
+    strand(&state, &id, 2).await; // 已达上限
+
+    assert_eq!(super::sweep::sweep_once(&state, now_ms()).await, 0, "到顶后不得再投");
+    assert!(popped_advance(&state).await.is_none(), "到顶后队列里不该有任务");
+
+    let (req_at, count, err) = ifline_row(&state, &id).await;
+    assert_eq!(req_at, 0, "🔴 必须清掉在飞标记——否则玩家还得再等一个陈旧线才能自己重点");
+    assert_eq!(count, 0, "链已终结，计数归零");
+    assert!(err.contains("上限"), "🔴 停手的理由必须留在读取面上，不能静默: {err}");
+}
+
+/// 一次推进落定（成功或失败）即清零补投计数——否则一条 if 线**一生**只能被补投 N 次。
+#[tokio::test]
+async fn finishing_an_advance_resets_the_redelivery_counter() {
+    let state = test_state().await;
+    let id = seed_open_ifline(&state).await;
+    strand(&state, &id, 2).await;
+
+    super::finish_advance(&state.db, &id, Some("这次失败了")).await;
+    let (req_at, count, err) = ifline_row(&state, &id).await;
+    assert_eq!(req_at, 0);
+    assert_eq!(count, 0, "🔴 落定即终结这条尝试链，下一次点击是全新的一条");
+    assert_eq!(err, "这次失败了", "失败原因照常落库（0050 的约定不变）");
+}
+
+/// 🔴 补投窗口恒 ≥ 请求层陈旧线 + 1 分钟，**由代码保证**而不是靠运营记得。
+/// 配小了会对仍在跑的任务补投——唯一键挡得住第二次落库，但那次模型调用是真烧掉的。
+#[test]
+fn sweep_window_can_never_fire_before_the_request_stale_line() {
+    let _env = SweepEnv::set(&[
+        ("MUSE_IFLINE_SWEEP_AFTER_MS", "1"), // 运营把它配成 1 毫秒
+        ("MUSE_IFLINE_ADVANCE_STALE_MS", "600000"),
+    ]);
+    assert!(
+        super::sweep::sweep_after_ms() >= super::advance_stale_ms() + 60_000,
+        "🔴 补投窗口被配小到早于陈旧线了：{} < {}",
+        super::sweep::sweep_after_ms(),
+        super::advance_stale_ms() + 60_000
+    );
+}
+
+/// §0.1：默认关闭。补投是这条链上唯一「凭数据自发调模型」的路径，且 if 线是付费内容。
+#[tokio::test]
+async fn sweep_defaults_to_off() {
+    let state = test_state().await;
+    assert!(!super::sweep::sweep_enabled(&state.db).await, "🔴 补投必须默认关闭（§0.1）");
 }

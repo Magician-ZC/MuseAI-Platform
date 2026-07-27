@@ -378,6 +378,26 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
         scopes: SCOPES_GLOBAL,
     },
     FlagDef {
+        name: "MUSE_IFLINE_ADVANCE_SWEEP",
+        // 🔴 默认关闭的理由与 `MUSE_SAFETY_RECHECK_SWEEP` 同源，且更重：if 线是**付费**内容，
+        // 补投是这条链上唯一一处「凭数据自发调模型」的路径。默认开着 = 一次代码合并直接抬起
+        // 成本曲线而没有人按过开关（§0.1 正是禁这个）。
+        default_enabled: false,
+        owner: "ifline",
+        desc: "if 线推进的**对账式补偿**（0052）：按 `ifline_worlds.advance_requested_at` 找出\
+               「在飞标记还在、且已过补投窗口」的行并补投回推进队列。闭合的是 `MemQueue` 不持久\
+               导致的投递丢失——0050 的陈旧线只让玩家**能再点一次**，这条才是「玩家没再点也补上」。\
+               🔴 它不是调度器：判据恒为玩家点击写下的在飞标记，不会凭空推进任何一条 if 线。\
+               🔴 补投次数有封顶（`MUSE_IFLINE_SWEEP_MAX_REDELIVERIES`，默认 3）——worker 若每次都在\
+               清标记前就死掉，无封顶的补投会变成无限烧钱的循环；到顶时清标记 + 写 `last_error`，\
+               不静默放弃。🔴 补投窗口恒 ≥ 请求层陈旧线 + 1 分钟（代码保证，不靠运营记得），\
+               否则会对仍在跑的任务补投、白烧一次调用。🔴 单实例假设（同 L3 sweep）",
+        // 🔵 新建件，无历史 env 语义，建成即接线。
+        wired: true,
+        // 解析档：跨世界的进程级循环，没有可解析的维度（同 L3 sweep）。
+        scopes: SCOPES_GLOBAL,
+    },
+    FlagDef {
         name: "MUSE_SAFETY_LEXICON",
         // 🔴 唯一默认为「开」的开关：审核链。关掉它 = 放行敏感词，
         // 所以对它而言「安全的那一侧」是开着，fail-closed 返回 true 才是 fail-**safe**。

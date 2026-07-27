@@ -126,6 +126,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 三者的排队时间互不绑架。🔴「玩家拉动」这条设计没变：入队只由玩家点击触发，
     // 没有任何调度器会自己推进 if 线。默认关闭（`MUSE_IFLINE_PARALLEL`）。
     ifline::spawn_workers(state.clone());
+    // if 线推进的**对账式补偿**（0052）：内存队列不持久，进程重启会带走在飞任务，
+    // 而 `advance_requested_at` 已写下。0050 的陈旧线只让玩家「能再点一次」，
+    // 这条循环才是「玩家没再点也把丢掉的那拍补上」。🔴 它不是调度器——判据恒为
+    // 玩家写下的在飞标记，不会凭空推进任何 if 线；补投次数有封顶（付费路径，真烧 token）。
+    // 默认关闭（`MUSE_IFLINE_ADVANCE_SWEEP`）。
+    ifline::sweep::spawn_sweeper(state.clone());
     // 通知 outbox 消费
     notifications::spawn_outbox_worker(state.clone());
 

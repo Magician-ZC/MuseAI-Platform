@@ -181,6 +181,10 @@ use crate::{idempotency, safety};
 /// （`red_line_never_mints_assets` / `red_line_never_writes_worldline` 两个用例的扫描面
 /// **本批次已扩到 `runner.rs`**——新增文件若不进扫描面，就是红线的盲区）。
 mod runner;
+// 推进的**对账式补偿**（0052）：内存队列丢了任务时，按数据重算待办并补投。
+// 🔴 它不是调度器——只补投**玩家已经点过**的那一次（判据恒为玩家写下的在飞标记），
+// 不会凭空推进任何一条 if 线。默认关闭（`MUSE_IFLINE_ADVANCE_SWEEP`）。
+pub(crate) mod sweep;
 
 #[cfg(test)]
 mod tests;
@@ -1229,8 +1233,10 @@ async fn finish_advance(db: &AnyPool, ifline_id: &str, error: Option<&str>) {
         None => (String::new(), 0),
     };
     if let Err(e) = sqlx::query(
-        "UPDATE ifline_worlds SET advance_requested_at = 0, last_error = $1, last_error_at = $2 \
-         WHERE id = $3",
+        // 🔴 同时清零 `advance_sweep_count`（0052）：这次尝试链已经结束（成功或失败都算结束），
+        // 下一次点击是全新的一条链。不清零的话，一条 if 线一生只能被自动补投 N 次。
+        "UPDATE ifline_worlds SET advance_requested_at = 0, advance_sweep_count = 0, \
+         last_error = $1, last_error_at = $2 WHERE id = $3",
     )
     .bind(&msg)
     .bind(at)

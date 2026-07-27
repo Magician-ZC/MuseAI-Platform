@@ -331,6 +331,12 @@ fn red_line_only_safety_chain_defaults_on() {
     // 有「没被复核过的拍」它就会发起送审。默认开着等于让一次代码合并抬高成本曲线而
     // 没有人按过开关，正是 §0.1 要挡的那件事。
     //
+    // 17 → 18：`MUSE_IFLINE_ADVANCE_SWEEP`（if 线推进的对账式补偿，migration 0052）。
+    // ⚠️ 与上一条（`MUSE_SAFETY_RECHECK_SWEEP`）同形态、同理由，但**赌注更大**：
+    // 它是第二处「凭数据自发调模型」的路径，而 if 线是**付费**内容——一次补投就是一次真的
+    // 模型调用。故它除了默认关闭，还自带补投次数封顶（`MUSE_IFLINE_SWEEP_MAX_REDELIVERIES`）：
+    // 一个每次都在清标记前就死掉的 worker，配上无封顶的补投，就是个无限烧钱的循环。
+    //
     // 这些都是登记表**新增了默认关闭的开关**，不是断言被放宽——上面那个循环仍逐条钉死
     // 「除审核链外默认值必须为 false」，新开关同样在其中。
     //
@@ -341,10 +347,10 @@ fn red_line_only_safety_chain_defaults_on() {
     // （过期即报警，正是它要的）。
     assert_eq!(
         KNOWN_FLAGS.len(),
-        17,
+        18,
         "登记表应覆盖 9 个存量 env 开关 + R3 新建的 MUSE_OOC_ANNOTATIONS / MUSE_IFLINE_PARALLEL / \
          MUSE_SOCIAL_IDENTITY_UNLOCK / MUSE_LIVE_STAGE + MUSE_DISPOSAL_NAME_GATE + \
-         MUSE_SAFETY_SEMANTIC_RECHECK + MUSE_SAFETY_RECHECK_SWEEP，\
+         MUSE_SAFETY_SEMANTIC_RECHECK + MUSE_SAFETY_RECHECK_SWEEP + MUSE_IFLINE_ADVANCE_SWEEP，\
          其中 MUSE_OFFPEAK_SCHEDULING 已由纯 env 迁入体系"
     );
 }

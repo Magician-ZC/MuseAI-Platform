@@ -774,14 +774,24 @@ async fn readout_requires_operator_role() {
 
 /// 🔴 **绝不进事务**：本模块从不 `begin()`，也不接受 `Transaction` 参数。
 /// 理由是 `check_text` 是网络调用——单连接池下事务持有唯一连接，调用期间再借连接必死锁。
+/// 🔴 **绝不进事务**：本模块从不 `begin()`，也不接受 `Transaction` 参数。
+/// 理由是 `check_text` 是网络调用——单连接池下事务持有唯一连接，调用期间再借连接必死锁。
+///
+/// 补偿轮询（`sweep.rs`）一并扫：它跑的是跨世界的扫描 + 队列写入，若把那一整段包进事务，
+/// 单连接池下同样会在「扫描期间任何再借连接的操作」上死锁——而它是后台循环，
+/// 死锁的表现是**悄悄不再补投**，比在请求路径上超时更难发现。
 #[test]
 fn red_line_never_opens_a_transaction() {
-    let code = strip_comments(include_str!("mod.rs"));
-    for forbidden in [".begin()", "Transaction<", "sqlx::Transaction"] {
-        assert!(
-            !code.contains(forbidden),
-            "🔴 第 3 层出现了事务用法「{forbidden}」——网络调用进事务 = 单连接池死锁 PoolTimedOut"
-        );
+    for (file, code) in [
+        ("mod.rs", strip_comments(include_str!("mod.rs"))),
+        ("sweep.rs", strip_comments(include_str!("sweep.rs"))),
+    ] {
+        for forbidden in [".begin()", "Transaction<", "sqlx::Transaction"] {
+            assert!(
+                !code.contains(forbidden),
+                "🔴 第 3 层（{file}）出现了事务用法「{forbidden}」——网络调用进事务 = 单连接池死锁 PoolTimedOut"
+            );
+        }
     }
 }
 
@@ -1117,4 +1127,353 @@ fn composed_text_covers_the_same_fields_as_layer_two() {
     assert!(t.contains("公开摘要") && t.contains("私有摘要") && t.contains("仲裁备注"), "{t}");
     assert_eq!(compose_text(None, None, None), "");
     assert_eq!(compose_text(None, None, Some("   ")), "", "空白备注不算内容");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 🔴 ⑩ 补偿轮询（`sweep`）：把内存队列丢掉的拍从**数据**里重新算出来
+//
+// 覆盖顺序按「写错了代价多大」排：
+//   · 🔴 续号而不是重号 —— 写错只在**账单**上显形（每轮重烧一遍整拍）
+//   · 🔴 无候选也要留终局行 —— 不留就永不收敛，同样只在账单上显形
+//   · 三道边界（grace / lookback / batch）各自真的挡住了什么
+//   · 覆盖上限被**如实量出来**（justOutsideWindow），而不是被掩盖
+//   · 源码级：轮询对 world_events / world_ticks 只有 SELECT
+// ═══════════════════════════════════════════════════════════════════════════
+
+use super::sweep;
+
+const MIN_MS: i64 = 60 * 1000;
+
+/// 造一行「已落定」的 `world_ticks`（轮询的扫描面）。
+async fn seed_done_tick(db: &AnyPool, world: &str, tick: i64, finished_at: i64) {
+    sqlx::query(
+        "INSERT INTO world_ticks (id, world_id, tick_no, base_revision, status, cost_tokens, \
+         started_at, finished_at, created_at) VALUES ($1, $2, $3, 0, 'done', 0, $4, $5, $6)",
+    )
+    .bind(new_id("wt"))
+    .bind(world)
+    .bind(tick)
+    .bind(finished_at)
+    .bind(finished_at)
+    .bind(finished_at)
+    .execute(db)
+    .await
+    .expect("seed world_ticks");
+}
+
+/// 造一行复核台账（轮询的判据面）。其余列走 DEFAULT —— 判据只看 outcome / attempt / created_at。
+async fn seed_run_row(
+    db: &AnyPool,
+    world: &str,
+    tick: i64,
+    attempt: i64,
+    outcome: &str,
+    created_at: i64,
+) {
+    sqlx::query(
+        "INSERT INTO safety_recheck_runs (id, world_id, tick_no, attempt, outcome, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(new_id("srr"))
+    .bind(world)
+    .bind(tick)
+    .bind(attempt)
+    .bind(outcome)
+    .bind(created_at)
+    .execute(db)
+    .await
+    .expect("seed safety_recheck_runs");
+}
+
+/// 一个「已落定 10 分钟、带一条 approved 公开事件、台账上一片空白」的拍 —— 缺口的标准形状。
+async fn seed_lost_tick(state: &AppState, world: &str, tick: i64) {
+    seed_tick(state, world, tick, &[pe(&format!("de-{world}-{tick}"), "甲", true)]).await;
+    seed_done_tick(&state.db, world, tick, now_ms() - 10 * MIN_MS).await;
+}
+
+async fn run_sweep(state: &AppState) -> sweep::SweepReport {
+    sweep::sweep_once(state, &mut sweep::InFlight::default()).await.expect("sweep")
+}
+
+/// 取一条补投的任务（超时即判为「根本没补投」，不挂死用例）。
+async fn pop_job(state: &AppState) -> Option<RecheckJob> {
+    tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        crate::queue::pop_json::<RecheckJob>(&*state.queue, TOPIC),
+    )
+    .await
+    .ok()
+    .flatten()
+}
+
+/// §0.1：轮询是这条链上唯一一处会「凭数据自发烧 token」的路径，默认必须是关的。
+#[test]
+fn sweep_flag_defaults_to_off() {
+    assert!(
+        !crate::flags::declared_default(sweep::ENV_SWEEP),
+        "🔴 §0.1：补偿轮询不需要有人推进世界就能发起送审，默认开着等于让一次合并抬高成本曲线"
+    );
+}
+
+/// 基本盘：队列把任务弄丢了（台账上一行都没有），轮询把这一拍算回来并补投。
+#[tokio::test]
+async fn sweep_requeues_a_tick_the_queue_lost() {
+    let state = test_state().await;
+    seed_running_world(&state).await;
+    enable_l3(&state.db, crate::flags::SCOPE_GLOBAL, "").await;
+    seed_lost_tick(&state, "w1", 7).await;
+
+    let r = run_sweep(&state).await;
+    assert_eq!((r.found, r.requeued), (1, 1), "{r:?}");
+
+    let job = pop_job(&state).await.expect("🔴 补投的任务应当出现在复核队列里");
+    assert_eq!((job.world_id.as_str(), job.tick_no), ("w1", 7));
+    assert_eq!(job.attempt, 1, "台账为空 ⇒ 这是第 1 次尝试");
+    assert!(job.retry_ids.is_empty(), "补偿路径重查整拍：那份 retry_ids 名单随丢失的任务一起没了");
+}
+
+/// 🔴 **续号，不是重号**。台账唯一键是 `(world_id, tick_no, attempt)` + `ON CONFLICT DO NOTHING`：
+/// 补投若一律从 1 开始，跑完的结果会被冲突整行吞掉 → 台账永远没有终局行 →
+/// 下一轮又当缺口补投 → **每隔一个 interval 重烧一遍整拍的 provider 调用**，
+/// 而运营面上什么都看不出来（runs 不涨、缺口不降）。
+#[tokio::test]
+async fn sweep_resumes_the_attempt_chain_instead_of_restarting_at_one() {
+    let mut state = test_state().await;
+    state.moderation = ScriptedModeration::verdict(ModerationVerdict::Approved);
+    seed_running_world(&state).await;
+    enable_l3(&state.db, crate::flags::SCOPE_GLOBAL, "").await;
+    seed_lost_tick(&state, "w1", 3).await;
+    // 这条尝试链走到第 2 次就断在重试间隙（进程被重启带走了）。
+    seed_run_row(&state.db, "w1", 3, 1, OUTCOME_RETRY, now_ms() - 12 * MIN_MS).await;
+    seed_run_row(&state.db, "w1", 3, 2, OUTCOME_RETRY, now_ms() - 11 * MIN_MS).await;
+
+    assert_eq!(run_sweep(&state).await.requeued, 1);
+    let requeued = pop_job(&state).await.expect("应当补投");
+    assert_eq!(requeued.attempt, 3, "🔴 必须接着 MAX(attempt) 往下走；重置成 1 会被唯一键吞掉结果");
+
+    // ── 反证：若补投真用了 attempt=1，跑完也写不进台账 ────────────────────────
+    let before = count(&state.db, "SELECT COUNT(*) FROM safety_recheck_runs").await;
+    run_recheck(&state, &job("w1", 3, 1)).await.unwrap();
+    assert_eq!(
+        count(&state.db, "SELECT COUNT(*) FROM safety_recheck_runs").await,
+        before,
+        "🔴 重号的结果被 ON CONFLICT DO NOTHING 整行吞掉 —— 这正是「永不收敛地重烧 token」的机制"
+    );
+    assert_eq!(run_sweep(&state).await.found, 1, "重号跑完，缺口一点没少");
+
+    // ── 续号跑完 ⇒ 留下终局行 ⇒ 缺口消失（收敛） ────────────────────────────
+    run_recheck(&state, &job("w1", 3, 3)).await.unwrap();
+    assert_eq!(run_sweep(&state).await.found, 0, "🔴 续号跑完后必须收敛");
+}
+
+/// 终局的三种 outcome 都算「查过了」，一律不再补投。
+///
+/// `skipped` 也是终局：它表达的是「看过了，这一拍没有可送审的内容」。把它排除在终局之外，
+/// 会让正文全空的拍被无限重投。
+#[tokio::test]
+async fn sweep_ignores_ticks_that_already_have_a_terminal_run_row() {
+    for outcome in [OUTCOME_DONE, OUTCOME_FAILED_CLOSED, OUTCOME_SKIPPED] {
+        let state = test_state().await;
+        seed_running_world(&state).await;
+        enable_l3(&state.db, crate::flags::SCOPE_GLOBAL, "").await;
+        seed_lost_tick(&state, "w1", 1).await;
+        seed_run_row(&state.db, "w1", 1, 1, outcome, now_ms() - 9 * MIN_MS).await;
+
+        assert_eq!(run_sweep(&state).await.found, 0, "🔴 outcome={outcome} 是终局，不该再被补投");
+    }
+}
+
+/// 边界①（grace）：刚落定的拍留给正常路径自己跑完；台账上有 grace 以内的行也算「有人正在动它」。
+#[tokio::test]
+async fn sweep_leaves_alone_what_is_still_within_grace() {
+    let state = test_state().await;
+    seed_running_world(&state).await;
+    enable_l3(&state.db, crate::flags::SCOPE_GLOBAL, "").await;
+
+    // ① 10 秒前刚落定 —— 正常路径多半还在队列里排着。
+    seed_tick(&state, "w1", 1, &[pe("de-a", "甲", true)]).await;
+    seed_done_tick(&state.db, "w1", 1, now_ms() - 10_000).await;
+    // ② 落定够久，但台账上有一行刚写的 retry —— 有人正在重试，轮询不插手。
+    seed_tick(&state, "w1", 2, &[pe("de-b", "乙", true)]).await;
+    seed_done_tick(&state.db, "w1", 2, now_ms() - 10 * MIN_MS).await;
+    seed_run_row(&state.db, "w1", 2, 1, OUTCOME_RETRY, now_ms() - 1_000).await;
+
+    let r = run_sweep(&state).await;
+    assert_eq!(r.found, 0, "🔴 与在飞任务重复送审 = 白烧一遍 token：{r:?}");
+    assert!(pop_job(&state).await.is_none());
+}
+
+/// 边界②（lookback）：掉出回看窗口的拍**永远补不回来**——这是真实的覆盖上限。
+/// 本用例同时钉住「它被如实量出来了」：`durability.justOutsideWindow > 0`
+/// 就是「`MUSE_SAFETY_L3_SWEEP_LOOKBACK_MS` 配短了」的直接证据。
+#[tokio::test]
+async fn ticks_outside_the_lookback_window_are_lost_and_said_so() {
+    let state = test_state().await;
+    seed_running_world(&state).await;
+    enable_l3(&state.db, crate::flags::SCOPE_GLOBAL, "").await;
+    // 默认 lookback 24h：30 小时前落定的拍已经掉出窗口。
+    seed_tick(&state, "w1", 5, &[pe("de-old", "甲", true)]).await;
+    seed_done_tick(&state.db, "w1", 5, now_ms() - 30 * 60 * MIN_MS).await;
+
+    assert_eq!(run_sweep(&state).await.found, 0, "掉出窗口的拍不再被补投（这是上限，不是 bug）");
+
+    let d = &sweep::gap_report(&state).await;
+    assert_eq!(d["unresolvedInWindow"], 0);
+    assert_eq!(
+        d["justOutsideWindow"], 1,
+        "🔴 覆盖上限必须被量出来，而不是悄悄吃掉：{d}"
+    );
+    let honesty = d["honesty"].as_array().expect("honesty[]");
+    assert!(
+        honesty.iter().any(|s| s.as_str().unwrap_or("").contains("永远补不回来")),
+        "🔴 运营面必须直说这条链有补不回来的部分：{d}"
+    );
+}
+
+/// 第 3 层对某个世界是关的 ⇒ 那个世界的拍不补投（不开就不查，本来就不该有复核行）。
+/// 但它仍出现在 `unresolvedInWindow` 里 —— 两个数分开给，见 `gap_report` 的字段表。
+#[tokio::test]
+async fn sweep_skips_worlds_where_layer_three_is_off() {
+    let state = test_state().await;
+    seed_running_world(&state).await;
+    seed_world(&state.db, "w2", 0, "running").await;
+    // 只给 w1 开，w2 走全局默认（关）。
+    enable_l3(&state.db, crate::flags::SCOPE_WORLD, "w1").await;
+    seed_lost_tick(&state, "w1", 1).await;
+    seed_lost_tick(&state, "w2", 1).await;
+
+    let r = run_sweep(&state).await;
+    assert_eq!((r.found, r.requeued, r.skipped_flag_off), (2, 1, 1), "{r:?}");
+    let job = pop_job(&state).await.expect("w1 应当被补投");
+    assert_eq!(job.world_id, "w1");
+    assert!(pop_job(&state).await.is_none(), "🔴 关着第 3 层的世界不得被补投（那会绕开开关烧 token）");
+
+    let d = sweep::gap_report(&state).await;
+    assert_eq!(d["unresolvedInWindow"], 2, "缺口是事实：两拍都没有终局行");
+    assert_eq!(d["enabledWorldTicks"], 1, "🔴 其中只有 1 拍是**真缺口**，另一拍是「压根没开」");
+}
+
+/// 补投后到台账落行之间有一段空窗（任务还在队列里排着）。若下一轮扫描落在这段空窗里，
+/// 不做去重就会重复补投同一拍 —— 而重复的是**真实的 provider 调用**。
+#[tokio::test]
+async fn sweep_does_not_requeue_what_it_just_requeued() {
+    let state = test_state().await;
+    seed_running_world(&state).await;
+    enable_l3(&state.db, crate::flags::SCOPE_GLOBAL, "").await;
+    seed_lost_tick(&state, "w1", 1).await;
+
+    // 同一个 InFlight 连扫两轮 = 同一个进程里两次相邻的扫描。
+    let mut in_flight = sweep::InFlight::default();
+    let first = sweep::sweep_once(&state, &mut in_flight).await.unwrap();
+    let second = sweep::sweep_once(&state, &mut in_flight).await.unwrap();
+    assert_eq!(first.requeued, 1);
+    assert_eq!((second.found, second.requeued, second.skipped_in_flight), (1, 0, 1), "{second:?}");
+
+    assert!(pop_job(&state).await.is_some());
+    assert!(pop_job(&state).await.is_none(), "🔴 队列里只该有一份");
+}
+
+/// 🔴 收敛的前提：「看过了，这一拍没有可送审的内容」**要落账**。
+///
+/// 不落账时，一拍若有 approved 事件但正文全空，复核会一直 skip、一直不留行，
+/// 于是每一轮扫描都把它当缺口重投一次，永不收敛。
+#[tokio::test]
+async fn a_tick_with_nothing_to_check_still_leaves_a_terminal_row() {
+    let mut state = test_state().await;
+    let provider = ScriptedModeration::verdict(ModerationVerdict::Rejected);
+    state.moderation = provider.clone();
+    seed_running_world(&state).await;
+    enable_l3(&state.db, crate::flags::SCOPE_GLOBAL, "").await;
+    seed_tick(&state, "w1", 0, &[pe("de-blank", "   ", true)]).await;
+    seed_done_tick(&state.db, "w1", 0, now_ms() - 10 * MIN_MS).await;
+
+    assert_eq!(run_sweep(&state).await.requeued, 1, "台账为空 ⇒ 第一轮确实该补投它一次");
+
+    let r = run_recheck(&state, &job("w1", 0, 1)).await.unwrap();
+    assert_eq!(r.outcome, OUTCOME_SKIPPED);
+    assert_eq!(provider.calls(), 0, "🔴 无候选不得调用 provider");
+    assert_eq!(
+        count(&state.db, "SELECT COUNT(*) FROM safety_recheck_runs").await,
+        1,
+        "🔴 「看过了，没东西可看」必须入账"
+    );
+    let (chars, checked): (i64, i64) = sqlx::query(
+        "SELECT chars_checked, public_checked FROM safety_recheck_runs",
+    )
+    .fetch_one(&state.db)
+    .await
+    .map(|r| (r.try_get("chars_checked").unwrap(), r.try_get("public_checked").unwrap()))
+    .unwrap();
+    assert_eq!((chars, checked), (0, 0), "这一行是零成本记录，不得污染 T5 成本口径");
+
+    // 🔴 把这行台账的时间推到 grace 之外再扫。否则「下一轮找不到它」有两个可能的原因
+    // （① skipped 算终局；② 那行是 grace 以内刚写的、被「有人正在动它」挡掉了），
+    // 用例就证不出想证的那一个 —— 这是故障注入（把 skipped 移出终局集合）才暴露出来的弱点。
+    sqlx::query("UPDATE safety_recheck_runs SET created_at = $1")
+        .bind(now_ms() - 30 * MIN_MS)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        run_sweep(&state).await.found,
+        0,
+        "🔴 skipped 必须算终局：不算的话，正文全空的拍会被每一轮扫描无限重投"
+    );
+}
+
+/// 开关关闭那一种 skip **仍然不落库** —— 与上一条的口径故意不同：
+/// 关闭时的行为必须与接线前逐字节相同（`disabled_is_byte_identical_to_before_wiring`）。
+#[tokio::test]
+async fn the_disabled_skip_still_writes_nothing() {
+    let state = test_state().await;
+    seed_running_world(&state).await;
+    seed_tick(&state, "w1", 0, &[pe("de-1", "甲", true)]).await;
+
+    assert_eq!(run_recheck(&state, &job("w1", 0, 1)).await.unwrap().outcome, OUTCOME_SKIPPED);
+    assert_eq!(
+        count(&state.db, "SELECT COUNT(*) FROM safety_recheck_runs").await,
+        0,
+        "🔴 开关关闭时不得留下任何痕迹（两种 skip 的落库口径是分开的）"
+    );
+}
+
+/// 缺口报告不依赖轮询是否跑过 / 是否开着：数字从两张既有表现算。
+/// 若它读的是轮询自己的计数器，轮询一死，数字就冻结在健康的样子，而缺口在背后继续长。
+#[tokio::test]
+async fn gap_report_is_computed_from_data_not_from_the_sweepers_own_bookkeeping() {
+    let state = test_state().await;
+    seed_running_world(&state).await;
+    enable_l3(&state.db, crate::flags::SCOPE_GLOBAL, "").await;
+    seed_lost_tick(&state, "w1", 1).await;
+    seed_lost_tick(&state, "w1", 2).await;
+
+    // 一次都没扫过，开关也没开 —— 缺口照样报得出来。
+    let d = sweep::gap_report(&state).await;
+    assert_eq!(d["sweepEnabled"], false, "轮询开关默认关闭");
+    assert_eq!(d["unresolvedInWindow"], 2);
+    assert_eq!(d["enabledWorldTicks"], 2);
+
+    // 也进了运营面（一处口径，不是第二套数）。
+    let app = build_router(state.clone());
+    let (st, body) = get_json(&app, "/api/admin/safety/recheck", &admin_token(&state, "operator")).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body["durability"]["unresolvedInWindow"], 2, "{body}");
+    assert_eq!(body["durability"]["flag"], sweep::ENV_SWEEP);
+}
+
+/// 🔴 源码级：轮询对 `world_events` / `world_ticks` **只有 SELECT**。
+/// 它是一个「重新算待办」的旁路，一旦长出写路径，`world_events` 的写入盘点
+/// （`red_line_world_events_has_one_ratchet_and_one_guarded_relax`）就会多出一条没评审过的。
+#[test]
+fn red_line_sweep_only_reads_the_world_tables() {
+    let code = strip_comments(include_str!("sweep.rs"));
+    for verb in ["UPDATE", "INSERT INTO", "DELETE FROM"] {
+        for table in ["world_events", "world_ticks", "safety_recheck_runs"] {
+            let forbidden = format!("{verb} {table}");
+            assert!(
+                !code.contains(&forbidden),
+                "🔴 补偿轮询出现了写入语句「{forbidden}」——它只应当重新算待办，不该自己改状态"
+            );
+        }
+    }
 }

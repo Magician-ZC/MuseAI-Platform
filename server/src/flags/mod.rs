@@ -271,6 +271,23 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
         wired: true,
     },
     FlagDef {
+        name: "MUSE_SAFETY_RECHECK_SWEEP",
+        // 🔴 默认关闭的理由比第 3 层本身**多一条**：轮询是这条链上唯一一处会「凭数据自发烧
+        // token」的路径——它不需要有人推进世界就能发起送审。这类东西默认开着，
+        // 等于让一次代码合并把成本曲线抬起来而没有人按过开关（§0.1 正是禁这个）。
+        default_enabled: false,
+        owner: "safety",
+        desc: "第 3 层复核的**补偿轮询**（扫尾未复核拍）：按 `world_ticks ⋈ safety_recheck_runs` \
+               对账，把「已落定、带 approved 事件、却没有终局复核行」的拍补投回复核队列。\
+               闭合的是 `MemQueue` 不持久导致的投递丢失，**并且**覆盖持久队列覆盖不了的\
+               「压根没入队」（开关当时关着 / tick 走 blocked·cas_conflict 分支没到入队那行）。\
+               🔴 有真实覆盖上限：只回看 `MUSE_SAFETY_L3_SWEEP_LOOKBACK_MS`（默认 24h），\
+               挂机超过这段的拍**永远补不回来**——`GET /admin/safety/recheck` 的 \
+               `durability.justOutsideWindow` 把它量出来。🔴 单实例假设（多实例会重复补投）",
+        // 🔵 新建件，无历史 env 语义，建成即接线。
+        wired: true,
+    },
+    FlagDef {
         name: "MUSE_SAFETY_LEXICON",
         // 🔴 唯一默认为「开」的开关：审核链。关掉它 = 放行敏感词，
         // 所以对它而言「安全的那一侧」是开着，fail-closed 返回 true 才是 fail-**safe**。

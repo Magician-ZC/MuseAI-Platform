@@ -845,6 +845,10 @@ if 线：   从终局那一拍岔出去的、只属于你的一条平行线   �
 
 总规格 §15 五层漏斗的第 3 层。开关 **`MUSE_SAFETY_SEMANTIC_RECHECK`，默认关闭**（按世界灰度）。
 
+⚠️ **这条链一共三个开关，三个都得按**，任缺一个的表现都不一样：provider 配置
+（不配 = 用 Dev 桩，跑但拦不住）· `MUSE_SAFETY_SEMANTIC_RECHECK`（不开 = 根本不跑）·
+`MUSE_SAFETY_RECHECK_SWEEP`（不开 = 跑，但队列丢掉的拍没人捡，见下方「投递可靠性」行）。
+
 🔴 **先看这条**：`ModerationProvider` 当前唯一实现是 Dev 桩（`providers::DevModeration`），
 真实语义分类**一次都没有发生**。本层交付的是**管线**，不是防线；接真实服务商 = 换实现并把
 `is_dev_stub()` 覆写为 `false`。**不得**据此表述为「五层漏斗已完整」或「内容安全已就绪」。
@@ -859,11 +863,15 @@ if 线：   从终局那一拍岔出去的、只属于你的一条平行线   �
 | 失败 | 先重试（`MUSE_SAFETY_L3_MAX_ATTEMPTS` / `..._BACKOFF_MS` / `..._TIMEOUT_MS`），预算耗尽 → 🔴 **fail-closed**：收紧为 `pending` + 记险 + **无条件**进人审队列。方向不参数化——与 `MUSE_SAFETY_LEXICON` 的 fail-safe（默认「继续过滤」）自洽 |
 | 与第 4 层 | 播出面本就只出 `approved`，故收紧发生在直播水位线之前 ⇒ 观众根本看不到。`interceptedBeforeBroadcast` 是「`MUSE_LIVE_DELAY_TICKS` 够不够」的度量，口径对齐 `live_withholds.preemptive`。⚠️ 它**不等于**「没人看见」：延迟只作用于世界外，成员的读取面不延迟。已返回给客户端的字节收不回，平台也不另发撤回通知 |
 | 留痕 | 一律走 `safety` 既有入口（`record_risk` + 第 2/3 层共用的那条 `audit_queue` 写入语句），本层不另开写入路径 |
-| 成本 | `cost.ratioAvailable` 恒为 **`false`**：T5 门槛「内容审核成本 ≤ 生成成本的 5%」需要审核侧的计价口径，而 `check_text` 只回裁决、不回 token/费用。本端点先把**调用量**（`moderationCallsInWindow`）与**送审字符数**变成可查的数（此前一次调用都没被计过数），分母侧 `generationTokensInWindow` 已可得 |
+| 投递可靠性 | 响应块 `durability`。队列是进程内内存队列、**不持久**；`MUSE_SAFETY_RECHECK_SWEEP`（**默认关**）按 `world_ticks ⋈ safety_recheck_runs` 对账，把「没有终局复核行」的拍补投回去。🔴 有硬上限：只回看 `MUSE_SAFETY_L3_SWEEP_LOOKBACK_MS`（默认 24h），`justOutsideWindow > 0` = 已有拍**永远补不回来**。数字**现算**，不读轮询自己的记账 ⇒ 轮询关着/挂了也照样有效 |
+| 成本 | `cost.ratioAvailable` **两侧单价都显式配置时才为 `true`**：T5 门槛「内容审核成本 ≤ 生成成本的 5%」= 审核侧 `MUSE_MODERATION_HTTP_PRICE_CENTS_PER_1K_CALLS` × `moderationCallsInWindow`（含重试）÷ 生成侧 `MUSE_TOKEN_CNY_CENTS_PER_1K` × `generationTokensInWindow`。缺任一半 → `false` + `why` 明说缺哪半。🔴 生成侧**不回落代码内默认估算**（拿估算算门槛得到的是「估算的估算」，在看板上和真值长得一样）。比值一律万分比整数 `ratioBp`，禁浮点 |
 
-⚠️ **已知缺口（第 2 层就存在，本层让它更容易被触发）**：`admin_api::audit::writeback_target` 对
-`world_event` 主体返回 `None`，人审在队列里点「通过」**不会**把 `world_events.moderation`
-写回 `approved`。补它需要在 `world_events` 上开一条**放宽**路径，属红线邻近改动，应单独评审。
+✅ **原登记的缺口已闭合（migration 0047）**：此处曾长期写着「`admin_api::audit::writeback_target`
+对 `world_event` 主体返回 `None`，人审点『通过』不会写回 `approved`」——那条已由 0047 补上：
+`POST /admin/audit-queue/{id}/review` 现在能回写，`world_events` 上因此有了**全仓唯一一条放宽语句**
+（`SET` 仍只有 `moderation` 一列、按主键点名、CAS、起点白名单 `IN ('pending','rejected')` 写死在
+SQL 里），权限分 reviewer / admin 两档。三条写入路径由源码级红线用例
+`red_line_world_events_has_one_ratchet_and_one_guarded_relax` 全仓盘点、逐条钉死形状。
 
 ### 人工校准面（无迁移；总规格 §79/§83「人工校准 → 仿真试跑 → 世界质量回归」的第一环）
 

@@ -117,6 +117,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 与世界推进的排队时间不得互相绑架（provider 慢一点不该让世界少跑几拍）。
     // 默认关闭（`MUSE_SAFETY_SEMANTIC_RECHECK`），关着时队列里一个任务都不会有。
     safety::semantic::spawn_workers(state.clone());
+    // §15 第 3 层的**补偿轮询**：内存队列不持久，进程重启会把在飞的复核任务带走；
+    // 还有一类拍（blocked / cas_conflict 收尾）压根就没经过入队那一行。轮询按
+    // `world_ticks ⋈ safety_recheck_runs` 对账，把没有终局复核行的拍补投回去。
+    // 默认关闭（`MUSE_SAFETY_RECHECK_SWEEP`），关着时这条循环只做一次开关解析。
+    safety::semantic::sweep::spawn_sweeper(state.clone());
     // 通知 outbox 消费
     notifications::spawn_outbox_worker(state.clone());
 

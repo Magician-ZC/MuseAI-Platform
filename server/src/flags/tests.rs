@@ -246,14 +246,27 @@ fn red_line_only_safety_chain_defaults_on() {
     // 🔴 它默认关闭还有第二重意义：provider 目前是 Dev 桩，开着也拦不住任何东西，
     // 默认关闭避免了「链路开着」被误读成「防线生效」。
     //
+    // 16 → 17：`MUSE_SAFETY_RECHECK_SWEEP`（第 3 层复核的补偿轮询，migration 0048）。
+    // ⚠️ 这是**第三个属于 `safety` 的开关**，默认同样为关，但理由与上面两个都不同：
+    // 它是全仓唯一一处**凭数据自发烧 token** 的路径——不需要有人推进世界，只要数据里
+    // 有「没被复核过的拍」它就会发起送审。默认开着等于让一次代码合并抬高成本曲线而
+    // 没有人按过开关，正是 §0.1 要挡的那件事。
+    //
     // 这些都是登记表**新增了默认关闭的开关**，不是断言被放宽——上面那个循环仍逐条钉死
     // 「除审核链外默认值必须为 false」，新开关同样在其中。
+    //
+    // 🔵 这条计数是**有意的棘轮**，不是会过期的基线：它就是要在每次新增开关时变红，
+    // 逼一次人工评审（同 `red_line_world_events_has_one_ratchet_and_one_guarded_relax`
+    // 钉死「world_events 上只许有 3 条写路径」）。与 CLAUDE.md 里去掉的那几处硬编码计数
+    // 性质相反——那些是**描述现状**的文档数字（过期即误导），这个是**约束变更**的闸门
+    // （过期即报警，正是它要的）。
     assert_eq!(
         KNOWN_FLAGS.len(),
-        16,
+        17,
         "登记表应覆盖 9 个存量 env 开关 + R3 新建的 MUSE_OOC_ANNOTATIONS / MUSE_IFLINE_PARALLEL / \
          MUSE_SOCIAL_IDENTITY_UNLOCK / MUSE_LIVE_STAGE + MUSE_DISPOSAL_NAME_GATE + \
-         MUSE_SAFETY_SEMANTIC_RECHECK，其中 MUSE_OFFPEAK_SCHEDULING 已由纯 env 迁入体系"
+         MUSE_SAFETY_SEMANTIC_RECHECK + MUSE_SAFETY_RECHECK_SWEEP，\
+         其中 MUSE_OFFPEAK_SCHEDULING 已由纯 env 迁入体系"
     );
 }
 
@@ -941,6 +954,11 @@ async fn list_endpoint_reports_effective_global_state() {
             "MUSE_LIVE_STAGE",
             "MUSE_OFFPEAK_SCHEDULING",
             "MUSE_SAFETY_SEMANTIC_RECHECK",
+            //   - `MUSE_SAFETY_RECHECK_SWEEP`：第 3 层的补偿轮询，新建件、建成即接线
+            //     （`safety::semantic::sweep::spawn_sweeper`）。⚠️ 它默认关闭还有一条别的开关
+            //     没有的理由：轮询是全仓唯一一处**凭数据自发烧 token** 的路径——不需要有人
+            //     推进世界就能发起送审。这类东西默认开着，等于让一次合并抬高成本曲线。
+            "MUSE_SAFETY_RECHECK_SWEEP",
             "MUSE_DISPOSAL_NAME_GATE"
         ],
         "已接线清单：0036 的参考接线 + R3 新建的 OOC 注解权 / if 线 / 真人社交解锁 / 直播场 + \

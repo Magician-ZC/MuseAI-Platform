@@ -56,10 +56,22 @@
 //! - **选 ③** 还白拿两样：`due_ms` 天然是**退避重排**的原语（重试不需要占着一个任务 sleep），
 //!   `topic` 天然把审核流量与 tick 流量隔在两条独立队列上。
 //!
-//! ⚠️ **已知边界**：`MemQueue` 是进程内内存队列，**不持久**。进程重启时在飞的复核任务会丢，
-//! 那一拍的事件就停留在 `approved` 且再无人复核。这不是本模块引入的新性质（tick 队列同理），
-//! 但对审核链更要紧，故如实登记为遗留：接 Redis 实现（`queue::Queue` trait 不变）或加一条
-//! 「扫尾未复核拍」的补偿轮询即可闭合。
+//! ✅ **已闭合（原登记为遗留）**：`MemQueue` 是进程内内存队列，**不持久**——进程重启时在飞的
+//! 复核任务会丢，那一拍的事件就停留在 `approved` 且再无人复核。原登记给了两条闭合路径
+//! （接 Redis / 加补偿轮询），本批次走的是后者：[`sweep`]。
+//!
+//! 选轮询不是因为它更省事，是因为**两条路闭合的不是同一个洞**。持久队列保证的是
+//! 「**已经入队**的任务不丢」；而这条链上更常见的失败是「**根本没入队**」——开关当时关着、
+//! tick 走的是 blocked / cas_conflict 分支压根没到 `enqueue_after_commit` 那一行、
+//! `push_json` 序列化失败被静默吞掉。队列对这些一无所知，因为待办从没进过它的视野。
+//! 轮询不问「任务在哪」，它问「**这一拍到底被复核过没有**」，答案从
+//! `world_ticks ⋈ safety_recheck_runs` 现算。🔵 写这条对账查询时才发现的一个洞：
+//! blocked / cas_conflict 收尾的拍此前**从未被第 3 层看过一眼**。
+//!
+//! ⚠️ 轮询自身也有边界，且它们**不假装不存在**：回看窗口是一条真实的覆盖上限
+//! （挂机超过 `MUSE_SAFETY_L3_SWEEP_LOOKBACK_MS` 的那段永远补不回来，运营面单列一个
+//! `justOutsideWindow` 把它量出来）、单实例假设、补偿路径比正常重试粗（重查整拍）。
+//! 三条都写在 [`sweep`] 的模块头与 `GET /admin/safety/recheck` 的 `durability.honesty[]` 里。
 //!
 //! ════════════════════════════════════════════════════════════════════════════
 //! 🔴 只收紧、不改写
@@ -203,6 +215,9 @@ use crate::error::ApiError;
 use crate::providers::ModerationVerdict;
 
 use super::{record_risk, verdict_str, Severity};
+
+/// 补偿轮询（「扫尾未复核拍」）。闭合的是本模块头此前登记的 `MemQueue` 不持久那条遗留。
+pub(crate) mod sweep;
 
 #[cfg(test)]
 pub(crate) mod testkit;
@@ -454,13 +469,38 @@ pub(crate) async fn run_recheck(state: &AppState, job: &RecheckJob) -> Result<Ru
     let attempt = job.attempt.max(1);
 
     // 每次尝试都重解析开关：运营在重试期间关掉第 3 层，在飞的任务立刻停手（不再收紧任何东西）。
+    //
+    // 🔴 这一条早返回**不落台账**，且必须保持不落：`disabled_is_byte_identical_to_before_wiring`
+    // 要求开关关闭时的行为与接线前逐字节相同，写一行 `skipped` 就破了那条约束
+    // （下面「无候选」那一条则相反，见那里的说明——两种 skip 的落库口径**故意不同**）。
     if !enabled(&state.db, &job.world_id).await {
         return Ok(RunReport { outcome: OUTCOME_SKIPPED, ..Default::default() });
     }
 
     let candidates = load_candidates(&state.db, &job.world_id, job.tick_no, &job.retry_ids).await?;
     if candidates.is_empty() {
-        return Ok(RunReport { outcome: OUTCOME_SKIPPED, ..Default::default() });
+        // 🔴 「看过了，这一拍没有可送审的内容」**要落账**。
+        //
+        // 它此前不落账，因为没人从数据侧反过来问过「这一拍查过没有」。补偿轮询
+        // （`sweep`）正是那个提问者：它的判据是「有没有终局行」，而一拍若有 approved 事件
+        // 但正文全空（或已全被第 2 层拦下），复核会一直 skip、一直不留行，于是**每一轮扫描
+        // 都把它当缺口重投一次，永不收敛**。落一行 `skipped` 就把这个循环钉死了。
+        //
+        // 落的这行是**零成本记录**：没调过 provider，所有计数列为 0，`chars_checked` 为 0，
+        // 于是成本聚合与 T5 比值一分钱都不受影响（`runs` 会 +1，那正是「查过一次」的事实）。
+        let r = RunReport { outcome: OUTCOME_SKIPPED, ..Default::default() };
+        persist_run(
+            &state.db,
+            job,
+            attempt,
+            &r,
+            public_sample_bp(),
+            private_sample_bp(),
+            state.moderation.is_dev_stub(),
+            now_ms() - started,
+        )
+        .await?;
+        return Ok(r);
     }
 
     let (pub_bp, priv_bp) = (public_sample_bp(), private_sample_bp());
@@ -1123,6 +1163,8 @@ async fn recheck_overview(
                           世界成员的 /worlds/{id}/events 不延迟，对成员而言第 3 层恒为事后收紧。\
                           已经返回给客户端的字节收不回，平台也不会为此另发撤回通知（越描越黑）。",
         },
+        // ── 🔴 投递可靠性：这条链漏过多少拍（现算，不看轮询自己的记账） ─────────
+        "durability": sweep::gap_report(&state).await,
         // ── 成本 ───────────────────────────────────────────────────────────
         "cost": cost,
         "dashboardIntegration": {

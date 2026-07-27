@@ -112,6 +112,7 @@ cd server && MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo ru
 | `MUSE_SAFETY_LEXICON` | **开启** | 运行时敏感词库总开关(§15 第 2 层)。**默认开启且应保持开启**——内容安全是合规主体责任下的恒开设施,此开关定位是误伤应急阀,不是灰度位 |
 | `MUSE_SAFETY_LEXICON_EXTRA` | 空 | 运营补充敏感词(逗号/分号/换行分隔),归类 `custom`、低危 |
 | `MUSE_SAFETY_RUNTIME_AUDIT` | `high` | 运行时命中入人审队列的策略:`high`(仅高危)/`all`/`none`。**命中一律记 risk_events**,本开关只管是否额外入 `audit_queue`(每 tick 每事件都入队会淹掉人审)。配错值回落 `high`,不静默放宽或收紧 |
+| `MUSE_SAFETY_RECHECK_SWEEP` | **关闭** | 第 3 层复核的**补偿轮询**(扫尾未复核拍)。内存队列不持久,进程重启会把在飞的复核任务带走;另有一类拍(tick 走 blocked / cas_conflict 收尾)压根没经过入队那一行。开着它才会按 `world_ticks ⋈ safety_recheck_runs` 对账补投。🔴 **有真实覆盖上限**:只回看 `MUSE_SAFETY_L3_SWEEP_LOOKBACK_MS`(默认 24h),挂机超过这段的拍**永远补不回来**——`GET /api/admin/safety/recheck` 的 `durability.justOutsideWindow` 就是量它的。🔴 **单实例**:多实例同开会重复补投(重复的 provider 调用是真烧的),同 `world_events.sequence` 那条,属发布纪律。调参前缀 `MUSE_SAFETY_L3_SWEEP_*`(间隔 / 宽限 / 回看 / 批量) |
 | `MUSE_CORS_ORIGINS` | 本地开发六项(见下) | 跨源白名单(逗号分隔)。**三个前端都与 server 不同源**:玩家端 Vite `:1420`、运营后台 Vite `:1430`、Tauri webview(`tauri://localhost` / `https://tauri.localhost`),而 server 在 `:8787`。🔴 **生产必配**——不配则只放行本地开发来源,线上域名会被拦。非法条目跳过并告警,全部非法则退化为「不放行任何跨源」(fail-closed:配错了宁可前端连不上、立刻可见,也不静默放宽成通配)。**刻意不提供通配选项**:这些接口虽有 JWT 鉴权,放开任意源仍是无谓攻击面 |
 
 > 🔴 **配上 `MUSE_MODERATION_HTTP_ENDPOINT` 的那一刻,一件事当场生效、另一件不会——两者极易混淆。**
@@ -120,6 +121,7 @@ cd server && MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo ru
 > |---|---|---|
 > | **静态内容审核**(角色卡 / 世界模板 / 装配钩子 / 入站托梦信) | **没有独立开关**——`safety::moderate_and_queue` 无条件调 `check_text` | **当场切到真实厂商。** 厂商挂了 → 这些上传返回 500 而不是被放行(fail-closed,方向正确,但这是配置当天就能看见的行为变化,不该事后才发现) |
 > | **第 3 层运行时语义复核** | `MUSE_SAFETY_SEMANTIC_RECHECK`,**默认关** | **不会自己开始。** 配好 provider ≠ 开始复核,两个开关是分离的 |
+> | **第 3 层的投递补漏**(补偿轮询) | `MUSE_SAFETY_RECHECK_SWEEP`,**默认关** | **也不会自己开始**,而且它与上一行**还是分离的**:第 3 层开着、轮询关着 = 复核会跑,但**丢掉的拍没人捡**。这条链一共三个开关,三个都得按 |
 >
 > ⚠️ 本 provider 是**文本**审核。它刻意**不继承** trait 的 `check_image` 直过默认——那会造出一个
 > 自称「已接真实服务」(`is_dev_stub() == false`)却放行每一张图的 provider,正是 `is_dev_stub`
@@ -220,8 +222,8 @@ cd server && MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo ru
 ```bash
 # 引擎 + 后端 + 桌面壳
 cargo test --manifest-path crates/muse-engine/Cargo.toml          # 291 passed
-(cd server && cargo test)                                          # 996 passed(default,含黄金世界回归)
-(cd server && cargo test --features billing,arena)                 # 1074 passed
+(cd server && cargo test)                                          # 1008 passed(default,含黄金世界回归)
+(cd server && cargo test --features billing,arena)                 # 1086 passed
 (cd server && cargo test golden)                                   # 14 passed(12 项 runtime::golden::* + 2 项录放 round-trip)
 cargo test --manifest-path src-tauri/Cargo.toml                    # 216 passed
 # 前端 + 后台
@@ -348,8 +350,18 @@ curl -sX POST 127.0.0.1:8787/api/auth/challenge -H 'Content-Type: application/js
 1. 🔴 **Postgres 生产路径从未在真实部署下跑过。** 两个 feature 组合的测试在 PG 上全绿
    (占位符与 `SUM()` 返回 `numeric` 两类根因已修完),但那只证明**SQL 可移植**;
    连接池行为、超时、迁移锁、故障恢复**零验证**。按 §0.3 是 `Implemented`,不是 `Production-ready`。
-2. 🔴 **`MemQueue` 不持久**:第 3 层语义复核的在飞任务在进程重启时丢失,那一拍停在 `approved`
-   且无人复核。补法是 Redis 实现(trait 不变)或补偿轮询。
+2. ⚠️ **`MemQueue` 不持久**——第 3 层的丢包**已有补漏,但那条补漏默认关着,且自己也有上限**。
+   队列仍不持久(进程重启带走在飞任务),补的是**下游**:`MUSE_SAFETY_RECHECK_SWEEP`
+   按 `world_ticks ⋈ safety_recheck_runs` 对账,把「没有终局复核行」的拍补投回去。
+   它同时覆盖持久队列覆盖不了的「压根没入队」——包括一类此前无人登记的漏:
+   tick 走 blocked / cas_conflict 收尾时**根本没执行到入队那一行**。
+   上线要知道三件事:
+   - 🔴 **默认关**。第 3 层开着、轮询关着 = 复核会跑,但丢掉的拍没人捡。这条链**三个开关**
+     (provider 配置 / `MUSE_SAFETY_SEMANTIC_RECHECK` / `MUSE_SAFETY_RECHECK_SWEEP`)都得按。
+   - 🔴 **回看窗口是硬上限**(`MUSE_SAFETY_L3_SWEEP_LOOKBACK_MS`,默认 24h)。挂机超过这段的拍
+     **永远补不回来**。`GET /api/admin/safety/recheck` 的 `durability.justOutsideWindow > 0`
+     就是「这个值配短了」的直接证据——它现算,不看轮询自己的记账,所以轮询死了它照样会涨。
+   - 🔴 **单实例假设**。多实例同开会重复补投,重复的 provider 调用是真烧的(同第 3 条,发布纪律)。
 3. 🔴 **多实例滚动发布期间 `world_events.sequence` 仍可能撞号**:发号器(迁移 `0043`)解决的是
    同版本并发,而「旧实例继续往已登记世界写」是**发布纪律**问题,迁移解决不了。
    撞号的后果是 WS 断线补偿会永久漏掉一条事件。
@@ -376,10 +388,18 @@ MUSE_TEST_DATABASE_URL=postgres://…  cargo test --manifest-path server/Cargo.t
 cargo test --manifest-path server/Cargo.toml golden
 # 3. 配好审核 provider 后,确认它真的翻面了(而不是仍在用 Dev 桩)
 curl -H "Authorization: Bearer <admin>" localhost:8787/api/admin/safety/recheck | grep providerStub
+# 4. 确认第 3 层没有在悄悄漏拍(即使还没开轮询,这个数也是真的)
+curl -H "Authorization: Bearer <admin>" localhost:8787/api/admin/safety/recheck \
+  | python3 -m json.tool | grep -A4 '"durability"'
 ```
 
 第 3 条是**唯一能证明内容审核真的接上了**的检查:`providerStub` 为 `false`、`source` 为
 `production`,且 `honesty[]` 不再说「拦不住任何东西」。**以这组字段为准,不以任何文档为准。**
+
+第 4 条看 `durability`:`enabledWorldTicks` 是**真缺口**(那些世界开着第 3 层却没有终局复核行),
+`justOutsideWindow > 0` 说明已经有拍掉出补偿窗口、再也补不回来。这两个数**从数据现算**,
+不读轮询自己的记账——所以它们在轮询关着、挂了、压根没部署的情况下同样有效,
+可以拿来决定「要不要开这个开关」,而不是开了才知道有没有用。
 
 ---
 

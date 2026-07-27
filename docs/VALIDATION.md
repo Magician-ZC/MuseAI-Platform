@@ -816,6 +816,29 @@ golden `14`，`runtime/simulation/baseline.json` 与 golden 基线**一个字节
 > `docs/build/open-decisions.md`**。把两者混在一起会让「还没做」与「还没定」看起来是
 > 一回事——前者是欠账,后者是等一个人拍板,处理方式完全不同。
 
+### 3.7 server↔engine 的 JSON 边界：手读字符串键的地方（登记于 2026-07-27）
+
+> `narrative_state_json` 是 server 与 `muse-engine` 之间**唯一靠 JSON 传递、且部分消费方
+> 按字符串键手读**的边界。手读的地方**没有编译期检查**：引擎侧改一个字段名，读侧看到的
+> 只是「取不到值」，而各自的用例都会绿——两边各按自己的假设测了自己那一半。
+
+| 消费方 | 读法 | 失败方向 | 现状 |
+|---|---|---|---|
+| `events::world_state_summary` | **类型化**（`serde_json::from_str::<NarrativeState>` 后访问 `rel.known_to`） | 编译期就挡住 | ✅ **这是正确范式** |
+| `memorial`（死亡证据 (b)） | 手读 `narrative.pendingConsents[].{subject,eventKind}` | 🔴 **fail-open**：键不存在与「已落定」无法区分 → 卡仅凭同意就被封卷 | ✅ 已用真实引擎类型钉住（4 条用例）+ 两份拷贝同步的源码级不变式 |
+| `social::bond_between` | 手读 `relations[].{from,to,trust,affinity,fear,debt}` | 🔴 **fail-open 且撞隐私红线**：字段漂移 → 全读 0.0 → `hostile=false`，一票否决静默失效，而 `died_together` 是**独立**解锁路径仍会放行 ⇒ **敌对线的两人能互解真人身份**（违反 §14） | ✅ 已用真实引擎类型钉住（3 条用例） |
+
+**为什么不直接把手读改成类型化**（那样结构上就没有这个问题）：两者的**容错语义不同**。
+手读是逐字段宽容的（缺一个字段只影响那一个维度）；类型化是整体严格的——
+`RelationState.trust` 等没有 `#[serde(default)]`，一份缺字段的历史/异常状态会让**整次反序列化失败**，
+于是所有关系一起消失。在隐私判定这条路径上，把「少读到一个维度」升级成「看不到任何关系」
+是另一种事故。故本批次选择**用测试钉住线上形状**，而不是改容错语义；
+真要改成类型化，需要先给引擎侧字段补 `#[serde(default)]` 并单独评审。
+
+🔵 三处故障注入实测：给引擎侧 `trust` / `fear` 改名 → 立刻红。
+⚠️ 而给 `RelationState` **去掉 `rename_all`** 不会红——那是**正确的**：它读到的几个字段都是单词，
+camelCase 与 snake_case 同形。`known_to` 才受影响，而那一处是类型化读的。
+
 ## 4. 验证基建三件套（优先于新增功能）
 
 1. **黄金世界回归**：一个公版/原创标准样板（固定角色卡 + 世界模板 + 20-30 个关键剧情测试点，

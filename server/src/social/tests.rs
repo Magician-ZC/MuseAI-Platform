@@ -1596,3 +1596,113 @@ async fn the_distribution_never_leaks_who() {
     }
     assert!(b.get("items").is_none() && b.get("requests").is_none(), "不得有逐条明细");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 🔴 跨 crate 线上契约：引擎写出来的 `relations`，敌对判据读得懂吗
+//
+// `bond_between` 按**字符串键**手读引擎的 `RelationState`（from / to / trust /
+// affinity / fear / debt）。而 `muse-engine` 侧与本模块**各自按自己的假设写**，
+// 中间没有任何东西验证两边说的是同一件事——本模块既有用例喂的都是**手写 JSON**。
+//
+// 🔴 **失败方向是 fail-open，且撞的是隐私红线。** 字段名一旦漂移，`f()` 对每个维度都
+// 取不到值 → 全部读成 0.0 → 同时发生两件事：
+//   ① `positive = 0` → 正向路径走不通（这一半是 fail-closed，无害）；
+//   ② `hostile = false` → **一票否决静默失效**。
+// 而 `died_together` 是一条**独立**的解锁路径（不看 positive）——于是
+// **敌对线的两个玩家仍能互相解锁真人身份**，直接违反 §14「敌对线永久匿名（一票否决）」。
+//
+// 下面用**真实引擎类型 + 真实 serde** 走一遍，把这条契约钉住：谁改了序列化，这里立刻红。
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 用**引擎自己的类型**造一份含关系的叙事态并序列化——不是手写 JSON。
+/// 手写 JSON 只能验「读侧认得我手写的形状」，验不到「引擎真的写出这个形状」。
+fn engine_state_with_relation(from: &str, to: &str, trust: f32, affinity: f32, fear: f32, debt: f32) -> String {
+    use muse_engine::narrative::types::{NarrativeState, RelationState};
+    let mut st = NarrativeState::default();
+    st.relations.push(RelationState {
+        from: from.into(),
+        to: to.into(),
+        trust,
+        affinity,
+        fear,
+        debt,
+        known_to: Vec::new(),
+        notes: Vec::new(),
+    });
+    serde_json::to_string(&st).expect("引擎叙事态可序列化")
+}
+
+/// 🔴 **敌对必须被引擎写出来的形状识别到**——这条一旦失效，一票否决就静默失效，
+/// 而 `died_together` 那条独立路径仍会放行，敌对线的两人就能互解真人身份（§14 红线）。
+#[test]
+fn hostility_is_detected_from_what_the_engine_actually_writes() {
+    // 强敌意：trust 深负（超过 hostile_max 默认阈值）。
+    let json = engine_state_with_relation("cA", "cB", -0.9, 0.0, 0.0, 0.0);
+    let view = super::bond_between(&json, "cA", "cB", 0.5, 0.6);
+    assert!(
+        view.hostile,
+        "🔴 敌对没被识别到。这条红了多半是 muse-engine 的 RelationState 改了序列化\
+         （改名 / 去掉 rename_all）——而读侧对此**完全无法与「关系平淡」区分**：\
+         两者都读成 0.0。失败方向是 fail-open，且 died_together 那条独立路径仍会放行。\
+         实得 {view:?}"
+    );
+    assert!(view.edges > 0, "边必须被数到，否则说明连 from/to 都没匹配上: {view:?}");
+
+    // 高恐惧同样构成敌对（另一条判据，独立于 trust/affinity）。
+    let fear_json = engine_state_with_relation("cA", "cB", 0.1, 0.1, 0.9, 0.0);
+    assert!(
+        super::bond_between(&fear_json, "cA", "cB", 0.5, 0.6).hostile,
+        "🔴 fear 维度的敌对判据也必须认得引擎写出来的形状"
+    );
+}
+
+/// 正向分也必须从引擎写出来的形状里算得出来——否则解锁门恒不通过，
+/// 而那是 fail-closed 的一半：不报错、不告警，只是**所有人永远解锁不了**。
+#[test]
+fn the_positive_bond_is_computed_from_what_the_engine_actually_writes() {
+    let json = engine_state_with_relation("cA", "cB", 0.8, 0.4, 0.0, 0.0);
+    let view = super::bond_between(&json, "cA", "cB", 0.5, 0.6);
+    assert!(!view.hostile, "无敌意: {view:?}");
+    assert_eq!(view.edges, 1, "{view:?}");
+    // 逐边 max(trust, affinity, debt, 0) = 0.8；单边时跨边 min 就是它本身。
+    assert!(
+        (view.positive - 0.8).abs() < 1e-6,
+        "🔴 正向分算不出来 = 解锁门恒不通过，而它**不报错也不告警**——\
+         所有人永远解锁不了，且没人知道为什么。实得 {view:?}"
+    );
+
+    // 🔴 debt 计入正向、fear 不计入：这是现行公式（open-decisions §2 仍待产品确认），
+    // 但**只要它还是现行公式，就该被钉住**——悄悄改掉它会改变谁能看到谁的真身。
+    let debt_json = engine_state_with_relation("cA", "cB", 0.0, 0.0, 0.0, 0.7);
+    assert!((super::bond_between(&debt_json, "cA", "cB", 0.5, 0.6).positive - 0.7).abs() < 1e-6,
+            "debt 目前计入正向");
+    let fear_only = engine_state_with_relation("cA", "cB", 0.0, 0.0, 0.4, 0.0);
+    assert_eq!(
+        super::bond_between(&fear_only, "cA", "cB", 0.5, 0.6).positive, 0.0,
+        "🔴 fear 绝不计入正向 —— 怕一个人不是跟他关系好"
+    );
+}
+
+/// 🔴 **双向取 min**：单方面的好感不构成羁绊线。
+/// 用引擎写出来的两条有向边验——A→B 很好、B→A 平淡时，正向分取**弱的那一向**。
+#[test]
+fn a_one_sided_bond_does_not_pass_because_the_weaker_direction_gates() {
+    use muse_engine::narrative::types::{NarrativeState, RelationState};
+    let mk = |from: &str, to: &str, trust: f32| RelationState {
+        from: from.into(), to: to.into(), trust, affinity: 0.0, fear: 0.0, debt: 0.0,
+        known_to: Vec::new(), notes: Vec::new(),
+    };
+    let mut st = NarrativeState::default();
+    st.relations.push(mk("cA", "cB", 0.9)); // 一头热
+    st.relations.push(mk("cB", "cA", 0.1)); // 对方平淡
+    let json = serde_json::to_string(&st).unwrap();
+
+    let view = super::bond_between(&json, "cA", "cB", 0.5, 0.6);
+    assert_eq!(view.edges, 2, "两条有向边都要数到: {view:?}");
+    assert!(
+        (view.positive - 0.1).abs() < 1e-6,
+        "🔴 必须取**弱的那一向**（0.1），不是强的、也不是平均。\
+         「双向自愿」在数据层的前置就是这一步——一头热的人不该因为自己感觉好\
+         就够格去要对方的真身。实得 {view:?}"
+    );
+}

@@ -1806,6 +1806,51 @@ async fn seed_routes_json(db: &AnyPool, version: &str, routes: serde_json::Value
 
 /// 测试点 #8：RoutesConfig 带 maxOutputTokens → 解析出的值等于配置值；缺字段 → 回退默认。
 #[tokio::test]
+async fn resolve_model_routes_reads_fallback_and_stays_backward_compatible() {
+    let state = test_state().await;
+    let p = |m: &str| json!({ "interface": "OpenAI-compatible", "baseUrl": "http://mock", "apiKey": "k", "model": m });
+
+    // 🔴 旧 routes_json（无 fallback 字段）→ None，**逐字节向后兼容**。
+    // 这一条比「能读出来」更要紧：绝大多数世界都是这个形态，读错了等于给所有世界
+    // 悄悄开了一条备用路由（而 `FallbackModelClient` 在 None 时是纯透传）。
+    seed_routes_json(&state.db, "v-nofb", json!({ "default": p("main") })).await;
+    let (_r, _m, fb) =
+        super::resolve_model_routes(&state.db, "v-nofb").await.unwrap().expect("应解析出路由");
+    assert!(fb.is_none(), "🔴 未声明 fallback 的世界不得凭空长出一条备用路由");
+
+    // 声明了 → 读出来，且**不是**主路由那一个。
+    seed_routes_json(
+        &state.db,
+        "v-fb",
+        json!({ "default": p("main"), "fallback": p("backup") }),
+    )
+    .await;
+    let (routes, _m, fb) =
+        super::resolve_model_routes(&state.db, "v-fb").await.unwrap().expect("应解析出路由");
+    assert_eq!(routes.default.model, "main");
+    assert_eq!(fb.expect("应读出备用路由").model, "backup");
+}
+
+/// 🔴 `world_ticks.fallback_used` 的默认值必须是 **0 而不是 NULL**，且存量行也是 0。
+/// 0 在这里是**真的**——本列上线前没有回退这回事，不是「不知道」。
+#[tokio::test]
+async fn fallback_used_defaults_to_zero_for_existing_rows() {
+    let state = test_state().await;
+    sqlx::query(
+        "INSERT INTO world_ticks (id, world_id, tick_no, base_revision, status, created_at) \
+         VALUES ('wt_fb', 'w_fb', 0, 0, 'pending', 1)",
+    )
+    .execute(&state.db)
+    .await
+    .unwrap();
+    let n: i64 = sqlx::query_scalar("SELECT fallback_used FROM world_ticks WHERE id = 'wt_fb'")
+        .fetch_one(&state.db)
+        .await
+        .expect("🔴 该列必须 NOT NULL DEFAULT 0 —— NULL 会让「没回退过」与「不知道」混起来");
+    assert_eq!(n, 0);
+}
+
+#[tokio::test]
 async fn resolve_model_routes_reads_max_output_tokens_from_config() {
     let state = test_state().await;
     let profile =
@@ -1813,19 +1858,19 @@ async fn resolve_model_routes_reads_max_output_tokens_from_config() {
 
     // 带 maxOutputTokens（camelCase）→ 读取配置值。
     seed_routes_json(&state.db, "v-cfg", json!({ "default": profile, "maxOutputTokens": 4096 })).await;
-    let (_routes, max_cfg) =
+    let (_routes, max_cfg, _fb) =
         super::resolve_model_routes(&state.db, "v-cfg").await.unwrap().expect("应解析出路由");
     assert_eq!(max_cfg, 4096, "应读取世界路由配置的 maxOutputTokens");
 
     // 缺字段 → 回退 DEFAULT_MAX_OUTPUT_TOKENS（旧世界零改动向后兼容）。
     seed_routes_json(&state.db, "v-def", json!({ "default": profile })).await;
-    let (_routes2, max_def) =
+    let (_routes2, max_def, _fb) =
         super::resolve_model_routes(&state.db, "v-def").await.unwrap().expect("应解析出路由");
     assert_eq!(max_def, super::DEFAULT_MAX_OUTPUT_TOKENS, "缺字段应回退默认上限");
 
     // 显式 0 视为无效 → 回退默认（不允许 0 上限把 max_tokens 直接归零）。
     seed_routes_json(&state.db, "v-zero", json!({ "default": profile, "maxOutputTokens": 0 })).await;
-    let (_routes3, max_zero) =
+    let (_routes3, max_zero, _fb) =
         super::resolve_model_routes(&state.db, "v-zero").await.unwrap().expect("应解析出路由");
     assert_eq!(max_zero, super::DEFAULT_MAX_OUTPUT_TOKENS, "maxOutputTokens=0 应回退默认");
 }

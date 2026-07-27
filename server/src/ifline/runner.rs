@@ -508,7 +508,8 @@ pub(super) async fn advance_one_beat(
 
     // ── 原世界（**只读**：本模块对世界线表只有 SELECT） ───────────────────────
     let origin = crate::worlds::load_world(db, &row.origin_world_id).await?;
-    let Some((routes, max_output_tokens)) =
+    // if 线沿用原世界钉住的路由（含备用路由）——分叉忠实于原世界的配置。
+    let Some((routes, max_output_tokens, route_fallback)) =
         crate::runtime::resolve_model_routes(db, &origin.model_route_version).await?
     else {
         // 与 `runtime` 的 `no_model_config` 同口径：dev 无模型配置 → 明确拒绝，不空跑。
@@ -714,6 +715,14 @@ pub(super) async fn advance_one_beat(
         Some(m) => m,
         None => Arc::new(HttpModelClient::new()?),
     };
+    // 备用路由包在最外层（同 `runtime::process_tick_inner`）。if 线的回退次数目前**不单独落库**——
+    // `ifline_beats` 没有对应列，而 if 线的成本已逐拍记在 `cost_tokens` 里（回退那次自然在内）。
+    // 如实说明：if 线看不出「这一拍走没走备用」，世界线看得出（`world_ticks.fallback_used`）。
+    let model: Arc<dyn ModelClient> = Arc::new(crate::runtime::fallback::FallbackModelClient::new(
+        model,
+        route_fallback,
+        Arc::new(crate::runtime::fallback::FallbackMeter::default()),
+    ));
 
     // 6) 跑（失败重试一次，每次尝试独立计量器 → 只计成功那次的 token；口径同 `runtime`）。
     let mut last_err: Option<String> = None;

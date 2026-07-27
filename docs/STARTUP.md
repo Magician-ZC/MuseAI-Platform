@@ -223,8 +223,8 @@ cd server && MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo ru
 ```bash
 # 引擎 + 后端 + 桌面壳
 cargo test --manifest-path crates/muse-engine/Cargo.toml          # 291 passed
-(cd server && cargo test)                                          # 1041 passed(default,含黄金世界回归)
-(cd server && cargo test --features billing,arena)                 # 1119 passed
+(cd server && cargo test)                                          # 1049 passed(default,含黄金世界回归)
+(cd server && cargo test --features billing,arena)                 # 1127 passed
 (cd server && cargo test golden)                                   # 14 passed(12 项 runtime::golden::* + 2 项录放 round-trip)
 cargo test --manifest-path src-tauri/Cargo.toml                    # 216 passed
 # 前端 + 后台
@@ -441,9 +441,12 @@ curl -H "Authorization: Bearer <admin>" localhost:8787/api/admin/safety/recheck 
   立绘/切片为 DevProvider 占位。⚠️ 它**等的是凭据不是决定**,同真实审核服务商。
 - **创作者结算**:与用户钱包是两套账,本期只做用户侧。🔴 若涉及真实提现,
   它本身就是对「无提现」这条**平台红线的修改**,必须走显式评审。
-- **模型备用路由**:`model_routes.routes_json` 里没有这个概念。它不是「缺数据源」而是
-  **缺语义定义**(形状 / 回退触发条件 / 成本口径三件),见 open-decisions §4——
-  那是本清单里最接近「可以直接做」的一项。
+- ~~**模型备用路由**~~ —— **已定并已实现**(2026-07-27,migration `0051`)。
+  `routes_json` 可声明单个 `fallback` profile;**只在传输层失败时回退**
+  (内容错误绝不回退——那会给「模型持续输出坏 JSON」装一个成本放大器);
+  成本相加,回退次数落 `world_ticks.fallback_used`。做成 `ModelClient` 包装器,引擎一行没改。
+  ⚠️ 运营面「路由错误率」那一栏仍是 `—`:数据源有了,但分母口径(每拍/每次调用/每世界)
+  还要定一次,见 open-decisions §4 尾部。
 
 ---
 

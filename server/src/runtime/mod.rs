@@ -964,6 +964,11 @@ struct SchedWorld {
     room_type: String,
 }
 
+/// 模型备用路由（open-decisions §4）：主路由传输层失败时换一家再试一次。
+/// 做成 `ModelClient` 包装器而不是改引擎——路由与回退是**运营配置**，
+/// 而 `muse-engine` 是宿主无关的叙事内核，桌面轨同用它。
+pub(crate) mod fallback;
+
 // ---------- 版本钉住解析 ----------
 
 // rename_all=camelCase：与 ModelProfile（baseUrl/apiKey）及桌面端 agentConfigs 命名一致；
@@ -981,10 +986,28 @@ struct RoutesConfig {
     /// `DEFAULT_MAX_OUTPUT_TOKENS`。`#[serde(default)]` 保证旧 routes_json（无此字段）零改动向后兼容。
     #[serde(default)]
     max_output_tokens: Option<u32>,
+    /// 🔴 **备用路由**（open-decisions §4）：主路由传输层失败（连接/超时/5xx/429）时换它再试一次。
+    ///
+    /// 取**单个** profile 而不是一条列表，是刻意的：链式回退的成本是几何级的，
+    /// 而运营真正需要的是「主的挂了有个顶上的」，不是「排一队」。
+    ///
+    /// 🔴 它**不按 stage 分**：厂商挂了是 provider 级的事，不是「writer 挂了但 critic 还活着」。
+    /// 按 stage 配意味着要维护 6 份备用配置，而故障模式并不按 stage 分布。
+    ///
+    /// `#[serde(default)]` ⇒ 旧 routes_json（无此字段）**零改动向后兼容**，且
+    /// 未声明时 `FallbackModelClient` 逐字节退化为直接透传（同 `max_output_tokens` 的做法）。
+    #[serde(default)]
+    fallback: Option<ModelProfile>,
 }
 
-/// 解析世界钉住的 model_route_version → (ModelRoutes, max_output_tokens)；无匹配/缺 default profile →
-/// None（dev 跳过信号）。max_output_tokens 取配置值，缺省回退 `DEFAULT_MAX_OUTPUT_TOKENS`（>0 兜底）。
+/// 解析世界钉住的 model_route_version → `(ModelRoutes, max_output_tokens, fallback)`；
+/// 无匹配 / 缺 default profile → None（dev 跳过信号）。
+/// max_output_tokens 取配置值，缺省回退 `DEFAULT_MAX_OUTPUT_TOKENS`（>0 兜底）。
+///
+/// 🔴 `fallback` **并列返回而不是塞进 `ModelRoutes`**：那是引擎类型（`muse-engine`），
+/// 而备用路由是**平台侧的运营配置**——桌面轨同用那个 crate，不该背上它。
+/// 消费方是 `runtime::fallback::FallbackModelClient`（一个 `ModelClient` 包装器），
+/// 引擎自始至终不知道有这回事。
 ///
 /// `pub(crate)`：模型路由是**运营配置的唯一解析口**（含"dev 无配置则跳过"这条 fail-closed 语义）。
 /// 本进程内其它调用引擎的路径必须走同一个解析器，否则会出现"运营把某版本路由停用了、
@@ -992,7 +1015,7 @@ struct RoutesConfig {
 pub(crate) async fn resolve_model_routes(
     db: &AnyPool,
     version: &str,
-) -> Result<Option<(ModelRoutes, u32)>, ApiError> {
+) -> Result<Option<(ModelRoutes, u32, Option<ModelProfile>)>, ApiError> {
     let Some(row) = sqlx::query("SELECT routes_json FROM model_routes WHERE version = $1 LIMIT 1")
         .bind(version)
         .fetch_optional(db)
@@ -1019,6 +1042,7 @@ pub(crate) async fn resolve_model_routes(
             director: cfg.director,
         },
         max_output_tokens,
+        cfg.fallback,
     )))
 }
 
@@ -2212,7 +2236,8 @@ async fn process_tick_inner(
     }
 
     // 5) 模型配置解析：无配置 → dev 跳过（不 panic）。max_output_tokens 随路由一并钉住（按世界可调）。
-    let Some((routes, max_output_tokens)) = resolve_model_routes(db, &world.model_route_version).await?
+    let Some((routes, max_output_tokens, route_fallback)) =
+        resolve_model_routes(db, &world.model_route_version).await?
     else {
         tracing::warn!(world_id, version = %world.model_route_version, "world 无模型配置，tick 跳过");
         finish_tick_noop(db, world_id, tick_no, Some("no_model_config")).await?;
@@ -2477,6 +2502,15 @@ async fn process_tick_inner(
         Some(m) => m,
         None => Arc::new(HttpModelClient::new()?),
     };
+    // 🔴 备用路由（open-decisions §4）：包在最外层，于是**录制/回放与注入的 mock 都不受影响**
+    // （它们替换的是 `model`，包装器照样包着替换后的那一个）。
+    // `route_fallback` 为 None 时逐字节退化为直接透传——那是绝大多数世界的情形。
+    let fallback_meter = Arc::new(fallback::FallbackMeter::default());
+    let model: Arc<dyn ModelClient> = Arc::new(fallback::FallbackModelClient::new(
+        model,
+        route_fallback,
+        fallback_meter.clone(),
+    ));
     // 9.0) 录制 / 回放接线（任务 #46，`runtime::record`，**默认关闭**）。
     //
     // 这里是整条 tick 路径上模型客户端的**唯一出口**：`process_tick`（生产，内部造 HttpModelClient）
@@ -2653,6 +2687,7 @@ async fn process_tick_inner(
                     &endgame_policy,
                     terminal.as_ref(),
                     selected_ending.as_deref(),
+                    fallback_meter.get(),
                 )
                 .await?;
                 // 提交成功（Done/Concluded）→ 清零该世界的连续 blocked 计数（B. stall hint）。
@@ -2696,6 +2731,9 @@ async fn commit_tick(
     policy: &RoomEndgamePolicy,
     terminal: Option<&Terminal>,
     ending: Option<&str>,
+    // 本拍走了几次备用路由（open-decisions §4 的成本口径决定）。由 `process_tick_inner`
+    // 在造 `FallbackModelClient` 时建，跑完引擎回合后读出来传进来——**与 cost_tokens 同源同时刻**。
+    fallback_used: i64,
 ) -> Result<TickStatus, ApiError> {
     let now = now_ms();
     let cost = cost_tokens as i64;
@@ -2780,11 +2818,15 @@ async fn commit_tick(
 
     sqlx::query(
         "UPDATE world_ticks SET status='done', cost_tokens=$1, started_at=COALESCE(started_at, $2), \
-         finished_at=$3, error=NULL WHERE world_id=$4 AND tick_no=$5",
+         finished_at=$3, error=NULL, fallback_used=$4 WHERE world_id=$5 AND tick_no=$6",
     )
     .bind(cost)
     .bind(now)
     .bind(now)
+    // 🔴 本拍走了几次备用路由（migration 0051）。**与 cost_tokens 同一条语句**落库：
+    // 成本与「这笔成本是怎么花的」必须同成同败，否则账单变贵时对不上账
+    //（分不清是模型涨价了还是一直在回退）。0 = 没回退过，那是绝大多数拍的情形。
+    .bind(fallback_used)
     .bind(world_id)
     .bind(tick_no)
     .execute(&mut *tx)

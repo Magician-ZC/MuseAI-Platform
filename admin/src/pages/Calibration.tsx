@@ -21,7 +21,7 @@
 // 数据诚实纪律（设计文档 §9.1）：只渲染接口真实返回的字段，null 一律显示 `—`，
 // 比率为 null 时不得当 0% 渲染（formatPercent 已处理）。
 import { useCallback, useEffect, useState } from 'react';
-import { Alert, Button, Drawer, Empty, Space, Table, Tabs, Tag, Typography } from 'antd';
+import { Alert, Button, Drawer, Empty, Space, Table, Tabs, Tag, Tooltip, Typography } from 'antd';
 import type { TableColumnsType } from 'antd';
 import { useLocation } from 'react-router-dom';
 import { adminFetch } from '../api';
@@ -81,6 +81,14 @@ interface StageShape {
   realmTierLabel?: string | null;
   hasEndgame?: boolean;
   isSuperset?: boolean;
+  /**
+   * 骨架里**无人读取**的键（拼错 / 残留）。非空即意味着上面那排计数里有几项的 0 是假的。
+   * 建模板期已由后端拦掉，但**存量模板建在那道闸之前**——这两栏是它们唯一的发现途径，
+   * 所以必须显式渲染出来：只在接口里返回、页面上不画，等于没有发现途径。
+   */
+  unknownTopLevelKeys?: string[];
+  /** 同上，但嵌套层，形如 `mainlineNodes[mn-1].constrait`。比顶层更隐蔽——计数依旧是对的。 */
+  unknownNestedKeys?: string[];
 }
 
 interface StageTemplate {
@@ -796,6 +804,24 @@ function StageSplitting({ deepLink }: { deepLink?: string }) {
                             )}
                             {r.shape.hasPayoutTable && <Tag color="green">产出表</Tag>}
                             {r.shape.hasEndgame && <Tag color="green">终局策略</Tag>}
+                            {/* 拼错的键：左边那排计数会「看着正常」，所以必须单独喊出来。
+                                悬浮给出完整清单（键可能不少，平铺会把这一列撑爆）。 */}
+                            {((r.shape.unknownTopLevelKeys?.length ?? 0) > 0 ||
+                              (r.shape.unknownNestedKeys?.length ?? 0) > 0) && (
+                              <Tooltip
+                                title={[
+                                  ...(r.shape.unknownTopLevelKeys ?? []),
+                                  ...(r.shape.unknownNestedKeys ?? []),
+                                ].join('、')}
+                              >
+                                <Tag color="red">
+                                  无人读取的键{' '}
+                                  {(r.shape.unknownTopLevelKeys?.length ?? 0) +
+                                    (r.shape.unknownNestedKeys?.length ?? 0)}
+                                  （左边的计数不可信）
+                                </Tag>
+                              </Tooltip>
+                            )}
                           </Space>
                         ) : (
                           // 骨架不是合法 JSON → 明说，不拿 0 冒充（数据诚实纪律）。

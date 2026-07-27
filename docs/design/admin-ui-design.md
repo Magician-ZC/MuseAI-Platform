@@ -153,18 +153,26 @@
 
 ### 9.1 正式模式的空态字段（数据诚实纪律）
 
-按 `docs/VALIDATION.md` §0 状态语言：正式模式只渲染接口真实返回的字段，后端没有的一律显示 `—` / 空态，代码就地留 `TODO(接口缺字段)`，**不得用常量冒充真实能力**。当前空态清单与所需后端字段：
+按 `docs/VALIDATION.md` §0 状态语言：正式模式只渲染接口真实返回的字段，后端没有的一律显示 `—` / 空态，代码就地留 `TODO(接口缺字段)`，**不得用常量冒充真实能力**。
+
+> **2026-07-27 补齐了其中五项**（标 ✅ 的行）。挑这五项是因为它们是**事实字段**（时刻、计数、留痕、窗口参数），推得出来、不需要产品先定口径；剩下未补的两项不是懒得做：
+> - **健康指标条的「需关注」档**——它是一个**判断**，而「什么叫需关注」目前没有产品定义。凭空定一个阈值，得到的会是一个看起来权威、实际没人认可的分档。
+> - **备用路由 / 路由错误率**——`model_routes.routes_json` 里根本没有「备用路由」这个概念，补它要先动数据模型与引擎的路由选择逻辑，不是投影一个已有字段。
+>
+> 🔴 补齐时每一项的重点都不在「有数了」，而在**空值口径**：「还没动过」与「很久没动了」、「昨日为 0」与「涨了无穷」、「没激活过」与「不知道」——混起来会让运营读出一个不存在的结论。逐条见下表右列。
+
+当前空态清单与所需后端字段：
 
 | 界面位置 | 现状 | 需要的后端字段（建议端点） |
 |---|---|---|
 | 健康指标条 运行中/需关注/已熔断 | 按“已加载世界”本地统计，翻页未完时标注“未加载完” | 平台级汇总（`GET /admin/worlds/summary`）。`metrics/overview` 的 `worlds.active/fused` 是另一套口径（无“需关注”档、与本页派生态不一致），不能顶替 |
 | 表格 风控延迟 | `—` | `moderationLatency`（`GET /admin/worlds`）。~~全仓无任何一处记录机审调用耗时~~ —— **数据源已于 2026-07-27 补上**（migration `0049`：`safety_recheck_runs.provider_ms`，只累加 `check_text` 两端时钟差，超时/报错照算；读取面 `GET /admin/safety/recheck` 的 `providerLatency`）。🔴 **本列仍应保持 `—`**：provider 是 Dev 桩（恒 0 的延迟与「非常快」在本列上长得一样）· 第 3 层默认关（多数世界一片 null）· 该列只覆盖运行时投影这条链，静态审核不落本表，摆在世界列表里会被读成该世界的机审总体 SLA。⚠️ 两个**不得充数**的近似：`audit_queue.created_at/reviewed_at` 是人审周转（小时/天量级，一眼可辨）；同表 `latency_ms` 是一次尝试全程（含 DB 与记账，系统性偏大却看起来完全合理，更难识破） |
-| 表格 最后活动 | `—` | `lastActivityAt`（`GET /admin/worlds`）。`worlds.updated_at` 已存在但未投影；`createdAt` ≠ 最后活动 |
-| 诊断栏 启动时间 | `—`，另显示真实创建时间 | `startedAt`（diagnostics.world） |
-| 诊断栏 风险命中 | 口径改为“累计”，日环比 `—` | 按日聚合的 `riskEventCountsToday` 与昨日值 |
+| 表格 最后活动 | ✅ **已补**（2026-07-27） | `lastActivityAt`（`GET /admin/worlds`）= `MAX(world_ticks.finished_at)`，即**最后一拍跑完**的时刻。🔴 **刻意不用 `worlds.updated_at`**（本行原先的建议）：那一列任何一次写世界行都会动——运营点一次暂停、改一次预算都会刷新它，于是「最后活动」会把**运营自己的操作**记成世界活动，早就停摆的世界永远看起来很新鲜。从未跑完过任何一拍 → `null`（「还没动过」≠「很久没动了」）|
+| 诊断栏 启动时间 | ✅ **已补**（2026-07-27） | `startedAt`（diagnostics.world）= `MIN(world_ticks.created_at)`，即**首拍被排期**的时刻。`worlds` 上没有「转 running 的时刻」这一列，而首拍排期是那次状态转换留下的唯一确定性痕迹——与其加一列记一个能推出来的事实，不如把口径说明白。没排过拍 → `null`，**不回落 `createdAt`** |
+| 诊断栏 风险命中 | ✅ **日环比已补**（2026-07-27） | `riskEventDaily.{today,yesterday,delta}`（UTC 日界，口径同成本看板 `utc_day_start_ms`）。累计计数 `riskEventCounts` 不变。🔴 **不给环比百分比**：昨日可能为 0，而 0 做分母得到的不是「涨了无穷」，是「没有可比基数」|
 | 诊断栏 备用路由 / 路由错误率 | `—`，当前路由旁改显示真实 Tick 失败率 | `backupRoute`、`routeErrorRate` |
-| 诊断栏 Prompt 更新人 / 更新时间 | `—` | `promptSetUpdatedBy`、`promptSetUpdatedAt` |
-| 延迟曲线与时间线取数窗口 | 客户端按时间范围过滤 diagnostics 最近 10 个 tick | diagnostics 支持 `?since=` / `?window=` 与更大采样量 |
+| 诊断栏 Prompt 更新人 / 更新时间 | ✅ **已补**（2026-07-27），但**字段名与本行原先的提法不同** | `promptSet.{version,createdAt,activatedBy,activatedAt}`。`prompt_versions` 上**没有** `updated_by` 列，所以不存在「更新人」；但它没丢——`POST /admin/prompts/{id}/activate` 每次都往 `audit_logs` 写一条 `prompt.activate`（actor + 时刻）。故给的是**激活留痕**，字段如实叫 `activatedBy/At`，不叫 `updatedBy`（那会让人以为表上真有这么一列）。从未经端点激活过（直接播种进库）→ `null`，**不猜**。`createdAt` = 该版本各 scope 行的 `MAX(created_at)`（一个版本对应多行）|
+| 延迟曲线与时间线取数窗口 | ✅ **已补**（2026-07-27） | diagnostics 支持 `?limit=`（默认 **10，与加参数之前逐字节一致**；上限 500）与 `?sinceMs=`（按 `created_at` 收窄）。🔴 上限是刻意的：这是被轮询的运营端点，不封顶等于留了一条「拉一个跑了半年的世界就把整张 `world_ticks` 扫回来」的路 |
 
 已由成本仪表与世界封面（`server/src/admin_api/worlds_ops.rs`、`dashboards.rs`）补齐并接线的字段，前端不再留空态；**单位口径必须照下表渲染**：
 

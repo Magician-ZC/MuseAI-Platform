@@ -4081,3 +4081,240 @@ async fn calibration_payload_strings_are_plain_text() {
         }
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 设计文档 §9.1「正式模式的空态字段」：把其中**不需要产品口径**的四项补上
+//
+// 这四项是事实字段（时刻、计数、留痕），不是判断（「需关注」那一档要先有定义，
+// 故不在本批）。每一条的重点都不在「有数了」，而在**空值口径**——
+// 「还没动过」与「很久没动了」、「昨日为 0」与「涨了无穷」、「没激活过」与「不知道」，
+// 混起来就会让运营读出一个不存在的结论。
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 🔴 `lastActivityAt` = 最后一拍**跑完**的时刻，且「从没跑完过」必须是 `null` 而不是 0。
+#[tokio::test]
+async fn last_activity_is_the_last_finished_tick_not_the_row_mtime() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+    let wid = crate::worlds::create_world(
+        &state.db,
+        crate::worlds::CreateWorldParams::official("tpl_la", 1, "活动世界"),
+    )
+    .await
+    .unwrap();
+
+    // ① 一拍都没跑完 → null（新房不是僵尸房）。
+    let (_st, b) = get(&app, "/api/admin/worlds", Some(&admin)).await;
+    let item = b["worlds"].as_array().unwrap().iter().find(|w| w["id"] == wid.as_str()).unwrap();
+    assert!(item["lastActivityAt"].is_null(), "🔴 没跑完过任何一拍必须是 null，不是 0: {item}");
+
+    // ② 落一拍 done + finished_at，再看。
+    let t = now_ms() - 5_000;
+    sqlx::query(
+        "INSERT INTO world_ticks (id, world_id, tick_no, base_revision, status, cost_tokens, \
+         finished_at, created_at) VALUES ($1, $2, 0, 0, 'done', 10, $3, $4)",
+    )
+    .bind(new_id("wt"))
+    .bind(&wid)
+    .bind(t)
+    .bind(t)
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    // 🔴 顺手把世界行改一下（模拟运营暂停/改预算）——`updated_at` 会变，而「最后活动」不该变。
+    sqlx::query("UPDATE worlds SET updated_at = $1 WHERE id = $2")
+        .bind(now_ms())
+        .bind(&wid)
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    let (_st, b) = get(&app, "/api/admin/worlds", Some(&admin)).await;
+    let item = b["worlds"].as_array().unwrap().iter().find(|w| w["id"] == wid.as_str()).unwrap();
+    assert_eq!(
+        item["lastActivityAt"], json!(t),
+        "🔴 必须是最后一拍跑完的时刻；跟着 worlds.updated_at 走会把**运营自己的操作**记成世界活动，\
+         一个早就停摆的世界会永远看起来很新鲜: {item}"
+    );
+}
+
+/// 🔴 `startedAt` = **首拍被排期**的时刻，不是建房时刻；没排过拍 → `null`。
+#[tokio::test]
+async fn started_at_is_the_first_scheduled_tick_not_world_creation() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+    let wid = crate::worlds::create_world(
+        &state.db,
+        crate::worlds::CreateWorldParams::official("tpl_sa", 1, "未开演的房"),
+    )
+    .await
+    .unwrap();
+
+    let (_st, d) = get(&app, &format!("/api/admin/worlds/{wid}/diagnostics"), Some(&admin)).await;
+    assert!(
+        d["world"]["startedAt"].is_null(),
+        "🔴 房建好但没开演 → null，绝不回落 createdAt（「还没开演」与「很早就开演了」必须分得开）"
+    );
+
+    let first = now_ms() - 60_000;
+    for (n, at) in [(0i64, first), (1, first + 1_000)] {
+        sqlx::query(
+            "INSERT INTO world_ticks (id, world_id, tick_no, base_revision, status, cost_tokens, created_at) \
+             VALUES ($1, $2, $3, 0, 'done', 0, $4)",
+        )
+        .bind(new_id("wt"))
+        .bind(&wid)
+        .bind(n)
+        .bind(at)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+    let (_st, d) = get(&app, &format!("/api/admin/worlds/{wid}/diagnostics"), Some(&admin)).await;
+    assert_eq!(d["world"]["startedAt"], json!(first), "取的是**首**拍，不是最近一拍");
+}
+
+/// 🔴 风控日环比：UTC 日界；昨日为 0 时**不给百分比**（0 做分母不是「涨了无穷」）。
+#[tokio::test]
+async fn risk_event_daily_uses_utc_day_and_refuses_a_ratio_without_a_base() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+    let wid = crate::worlds::create_world(
+        &state.db,
+        crate::worlds::CreateWorldParams::official("tpl_rd", 1, "风控世界"),
+    )
+    .await
+    .unwrap();
+
+    let today = crate::admin_api::dashboards::utc_day_start_ms(now_ms());
+    let day = crate::admin_api::dashboards::DAY_MS;
+    // 今日 2 条、昨日 1 条、前日 1 条（前日不该进任何一档）。
+    for at in [today + 1_000, today + 2_000, today - day + 1_000, today - 2 * day + 1_000] {
+        sqlx::query(
+            "INSERT INTO risk_events (id, user_id, world_id, kind, detail_json, created_at) \
+             VALUES ($1, NULL, $2, 'lexicon', '{}', $3)",
+        )
+        .bind(new_id("rk"))
+        .bind(&wid)
+        .bind(at)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+
+    let (_st, d) = get(&app, &format!("/api/admin/worlds/{wid}/diagnostics"), Some(&admin)).await;
+    let daily = &d["riskEventDaily"];
+    assert_eq!(daily["today"], json!(2), "{daily}");
+    assert_eq!(daily["yesterday"], json!(1), "🔴 前日那条不得混进昨日: {daily}");
+    assert_eq!(daily["delta"], json!(1));
+    assert!(
+        daily.get("ratio").is_none() && daily.get("percent").is_none(),
+        "🔴 不得给环比百分比 —— 昨日可能为 0，而 0 做分母得到的不是「涨了无穷」，是「没有可比基数」"
+    );
+    // 累计计数仍在（口径「累计」不变，日环比是新增的另一档）。
+    assert!(d["riskEventCounts"].is_array());
+}
+
+/// 🔴 Prompt 治理留痕：`activatedBy/At` 来自 `audit_logs`，从未激活过 → `null`，**不猜**。
+#[tokio::test]
+async fn prompt_set_activation_trace_comes_from_audit_and_is_null_when_absent() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+    let wid = crate::worlds::create_world(
+        &state.db,
+        crate::worlds::CreateWorldParams::official("tpl_pv", 1, "治理世界"),
+    )
+    .await
+    .unwrap();
+    let ver: String = sqlx::query_scalar("SELECT prompt_set_version FROM worlds WHERE id = $1")
+        .bind(&wid)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+
+    // 直接播种两行（每 scope 一行，同一个 version）——**没有经过激活端点**。
+    for (i, scope) in ["director", "writer"].iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO prompt_versions (id, scope, version, content, active, canary_world_ids, created_at) \
+             VALUES ($1, $2, $3, 'x', 1, '[]', $4)",
+        )
+        .bind(format!("pv_{i}"))
+        .bind(scope)
+        .bind(&ver)
+        .bind(now_ms() - 10_000 + i as i64 * 1_000)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+
+    let (_st, d) = get(&app, &format!("/api/admin/worlds/{wid}/diagnostics"), Some(&admin)).await;
+    let ps = &d["promptSet"];
+    assert_eq!(ps["version"], json!(ver));
+    assert!(ps["createdAt"].is_i64(), "多行取 MAX(created_at): {ps}");
+    assert!(
+        ps["activatedBy"].is_null() && ps["activatedAt"].is_null(),
+        "🔴 没经端点激活过就是 null —— 不拿 created_at 冒充「谁在什么时候激活的」: {ps}"
+    );
+
+    // 走真实激活端点后，留痕出现。
+    let (st, _) = post(&app, "/api/admin/prompts/pv_0/activate?reason=试", Some(&admin), json!({})).await;
+    assert_eq!(st, StatusCode::OK);
+    let (_st, d) = get(&app, &format!("/api/admin/worlds/{wid}/diagnostics"), Some(&admin)).await;
+    let ps = &d["promptSet"];
+    assert!(ps["activatedBy"].is_string(), "激活后应当能查到是谁: {ps}");
+    assert!(ps["activatedAt"].is_i64());
+}
+
+/// 诊断取数窗口：不传参数 = **与加参数之前逐字节一致**（10 拍）；可放宽、可按时间收窄、有上界。
+#[tokio::test]
+async fn diagnostics_window_defaults_to_the_previous_behaviour() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+    let wid = crate::worlds::create_world(
+        &state.db,
+        crate::worlds::CreateWorldParams::official("tpl_dw", 1, "多拍世界"),
+    )
+    .await
+    .unwrap();
+    let base = now_ms() - 100_000;
+    for n in 0..25i64 {
+        sqlx::query(
+            "INSERT INTO world_ticks (id, world_id, tick_no, base_revision, status, cost_tokens, created_at) \
+             VALUES ($1, $2, $3, 0, 'done', 1, $4)",
+        )
+        .bind(new_id("wt"))
+        .bind(&wid)
+        .bind(n)
+        .bind(base + n * 1_000)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+
+    let n_of = |v: &Value| v["ticks"].as_array().map(|a| a.len()).unwrap_or(0);
+    let (_st, d) = get(&app, &format!("/api/admin/worlds/{wid}/diagnostics"), Some(&admin)).await;
+    assert_eq!(n_of(&d), 10, "🔴 不传参数必须与加窗口参数之前逐字节一致");
+
+    let (_st, d) = get(&app, &format!("/api/admin/worlds/{wid}/diagnostics?limit=25"), Some(&admin)).await;
+    assert_eq!(n_of(&d), 25, "可以放宽");
+
+    // 时间窗收窄：只要最后 5 拍。
+    let since = base + 20 * 1_000;
+    let (_st, d) = get(
+        &app,
+        &format!("/api/admin/worlds/{wid}/diagnostics?limit=100&sinceMs={since}"),
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(n_of(&d), 5, "sinceMs 按 created_at 收窄");
+
+    // 上界：这是被轮询的运营端点，不封顶等于给了一条「把整张表扫回来」的路。
+    let (_st, d) = get(&app, &format!("/api/admin/worlds/{wid}/diagnostics?limit=99999"), Some(&admin)).await;
+    assert_eq!(n_of(&d), 25, "超出上界按上界截断（本世界只有 25 拍）");
+}

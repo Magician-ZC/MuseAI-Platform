@@ -807,9 +807,9 @@ if 线：   从终局那一拍岔出去的、只属于你的一条平行线   �
 永久移除不可逆（位图连对象字节一并删除），口径与 `restore` 逐字一致，不给不可逆开申诉侧门；
 重新上线的路径是作者重新发布。若运营在裁决前已自行恢复，`overturn` 如实记 `overturned` 且不再动状态
 （`restored:false` + `alreadyRestored:true`）——报 409 只会留下一条永远卡在 `pending` 的僵尸行。
-| GET | `/api/admin/worlds` | operator | 世界列表。含 `participantCount`、`successRate`（**0..1 小数**，无已终结 tick 时为 null）、`todayTokens`/`todayCostCents`/`todayCostCny` |
+| GET | `/api/admin/worlds` | operator | 世界列表。含 `participantCount`、`successRate`（**0..1 小数**，无已终结 tick 时为 null）、`todayTokens`/`todayCostCents`/`todayCostCny`。**2026-07-27 新增** `lastActivityAt` = `MAX(world_ticks.finished_at)`（最后一拍**跑完**的时刻）。🔴 刻意不用 `worlds.updated_at`：那一列任何一次写世界行都会动（暂停、改预算……），会把**运营自己的操作**记成世界活动，早就停摆的世界永远看起来很新鲜。从未跑完过任何一拍 → `null`，不是 0 |
 | POST | `/api/admin/worlds` | operator | 官方建房。可选 `cover`（一次建完带图）· 可选 `series: {maxInstances}`（**登记为世界系列 1 号实例**，migration 0035；开关未开时 400，见 §3「世界系列自动扩容」）|
-| GET | `/api/admin/worlds/{id}/diagnostics` | operator | 脱敏诊断（采样种子不外泄）。`budget` 含金额换算与用量比：`spentCny`/`dailyCnyBudget`/`usageRatio`（**0..1**，取 token 与 cny 两维较大者）/`spentTokensTodayEffective`（跨日已归零）。另含 `series`（系列队列态；**不受 env 开关门控**——关阀时运营更需要看得见队列，开关状态另作 `autoscaleEnabled` 明示）与 `beBiography`（崩塌封卷元信息，正文另走玩家读取面）|
+| GET | `/api/admin/worlds/{id}/diagnostics?limit=&sinceMs=` | operator | 脱敏诊断（采样种子不外泄）。`budget` 含金额换算与用量比：`spentCny`/`dailyCnyBudget`/`usageRatio`（**0..1**，取 token 与 cny 两维较大者）/`spentTokensTodayEffective`（跨日已归零）。另含 `series`（系列队列态；**不受 env 开关门控**——关阀时运营更需要看得见队列，开关状态另作 `autoscaleEnabled` 明示）与 `beBiography`（崩塌封卷元信息，正文另走玩家读取面）。**2026-07-27 补齐设计文档 §9.1 的四项空态**：`world.startedAt`（= `MIN(world_ticks.created_at)`，**首拍排期时刻**，不是建房时刻；没排过拍 → `null`，不回落 `createdAt`）· `riskEventDaily.{today,yesterday,delta}`（UTC 日界，🔴 **不给环比百分比**——昨日可能为 0，0 做分母不是「涨了无穷」是「没有可比基数」）· `promptSet.{version,createdAt,activatedBy,activatedAt}`（🔴 `prompt_versions` 上没有 `updated_by` 列，`activatedBy/At` 来自 `audit_logs` 的 `prompt.activate`；从未经端点激活过 → `null`，**不猜**）· 取数窗口 `?limit=`（默认 **10，与加参数之前逐字节一致**，上限 500）与 `?sinceMs=`（按 `created_at` 收窄）|
 | POST | `/api/admin/worlds/{id}/pause`·`/resume` | operator | 暂停/恢复（需审计理由） |
 | GET | `/api/admin/world-templates?sagaId=` | operator, reviewer | 模板列表。带 `sagaId` 时切换为**阶段列表**语义：只返回该世界系列，按 `stage_no` 升序（剧情顺序）且不分页 |
 | POST | `/api/admin/world-templates` | operator | 建模板。可选 `sagaId` + `stageNo`（总规格 §3 Saga 归组），二者必须成对，`stageNo` ∈ 1-999；都不传 = 独立模板 |

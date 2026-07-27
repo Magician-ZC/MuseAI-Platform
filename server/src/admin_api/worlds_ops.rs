@@ -53,7 +53,12 @@ async fn active_member_counts(db: &AnyPool, ids: &[String]) -> Result<HashMap<St
     Ok(out)
 }
 
-/// 页内世界的 tick 聚合：`(今日 token, done 数, failed 数)`，一次 GROUP BY + IN 取整页。
+/// 页内世界的 tick 聚合：`(今日 token, done 数, failed 数, 最后活动时刻)`，一次 GROUP BY + IN 取整页。
+///
+/// 🔵 `最后活动时刻` = `MAX(finished_at)`，即**这个世界最后一次真的推进完一拍**的时刻。
+/// 刻意**不用** `worlds.updated_at`（设计文档 §9.1 原先的建议）：那一列任何一次写世界行都会动
+/// ——运营点一次暂停、改一次预算、装配一次实例都会刷新它，于是「最后活动」会把
+/// **运营自己的操作**记成世界的活动，一个早就停摆的世界看起来永远很新鲜。
 ///
 /// 今日窗口 `[day_start, day_end)` 由**调用方在 Rust 侧算好毫秒区间**再绑参，SQL 只做 BIGINT 范围比较——
 /// `strftime`/`date_trunc` 是方言特有的，SQLite/Postgres 双跑必须避开（db.rs 可移植 SQL 子集约定）。
@@ -64,7 +69,7 @@ async fn tick_stats_by_world(
     ids: &[String],
     day_start: i64,
     day_end: i64,
-) -> Result<HashMap<String, (i64, i64, i64)>, ApiError> {
+) -> Result<HashMap<String, (i64, i64, i64, i64)>, ApiError> {
     let mut out = HashMap::new();
     if ids.is_empty() {
         return Ok(out);
@@ -77,7 +82,8 @@ async fn tick_stats_by_world(
         "SELECT world_id, \
          CAST(COALESCE(SUM(CASE WHEN created_at >= {day_from} AND created_at < {day_to} THEN cost_tokens ELSE 0 END), 0) AS BIGINT) AS today_tokens, \
          CAST(COALESCE(SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END), 0) AS BIGINT) AS done_n, \
-         CAST(COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS BIGINT) AS failed_n \
+         CAST(COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS BIGINT) AS failed_n, \
+         CAST(COALESCE(MAX(finished_at), 0) AS BIGINT) AS last_activity \
          FROM world_ticks WHERE world_id IN ({placeholders}) GROUP BY world_id"
     );
     let mut query = sqlx::query(&sql).bind(day_start).bind(day_end);
@@ -91,6 +97,7 @@ async fn tick_stats_by_world(
                 r.try_get::<i64, _>("today_tokens")?,
                 r.try_get::<i64, _>("done_n")?,
                 r.try_get::<i64, _>("failed_n")?,
+                r.try_get::<i64, _>("last_activity")?,
             ),
         );
     }
@@ -169,8 +176,8 @@ pub(super) async fn list_worlds(
         next_cursor = Some(format!("{created_at}:{id}"));
         // 在场人数：无成员行的世界即 0（0 是真实答案，不是缺数据）。
         let participant_count = participants.get(&id).copied().unwrap_or(0);
-        let (today_tokens, done_n, failed_n) =
-            tick_stats.get(&id).copied().unwrap_or((0, 0, 0));
+        let (today_tokens, done_n, failed_n, last_activity) =
+            tick_stats.get(&id).copied().unwrap_or((0, 0, 0, 0));
         let today_cents = tokens_to_cents(today_tokens);
         // 成功率口径：**已终结 tick** 中 done 的占比，即 done/(done+failed)，取值 0..1（不是百分数）。
         // pending/running 不进分母——它们还没有结果，计入会把「排队中」误报成「失败」。
@@ -203,6 +210,10 @@ pub(super) async fn list_worlds(
             "todayTokens": today_tokens,
             "todayCostCents": today_cents,
             "todayCostCny": cents_to_cny(today_cents),
+            // 最后活动 = 最后一拍**跑完**的时刻。从未跑完过任何一拍（新房 / 只排了队 / 全失败）
+            // → `null` 而不是 0 或 createdAt：「还没动过」与「很久没动了」是两件事，
+            // 合成一个数会让运营把新房误判成僵尸房。
+            "lastActivityAt": if last_activity > 0 { json!(last_activity) } else { Value::Null },
             // moderationLatency —— **仍不下发**，但理由已经和当初不一样了，故整条重写。
             //
             // 此处原文是 `TODO(数据源缺失)`：「需要每次机审调用的耗时，**全仓无任何一处记录它**」。
@@ -244,10 +255,31 @@ pub(super) async fn list_worlds(
 /// GET /admin/worlds/{id}/diagnostics：卡死诊断视图。
 /// 脱敏：只出调用元数据/tick 错误码/预算/规则命中(风控计数)/事件审核态，
 /// 不返回任何私密叙事内容（public/private 投影一律不暴露，§10）。
+/// 诊断视图的取数窗口（设计文档 §9.1：延迟曲线与时间线此前只能拿最近 10 拍，
+/// 前端只好在客户端按时间范围过滤——窗口一拉长就没数据了）。
+///
+/// 两个都可选、都有上界：`sinceMs` 给绝对时间窗（毫秒 epoch，按 `created_at` 过滤），
+/// `limit` 给条数（默认仍是 10，与接线前逐字节一致；上限 `MAX_DIAG_TICKS`）。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct DiagQuery {
+    #[serde(default)]
+    since_ms: Option<i64>,
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+/// 诊断视图一次最多回多少拍。**有上界**是刻意的：这是运营后台按世界轮询的端点，
+/// 不封顶等于给了一条「拉一个跑了半年的世界」就把整张 world_ticks 扫回来的路。
+const MAX_DIAG_TICKS: i64 = 500;
+/// 默认条数：与加窗口参数**之前逐字节一致**（不传参数 = 行为零变化）。
+const DEFAULT_DIAG_TICKS: i64 = 10;
+
 pub(super) async fn diagnostics(
     State(state): State<AppState>,
     admin: AdminUser,
     Path(id): Path<String>,
+    Query(q): Query<DiagQuery>,
 ) -> Result<Json<Value>, ApiError> {
     require_role(&admin, &["operator"])?;
     let world = load_world(&state.db, &id).await?; // 不存在 → NotFound
@@ -255,12 +287,25 @@ pub(super) async fn diagnostics(
     // 「落库意图 vs 实际生效」这一对，用全局值算会让按世界的急停阀在诊断页上看不见。
     let dm_on = deathmatch_enabled(&state.db, Some(&id)).await;
 
-    // 最近 10 个 tick 的元数据（含错误码），不含叙事产物。
-    let tick_rows = sqlx::query(
+    // 最近 N 个 tick 的元数据（含错误码），不含叙事产物。窗口可由查询参数收窄/放宽。
+    let diag_limit = q.limit.unwrap_or(DEFAULT_DIAG_TICKS).clamp(1, MAX_DIAG_TICKS);
+    // 占位符按 **SQL 文本顺序**发号；`sinceMs` 段出不出现要到运行时才知道。
+    let mut ph = Placeholders::new();
+    let p_world = ph.take();
+    let mut tick_sql = format!(
         "SELECT tick_no, status, error, cost_tokens, started_at, finished_at, created_at \
-         FROM world_ticks WHERE world_id = $1 ORDER BY tick_no DESC LIMIT 10",
-    )
-    .bind(&id)
+         FROM world_ticks WHERE world_id = {p_world}"
+    );
+    if q.since_ms.is_some() {
+        tick_sql.push_str(&format!(" AND created_at >= {}", ph.take()));
+    }
+    tick_sql.push_str(&format!(" ORDER BY tick_no DESC LIMIT {}", ph.take()));
+    let mut tick_q = sqlx::query(&tick_sql).bind(&id);
+    if let Some(since) = q.since_ms {
+        tick_q = tick_q.bind(since);
+    }
+    let tick_rows = tick_q.bind(diag_limit);
+    let tick_rows = tick_rows
     .fetch_all(&state.db)
     .await?;
     let mut ticks = Vec::new();
@@ -328,6 +373,74 @@ pub(super) async fn diagnostics(
         None => Value::Null,
     };
 
+    // ── 世界「开始跑」的时刻（设计文档 §9.1「诊断栏 启动时间」） ──────────────
+    //
+    // 🔴 口径写清楚：**首拍被排期的时刻**（`MIN(world_ticks.created_at)`），不是 `worlds.created_at`
+    //（那是建房时刻，房建好可以放着不开）。`worlds` 上没有「转 running 的时刻」这一列，
+    // 而首拍排期是这条状态转换留下的**唯一确定性痕迹**——与其加一列去记一个能推出来的事实，
+    // 不如把口径说明白。一拍都没排过 → `null`（不是 0、也不回落 createdAt：
+    // 「还没开演」与「很早就开演了」在运营页上必须分得开）。
+    let started_at: Option<i64> = sqlx::query(
+        "SELECT CAST(COALESCE(MIN(created_at), 0) AS BIGINT) AS t FROM world_ticks WHERE world_id = $1",
+    )
+    .bind(&id)
+    .fetch_one(&state.db)
+    .await
+    .ok()
+    .and_then(|r| r.try_get::<i64, _>("t").ok())
+    .filter(|t| *t > 0);
+
+    // ── 风控命中的日环比（设计文档 §9.1「诊断栏 风险命中：日环比 —」） ────────
+    //
+    // UTC 日界，与 `dashboards` / `world_budgets.budget_day` 完全同一套口径
+    //（`utc_day_start_ms` + `DAY_MS`）；SQL 只做 BIGINT 范围比较，不用任何时间函数方言。
+    let today_start = utc_day_start_ms(now_ms());
+    let risk_daily = sqlx::query(
+        "SELECT \
+         CAST(COALESCE(SUM(CASE WHEN created_at >= $1 AND created_at < $2 THEN 1 ELSE 0 END), 0) AS BIGINT) AS today_n, \
+         CAST(COALESCE(SUM(CASE WHEN created_at >= $3 AND created_at < $4 THEN 1 ELSE 0 END), 0) AS BIGINT) AS yday_n \
+         FROM risk_events WHERE world_id = $5",
+    )
+    .bind(today_start)
+    .bind(today_start + DAY_MS)
+    .bind(today_start - DAY_MS)
+    .bind(today_start)
+    .bind(&id)
+    .fetch_one(&state.db)
+    .await?;
+    let risk_today: i64 = risk_daily.try_get("today_n")?;
+    let risk_yesterday: i64 = risk_daily.try_get("yday_n")?;
+
+    // ── Prompt 版本的治理留痕（设计文档 §9.1「Prompt 更新人 / 更新时间」） ────
+    //
+    // 一个 `prompt_set_version` 对应 `prompt_versions` 里**多行**（每个 scope 一行，
+    // 见 `runtime::resolve_prompts`），故「这套 prompt 何时成型」取那几行的 `MAX(created_at)`。
+    //
+    // 🔴 「更新人」在 `prompt_versions` 上**没有列**，但它并没有丢：`POST /admin/prompt-versions/{id}/activate`
+    // 每次都往 `audit_logs` 写一条 `prompt.activate`（actor + 时刻 + 理由）。所以这里给的是
+    // **激活留痕**而不是「行被谁改过」——两者语义不同，字段名如实叫 `activatedBy` / `activatedAt`，
+    // 不叫 `updatedBy`（那会让人以为 `prompt_versions` 上真有这么一列）。
+    // 从未经端点激活过（如直接播种进库）→ 两者为 `null`，**不猜**。
+    let prompt_created_at: Option<i64> = sqlx::query(
+        "SELECT CAST(COALESCE(MAX(created_at), 0) AS BIGINT) AS t FROM prompt_versions WHERE version = $1",
+    )
+    .bind(&world.prompt_set_version)
+    .fetch_one(&state.db)
+    .await
+    .ok()
+    .and_then(|r| r.try_get::<i64, _>("t").ok())
+    .filter(|t| *t > 0);
+    // 次级键 id ASC 保证全序：同一毫秒可能激活多个 scope，PG 对并列行不保证顺序。
+    let prompt_activation = sqlx::query(
+        "SELECT a.actor_id AS actor_id, a.created_at AS at FROM audit_logs a \
+         WHERE a.action = 'prompt.activate' \
+         AND a.subject IN (SELECT id FROM prompt_versions WHERE version = $1) \
+         ORDER BY a.created_at DESC, a.id DESC LIMIT 1",
+    )
+    .bind(&world.prompt_set_version)
+    .fetch_optional(&state.db)
+    .await?;
+
     // 规则命中：本世界风控事件按 kind 聚合计数（不出 detail_json 内容）。
     let risk_rows = sqlx::query(
         "SELECT kind, COUNT(*) AS n FROM risk_events WHERE world_id = $1 GROUP BY kind",
@@ -392,6 +505,8 @@ pub(super) async fn diagnostics(
             "visibility": world.visibility,
             "roomType": world.room_type,
             "stateRevision": world.state_revision,
+            // 开始跑的时刻 = **首拍被排期**的时刻（不是建房时刻；口径见上方注释）。
+            "startedAt": started_at,
             "engineVersion": world.engine_version,
             "promptSetVersion": world.prompt_set_version,
             "modelRouteVersion": world.model_route_version,
@@ -407,6 +522,26 @@ pub(super) async fn diagnostics(
         "series": series_json,
         "beBiography": biography_json,
         "riskEventCounts": risk_counts,
+        // 日环比（UTC 日界，口径同成本看板）。`delta` 是**今日减昨日**，可正可负；
+        // 昨日为 0 时不给百分比——0 做分母得到的不是「涨了 ∞%」而是「没有可比基数」。
+        "riskEventDaily": {
+            "today": risk_today,
+            "yesterday": risk_yesterday,
+            "delta": risk_today - risk_yesterday,
+            "dayBoundary": "UTC",
+            "note": "口径与 world_budgets.budget_day / 成本看板完全一致（utc_day_start_ms）。\
+                     昨日为 0 时不给环比百分比：0 做分母不是「涨了无穷」，是「没有可比基数」。",
+        },
+        // Prompt 版本治理留痕。⚠️ `activatedBy/At` 来自 audit_logs 的 `prompt.activate`，
+        // 不是 `prompt_versions` 上的列——从未经端点激活过（直接播种进库）时为 null，**不猜**。
+        "promptSet": {
+            "version": world.prompt_set_version,
+            "createdAt": prompt_created_at,
+            "activatedBy": prompt_activation.as_ref().and_then(|r| r.try_get::<String, _>("actor_id").ok()),
+            "activatedAt": prompt_activation.as_ref().and_then(|r| r.try_get::<i64, _>("at").ok()),
+            "note": "createdAt = 该版本各 scope 行的 MAX(created_at)（一个版本对应多行，每 scope 一行）；\
+                     activatedBy/At = audit_logs 里最近一条 prompt.activate。两者语义不同，故分列。",
+        },
         "eventStats": { "total": ev_total, "byModeration": ev_by_moderation },
         "redactionNote": "诊断视图脱敏：不含私密叙事/投影内容；查看必要内容需另行授权（§10）。",
     })))

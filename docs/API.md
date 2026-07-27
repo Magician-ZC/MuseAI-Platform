@@ -97,7 +97,7 @@
 | GET | `/api/worlds/{id}/stream` | JWT（query） | WebSocket 实时流。浏览器 WS 不能带头，token 走 `?token=` 或 `?access_token=`，支持 `?lastEventId=` 断线补偿 |
 | GET | `/api/worlds/{id}/state-summary` | JWT | 状态面板聚合 |
 | POST | `/api/worlds/{id}/interventions` | JWT | 干预投递（托梦 / 递道具） |
-| GET | `/api/worlds/{id}/interventions/mine` | JWT | 我的干预记录 |
+| GET | `/api/worlds/{id}/interventions/mine` | JWT | 我的干预记录。**2026-07-27 新增** `dreamQuota`：`base` / `bonus`（OOC 申诉补偿，**单列**——玩家有权知道多出来那条是申诉换来的）/ `effective` / `used` / `remaining`。🔴 此前玩家只能靠**被拒绝**发现没额度了，而有效额度 = 基础 + 补偿，补偿是复核后补发的，玩家**在构造上算不出这个数**。统计口径与 `create_intervention` 的判定**逐字相同**（`status IN (accepted, applied)`）——已被引擎消费的托梦**仍占额度**。⚠️ 没入场的人给 `applicable: false` 而**不是** `remaining: 0`：「还没进这个世界」与「额度用光了」是两件事 |
 | GET | `/api/me/consents` | JWT | 待响应的同意征询 |
 | POST | `/api/worlds/{id}/consents/{cid}/respond` | JWT | 同意响应（超时保守：不可逆事件默认不发生） |
 | POST | `/api/worlds/{id}/chapters/start` | JWT | 章节房开章 |

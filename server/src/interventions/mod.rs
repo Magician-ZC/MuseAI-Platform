@@ -276,6 +276,33 @@ async fn create_intervention(
     Ok(Json(resp))
 }
 
+/// 我在这个世界里的干预记录 + **剩余托梦额度**。
+///
+/// ════════════════════════════════════════════════════════════════════════════
+/// 🔴 为什么必须给额度，而不只是给记录
+/// ════════════════════════════════════════════════════════════════════════════
+///
+/// 此前玩家**只能靠「被拒绝」发现自己没额度了**（`rejectReason: "quota"`）。
+/// 那已经够糟，而真正的问题是：有效额度是 `基础配额 + OOC 申诉补偿`，
+/// 而补偿是复核「确认模型确实演错了」之后补发的——**玩家在构造上算不出这个数**。
+/// 他既不知道自己被补过几条，也没有任何地方能查。
+///
+/// 于是「还能不能托梦」这件事对玩家是**不可知**的，只能试。托梦是 §8 的核心互动，
+/// 让它变成一个碰运气的按钮，是把一个确定性的规则做成了体验上的随机。
+///
+/// ⚠️ 这里**没有改任何口径**：`used` 的统计 SQL 与 `create_intervention` 里那条
+/// **逐字相同**（同一个 `WHERE world_id AND character_id AND kind='whisper'
+/// AND status IN ('accepted','applied')`），补偿也走同一个 `dream_quota_bonus`。
+/// 露出来的就是**正在决定事情的那个数**，不是另算一份。
+///
+/// ════════════════════════════════════════════════════════════════════════════
+/// 「每阶段」= 每世界实例（`docs/build/open-decisions.md` §3）
+/// ════════════════════════════════════════════════════════════════════════════
+///
+/// 配额按 `(world_id, character_id)` 统计，即**一个世界实例一份**。
+/// 「Saga 是否落成一个实例跨多个阶段」尚未拍板（见 open-decisions §3），
+/// 在那之前「阶段」与「世界实例」是同一件事。响应里把这句话**写出来**，
+/// 免得玩家把它理解成「每天」或「每个 Saga」——那是两个数量级的差别。
 async fn my_interventions(
     State(state): State<AppState>,
     user: AuthUser,
@@ -296,7 +323,61 @@ async fn my_interventions(
             json!({"id": id, "kind": kind, "characterId": cid, "status": status, "rejectReason": reason, "createdAt": created})
         })
         .collect();
-    Ok(Json(json!({ "interventions": items })))
+
+    // 本人在这个世界的角色（一人一卡：`world_members` 上 (world_id, cloud_character_id) 唯一，
+    // 且 join 有防自刷门，故至多一张）。没入场过 → 没有额度可言，给 null 而不是 0：
+    // 「还没进这个世界」与「额度用光了」是两件事，混成 0 会让玩家以为自己被封了。
+    let cid: Option<String> = sqlx::query_scalar(
+        "SELECT cloud_character_id FROM world_members \
+         WHERE world_id = $1 AND user_id = $2 AND status = 'active' \
+         ORDER BY cloud_character_id ASC LIMIT 1",
+    )
+    .bind(&world_id)
+    .bind(&user.user_id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let quota = match cid.as_deref() {
+        None => json!({
+            "applicable": false,
+            "why": "你还没有角色在这个世界里（未入场），故没有托梦额度可言。\
+                    ⚠️ 这不是「额度用光了」——入场后额度按下方口径重新算。",
+        }),
+        Some(cid) => {
+            // 🔴 与 `create_intervention` 的判定**逐字相同**的统计口径。两处一旦漂移，
+            // 玩家看到的「还剩 2 条」和实际能发的条数就会对不上，而那种 bug 只有玩家会遇到。
+            let used: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM interventions \
+                 WHERE world_id = $1 AND character_id = $2 AND kind = 'whisper' \
+                   AND status IN ('accepted', 'applied')",
+            )
+            .bind(&world_id)
+            .bind(cid)
+            .fetch_one(&state.db)
+            .await?;
+            let base = dream_quota_per_stage();
+            let bonus = crate::annotations::dream_quota_bonus(&state.db, &world_id, cid).await;
+            json!({
+                "applicable": true,
+                "characterId": cid,
+                "base": base,
+                // 🔴 补偿单列而不是并进 base：玩家有权知道「多出来的这条是申诉换来的」，
+                // 而不是以为基础额度变了。口径同 `annotations` 的加数表。
+                "bonus": bonus,
+                "effective": base + bonus,
+                "used": used,
+                "remaining": (base + bonus - used).max(0),
+                "scope": "per_world_instance_per_character",
+                "scopeNote": "每个**世界实例**一份，按角色算。当前「阶段」与「世界实例」是同一件事\
+                              （Saga 是否跨阶段尚未拍板）。⚠️ 它**不是**「每天」——额度不随墙钟回补，\
+                              世界一直不提交拍时早先发出的托梦依然占额度。",
+                "bonusNote": "bonus 来自 OOC 申诉复核确认「模型确实演错了」后的补偿（§7 第 2 级）。\
+                              它是**加数**：基础额度与已用计数一个字节都不受影响。",
+            })
+        }
+    };
+
+    Ok(Json(json!({ "interventions": items, "dreamQuota": quota })))
 }
 
 #[cfg(test)]
@@ -371,6 +452,129 @@ mod tests {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let v = serde_json::from_slice(&bytes).unwrap_or(json!(null));
         (status, v)
+    }
+
+    /// 取 `GET /worlds/{id}/interventions/mine` 的 `dreamQuota`。
+    async fn quota_of(state: &AppState, tk: &str, world: &str) -> serde_json::Value {
+        let resp = crate::app::build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/api/worlds/{world}/interventions/mine"))
+                    .header("authorization", format!("Bearer {tk}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
+        v["dreamQuota"].clone()
+    }
+
+    /// 🔴 **剩余额度必须在花掉之前查得到**。
+    ///
+    /// 此前玩家只能靠「被拒绝」发现没额度了，而有效额度 = 基础 + OOC 申诉补偿——
+    /// 补偿是复核之后补发的，玩家**在构造上算不出这个数**。于是「还能不能托梦」
+    /// 对他是不可知的，只能试。托梦是 §8 的核心互动，让它变成碰运气的按钮，
+    /// 是把一条确定性的规则做成了体验上的随机。
+    #[tokio::test]
+    async fn remaining_dream_quota_is_visible_before_you_spend_it() {
+        let _g = quota_guard();
+        let state = test_state().await;
+        seed_user(&state.db, "u1").await;
+        seed_world(&state.db, "w1", 0, "running").await;
+        seed_member(&state.db, "m1", "w1", "u1", "c1", "active").await;
+        let tk = token(&state, "u1");
+
+        let q = quota_of(&state, &tk, "w1").await;
+        assert_eq!(q["applicable"], json!(true), "{q}");
+        assert_eq!(q["used"], json!(0));
+        assert_eq!(q["remaining"], q["effective"], "一条没发时 remaining == effective: {q}");
+        assert_eq!(q["scope"], "per_world_instance_per_character");
+
+        // 发一条 → used 加一、remaining 减一（口径与 create 的判定同源）。
+        post_intervention(
+            &state,
+            &tk,
+            "w1",
+            json!({"kind": "whisper", "characterId": "c1", "payload": {"text": "早些歇息"}, "expectedWorldRevision": 0}),
+        )
+        .await;
+        let q2 = quota_of(&state, &tk, "w1").await;
+        assert_eq!(q2["used"], json!(1), "{q2}");
+        assert_eq!(
+            q2["remaining"].as_i64().unwrap(),
+            q["remaining"].as_i64().unwrap() - 1,
+            "🔴 读出来的剩余必须与实际能发的条数同源，否则玩家看到的「还剩 2 条」会对不上"
+        );
+
+        // 🔴 **已被引擎消费的托梦（applied）仍然占额度**——这是配额口径的要害，
+        // 也是读取面最容易与判定漂移的地方（少算 applied，玩家就会看到一个比实际大的剩余，
+        // 然后在发的时候被拒）。故意直插一条 applied 行来钉住它。
+        //
+        // ⚠️ 这一条是故障注入补出来的：上一版只发了一条 accepted，于是把读取面的
+        // `IN ('accepted','applied')` 改成 `IN ('accepted')` 后**所有用例照样绿**。
+        sqlx::query(
+            "INSERT INTO interventions (id, world_id, user_id, character_id, kind, payload_json, \
+             expected_revision, status, reject_reason, created_at) \
+             VALUES ('iv_applied', 'w1', 'u1', 'c1', 'whisper', '{}', 0, 'applied', NULL, $1)",
+        )
+        .bind(crate::db::now_ms())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let q3 = quota_of(&state, &tk, "w1").await;
+        assert_eq!(
+            q3["used"], json!(2),
+            "🔴 已被引擎消费的托梦仍占额度 —— 少算它，玩家会看到一个比实际大的剩余然后被拒: {q3}"
+        );
+    }
+
+    /// 🔴 **没入场 ≠ 额度用光**。给 `applicable: false` 而不是 `remaining: 0`——
+    /// 后者会让玩家以为自己被封了。
+    #[tokio::test]
+    async fn not_being_in_the_world_is_not_the_same_as_having_no_quota_left() {
+        let _g = quota_guard();
+        let state = test_state().await;
+        seed_user(&state.db, "u1").await;
+        seed_world(&state.db, "w1", 0, "running").await;
+        // 刻意不 seed_member：这个人没进过这个世界。
+        let tk = token(&state, "u1");
+
+        let q = quota_of(&state, &tk, "w1").await;
+        assert_eq!(q["applicable"], json!(false), "{q}");
+        assert!(q.get("remaining").is_none(), "🔴 不得给 remaining: 0 —— 那会被读成「额度用光了」: {q}");
+        assert!(
+            q["why"].as_str().unwrap_or("").contains("不是「额度用光了」"),
+            "得把这两件事的区别直说: {q}"
+        );
+    }
+
+    /// OOC 申诉补偿**单列**，不并进基础额度：玩家有权知道「多出来的这条是申诉换来的」。
+    #[tokio::test]
+    async fn the_appeal_bonus_is_reported_separately_from_the_base_quota() {
+        let _g = quota_guard();
+        let state = test_state().await;
+        seed_user(&state.db, "u1").await;
+        seed_world(&state.db, "w1", 0, "running").await;
+        seed_member(&state.db, "m1", "w1", "u1", "c1", "active").await;
+        sqlx::query(
+            "INSERT INTO dream_quota_compensations (id, appeal_id, world_id, character_id, \
+             user_id, grants, reason, created_at) VALUES ('dqc1', 'ap1', 'w1', 'c1', 'u1', 2, 'x', $1)",
+        )
+        .bind(crate::db::now_ms())
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+        let q = quota_of(&state, &token(&state, "u1"), "w1").await;
+        assert_eq!(q["bonus"], json!(2), "{q}");
+        assert_eq!(
+            q["effective"].as_i64().unwrap(),
+            q["base"].as_i64().unwrap() + 2,
+            "🔴 有效额度 = 基础 + 补偿；把补偿并进 base 会让玩家以为基础额度变了: {q}"
+        );
     }
 
     #[tokio::test]

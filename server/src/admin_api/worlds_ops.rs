@@ -633,7 +633,8 @@ pub(super) async fn create_world(
     let series_req = match &req.series {
         None => None,
         Some(s) => {
-            if !series_autoscale_enabled() {
+            // ctx 恒为 global（本开关刻意不设 world 档，见 `worlds::series_autoscale_enabled`）。
+            if !series_autoscale_enabled(&state.db).await {
                 return Err(ApiError::BadRequest(
                     "世界系列自动扩容尚未开启：该能力属未验证功能，需运营先显式打开开关（MUSE_WORLD_SERIES_AUTOSCALE）后方可登记系列"
                         .into(),

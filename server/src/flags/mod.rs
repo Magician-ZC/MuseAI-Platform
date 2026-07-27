@@ -202,7 +202,11 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
         default_enabled: false,
         owner: "worlds",
         desc: "世界系列自动扩容（1 号满员开 2 号）",
-        wired: false,
+        // 🔵 已接线，但**只有 global 档**——这是这批里唯一主动放弃灰度粒度的一个：
+        // ① 系列是一串世界实例，按世界灰度会让同一系列半开半关（1 号能指到 2 号、
+        //    2 号却开不出 3 号）；② 逐系列的闸已经存在（`world_series.status`），
+        // 再加一档就是第三道语义重叠、最容易被忘记的闸。🔴 两道闸都开才扩容。
+        wired: true,
     },
     FlagDef {
         name: "MUSE_WORLD_BE_BIOGRAPHY",
@@ -412,9 +416,14 @@ pub const fn declared_default(name: &str) -> bool {
 ///   ⚠️ 原注那条提醒仍然有效且**依然没被违反**：`MUSE_MEMORIAL_BOND_MIN` /
 ///   `MUSE_MEMORIAL_PAGE_SIZE` 是**参数化 env（非布尔）**，本体系只管布尔开关，
 ///   参数化配置是另一件事（§0.2），迁移时一个都没往 `runtime_flags` 里塞。
-/// - `MUSE_WORLD_SERIES_AUTOSCALE`：扩容判定在 join 的事务路径上，事务边界注意事项同上。
-///   它已有**逐系列**的 `world_series.status` 急停阀，与本体系的 world 作用域**语义重叠**：
-///   迁移时要明确「两道闸都开才扩容」，不要让 `runtime_flags` 变成第三道容易被忘记的闸。
+/// - ~~`MUSE_WORLD_SERIES_AUTOSCALE`~~ —— **已迁（2026-07-27）**。原注对「语义重叠」的提醒
+///   直接决定了结论：它**只接 global 档，不给 world 档**。逐系列的闸已经是
+///   `world_series.status`，再加一档 world 作用域就是第三道容易被忘记的闸；而且系列是
+///   **一串**世界实例，按世界灰度会让同一系列半开半关（1 号能指到 2 号、2 号却开不出 3 号）。
+///   🔴 两道闸都开才扩容，缺一不可。
+///   ⚠️ 原注另一句「扩容判定在 join 的事务路径上」**是不准确的**，已改正：
+///   `ensure_next_series_instance` 由 `world_full_conflict` 调用，那是撞满员后的 **409 构造
+///   路径**，join 的事务此时还没开。照着原注去做一次 bool 穿透是白费功夫。
 /// - ~~`MUSE_WORLD_BE_BIOGRAPHY`~~ —— **已迁（2026-07-27）**。封卷路径的事务边界注意事项同上，
 ///   经 [`crate::progression::SettlementFlags`] 传入（第三个字段）。
 ///   🔵 它是这批里唯一**两侧 ctx 同档**（都按 world）的：传记是公共事实不是个人资产，

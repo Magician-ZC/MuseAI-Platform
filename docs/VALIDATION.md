@@ -260,8 +260,16 @@
   对「端点里传的是 world 还是 global」完全无感；③ 字段接串那条用 `collapsed = false`，
   BE 传记那一行根本没被走到。全部改成走真实入口（真实结算函数 / 真实 HTTP 端点 /
   `collapsed = true`）后三处注入才红。**教训：验开关接线，必须从接线点的上游进去。**
-- 未迁：`MUSE_CONTAINER_ASSEMBLY` · `MUSE_WORLD_SERIES_AUTOSCALE` ·
-  `MUSE_SAFETY_LEXICON`（🔴 最后迁或不迁）。
+- ~~`MUSE_WORLD_SERIES_AUTOSCALE`~~ —— **已迁（2026-07-27）**。原注对「语义重叠」的提醒直接
+  决定了结论：它**只接 global 档，不给 world 档**——这是这批里唯一**主动放弃灰度粒度**的一个。
+  逐系列的闸已经是 `world_series.status`，再加一档就是第三道容易被忘记的闸；且系列是**一串**
+  世界实例，按世界灰度会让它半开半关（1 号能指到 2 号、2 号却开不出 3 号）。
+  🔴 **两道闸都开才扩容**，有用例钉住「全局开关不是逐系列闸的旁路」。
+  ⚠️ 原注另一句「扩容判定在 join 的事务路径上」**不准确**，已改正：
+  `ensure_next_series_instance` 由 `world_full_conflict` 调用，那是撞满员后的 **409 构造路径**，
+  join 的事务此时还没开。照着原注去做一次 bool 穿透是白费功夫——**迁移清单本身也会过期，
+  动手前先按当前代码复核一遍**。
+- 未迁：`MUSE_CONTAINER_ASSEMBLY` · `MUSE_SAFETY_LEXICON`（🔴 最后迁或不迁）。
 
 共同的坑：**多数消费点在事务内**（结算铸卡 / 封卷 / 扩容判定），`is_enabled` 会查库，
 须在进事务前解析一次再把 bool 传进去，否则 SQLite 单连接池自锁。
@@ -307,7 +315,7 @@
 `admin_api::audit::writeback_target` 现在返回回写坐标，`world_events` 上因此有了全仓
 **唯一一条放宽语句**（`SET` 只有 `moderation` 一列、按主键点名、CAS、起点白名单写死在 SQL 里），
 权限分 reviewer / admin 两档，三条写入路径由源码级红线用例全仓盘点 ·
-**其余存量 env 开关接入运行时开关体系**（副本卡 / 生死状档 / 房间邀请 / 传世卡 / BE 传记已迁，清单与注意事项见上）·
+**其余存量 env 开关接入运行时开关体系**（副本卡 / 生死状档 / 房间邀请 / 传世卡 / BE 传记 / 系列扩容已迁，清单与注意事项见上）·
 **处置申诉只覆盖 `character` / `character_avatar` 两类主体**（如实的范围，不是遗漏：
 `world_cover` 属于世界、`world_templates` 根本没有 owner 列，给它们开申诉入口只会得到一个
 没人有资格提交的端点；要覆盖需先定义"世界封面 / 模板的作者是谁"这条产品口径）。

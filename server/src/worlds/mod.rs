@@ -1436,8 +1436,9 @@ pub async fn create_world(db: &AnyPool, p: CreateWorldParams) -> Result<String, 
 //         关掉之后既有系列立即停止扩容（已开出的实例不受影响，那是世界不是功能），再打开原样恢复。
 //   闸二：系列**必须显式登记**（`world_series` 表，运营建 1 号房时带 `series` 参数）。
 //         未登记的世界——含全部历史世界与全部玩家自建房——永不扩容，行为零变化。
-// ⚠️ 沿用现有 env 范式（同 `deathmatch_enabled` / `subplot_cards_enabled`）：本仓库尚无配置表，
-//    做不到按世界灰度，这是已知缺口；将来配置表落地只改本节函数内部，调用点与降级语义不变。
+// 🔵 闸一已接入运行时开关体系（`crate::flags`），于是运营在后台点一下即刻生效、不必重启进程，
+//    且每次开关变更都落 `audit_logs`。原注写的「做不到按世界灰度，这是已知缺口」——
+//    **那个缺口现在被有意保留**，见 `series_autoscale_enabled` 的作用域说明。
 
 /// 世界系列自动扩容的运营开关环境变量。
 const ENV_SERIES_AUTOSCALE: &str = "MUSE_WORLD_SERIES_AUTOSCALE";
@@ -1455,20 +1456,41 @@ const HARD_SERIES_MAX_INSTANCES: i64 = 200;
 /// 系列状态：可继续扩容。
 const SERIES_STATUS_ACTIVE: &str = "active";
 
-/// 自动扩容是否已由运营开启（env 覆盖 + 默认常量，范式同 `deathmatch_enabled`）。
+/// 🔴 **编译期钉死默认值的两个事实源**（本常量 + `flags::KNOWN_FLAGS`）。
+const _: () = assert!(
+    crate::flags::declared_default(ENV_SERIES_AUTOSCALE) == DEFAULT_SERIES_AUTOSCALE_ENABLED,
+    "flags::KNOWN_FLAGS 中 MUSE_WORLD_SERIES_AUTOSCALE 的默认值必须与 DEFAULT_SERIES_AUTOSCALE_ENABLED 一致"
+);
+
+/// 自动扩容是否已由运营开启。
 ///
-/// 开关是**全局急停阀**，生效在读取侧（`ensure_next_series_instance` / `series_view` 第一行）：
+/// 开关是**急停阀**，生效在读取侧（`ensure_next_series_instance` / `series_view` 第一行）：
 /// 关掉即刻停止一切扩容与排队指路，再打开则原样恢复——可逆，不是一次性阉割。
-pub fn series_autoscale_enabled() -> bool {
-    match std::env::var(ENV_SERIES_AUTOSCALE) {
-        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "on" | "yes" => true,
-            "0" | "false" | "off" | "no" => false,
-            // 配错不静默开启会自动建世界的能力：回落默认（关闭）。
-            _ => DEFAULT_SERIES_AUTOSCALE_ENABLED,
-        },
-        Err(_) => DEFAULT_SERIES_AUTOSCALE_ENABLED,
-    }
+///
+/// ════════════════════════════════════════════════════════════════════════════
+/// 🔴 已接入运行时开关体系（`crate::flags`）—— 但**只取 global，刻意不加 world 档**
+/// ════════════════════════════════════════════════════════════════════════════
+///
+/// 这是这批迁移里唯一一个**主动放弃灰度粒度**的。两条理由：
+///
+/// 1. **粒度对不上**：一个系列是**一串世界实例**（1 号、2 号、3 号……），而扩容是系列级行为。
+///    按世界灰度意味着「1 号开着、2 号关着」——那会让同一个系列半开半关：
+///    在 1 号撞满员能被指到 2 号，在 2 号撞满员却开不出 3 号。系列会卡在一个谁也说不清的号上。
+/// 2. **已经有一道逐系列的闸了**：`world_series.status`（`active` / 非 `active`）就是
+///    「这个系列还扩不扩」的开关，运营改一行数据即可停某一个系列。再加一档 world 作用域，
+///    就成了**第三道语义重叠、且最容易被忘记的闸**——`flags::MIGRATION_NOTES` 原注
+///    正是提醒这一点。
+///
+/// 🔴 **两道闸都开才扩容**，缺一不可（本函数 = 全局急停阀 · `world_series.status` = 逐系列开关）。
+/// 迁进开关体系拿到的是「运营后台点一下即刻生效、不必重启进程」+「每次变更落 `audit_logs`」，
+/// **不是**新的灰度维度。
+///
+/// ℹ️ 消费点**全部不在事务内**：`ensure_next_series_instance` 由 `world_full_conflict` 调用，
+/// 那是 join 撞满员后的 **409 构造路径**，join 的事务此时还没开；`series_view` / `series_json`
+/// 是纯读；登记前门在建房事务之前。⚠️ 原注写的「扩容判定在 join 的事务路径上」**不准确**，
+/// 已按实际情况改正——不然下一个人会照着它去做一次不必要的 bool 穿透。
+pub async fn series_autoscale_enabled(db: &AnyPool) -> bool {
+    crate::flags::is_enabled(db, ENV_SERIES_AUTOSCALE, crate::flags::FlagCtx::global()).await
 }
 
 /// 系列实例数的全局硬顶（运营可调；缺失/非法回落默认，再 clamp 进安全区间）。
@@ -1779,7 +1801,7 @@ pub(crate) async fn ensure_next_series_instance(
     db: &AnyPool,
     world: &WorldRow,
 ) -> Result<Option<(String, i64)>, ApiError> {
-    if !series_autoscale_enabled() {
+    if !series_autoscale_enabled(db).await {
         return Ok(None);
     }
     let Some((series, _self_no)) = load_series_of_world(db, &world.id).await? else {
@@ -1834,7 +1856,7 @@ async fn world_full_conflict(db: &AnyPool, world: &WorldRow) -> ApiError {
 /// GET 是幂等读，一次刷新详情页就自动开一个新世界是不可接受的副作用；
 /// 新号只在真的有人撞满员（POST join）时才开。
 async fn series_view(db: &AnyPool, world: &WorldRow) -> Result<Option<Value>, ApiError> {
-    if !series_autoscale_enabled() {
+    if !series_autoscale_enabled(db).await {
         return Ok(None);
     }
     let Some((series, instance_no)) = load_series_of_world(db, &world.id).await? else {
@@ -1881,7 +1903,7 @@ pub(crate) async fn series_admin_view(
         "maxInstancesEffective": series.effective_max_instances(),
         "globalCap": series_max_instances_cap(),
         "status": series.status,
-        "autoscaleEnabled": series_autoscale_enabled(),
+        "autoscaleEnabled": series_autoscale_enabled(db).await,
     })))
 }
 

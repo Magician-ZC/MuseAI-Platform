@@ -2654,6 +2654,70 @@ mod series_autoscale {
         );
     }
 
+    /// 🔴 **运行时开关生效，不必重启进程**——这是接入 `flags` 体系拿到的**唯一**增量
+    /// （本开关刻意不加 world 档，见 `series_autoscale_enabled` 的作用域说明）。
+    /// env 层保持关着，只往 `runtime_flags` 写一条 global 记录，扩容立刻开始。
+    #[tokio::test]
+    async fn runtime_flag_opens_autoscale_without_touching_env() {
+        let _sw = SeriesSwitch::set(false); // env 层：**关**
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_player(&state, "uR1", "cR1").await;
+        seed_player(&state, "uR2", "cR2").await;
+        let (wid, _sid) = seed_series_origin(&state, 1, 5).await;
+        assert_eq!(join(&app, &state, &wid, "uR1", "cR1").await.0, StatusCode::OK);
+
+        // 先确认 env 关着时确实不扩容（对照组，排除「本来就会扩」的解释）。
+        let (_st, body) = join(&app, &state, &wid, "uR2", "cR2").await;
+        assert!(next_world_id(&body).is_none(), "对照：env 关着不该指路");
+
+        // 只写一条 global 运行时记录（不动 env、不重启进程）。
+        sqlx::query(
+            "INSERT INTO runtime_flags (id, flag, scope, target_id, enabled, starts_at, ends_at, \
+             updated_by, updated_at, reason, created_at) \
+             VALUES ($1, 'MUSE_WORLD_SERIES_AUTOSCALE', 'global', '', 1, 0, 0, 'test', $2, 'test', $3)",
+        )
+        .bind(crate::db::new_id("rf"))
+        .bind(crate::db::now_ms())
+        .bind(crate::db::now_ms())
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+        let (st, body) = join(&app, &state, &wid, "uR2", "cR2").await;
+        assert_eq!(st, StatusCode::CONFLICT);
+        let next = next_world_id(&body);
+        assert!(next.is_some(), "🔴 运行时记录应当即刻生效并指路到新号: {body}");
+        assert_eq!(count_sql(&state, "SELECT COUNT(*) FROM worlds").await, 2, "应当开出 2 号");
+    }
+
+    /// 🔴 **两道闸都开才扩容**：运行时开关开着，但系列自己被停（`world_series.status` 非 active）
+    /// ⇒ 一个新世界都不许建。迁进开关体系**没有**把这道逐系列的闸变成可绕过的。
+    #[tokio::test]
+    async fn runtime_flag_does_not_override_the_per_series_gate() {
+        let _sw = SeriesSwitch::set(true); // 闸一：开
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_player(&state, "uS1", "cS1").await;
+        seed_player(&state, "uS2", "cS2").await;
+        let (wid, sid) = seed_series_origin(&state, 1, 5).await;
+        // 闸二：把系列停掉。
+        sqlx::query("UPDATE world_series SET status = 'closed' WHERE id = $1")
+            .bind(&sid)
+            .execute(&state.db)
+            .await
+            .unwrap();
+
+        assert_eq!(join(&app, &state, &wid, "uS1", "cS1").await.0, StatusCode::OK);
+        let (st, body) = join(&app, &state, &wid, "uS2", "cS2").await;
+        assert_eq!(st, StatusCode::CONFLICT);
+        assert!(
+            next_world_id(&body).is_none(),
+            "🔴 系列已停时不得扩容 —— 全局开关不是逐系列闸的旁路: {body}"
+        );
+        assert_eq!(count_sql(&state, "SELECT COUNT(*) FROM worlds").await, 1);
+    }
+
     /// 未登记进系列的世界（= 全部历史世界 + 全部玩家自建房）满员时行为零变化：
     /// 开关开着也不扩容——「逐系列显式登记」是第二道闸。
     #[tokio::test]

@@ -965,6 +965,10 @@ async fn list_endpoint_reports_effective_global_state() {
             // 结构体加了一个字段，没有给结算函数新增 bool 参数。那正是上一条迁移时
             // 建这个结构体的理由。
             "MUSE_MEMORIAL",
+            // 🔵 `MUSE_WORLD_SERIES_AUTOSCALE` 是这批里**唯一只接 global 档**的：
+            // 逐系列的闸已经是 `world_series.status`，再加一档 world 作用域就是第三道
+            // 语义重叠的闸；且系列是一串世界实例，按世界灰度会让它半开半关。
+            "MUSE_WORLD_SERIES_AUTOSCALE",
             // 🔵 `MUSE_WORLD_BE_BIOGRAPHY` 是 `SettlementFlags` 的第三个字段。它也是这批里
             // 唯一**两侧 ctx 同档**（都按 world）的——传记是公共事实不是个人资产，
             // 按人灰度会出现「同一份封卷 A 看得见 B 看不见」。

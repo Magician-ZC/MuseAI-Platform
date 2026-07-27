@@ -626,6 +626,20 @@ fn skeleton_declares_endgame_single_location_and_no_payout_table() {
     assert!(sk["worldItems"].as_array().unwrap().is_empty(), "微本不发道具（道具单一写入路径为 grant_item_tx）");
 }
 
+/// 🔴 微本模板是**第二条写入路径**：`ensure_template` 直接 INSERT，不过
+/// `POST /admin/world-templates` 上那道 `validate_skeleton_refs`。于是那道闸拦不到它——
+/// 微本骨架里写错一个顶层键（`forbiddenPredicates` → `forbidden_predicates` 之类），
+/// 结果是每一个新手玩家进的都是个静默退化的世界，且没有任何报错。这里补上等价的校验。
+#[test]
+fn microworld_skeleton_would_pass_the_create_template_gate() {
+    let sk = microworld::skeleton_value();
+    assert!(
+        crate::assembly::validate_skeleton_refs(&sk, false).is_ok(),
+        "{:?}",
+        crate::assembly::validate_skeleton_refs(&sk, false)
+    );
+}
+
 /// 模板 ensure 幂等：重复调用不改版本号；骨架变更（env 改参数）才升版。
 #[tokio::test]
 async fn ensure_template_is_idempotent_and_versions_on_change() {

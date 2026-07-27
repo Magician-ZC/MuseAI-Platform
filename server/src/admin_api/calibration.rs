@@ -313,6 +313,17 @@ fn skeleton_shape(raw: &str) -> Value {
         "realmTierLabel": realm.as_ref().map(RealmEntry::display),
         "hasEndgame": v.get("endgame").is_some_and(|x| !x.is_null()),
         "isSuperset": v.get("isSuperset").and_then(Value::as_bool).unwrap_or(false),
+        // 🔴 无人读取的顶层键（拼错 / 残留）。建模板期 `validate_skeleton_refs` 现在会拦掉它们，
+        // 但**存量模板是在那道闸之前建的**——那些行至今没人回头看过。而这类错的表现形式恰恰是
+        // 「上面那些计数全是 0，却没有任何报错」，运营看到只会以为模板就是这么写的。
+        // 故在同一张形状表里点名，让「空」与「拼错了所以空」在同一屏上可分辨。
+        "unknownTopLevelKeys": v.as_object().map(|o| {
+            o.keys()
+                .filter(|k| !k.starts_with("__"))
+                .filter(|k| !crate::assembly::SKELETON_TOP_LEVEL_KEYS.contains(&k.as_str()))
+                .cloned()
+                .collect::<Vec<_>>()
+        }).unwrap_or_default(),
     })
 }
 
@@ -1384,6 +1395,27 @@ mod tests {
         assert_eq!(full["identityPoolSize"], 2);
         assert_eq!(full["identityQuotaTotal"], 5);
         assert_eq!(full["identityLeadCount"], 1);
+    }
+
+    /// 「空」与「拼错了所以空」必须在同一屏上可分辨。
+    ///
+    /// 这是存量模板唯一的发现途径：建模板期那道闸是本次才加的，此前建的行没被校验过，
+    /// 而它们的症状与「运营就是没写主线」完全一样——形状表全 0、零报错。
+    #[test]
+    fn skeleton_shape_names_unknown_top_level_keys() {
+        let typo = skeleton_shape(r#"{"mainLineNodes":[1,2,3],"difficultyCurve":7}"#);
+        assert_eq!(typo["mainlineNodes"], 0, "拼错的键读不出来，计数确实是 0");
+        let unknown: Vec<String> = serde_json::from_value(typo["unknownTopLevelKeys"].clone()).unwrap();
+        assert!(unknown.contains(&"mainLineNodes".to_string()), "{unknown:?}");
+        assert!(unknown.contains(&"difficultyCurve".to_string()), "{unknown:?}");
+
+        // 合法骨架不得被报（含手读键与 `__` 注释键）。
+        let clean = skeleton_shape(
+            r#"{"__doc":"说明","mainlineNodes":[1],"endgame":{"minWorldTicks":5},
+                "forbiddenPredicates":["x == 1"]}"#,
+        );
+        assert_eq!(clean["mainlineNodes"], 1);
+        assert_eq!(clean["unknownTopLevelKeys"], serde_json::json!([]), "合法键不得被误报");
     }
 
     // ---------------- 维度三：境界档 ----------------

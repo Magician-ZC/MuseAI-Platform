@@ -898,6 +898,53 @@ golden `14`，`runtime/simulation/baseline.json` 与 golden 基线**一个字节
 ⚠️ 而给 `RelationState` **去掉 `rename_all`** 不会红——那是**正确的**：它读到的几个字段都是单词，
 camelCase 与 snake_case 同形。`known_to` 才受影响，而那一处是类型化读的。
 
+### 3.8 运营→server 的 JSON 边界：`skeleton_json` 的顶层键（**落地于 2026-07-27**）
+
+§3.7 记的是 server↔engine 那条边界。同一类问题在**另一条**边界上更严重，因为那一侧
+写 JSON 的是**运营的人**，而不是编译器管着的代码：`world_templates.skeleton_json`。
+
+**在此之前，没有任何一处知道这份 JSON 的合法顶层键集**——一半在 `assembly::Skeleton`
+（20 个字段，`Deserialize` + camelCase，模块私有），另一半散在手读点：`runtime` 按字符串键读
+`endgame`（min/maxWorldTicks，**决定世界何时结束**）与 `forbiddenPredicates`（**禁止谓词**）。
+两边互不认识对方的键。于是拼错一个顶层键的后果是**全程零报错**：
+
+| 拼错的键 | 静默后果 |
+|---|---|
+| `mainlineNodes` | 无主线大纲；`chapters::mainline_node_count` 归 0 → 通关判定退化 |
+| `endgame` | 世界结束条件退回默认，运营设定的场次长度失效 |
+| `forbiddenPredicates` | **禁止谓词失效，失败方向是放行** |
+| `payoutTable` / `identityPool` | 产出表 / 身份维度整个消失 |
+
+⚠️ 这**不是假想**：`admin_api::tests::template_create_and_review_flow` 里当"合法模板"用了很久的
+骨架是 `{ "mainNodes": [], "endings": [] }`——两个键都是编的（真名 `mainlineNodes` / `endingPool`），
+却一路 200 建成模板、全绿通过。加上这道闸的当天它就红了。
+
+**做法**：`assembly::SKELETON_TOP_LEVEL_KEYS` 成为唯一的合法键清单（含两个非 `Skeleton` 的手读键，
+各带注释说明谁读），`validate_skeleton_refs` 增加第 0 段——未知顶层键 → 建模板期 400 并点名，
+带「是不是想写 X？」的归一化建议（去大小写与下划线，故 `mainLineNodes` / `mainline_nodes` 都能指回）。
+`__` 前缀（`__doc` 注释键）豁免。**拒绝而非警告**：没人读的键只可能是拼错或残留。
+
+🔴 **第 0 段必须在「解析不出结构化骨架就放行」那条既有防御分支之前**，否则同时写错类型的骨架会
+绕过它——而写错一处的人通常不止写错一处。用例 `top_level_key_check_runs_before_the_lenient_parse_bailout`。
+
+🔴 **刻意不用 `#[serde(deny_unknown_fields)]`**：那会让整个 `Skeleton` 解析失败，反而触发上面
+那条防御分支、把校验整体关掉——比现状更糟。
+
+**三条写入路径盘了一遍**（`INSERT INTO world_templates` 的全部生产码出处）：
+`POST /admin/world-templates` 与 `POST /assets/worlds`（创作者发布）本来就调 `validate_skeleton_refs`，
+自动获得这道闸；`onboarding::microworld::ensure_template` **直接 INSERT、不过闸**，
+故补了等价用例 `microworld_skeleton_would_pass_the_create_template_gate`——微本骨架由代码生成、
+只有取值受 env 参数化（键集是静态的），用例钉住即够，不必付运行时校验的代价。
+
+**存量模板不会被回头校验**（闸是本次才加的）。它们的唯一发现途径是运营台的骨架形状表新增的
+`shape.unknownTopLevelKeys`（`GET /admin/sagas/{sagaId}`）——因为这类错的症状与「运营就是没写主线」
+完全一样：一排 0、零报错，两者必须在同一屏上可分辨。
+
+⚠️ **边界（别把这条读成"拼错已经不会发生了"）**：这道闸只管**顶层**键。嵌套层仍是静默的——
+`mainlineNodes[].advanceWhen` 拼成 `advanceWhen2`，谓词就只是悄悄消失（`runtime` 那里是
+`.get("advanceWhen").and_then(..)`）。覆盖嵌套需要把每个嵌套类型的键集都登记一遍，改动面另论，
+本批次**未做**，如实登记在此。
+
 ## 4. 验证基建三件套（优先于新增功能）
 
 1. **黄金世界回归**：一个公版/原创标准样板（固定角色卡 + 世界模板 + 20-30 个关键剧情测试点，

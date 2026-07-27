@@ -767,12 +767,31 @@ async fn template_create_and_review_flow() {
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
 
+    // 骨架顶层有无人读取的键 → 400。这个用例此前用的正是 `{ "mainNodes": [], "endings": [] }`——
+    // 两个键都是编的（真名 `mainlineNodes` / `endingPool`），却一路 200 建成了模板。
+    // 那不是测试写错的孤例，是产品面的真实形态：拼错的键不报错，只让对应功能静默取默认值。
+    let (st, body) = post(
+        &app,
+        "/api/admin/world-templates",
+        Some(&admin),
+        json!({ "title": "X", "roomType": "idle", "skeletonJson": { "mainNodes": [], "endings": [] } }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    // 与本函数其余校验一致，只报**第一个**冒犯者（键序由 serde_json 的有序 map 决定）。
+    let msg = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(msg.contains("无人读取的键"), "400 理由须是这一条: {body}");
+    assert!(
+        msg.contains("mainNodes") || msg.contains("endings"),
+        "400 须点名那个键，否则运营无从下手: {body}"
+    );
+
     // 合法创建 → pending + 入审核队列。
     let (st, body) = post(
         &app,
         "/api/admin/world-templates",
         Some(&admin),
-        json!({ "title": "官方模板", "roomType": "idle", "skeletonJson": { "mainNodes": [], "endings": [] } }),
+        json!({ "title": "官方模板", "roomType": "idle", "skeletonJson": { "mainlineNodes": [], "endingPool": [] } }),
     )
     .await;
     assert_eq!(st, StatusCode::OK);

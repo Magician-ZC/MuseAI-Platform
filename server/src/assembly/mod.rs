@@ -2544,6 +2544,65 @@ fn distribute_resident_items(
         .collect()
 }
 
+/// skeleton_json 的**全部合法顶层键**——本仓库唯一一处知道这个集合的地方。
+///
+/// 🔴 在此之前它谁也不知道：一半在 `struct Skeleton`（20 个字段，`Deserialize` + camelCase），
+/// 另一半散在**手读点**——`runtime` 按字符串键读 `endgame`（min/maxWorldTicks，决定世界何时结束）
+/// 与 `forbiddenPredicates`（禁止谓词，内容约束）。两边都不认识对方的键。
+///
+/// 于是拼错一个顶层键的后果是**全程零报错**：`Skeleton` 每个字段都 `#[serde(default)]`，
+/// 未知字段被 serde 忽略（没有也不该有 `deny_unknown_fields`，那会让整个结构解析失败、
+/// 反而触发下面那条「解析不出就放行」的防御分支，把校验整体关掉）；手读点则是
+/// `.get(k).and_then(..)` 后 `unwrap_or_default`。所以：
+///
+/// | 拼错的键 | 静默后果 |
+/// |---|---|
+/// | `mainlineNodes` | 无主线大纲；`chapters::mainline_node_count` 归 0 → 通关判定退化 |
+/// | `endgame` | 世界结束条件退回默认，运营设定的场次长度失效 |
+/// | `forbiddenPredicates` | **禁止谓词失效**，失败方向是放行 |
+/// | `payoutTable` / `identityPool` | 产出表 / 身份维度整个消失 |
+///
+/// 建模板期一次拦掉它，正是本文件既有的取舍（见下面那条 doc 的最后一段）。
+/// 表里未列 = 不会被任何人读，因此**拒绝**而不是警告：一个没人读的键只可能是拼错或残留。
+/// `__` 前缀的键（`__doc` 注释）豁免。
+///
+/// ⚠️ 加了新的手读键（`sk.get("xxx")`）而忘了往这张表里加，后果是**合法模板被拒**——响亮而不是静默，
+/// 这个方向安全。反方向（往 `Skeleton` 加字段忘了加这里）由
+/// `skeleton_top_level_keys_covers_every_skeleton_field` 在源码层钉住。
+pub(crate) const SKELETON_TOP_LEVEL_KEYS: &[&str] = &[
+    // ---- `struct Skeleton` 的字段（camelCase）----
+    "sourceWork",
+    "mainlineNodes",
+    "endingPool",
+    "hiddenContentPool",
+    "sideHookPool",
+    "worldItems",
+    "worldCharacters",
+    "locations",
+    "assemblyRules",
+    "storylines",
+    "identityPool",
+    "payoutTable",
+    "realmTier",
+    "sampling",
+    "isSuperset",
+    "subplotCardRefs",
+    "seams",
+    "nexus",
+    "anchors",
+    "container",
+    // ---- 不在 `Skeleton` 里、由 runtime 按字符串键手读的 ----
+    "endgame",             // runtime::…（结束条件：minWorldTicks / maxWorldTicks）
+    "forbiddenPredicates", // runtime::…（禁止谓词）
+];
+
+/// 键名归一化（仅用于「是不是想写 X？」的提示）：去掉大小写与非字母数字，
+/// 于是 `mainLineNodes` / `mainline_nodes` / `MainlineNodes` 都能指回 `mainlineNodes`——
+/// 这三种正是最可能的写法错误（Rust 侧字段是 snake_case，线上格式是 camelCase）。
+fn squash_key(k: &str) -> String {
+    k.chars().filter(char::is_ascii_alphanumeric).flat_map(char::to_lowercase).collect()
+}
+
 /// 建模板期引用完整性校验（Phase 3，`worlds_ops::create_template` 调用）：把 skeleton_json 试解析为
 /// `Skeleton`，校验目录引用无悬空——`reward_item_ref`（无内联 fallback 时）/`connections`/`residentItemIds`/
 /// `carried_item_ids`/`gate.requiredItemIds` 须能在对应目录（world_items / locations）解引用，
@@ -2555,6 +2614,27 @@ fn distribute_resident_items(
 /// 宽松边界：解析失败（类型不符）→ Ok（沿用 load_skeleton 的防御式 unwrap_or_default 语义，不因无关字段拦截合法模板）；
 /// 只在结构成立时对「明确写了引用」的字段判悬空，避免误伤退化路径（空目录 / 无地点的老模板全部放行）。
 pub(crate) fn validate_skeleton_refs(skeleton: &Value, container_on: bool) -> Result<(), String> {
+    // 0) 未知顶层键（见 `SKELETON_TOP_LEVEL_KEYS`）。**必须在下面那句防御式解析之前**——
+    //    它正是这一段要拦的东西：拼错的键不会让 `from_value::<Skeleton>` 失败，只会让对应字段静默取默认值。
+    if let Some(obj) = skeleton.as_object() {
+        for key in obj.keys() {
+            if key.starts_with("__") {
+                continue; // `__doc` 之类的注释键（golden fixture 在用），不参与校验。
+            }
+            if SKELETON_TOP_LEVEL_KEYS.contains(&key.as_str()) {
+                continue;
+            }
+            let hint = SKELETON_TOP_LEVEL_KEYS
+                .iter()
+                .find(|k| squash_key(k) == squash_key(key))
+                .map(|k| format!("（是不是想写 `{k}`？）"))
+                .unwrap_or_default();
+            return Err(format!(
+                "skeleton_json 顶层出现无人读取的键 `{key}`{hint}——它不会报错，只会让对应功能静默退化到默认值"
+            ));
+        }
+    }
+
     let Ok(sk) = serde_json::from_value::<Skeleton>(skeleton.clone()) else {
         return Ok(()); // 解析不出结构化骨架 → 不做引用校验（防御式，与运行时装配一致）。
     };
@@ -3874,6 +3954,123 @@ mod sampling_tests {
         let sk = with_identities(superset(), standard_pool());
         let s = plan_with_roster(&sk, "world_empty_roster", &[]);
         assert!(s.identity_assignments.is_empty());
+    }
+
+    // ---------- 建模板期校验：未知顶层键 ----------
+    //
+    // 这一组防的是本文件里最不像 bug 的那类 bug：**拼错一个键，全程零报错**。
+    // `Skeleton` 每个字段都 `#[serde(default)]`，未知字段被 serde 忽略；手读点则
+    // `.get(k)…unwrap_or_default()`。所以拼错的直接后果是「模板建成功了，但世界是空的」。
+
+    #[test]
+    fn validate_rejects_misspelled_top_level_key() {
+        // 大小写写错（camelCase 里最常见的一种）。
+        let err = validate_skeleton_refs(&json!({ "mainLineNodes": [] }), false).unwrap_err();
+        assert!(err.contains("mainLineNodes"), "错误须点名那个键: {err}");
+        assert!(err.contains("是不是想写 `mainlineNodes`"), "须给出归一化后的近似建议: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_snake_case_top_level_key() {
+        // 照着 Rust 侧字段名（snake_case）写线上格式，是另一种高频错法。
+        let err = validate_skeleton_refs(&json!({ "forbidden_predicates": [] }), false).unwrap_err();
+        assert!(err.contains("是不是想写 `forbiddenPredicates`"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_key_nobody_reads() {
+        // 无近似项 → 仍然拒绝，只是不给建议（没人读的键只可能是残留或臆造）。
+        let err = validate_skeleton_refs(&json!({ "difficultyCurve": 3 }), false).unwrap_err();
+        assert!(err.contains("difficultyCurve"), "{err}");
+        assert!(!err.contains("是不是想写"), "无近似项时不该硬凑建议: {err}");
+    }
+
+    // 🔴 这两个键**不在 `struct Skeleton` 里**，只被 runtime 按字符串键手读。
+    // 若有人"清理"清单时按 `Skeleton` 的字段表重写它，真实模板会当场被拒——本例即那道闸。
+    #[test]
+    fn validate_accepts_hand_read_keys_absent_from_skeleton_struct() {
+        let v = json!({
+            "endgame": { "minWorldTicks": 10, "maxWorldTicks": 40 },
+            "forbiddenPredicates": ["world.warDeclared == true"],
+        });
+        assert!(validate_skeleton_refs(&v, false).is_ok(), "{:?}", validate_skeleton_refs(&v, false));
+    }
+
+    /// 🔴 顺序钉子：未知键校验必须**先于**「解析不出结构化骨架就放行」那条防御分支。
+    /// 下面这份骨架同时带了拼错的键**和**一个类型不符的字段（`worldItems` 应为数组）——
+    /// 后者会让 `from_value::<Skeleton>` 失败。若把新校验挪到那句之后，这里会静默变成 Ok，
+    /// 而这恰恰是最该拦的一类：写错一处的人通常不止写错一处。
+    #[test]
+    fn top_level_key_check_runs_before_the_lenient_parse_bailout() {
+        let v = json!({ "mainLineNodes": [], "worldItems": "本该是数组" });
+        assert!(
+            serde_json::from_value::<Skeleton>(v.clone()).is_err(),
+            "前提：这份骨架必须解析失败，否则本例证明不了顺序"
+        );
+        let err = validate_skeleton_refs(&v, false).unwrap_err();
+        assert!(err.contains("mainLineNodes"), "{err}");
+    }
+
+    #[test]
+    fn validate_accepts_double_underscore_comment_keys() {
+        // golden fixture 用 `__doc` 放说明文字，是既有约定。
+        assert!(validate_skeleton_refs(&json!({ "__doc": "本骨架用于回归", "__note": 1 }), false).is_ok());
+    }
+
+    /// 源码层红线：`struct Skeleton` 的每个字段都必须在 `SKELETON_TOP_LEVEL_KEYS` 里。
+    /// 往结构体加字段而忘了加清单 → 用了新字段的合法模板被拒，本例先一步指出漏了哪个。
+    #[test]
+    fn skeleton_top_level_keys_covers_every_skeleton_field() {
+        let src = include_str!("mod.rs");
+        let start = src.find("struct Skeleton {").expect("找不到 struct Skeleton");
+        let body = &src[start..start + src[start..].find("\n}").expect("找不到结构体结尾")];
+
+        let mut fields = Vec::new();
+        for line in body.lines() {
+            // 只取本结构体的一级字段：恰好 4 空格缩进、非属性/注释、形如 `name: Type,`。
+            if !line.starts_with("    ") || line.starts_with("     ") {
+                continue;
+            }
+            let t = line.trim();
+            if t.starts_with('#') || t.starts_with("//") {
+                continue;
+            }
+            let Some((name, _)) = t.split_once(':') else { continue };
+            if !name.chars().all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit()) {
+                continue;
+            }
+            let mut camel = String::new();
+            let mut up = false;
+            for c in name.chars() {
+                match c {
+                    '_' => up = true,
+                    _ if up => {
+                        camel.extend(c.to_uppercase());
+                        up = false;
+                    }
+                    _ => camel.push(c),
+                }
+            }
+            fields.push(camel);
+        }
+
+        assert!(fields.len() >= 20, "字段解析疑似失效，只解出 {}: {fields:?}", fields.len());
+        for f in &fields {
+            assert!(
+                SKELETON_TOP_LEVEL_KEYS.contains(&f.as_str()),
+                "`Skeleton` 的字段 `{f}` 不在 SKELETON_TOP_LEVEL_KEYS 里——用到它的模板会被建模板期校验拒掉"
+            );
+        }
+    }
+
+    /// 端到端：黄金世界的真实骨架必须通过这道新校验。
+    /// 它是仓库里唯一一份「运营真会写成那样」的完整模板，也是 `endgame` / `forbiddenPredicates` /
+    /// `__doc` 三个非 `Skeleton` 键的现实出处。
+    #[test]
+    fn golden_skeleton_passes_top_level_key_check() {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../runtime/golden/skeleton.json")).expect("golden 骨架 JSON");
+        assert!(validate_skeleton_refs(&v, false).is_ok(), "{:?}", validate_skeleton_refs(&v, false));
     }
 
     // ---------- 建模板期校验：身份池引用完整性 ----------

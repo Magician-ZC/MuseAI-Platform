@@ -814,7 +814,7 @@ if 线：   从终局那一拍岔出去的、只属于你的一条平行线   �
 | GET | `/api/admin/worlds/{id}/diagnostics?limit=&sinceMs=` | operator | 脱敏诊断（采样种子不外泄）。`budget` 含金额换算与用量比：`spentCny`/`dailyCnyBudget`/`usageRatio`（**0..1**，取 token 与 cny 两维较大者）/`spentTokensTodayEffective`（跨日已归零）。另含 `series`（系列队列态；**不受 env 开关门控**——关阀时运营更需要看得见队列，开关状态另作 `autoscaleEnabled` 明示）与 `beBiography`（崩塌封卷元信息，正文另走玩家读取面）。**2026-07-27 补齐设计文档 §9.1 的四项空态**：`world.startedAt`（= `MIN(world_ticks.created_at)`，**首拍排期时刻**，不是建房时刻；没排过拍 → `null`，不回落 `createdAt`）· `riskEventDaily.{today,yesterday,delta}`（UTC 日界，🔴 **不给环比百分比**——昨日可能为 0，0 做分母不是「涨了无穷」是「没有可比基数」）· `promptSet.{version,createdAt,activatedBy,activatedAt}`（🔴 `prompt_versions` 上没有 `updated_by` 列，`activatedBy/At` 来自 `audit_logs` 的 `prompt.activate`；从未经端点激活过 → `null`，**不猜**）· 取数窗口 `?limit=`（默认 **10，与加参数之前逐字节一致**，上限 500）与 `?sinceMs=`（按 `created_at` 收窄）|
 | POST | `/api/admin/worlds/{id}/pause`·`/resume` | operator | 暂停/恢复（需审计理由） |
 | GET | `/api/admin/world-templates?sagaId=` | operator, reviewer | 模板列表。带 `sagaId` 时切换为**阶段列表**语义：只返回该世界系列，按 `stage_no` 升序（剧情顺序）且不分页 |
-| POST | `/api/admin/world-templates` | operator | 建模板。可选 `sagaId` + `stageNo`（总规格 §3 Saga 归组），二者必须成对，`stageNo` ∈ 1-999；都不传 = 独立模板 |
+| POST | `/api/admin/world-templates` | operator | 建模板。可选 `sagaId` + `stageNo`（总规格 §3 Saga 归组），二者必须成对，`stageNo` ∈ 1-999；都不传 = 独立模板。骨架顶层出现无人读取的键（拼错 / 残留）→ 400 并点名该键 |
 | POST | `/api/admin/world-templates/{id}/star` | operator | 星级 curation（**3-5★ 唯一晋升路径**） |
 | GET | `/api/admin/sagas` | operator | 人工校准：阶段切分总览（每系列的阶段数 / 缺号 / 重号 / 未编号 / 审核态 / 星级跨度 / 世界数）。见下方「人工校准面」 |
 | GET | `/api/admin/sagas/{sagaId}` | operator | 人工校准：单系列逐阶段结构（按 `stage_no` 升序 = 剧情顺序）+ 每阶段骨架形状指标。系列不存在 → 404 |
@@ -899,6 +899,7 @@ SQL 里），权限分 reviewer / admin 两档。三条写入路径由源码级�
 | `duplicateStageNos` / `unnumberedTemplateCount` | 同一 `stage_no` 挂了多个模板 / `saga_id` 非空却 `stage_no ≤ 0`（建模板端点拦得住，直写库与历史数据拦不住） |
 | `contiguous` | 无缺号 ∧ 无重号 ∧ 无未编号。**只说明阶段坐标齐整，不代表内容质量合格** |
 | `shape.parsed` | `false` = 该模板 `skeleton_json` 不是合法 JSON，此时各形状指标**字段缺席**（不是 0）——「骨架坏了」与「骨架里真的一个主线节点都没有」是两件事 |
+| `shape.unknownTopLevelKeys` | 骨架顶层出现的、**无人读取**的键（拼错或残留；`__` 前缀的注释键豁免）。非空即意味着上面那排计数里有几项的 0 是假的——键拼错时 serde 静默取默认值，不报错。建模板期已由 `assembly::validate_skeleton_refs` 拦掉，**但存量模板建在那道闸之前**，这一栏是它们唯一的发现途径 |
 | `fillRatio` | **0..1 小数**（渲染须 ×100）。分母 = `quota × worldsWithAssignments`（只算真的参与过分配的世界）。分母为 0 → `null`，显示 `—`，**不得当 0% 读** |
 | `gini` | 声明池内各身份**原始分配人次**的集中度（复用 `slo::gini_coefficient`，与叙事注意力基尼同一实现）。**未按 quota 归一化**，配额不等的池须配合 `fillRatio` 一起读。身份 < 2 或一次分配都没发生 → `null` |
 | `activeMembersWithoutIdentity` | 在场却没有站位的角色数，**含「装配之后才入场」的成员**——他们本就不在那次分配的名单里，不是分配失败 |

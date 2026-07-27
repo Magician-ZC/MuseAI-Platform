@@ -271,19 +271,10 @@ async fn ensure_ops_enabled(db: &AnyPool) -> Result<(), ApiError> {
 /// （后者覆盖按世界/按用户灰度）。**fail-safe 方向是 false**（查库失败 → 按「没开过」处理）。
 /// 口径逐字抄 `annotations::entry_ever_open`。
 async fn entry_ever_open(db: &AnyPool) -> bool {
-    if ifline_enabled(db, None, None).await {
-        return true;
-    }
-    let n = sqlx::query(
-        "SELECT CAST(COUNT(*) AS BIGINT) AS n FROM runtime_flags WHERE flag = $1 AND enabled = 1",
-    )
-    .bind(ENV_IFLINE_PARALLEL)
-    .fetch_one(db)
-    .await
-    .ok()
-    .and_then(|r| r.try_get::<i64, _>("n").ok())
-    .unwrap_or(0);
-    n > 0
+    // 🔴 全仓唯一的「曾经开过吗」判定（见 `flags::entry_ever_open`）。
+    // 此前这里是四份手抄之一，其中一处的文档还明写着「口径逐字抄」——
+    // 它决定的是**指标诚不诚实**与**审核闭环开不开得了**，任一份漂移都不会有人立刻发现。
+    crate::flags::entry_ever_open(db, ENV_IFLINE_PARALLEL).await
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

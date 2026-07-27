@@ -309,3 +309,106 @@ mod tests {
         }
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 源码级红线扫描的共用取数
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 递归收集 `server/src` 下的**生产**源码，返回 `(相对路径, 剥掉测试模块后的源码)`。
+///
+/// 🔴 **必须按花括号配平剥离 `#[cfg(test)] mod X { .. }`，不能按模块名截断。**
+///
+/// 本仓库的内联测试模块**不止叫 `tests`**：`app::cors_tests`、`assembly::sampling_tests` /
+/// `container_tests` / `member_order_tests` 都是。按 `"\nmod tests {"` 截断的扫描器会把
+/// 这些文件的测试代码**当成生产代码扫**，于是任何红线断言都可能被一段测试夹具里的字符串
+/// 误伤——我写「`runtime_flags` 只许 `flags` 读」那条红线时就当场被 `assembly` 的
+/// `container_tests` 误报了一次。
+///
+/// ⚠️ 也不能按「第一个 `#[cfg(test)]`」截断：本仓库有若干**测试专用夹具**
+/// （`invitations::InvitationSwitch`、`assembly::ContainerSwitch` 等）定义在文件中段，
+/// 其后仍有生产代码。截断会把那些生产代码整段漏掉，让扫描形同虚设。
+///
+/// 跳过 `tests.rs` / `testkit.rs` 整个文件；遍历前排序，断言的失败信息不随文件系统顺序抖动。
+pub fn production_sources() -> Vec<(String, String)> {
+    fn strip_test_mods(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let bytes = src.as_bytes();
+        let mut i = 0usize;
+        while i < src.len() {
+            // 找下一个 `#[cfg(test)]`，其后（跳过空白/属性行）若是 `mod NAME {` 就整块跳过。
+            let Some(rel) = src[i..].find("#[cfg(test)]") else {
+                out.push_str(&src[i..]);
+                break;
+            };
+            let marker = i + rel;
+            let after = marker + "#[cfg(test)]".len();
+            // `#[cfg(test)]` 之后到行首非空白的第一个 token
+            let rest = &src[after..];
+            let trimmed_at = rest.len() - rest.trim_start().len();
+            let head = rest.trim_start();
+            let is_mod_block = head.starts_with("mod ") && {
+                // `mod NAME;` 是外置声明（对应文件已被整体跳过），不是块
+                head[..head.find(['{', ';']).map(|k| k + 1).unwrap_or(head.len())].ends_with('{')
+            };
+            if !is_mod_block {
+                out.push_str(&src[i..after]);
+                i = after;
+                continue;
+            }
+            out.push_str(&src[i..marker]);
+            // 从 `{` 起做花括号配平
+            let brace_at = after + trimmed_at + head.find('{').expect("上面已确认有 {");
+            let mut depth = 0i32;
+            let mut j = brace_at;
+            while j < bytes.len() {
+                match bytes[j] {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            j += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            i = j;
+        }
+        out
+    }
+
+    fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String, String)>) {
+        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("读目录 {dir:?}：{e}"))
+            .map(|e| e.expect("目录项").path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                walk(&path, root, out);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            if name == "tests.rs" || name == "testkit.rs" {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("读 {path:?}：{e}"));
+            let rel = path
+                .strip_prefix(root)
+                .expect("相对路径")
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.push((rel, strip_test_mods(&src)));
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut out = Vec::new();
+    walk(&root, &root, &mut out);
+    assert!(out.len() > 50, "🔴 源码遍历只收到 {} 个文件，扫描口径坏了", out.len());
+    out
+}

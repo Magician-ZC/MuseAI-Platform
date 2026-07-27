@@ -844,6 +844,37 @@ golden `14`，`runtime/simulation/baseline.json` 与 golden 基线**一个字节
 🔵 **那条红线用例上线当场抓出第 6 处**（`billing`）——我自己按 SQL 字面量扫的那一遍漏了它。
 四处故障注入全部被抓：改成 `!= 2` · 行缺失当成年 · 查库失败当成年 · 某模块又抄一份。
 
+### 3.6.2 「曾经开过吗」判据收归一处 + 源码级扫描器收归一处（2026-07-27）
+
+沿同一条线索扫到的第二处：**`entry_ever_open` 在四个模块里各写了一遍**
+（`annotations` / `ifline` / `livestage` / `social`），四份都**绕过 `flags` 直接查
+`runtime_flags`**——等于在「开关的唯一读取入口」旁边开了四条旁路。
+其中一处的文档还明写着「口径逐字抄 `annotations::entry_ever_open`」，
+**手抄被当成了实现方式**。
+
+🔴 它决定的是两件**不会立刻显形**的事：
+- **指标诚不诚实**：三态判定（`entry_not_open` / `no_data_in_window` / `ok`）。
+  漂移了指标照样出数，只是那个数是假的——而 T1/T5 门槛要拿它决定继续/调整/停止。
+- **审核闭环开不开得了**：按世界灰度开着时弹幕/举报会真实落库，而按全局解析会把运营面判成
+  404——弹幕进得来撤不下去、举报进得来处置不进去。漂移了运营面照样 404，只是本该可见。
+
+已收归 `flags::entry_ever_open(db, flag)`，并加源码级红线
+`red_line_only_flags_queries_the_runtime_flags_table`（豁免 `flags` 自身与 admin 的开关 CRUD 面）。
+
+**顺带收归的第二件事：源码级扫描器本身。**
+
+写上面那条红线时它当场误报了 `assembly/mod.rs`——因为既有扫描器按 `"\nmod tests {"`
+截断，而本仓库的内联测试模块**不止叫 `tests`**：`app::cors_tests`、
+`assembly::sampling_tests` / `container_tests` / `member_order_tests` 都是。
+按名字截断的扫描器会把这些文件的**测试代码当成生产代码扫**。
+
+已把扫描逻辑收进 `testkit::production_sources()`：按**花括号配平**剥离
+`#[cfg(test)] mod X { .. }`。⚠️ 也**不能**按「第一个 `#[cfg(test)]`」截断——
+本仓库有若干测试专用夹具（`InvitationSwitch` / `ContainerSwitch` 等）定义在文件中段，
+其后仍有生产代码，截断会让扫描形同虚设。
+
+🔵 故障注入连扫描器一起验：把它退回「按 mod tests 截断」→ 红线立刻红。
+
 ### 3.7 server↔engine 的 JSON 边界：手读字符串键的地方（登记于 2026-07-27）
 
 > `narrative_state_json` 是 server 与 `muse-engine` 之间**唯一靠 JSON 传递、且部分消费方

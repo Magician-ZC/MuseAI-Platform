@@ -351,48 +351,21 @@ async fn a_database_failure_is_treated_as_not_adult() {
 /// 故本条扫全仓生产代码：`age_declared` 的读取只允许出现在 `auth::is_declared_adult` 里。
 #[test]
 fn red_line_only_one_place_reads_the_age_declaration() {
-    let mut offenders: Vec<String> = Vec::new();
-    fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<String>) {
-        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
-            .unwrap_or_else(|e| panic!("读目录 {dir:?}：{e}"))
-            .map(|e| e.expect("目录项").path())
-            .collect();
-        entries.sort();
-        for path in entries {
-            if path.is_dir() {
-                walk(&path, root, out);
-                continue;
-            }
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-            if name == "tests.rs" || name == "testkit.rs" {
-                continue;
-            }
-            let src = std::fs::read_to_string(&path).unwrap_or_default();
-            // 内联 `mod tests {` 处截断（外置 `mod tests;` 声明不截）。
-            let src = match src.find("\nmod tests {") {
-                Some(i) => src[..i].to_string(),
-                None => src,
-            };
-            let rel = path.strip_prefix(root).expect("相对路径").to_string_lossy().to_string();
-            // 唯一豁免：判据本身所在的文件。
-            if rel.replace('\\', "/") == "auth/mod.rs" {
-                continue;
-            }
-            if src.contains("age_declared FROM users") || src.contains("AGE_DECLARED_ADULT: i64") {
-                out.push(rel);
-            }
-        }
-    }
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    walk(&root, &root, &mut offenders);
+    // 用共用扫描器（按花括号配平剥离内联测试模块，理由见 `testkit::production_sources`）。
+    let offenders: Vec<String> = crate::testkit::production_sources()
+        .into_iter()
+        // 唯一豁免：判据本身所在的文件。
+        .filter(|(rel, _)| rel != "auth/mod.rs")
+        .filter(|(_, src)| {
+            src.contains("age_declared FROM users") || src.contains("AGE_DECLARED_ADULT: i64")
+        })
+        .map(|(rel, _)| rel)
+        .collect();
     assert!(
         offenders.is_empty(),
         "🔴 未成年保护（真红线 §0.4）的判定必须只有一处（`auth::is_declared_adult`）。\
          这些文件又自己读了一遍年龄声明：{offenders:?}。\
-         五份手抄靠巧合保持一致，只要有一处写成 `!= 2`，未声明账号立刻全部变成成年，\
+         六份手抄靠巧合保持一致，只要有一处写成 `!= 2`，未声明账号立刻全部变成成年，\
          而那个模块自己的用例照样绿。"
     );
 }

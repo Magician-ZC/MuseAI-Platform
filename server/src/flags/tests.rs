@@ -1170,3 +1170,41 @@ async fn wired_onboarding_unchanged_when_table_empty() {
     let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runtime_flags").fetch_one(&state.db).await.unwrap();
     assert_eq!(n, 0, "整个过程不该产生任何开关记录");
 }
+
+/// 🔴 **全仓只许 `flags` 模块直接查 `runtime_flags` 表**。
+///
+/// 这个模块存在的全部意义是「开关的唯一读取入口」。而 `entry_ever_open`
+/// （「这块功能曾经对任何人开过吗」）此前在 **`annotations` / `ifline` / `livestage` /
+/// `social` 四个模块里各写了一遍**，四份都绕过本模块直接查表——等于在唯一入口旁边
+/// 开了四条旁路。其中一处的文档还明写着「口径逐字抄 `annotations::entry_ever_open`」，
+/// **手抄被当成了实现方式**。
+///
+/// 🔴 它决定的是两件不会立刻显形的事：
+/// - **指标诚不诚实**：三态判定（`entry_not_open` / `no_data_in_window` / `ok`）。
+///   漂移了指标照样出数，只是那个数是假的——而 T1/T5 门槛要拿它决定继续/调整/停止。
+/// - **审核闭环开不开得了**：按世界灰度开着时弹幕/举报会真实落库，而按全局解析会把
+///   运营面判成 404 —— 弹幕进得来撤不下去、举报进得来处置不进去。漂移了运营面照样 404，
+///   只是本该可见。
+///
+/// 两种失败都**不报错、不告警**。故用源码级扫描保证唯一性，而不是靠注释里的「口径一致」。
+#[test]
+fn red_line_only_flags_queries_the_runtime_flags_table() {
+    // 🔴 用共用扫描器：它按**花括号配平**剥离 `#[cfg(test)] mod X { .. }`，
+    // 而不是按模块名截断。本仓库的内联测试模块不止叫 `tests`（`cors_tests` /
+    // `container_tests` / `sampling_tests` / `member_order_tests`），
+    // 按名字截断会把它们的测试代码当成生产代码扫——本条第一版就被 `assembly` 误报过一次。
+    let offenders: Vec<String> = crate::testkit::production_sources()
+        .into_iter()
+        // 豁免：本模块自己，以及 admin 的开关 CRUD 面（它的语义就是直接操作这张表，
+        // 且写入侧的校验都落在 `flags::KNOWN_FLAGS` 上）。
+        .filter(|(rel, _)| rel != "flags/mod.rs" && rel != "admin_api/flags.rs")
+        .filter(|(_, src)| src.contains("FROM runtime_flags") || src.contains("INTO runtime_flags"))
+        .map(|(rel, _)| rel)
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "🔴 `runtime_flags` 只能由 `flags` 模块读写（admin 的开关 CRUD 面除外）。\
+         这些文件绕过了唯一入口：{offenders:?}。\
+         绕过的后果不会立刻显形——指标照常出数（只是假的）、运营面照常 404（只是本该可见）。"
+    );
+}

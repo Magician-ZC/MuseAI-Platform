@@ -548,7 +548,7 @@ fn payout_table_integrity_is_enforced_at_template_build_time() {
             { "label": "乙", "minScore": 3.0, "mileage": 30 }
         ]}
     });
-    assert!(crate::assembly::validate_skeleton_refs(&ok).is_ok());
+    assert!(crate::assembly::validate_skeleton_refs(&ok, false).is_ok());
 
     // 门槛重复 → 拒绝。
     let dup = json!({
@@ -557,7 +557,7 @@ fn payout_table_integrity_is_enforced_at_template_build_time() {
             { "label": "乙", "minScore": 2.0, "mileage": 30 }
         ]}
     });
-    let err = crate::assembly::validate_skeleton_refs(&dup).unwrap_err();
+    let err = crate::assembly::validate_skeleton_refs(&dup, false).unwrap_err();
     assert!(err.contains("门槛重复"), "{err}");
 
     // 负门槛 / 负权重 / 越界崩塌系数 / 空道具 id → 拒绝。
@@ -569,11 +569,11 @@ fn payout_table_integrity_is_enforced_at_template_build_time() {
             "item": { "id": "  ", "narrative": "x", "effectTags": [],
                       "origin": { "worldTemplateId": "t", "cosmology": [], "powerTier": 1 } } }] } }),
     ] {
-        assert!(crate::assembly::validate_skeleton_refs(&bad).is_err(), "应被拒绝: {bad}");
+        assert!(crate::assembly::validate_skeleton_refs(&bad, false).is_err(), "应被拒绝: {bad}");
     }
 
     // 老模板（无 payoutTable）一律放行，零影响。
-    assert!(crate::assembly::validate_skeleton_refs(&json!({ "mainlineNodes": [] })).is_ok());
+    assert!(crate::assembly::validate_skeleton_refs(&json!({ "mainlineNodes": [] }), false).is_ok());
 }
 
 // ==================== BE 结局传记（总规格 §9「世界线崩塌」） ====================

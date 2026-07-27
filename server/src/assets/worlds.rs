@@ -584,7 +584,10 @@ async fn publish(
 
     // 引用完整性校验（复用装配层，与 admin create_template 同一口径）：reward_item_ref / connections /
     // residentItemIds / carried_item_ids / gate.requiredItemIds 无悬空，gate.requiredCosmologies ∈ 官方枚举。
-    if let Err(msg) = crate::assembly::validate_skeleton_refs(&req.skeleton_json) {
+    // 🔴 容器装配的建模板前门只能取 **global** 档：建模板时**没有世界**（模板是世界的蓝图）。
+    // 装配期那一侧按世界解析，两处口径不同的理由见 `assembly::container_assembly_enabled`。
+    let container_on = crate::assembly::container_assembly_enabled(&state.db, None).await;
+    if let Err(msg) = crate::assembly::validate_skeleton_refs(&req.skeleton_json, container_on) {
         return Err(ApiError::BadRequest(msg));
     }
     // 超集完整性校验（§防刷 ①）：isSuperset / storyline 引用 / 冗余倍率 / variantGroup 成员数。

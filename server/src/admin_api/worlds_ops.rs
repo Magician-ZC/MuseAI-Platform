@@ -906,7 +906,10 @@ pub(super) async fn create_template(
     // Phase 3：引用完整性校验——reward_item_ref / connections / residentItemIds / carried_item_ids /
     // gate.requiredItemIds 须能在 world_items / locations 目录解引用，gate.requiredCosmologies ∈ 官方枚举。
     // 建模板期前置拦截坏引用，避免装配/运行时静默退化（防御式解析吞掉 → 数据错误难发现）。
-    if let Err(msg) = crate::assembly::validate_skeleton_refs(&req.skeleton_json) {
+    // 🔴 容器装配的建模板前门只能取 **global** 档：建模板时**没有世界**（模板是世界的蓝图）。
+    // 装配期那一侧按世界解析，两处口径不同的理由见 `assembly::container_assembly_enabled`。
+    let container_on = crate::assembly::container_assembly_enabled(&state.db, None).await;
+    if let Err(msg) = crate::assembly::validate_skeleton_refs(&req.skeleton_json, container_on) {
         return Err(ApiError::BadRequest(msg));
     }
     let admission = req.admission_json.unwrap_or_else(|| json!({ "mode": "open" }));

@@ -269,7 +269,19 @@
   `ensure_next_series_instance` 由 `world_full_conflict` 调用，那是撞满员后的 **409 构造路径**，
   join 的事务此时还没开。照着原注去做一次 bool 穿透是白费功夫——**迁移清单本身也会过期，
   动手前先按当前代码复核一遍**。
-- 未迁：`MUSE_CONTAINER_ASSEMBLY` · `MUSE_SAFETY_LEXICON`（🔴 最后迁或不迁）。
+- ~~`MUSE_CONTAINER_ASSEMBLY`~~ —— **已迁（2026-07-27）**，清单上最后一个被迁的。
+  装配期按 **world**（世界已存在，「先在一个房试自定义房装配」是自然单位），建模板前门只能按
+  **global**（建模板时没有世界，模板是世界的蓝图）。两侧不同在这里**不会半开半关**：
+  全局关时模板根本声明不了 refs，也就没有哪个世界会有 refs 可装。
+  ⚠️ 原注「装配期在 `assemble_instance` 内，同样要注意事务边界」**实际不需要**：
+  `load_container_cards` 的唯一调用点在 C-7 那次 CAS 占位写入**之前**。
+  `validate_container_refs` 收 bool 保持同步，是为了让它继续是**纯校验函数**（可任意复用），
+  不是因为事务边界。
+- **不迁**：`MUSE_SAFETY_LEXICON` —— 按 `MIGRATION_NOTES` 原注的判断保留为纯 env。
+  它是审核链、默认开启，消费点在 `runtime` commit **事务内的闸**上：事务内查库风险最大，
+  收益最小（「按世界灰度关掉敏感词过滤」不是一个合理的运营动作）。**这是有理由的不做，
+  不是遗漏。** 若将来一定要迁，只允许 global 作用域，且要有单独的红线用例断言它
+  永远不能被关到 `false` 以外的路径上去。
 
 共同的坑：**多数消费点在事务内**（结算铸卡 / 封卷 / 扩容判定），`is_enabled` 会查库，
 须在进事务前解析一次再把 bool 传进去，否则 SQLite 单连接池自锁。
@@ -315,7 +327,7 @@
 `admin_api::audit::writeback_target` 现在返回回写坐标，`world_events` 上因此有了全仓
 **唯一一条放宽语句**（`SET` 只有 `moderation` 一列、按主键点名、CAS、起点白名单写死在 SQL 里），
 权限分 reviewer / admin 两档，三条写入路径由源码级红线用例全仓盘点 ·
-**其余存量 env 开关接入运行时开关体系**（副本卡 / 生死状档 / 房间邀请 / 传世卡 / BE 传记 / 系列扩容已迁，清单与注意事项见上）·
+~~**其余存量 env 开关接入运行时开关体系**~~ —— **已完成**：可迁的 7 个全部迁完，`MUSE_SAFETY_LEXICON` 按原注有理由地保留为纯 env（清单见上）·
 **处置申诉只覆盖 `character` / `character_avatar` 两类主体**（如实的范围，不是遗漏：
 `world_cover` 属于世界、`world_templates` 根本没有 owner 列，给它们开申诉入口只会得到一个
 没人有资格提交的端点；要覆盖需先定义"世界封面 / 模板的作者是谁"这条产品口径）。

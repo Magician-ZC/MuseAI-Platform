@@ -186,7 +186,10 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
         default_enabled: false,
         owner: "assembly",
         desc: "自定义房容器装配（副本卡的消费端，无独立端点）",
-        wired: false,
+        // 🔵 已接线。ctx 两处不同：装配期按 **world**（世界已存在，「先在一个房试」是自然单位），
+        // 建模板前门只能按 **global**（建模板时没有世界，模板是世界的蓝图）。
+        // 两侧不同在这里不会半开半关——全局关时模板根本声明不了 refs。
+        wired: true,
     },
     FlagDef {
         name: "MUSE_MEMORIAL",
@@ -408,9 +411,14 @@ pub const fn declared_default(name: &str) -> bool {
 ///   world 的，照着写很自然会顺手把 world 也传上——那样运营给某个世界单独开闸就会产出
 ///   **一封谁都答不了的邀请**：发件侧命中 world 记录（开），收件侧（`/me/invitations` 跨世界、
 ///   结构上没有 world）落到 global（关）。理由全文见 `invitations::invitations_enabled`。
-/// - `MUSE_CONTAINER_ASSEMBLY`：**无独立端点**，消费点在建模板期（拒绝声明 `subplotCardRefs`）
-///   与装配期（忽略容器字段走原路径）。装配期在 `assembly::assemble_instance` 内，同样要注意
-///   事务边界。建模板期无 world_id/user_id 语义，实际只用 global。
+/// - ~~`MUSE_CONTAINER_ASSEMBLY`~~ —— **已迁（2026-07-27）**。原注对消费点的判断全对：
+///   建模板期（拒绝声明 `subplotCardRefs`）+ 装配期（忽略容器字段走原路径），
+///   且建模板期确实只能用 global（那时没有世界，模板是世界的蓝图）。
+///   🔵 装配期则**可以**按 world，故取 world 档——原注只说了建模板期那一侧。
+///   ⚠️ 原注说「装配期在 `assemble_instance` 内，同样要注意事务边界」——**实际不需要**：
+///   `load_container_cards` 的唯一调用点在 C-7 那次 CAS 占位写入**之前**，事务还没开。
+///   `validate_container_refs` 收 bool 保持同步，是为了让它继续是一个**纯校验函数**
+///   （可被任意上下文复用），而不是因为事务边界。
 /// - ~~`MUSE_MEMORIAL`~~ —— **已迁（2026-07-27）**。端点 404 且封卷本身不发生；封卷在结算事务内，
 ///   故与副本卡共用 [`crate::progression::SettlementFlags`]（往里加一个字段，没有新增 bool 参数）。
 ///   ⚠️ 原注那条提醒仍然有效且**依然没被违反**：`MUSE_MEMORIAL_BOND_MIN` /

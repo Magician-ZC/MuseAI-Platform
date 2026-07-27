@@ -1467,22 +1467,41 @@ const NEXUS_LOCATION_ID: &str = "loc-nexus";
 /// 枢纽地点缺省名（容器可用 `nexus.name` 覆盖）。
 const NEXUS_DEFAULT_NAME: &str = "交汇之地";
 
-/// 容器装配是否已由运营开启（env 覆盖 + 默认常量，范式同 `worlds::deathmatch_enabled`
-/// 与 `subplot::subplot_cards_enabled`——本仓库尚无配置表，env 是当前唯一的运营开关形态）。
+/// 🔴 **编译期钉死默认值的两个事实源**（本常量 + `flags::KNOWN_FLAGS`）。
+const _: () = assert!(
+    crate::flags::declared_default(ENV_CONTAINER_ASSEMBLY) == DEFAULT_CONTAINER_ASSEMBLY_ENABLED,
+    "flags::KNOWN_FLAGS 中 MUSE_CONTAINER_ASSEMBLY 的默认值必须与 DEFAULT_CONTAINER_ASSEMBLY_ENABLED 一致"
+);
+
+/// 容器装配是否已由运营开启。
 ///
 /// 开关是**可逆急停阀**：关掉之后所有容器房**立即**降级为「只装容器本体」的普通装配
 /// （种子回三段式、卡内容不进实例），再打开则原样恢复。已装配实例被 C-7 CAS 钉住不重掷，
 /// 故开关不会让在跑的房内容漂移。
-pub fn container_assembly_enabled() -> bool {
-    match std::env::var(ENV_CONTAINER_ASSEMBLY) {
-        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "on" | "yes" => true,
-            "0" | "false" | "off" | "no" => false,
-            // 配错不静默开启未验证的经济闭环：回落默认（关闭）。
-            _ => DEFAULT_CONTAINER_ASSEMBLY_ENABLED,
-        },
-        Err(_) => DEFAULT_CONTAINER_ASSEMBLY_ENABLED,
-    }
+///
+/// ════════════════════════════════════════════════════════════════════════════
+/// 🔴 已接入运行时开关体系（`crate::flags`）—— 两处 ctx 口径不同
+/// ════════════════════════════════════════════════════════════════════════════
+///
+/// | 消费点 | ctx | 为什么 |
+/// |---|---|---|
+/// | 装配期（`load_container_cards`，忽略 refs 走原路径） | **world + global** | 世界已存在，按房灰度是「先在一个房试自定义房装配」的自然单位 |
+/// | 建模板前门（`validate_container_refs`，不许声明 `subplotCardRefs`） | **只能 global** | 建模板时**没有世界**（模板是世界的蓝图），也没有 user 语义。结构性的，不是选择 |
+///
+/// ℹ️ 两侧口径不同在这里**不会造成半开半关**：全局关时模板根本声明不了 refs，于是也没有
+/// 哪个世界会有 refs 可装；全局开而某房关，则那个房走「读取侧降级」——那正是本开关**设计上
+/// 就有的**行为（「装配期忽略 refs，走原路径、产物逐字节不变」），不是新引入的不一致。
+///
+/// 🔴 **本函数不在事务里被调用**：`load_container_cards` 的唯一调用点在
+/// `assemble_instance` 里、**C-7 那次 CAS 占位写入之前**；建模板前门更在事务之外。
+/// 收 bool 的 `validate_container_refs` 保持同步，是为了让它继续是一个**纯校验函数**
+/// （可被任意上下文复用），而不是因为事务边界。
+pub async fn container_assembly_enabled(db: &AnyPool, world_id: Option<&str>) -> bool {
+    let ctx = match world_id {
+        Some(w) => crate::flags::FlagCtx::world(w),
+        None => crate::flags::FlagCtx::global(),
+    };
+    crate::flags::is_enabled(db, ENV_CONTAINER_ASSEMBLY, ctx).await
 }
 
 // 测试专用的开关 RAII 夹具 `ContainerSwitch` 定义在文件末尾的 `container_tests` 模块里。
@@ -2040,7 +2059,9 @@ async fn load_container_cards(
     world: &crate::worlds::WorldRow,
     skeleton: &Skeleton,
 ) -> Result<Vec<ContainerCard>, ApiError> {
-    if skeleton.subplot_card_refs.is_empty() || !container_assembly_enabled() {
+    if skeleton.subplot_card_refs.is_empty()
+        || !container_assembly_enabled(db, Some(&world.id)).await
+    {
         return Ok(Vec::new());
     }
     // 房主：无交易红线（§10「玩家间交易暂不开」）下，只能装自己的卡。
@@ -2533,7 +2554,7 @@ fn distribute_resident_items(
 ///
 /// 宽松边界：解析失败（类型不符）→ Ok（沿用 load_skeleton 的防御式 unwrap_or_default 语义，不因无关字段拦截合法模板）；
 /// 只在结构成立时对「明确写了引用」的字段判悬空，避免误伤退化路径（空目录 / 无地点的老模板全部放行）。
-pub(crate) fn validate_skeleton_refs(skeleton: &Value) -> Result<(), String> {
+pub(crate) fn validate_skeleton_refs(skeleton: &Value, container_on: bool) -> Result<(), String> {
     let Ok(sk) = serde_json::from_value::<Skeleton>(skeleton.clone()) else {
         return Ok(()); // 解析不出结构化骨架 → 不做引用校验（防御式，与运行时装配一致）。
     };
@@ -2714,7 +2735,7 @@ pub(crate) fn validate_skeleton_refs(skeleton: &Value) -> Result<(), String> {
 
     // 7) 容器形态（R2 自定义房，技术附录 §3）：副本卡引用 / 缝合边 / 锚点的**建房期硬门**。
     //    未声明 subplotCardRefs（普通模板）直接放行——本段一个字节都不影响它们。
-    validate_container_refs(&sk)?;
+    validate_container_refs(&sk, container_on)?;
 
     Ok(())
 }
@@ -2724,14 +2745,14 @@ pub(crate) fn validate_skeleton_refs(skeleton: &Value) -> Result<(), String> {
 /// 这里只做**不依赖 DB 的静态门**（结构、格式、白名单、保留字）；需要卡内容才能判的
 /// （卡内 id 含分隔符 / 卡内引用悬空 / cosmology 不相容 / 地点图不连通）由装配期的
 /// `compose_container_skeleton` 拒绝，两道门合起来覆盖「建房期就拒绝，不留到运行时静默退化」。
-fn validate_container_refs(sk: &Skeleton) -> Result<(), String> {
+fn validate_container_refs(sk: &Skeleton, container_on: bool) -> Result<(), String> {
     if sk.subplot_card_refs.is_empty() {
         // 普通模板：seams / nexus / anchors 单独声明而没有卡，是无意义配置，直接忽略（不拦老模板）。
         return Ok(());
     }
     // 🔴 前门拒绝（VALIDATION §0.1 未验证功能默认关闭）：开关未开时连声明都不许落库。
     // 读取侧另有降级（装配期忽略 refs 走原路径），两道合起来才是可逆急停阀。
-    if !container_assembly_enabled() {
+    if !container_on {
         return Err(
             "自定义房装配（subplotCardRefs）尚未开放：本功能由运营开关 MUSE_CONTAINER_ASSEMBLY 控制，默认关闭"
                 .to_string(),
@@ -3872,7 +3893,11 @@ mod sampling_tests {
             { "id": "official", "label": "户部主事", "quota": 3, "hookAffinity": ["arc-A", "h1", "s1"] },
             { "id": "jilted", "label": "被退婚的嫡女", "isLead": true }
         ]));
-        assert!(validate_skeleton_refs(&sk).is_ok(), "合法身份池不得被拦：{:?}", validate_skeleton_refs(&sk));
+        assert!(
+            validate_skeleton_refs(&sk, false).is_ok(),
+            "合法身份池不得被拦：{:?}",
+            validate_skeleton_refs(&sk, false)
+        );
     }
 
     #[test]
@@ -3881,14 +3906,14 @@ mod sampling_tests {
             { "id": "official", "quota": 2 },
             { "id": "official", "quota": 1 }
         ]));
-        let err = validate_skeleton_refs(&sk).unwrap_err();
+        let err = validate_skeleton_refs(&sk, false).unwrap_err();
         assert!(err.contains("id 重复"), "应报重复 id，实得：{err}");
     }
 
     #[test]
     fn validate_rejects_zero_quota() {
         let sk = skeleton_with_pool(serde_json::json!([{ "id": "official", "quota": 0 }]));
-        let err = validate_skeleton_refs(&sk).unwrap_err();
+        let err = validate_skeleton_refs(&sk, false).unwrap_err();
         assert!(err.contains("quota"), "应报 quota 非法，实得：{err}");
     }
 
@@ -3897,14 +3922,14 @@ mod sampling_tests {
         let sk = skeleton_with_pool(serde_json::json!([
             { "id": "official", "quota": 1, "hookAffinity": ["arc-NOPE"] }
         ]));
-        let err = validate_skeleton_refs(&sk).unwrap_err();
+        let err = validate_skeleton_refs(&sk, false).unwrap_err();
         assert!(err.contains("hookAffinity 悬空"), "应报引力悬空，实得：{err}");
     }
 
     #[test]
     fn validate_rejects_blank_identity_id() {
         let sk = skeleton_with_pool(serde_json::json!([{ "id": "  ", "label": "无名位", "quota": 1 }]));
-        let err = validate_skeleton_refs(&sk).unwrap_err();
+        let err = validate_skeleton_refs(&sk, false).unwrap_err();
         assert!(err.contains("缺少 id"), "应报缺少 id，实得：{err}");
     }
 
@@ -3912,7 +3937,7 @@ mod sampling_tests {
     #[test]
     fn validate_passes_skeleton_without_identity_pool() {
         let sk = serde_json::json!({ "hiddenContentPool": [ { "id": "h1" } ] });
-        assert!(validate_skeleton_refs(&sk).is_ok());
+        assert!(validate_skeleton_refs(&sk, false).is_ok());
     }
 
     // ---------- 境界档（总规格 §6【拍板 3】戏服原则）：schema 落点 + 零影响 + 平权红线 ----------
@@ -4027,29 +4052,29 @@ mod sampling_tests {
     fn validate_realm_tier_enums() {
         let sk = |rt: serde_json::Value| serde_json::json!({ "realmTier": rt });
 
-        assert!(validate_skeleton_refs(&sk(realm_json())).is_ok(), "合法境界档不得被拦");
+        assert!(validate_skeleton_refs(&sk(realm_json()), false).is_ok(), "合法境界档不得被拦");
 
         // 三项全留空 = 无战力体系题材（都市 / 言情 / 历史），§6 明说合法。
         assert!(
-            validate_skeleton_refs(&sk(serde_json::json!({ "id": "tier-broke", "label": "破产后的第三个月" }))).is_ok(),
+            validate_skeleton_refs(&sk(serde_json::json!({ "id": "tier-broke", "label": "破产后的第三个月" })), false).is_ok(),
             "空体系 / 空题材 / 空烈度是合法取值（境界泛化为处境）"
         );
 
-        let err = validate_skeleton_refs(&sk(serde_json::json!({ "id": "  " }))).unwrap_err();
+        let err = validate_skeleton_refs(&sk(serde_json::json!({ "id": "  " })), false).unwrap_err();
         assert!(err.contains("realmTier 缺少 id"), "应报缺少 id，实得：{err}");
 
-        let err = validate_skeleton_refs(&sk(serde_json::json!({ "id": "t", "cosmology": "斗气" }))).unwrap_err();
+        let err = validate_skeleton_refs(&sk(serde_json::json!({ "id": "t", "cosmology": "斗气" })), false).unwrap_err();
         assert!(err.contains("cosmology 非法"), "自由文本体系必须被拦，实得：{err}");
 
-        let err = validate_skeleton_refs(&sk(serde_json::json!({ "id": "t", "genre": "宫斗" }))).unwrap_err();
+        let err = validate_skeleton_refs(&sk(serde_json::json!({ "id": "t", "genre": "宫斗" })), false).unwrap_err();
         assert!(err.contains("genre 非法"), "自由文本题材必须被拦，实得：{err}");
 
         let err =
-            validate_skeleton_refs(&sk(serde_json::json!({ "id": "t", "conflictIntensity": "很凶" }))).unwrap_err();
+            validate_skeleton_refs(&sk(serde_json::json!({ "id": "t", "conflictIntensity": "很凶" })), false).unwrap_err();
         assert!(err.contains("conflictIntensity 非法"), "自由文本烈度必须被拦，实得：{err}");
 
         // 老模板（无 realmTier）照旧放行。
-        assert!(validate_skeleton_refs(&serde_json::json!({ "hiddenContentPool": [] })).is_ok());
+        assert!(validate_skeleton_refs(&serde_json::json!({ "hiddenContentPool": [] }), false).is_ok());
     }
 
     /// §6「角色带走道具与历练，**永不带走境界**」：境界档只存在于实例装配产物里，
@@ -4231,24 +4256,33 @@ mod container_tests {
 
     // ---------------- ① 开关：默认关闭 → 原路径、原公式 ----------------
 
-    #[test]
-    fn switch_defaults_to_off() {
+    /// env 语义（解析链第 ④ 层）。接入 `flags` 体系后**行为一字未改**——
+    /// 空 `runtime_flags` 表上解析必然落到 env，这正是「行为零变化」的回归保护。
+    #[tokio::test]
+    async fn switch_defaults_to_off() {
+        let db = crate::testkit::test_pool().await;
         // env 未设置时必须是关闭（VALIDATION §0.1 未验证功能默认关闭）。
         let prev = std::env::var(ENV_CONTAINER_ASSEMBLY).ok();
         std::env::remove_var(ENV_CONTAINER_ASSEMBLY);
-        let off = container_assembly_enabled();
+        let off = container_assembly_enabled(&db, None).await;
         if let Some(v) = prev {
             std::env::set_var(ENV_CONTAINER_ASSEMBLY, v);
         }
         assert!(!off, "MUSE_CONTAINER_ASSEMBLY 默认必须关闭");
         assert!(!DEFAULT_CONTAINER_ASSEMBLY_ENABLED, "默认常量必须是 false");
+        assert_eq!(
+            crate::flags::declared_default(ENV_CONTAINER_ASSEMBLY),
+            DEFAULT_CONTAINER_ASSEMBLY_ENABLED,
+            "登记表与模块常量必须同源（编译期已由 const assert 钉死，此处运行期复述）"
+        );
     }
 
-    #[test]
-    fn switch_rejects_garbage_value_by_falling_back_to_off() {
+    #[tokio::test]
+    async fn switch_rejects_garbage_value_by_falling_back_to_off() {
+        let db = crate::testkit::test_pool().await;
         let _sw = ContainerSwitch::set(false);
         std::env::set_var(ENV_CONTAINER_ASSEMBLY, "maybe");
-        assert!(!container_assembly_enabled(), "配错不得静默开启未验证功能");
+        assert!(!container_assembly_enabled(&db, None).await, "配错不得静默开启未验证功能");
     }
 
     // ---------------- ② 四段式种子只在容器形态生效 ----------------
@@ -4587,8 +4621,15 @@ mod container_tests {
 
     // ---------------- ⑧ 建房期拒绝（静态门 + 合并门） ----------------
 
+    /// 建模板前门的纯校验。`container_on` 直接取自 `ContainerSwitch` 所设的 env——
+    /// 端点侧真实的取法是 `container_assembly_enabled(&state.db, None).await`（global 档），
+    /// 这里在无 DB 的纯函数用例里等价复现它的 env 层。
     fn validate(v: serde_json::Value) -> Result<(), String> {
-        validate_skeleton_refs(&v)
+        let container_on = matches!(
+            std::env::var(ENV_CONTAINER_ASSEMBLY).as_deref().map(str::trim),
+            Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+        );
+        validate_skeleton_refs(&v, container_on)
     }
 
     #[test]
@@ -4600,6 +4641,78 @@ mod container_tests {
         assert!(err.contains("MUSE_CONTAINER_ASSEMBLY"), "应报未开放，实得：{err}");
         // 普通模板不受影响。
         assert!(validate(container_json()).is_ok(), "无 subplotCardRefs 的模板不得被本段拦住");
+    }
+
+    /// 🔴 **两处 ctx 口径**：装配期按 world、建模板前门只能按 global。
+    /// 本用例只写一条 **world** 记录（env 与 global 都关着），验：
+    /// ① 装配期按世界解析 ⇒ 那个房命中、别的房不命中；
+    /// ② 建模板前门取 global ⇒ 仍然拒绝（世界还不存在，没有 world 可解析）。
+    #[tokio::test]
+    async fn container_grayscale_is_per_world_on_the_assembly_side_only() {
+        let _sw = ContainerSwitch::set(false); // env 层：关
+        let db = crate::testkit::test_pool().await;
+        sqlx::query(
+            "INSERT INTO runtime_flags (id, flag, scope, target_id, enabled, starts_at, ends_at, \
+             updated_by, updated_at, reason, created_at) \
+             VALUES ($1, 'MUSE_CONTAINER_ASSEMBLY', 'world', 'w_open', 1, 0, 0, 'test', $2, 'test', $3)",
+        )
+        .bind(crate::db::new_id("rf"))
+        .bind(crate::db::now_ms())
+        .bind(crate::db::now_ms())
+        .execute(&db)
+        .await
+        .unwrap();
+
+        assert!(
+            container_assembly_enabled(&db, Some("w_open")).await,
+            "🔴 装配期按世界解析：被灰度选中的房应当命中"
+        );
+        assert!(
+            !container_assembly_enabled(&db, Some("w_other")).await,
+            "🔴 没被选中的房不得跟着开"
+        );
+        assert!(
+            !container_assembly_enabled(&db, None).await,
+            "🔴 建模板前门取 global —— 给某个世界开闸不等于允许新模板声明 subplotCardRefs"
+        );
+
+        // 🔴 上面三条只验到函数本身。真正要验的是**装配期那一行传的是 world 还是 global**，
+        // 所以再走一次 `load_container_cards`（故障注入实测：只有这一段能抓住把
+        // `Some(&world.id)` 写成 `None` 的错误，上面三条对它完全无感）。
+        //
+        // 判据取「进没进到开关之后那一步」：被灰度选中的房会继续往下走，撞上「容器房缺少房主」
+        // 而报错；没被选中的房在开关那一行就返回空。两种结果结构上不同，不会混淆。
+        let wid = crate::worlds::create_world(
+            &db,
+            crate::worlds::CreateWorldParams::official("tpl_ct", 1, "容器房"),
+        )
+        .await
+        .unwrap();
+        // 给这个真实世界写一条 world 记录（世界 id 由 create_world 生成，故先建后写）。
+        sqlx::query(
+            "INSERT INTO runtime_flags (id, flag, scope, target_id, enabled, starts_at, ends_at, \
+             updated_by, updated_at, reason, created_at) \
+             VALUES ($1, 'MUSE_CONTAINER_ASSEMBLY', 'world', $2, 1, 0, 0, 'test', $3, 'test', $4)",
+        )
+        .bind(crate::db::new_id("rf"))
+        .bind(&wid)
+        .bind(crate::db::now_ms())
+        .bind(crate::db::now_ms())
+        .execute(&db)
+        .await
+        .unwrap();
+        let world = crate::worlds::load_world(&db, &wid).await.unwrap();
+        let mut c = container_json();
+        c["subplotCardRefs"] = refs_json(&["c1"]);
+        let skeleton = sk(c);
+
+        let err = load_container_cards(&db, &world, &skeleton)
+            .await
+            .expect_err("被灰度选中的房应当走过开关那一行，并撞上「缺少房主」");
+        assert!(
+            format!("{err:?}").contains("房主"),
+            "🔴 走过开关之后应当撞上房主校验；实得 {err:?} —— 若是 Ok(空) 说明装配期读的是 global"
+        );
     }
 
     #[test]

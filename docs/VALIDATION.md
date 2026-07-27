@@ -979,6 +979,47 @@ camelCase 与 snake_case 同形。`known_to` 才受影响，而那一处是类�
 ⚠️ 另一条边界：**存量模板不会被回头校验**，闸只在写入路径上。存量的发现面是运营台的
 `shape.unknownTopLevelKeys` / `shape.unknownNestedKeys` 两栏——**看得见，但不会自动修**。
 
+### 3.9 创作者模板的机审覆盖面：包含表 → 排除表（**修于 2026-07-27**）
+
+§3.8 查骨架手读键时顺出来的，但性质不同、也更重：这不是「功能静默退化」，是**内容绕过机审**。
+
+`assets::worlds::world_scan_text` 是创作者发布模板（`POST /assets/worlds`）**唯一**的机审入口
+（`safety::moderate_and_queue` 的输入），也是运营再审（`takedown::recheck`）送的同一段文本。
+它此前是**包含表**——逐个列出「要扫哪个字段」：
+
+```
+sourceWork.title · worldCharacters[].card · locations[].name
+worldItems[].narrative · hiddenContentPool[].template · sideHookPool[].template · storylines[].summary
+```
+
+于是**漏掉一个字段 = 那个字段默认不过审**，且没有任何征兆。实测漏了这些，
+每一条都是创作者可写的自由文本，且直达模型或玩家：
+
+| 漏掉的字段 | 去哪（已逐条核到落点） |
+|---|---|
+| `mainlineNodes[].summary` | `runtime` → `OutlineNode.summary` → **导演 prompt**（`narrative/mod.rs` 把 outline 序列化进提示词） |
+| `identityPool[].label` | `brief_with_identity` → `唐三（户部主事）` → 感知层 brief → **模型** |
+| `realmTier.briefing` / `flavorNotes[]` | `parse_realm_costume` → `RoundInput.realm_costume` → **导演 prompt** |
+| 内联奖励道具的 `narrative`（`hiddenContentPool[].rewardItem` / `payoutTable…worldlineTiers[].item`） | 玩家背包。目录里的 `worldItems[].narrative` 扫了，**内联的这份没扫**——与「内联奖励是绕过品阶封顶的后门」是同一条内联路径 |
+| `forbiddenPredicates[].reason` / `payoutTable…worldlineTiers[].label` | 玩家可见文案 |
+
+**改法是把方向反过来**：默认扫一切字符串叶子，只排除标识符 / 枚举 / 受限 DSL
+（`NON_NARRATIVE_LEAVES`）。两个方向的失败代价不对称——漏扫 = 内容绕过机审，
+多扫 = 送审文本长几个 id。NPC 卡仍走 `card_scan_text` 的语义口径（与角色卡送审逐字一致）。
+
+🔵 故障注入用的是**改动前的真实实现**（`git show HEAD:…` 取回后原样替换）：
+`主线摘要探针` 确实不在送审文本里。这条是实测缺陷，不是推断。
+
+⚠️ **与 `MUSE_MODERATION_HTTP_MAX_CHARS` 的交互**：送审文本变长，更容易撞上客户端截断。
+该项**默认 0 = 不截断**（注释已写明理由：让厂商侧的长度拒绝变成一次 `Err` → fail-closed，
+比悄悄送半截文本过审安全），故默认配置下本改动的方向是安全的。但若运营把它调成正数，
+截断掉的是**字典序靠后**的那截（`serde_json::Map` 有序）——恰好包含 `worldCharacters`（NPC 卡）。
+provider 那里已有 warn（「尾部未经审核」），但 warn 不是拦截。**配这个值前请知悉这一点。**
+
+⚠️ **运营影响（须知悉）**：送审文本变宽了，因此**存量模板在下一次运营再审时可能不再过**——
+那是正确方向（它们本就是在欠扫的口径下过的），但会表现为「上次过了这次没过」。
+`takedown::recheck` 的「两次机审须看同一份内容」这条约束仍成立，只是基准从此刻起换了一版。
+
 ## 4. 验证基建三件套（优先于新增功能）
 
 1. **黄金世界回归**：一个公版/原创标准样板（固定角色卡 + 世界模板 + 20-30 个关键剧情测试点，

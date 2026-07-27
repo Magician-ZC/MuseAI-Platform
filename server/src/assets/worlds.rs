@@ -289,53 +289,108 @@ fn auto_star_rating(skeleton: &Value) -> i64 {
     }
 }
 
-/// 机审文本：拼接可叙述内容（源作品标题 + 各 NPC 卡语义字段 + 地点名 + 道具叙事 + 隐藏/支线模板 + 剧情线摘要）。
+/// 键名黑名单：**标识符 / 枚举 / 引用**，不是可叙述内容，故不进机审文本。
+///
+/// 🔴 这是**排除**表，不是包含表——这个方向是本函数的安全前提。
+///
+/// 它此前是包含表（逐个列出「要扫哪个字段」），于是漏掉一个字段 = 那个字段**默认不过审**，
+/// 而且没有任何征兆。实测漏了这些，每一条都是创作者可写的自由文本、且直达模型或玩家：
+///
+/// | 漏掉的字段 | 去哪 |
+/// |---|---|
+/// | `mainlineNodes[].summary` | `OutlineNode.summary` → **导演 prompt** |
+/// | `identityPool[].label` | `唐三（户部主事）` → 感知层 brief → **模型** |
+/// | `realmTier.briefing` / `flavorNotes[]` | `RealmCostume` → **导演 prompt** |
+/// | 内联奖励道具的 `narrative`（`hiddenContentPool[].rewardItem` / `payoutTable…item`） | 玩家背包（目录里的 `worldItems[].narrative` 扫了，内联的这份没扫） |
+/// | `forbiddenPredicates[].reason` / `payoutTable…label` | 玩家可见文案 |
+///
+/// 反过来（默认扫、显式排除）的失败方向是「多扫了几个 id」——代价是审核文本长一点点，
+/// 而漏扫的代价是内容绕过机审。两者不对称，所以方向只能是这一个。
+///
+/// ⚠️ 往这张表里加键 = 声明「这个字段永远不必过审」。加之前请确认它真的是标识符/枚举，
+/// 而不是「现在恰好没人往里写散文」。
+const NON_NARRATIVE_LEAVES: &[&str] = &[
+    // 标识符与引用
+    "id",
+    "sourceId",
+    "worldTemplateId",
+    "rewardItemRef",
+    "variantGroup",
+    "arcTags",
+    "connections",
+    "residentItemIds",
+    "requiredItemIds",
+    "mainlineNodeIds",
+    "hiddenPoolIds",
+    "endingIds",
+    "carriedItemIds",
+    "agendaNodes",
+    "keyCharacterIds",
+    "homeLocation",
+    "hookAffinity",
+    "cardRef",
+    // 枚举与受限取值域（`validate_skeleton_refs` 已按官方枚举卡住）
+    "affinity",
+    "constraint",
+    "cosmology",
+    "requiredCosmologies",
+    "genre",
+    "conflictIntensity",
+    "effectTags",
+    // 受限 DSL（`parse_predicate` 语法校验，写不成散文）
+    "expression",
+    "advanceWhen",
+];
+
+/// 机审文本：把骨架里**一切可叙述文本**拼成一段送审。
 /// 在语义拼接文本（而非序列化 JSON 串）上机审，绕过跨字段/跨元素分段绕过；NPC 卡复用 `card_scan_text` 语义。
 ///
-/// 可见性放宽至 `pub(crate)`（逻辑一字未改）：已过审模板的**运营再审**
-/// （`admin_api::takedown::recheck`）必须送与发布时**逐字一致**的那段文本进机审，
-/// 否则两次机审看的不是同一份内容，「上次过了这次没过」就无从归因。
+/// 取舍见 `NON_NARRATIVE_LEAVES`：默认全扫，只排除标识符/枚举/受限 DSL。
+///
+/// 可见性为 `pub(crate)`：已过审模板的**运营再审**（`admin_api::takedown::recheck`）
+/// 必须送与发布时**逐字一致**的那段文本进机审，否则两次机审看的不是同一份内容，
+/// 「上次过了这次没过」就无从归因。
+///
+/// 遍历确定性：`serde_json::Map` 默认有序（BTreeMap），同一份骨架恒得同一段文本——
+/// 上一条「逐字一致」要求的正是这个。
 pub(crate) fn world_scan_text(skeleton: &Value) -> String {
     let mut parts: Vec<String> = Vec::new();
-    let mut push = |s: &str| {
-        let t = s.trim();
-        if !t.is_empty() {
-            parts.push(t.to_string());
-        }
-    };
-
-    if let Some(t) = skeleton.pointer("/sourceWork/title").and_then(|v| v.as_str()) {
-        push(t);
-    }
-    if let Some(arr) = skeleton.get("worldCharacters").and_then(|v| v.as_array()) {
-        for wc in arr {
-            if let Some(card) = wc.get("card") {
-                let t = safety::card_scan_text(card);
-                if !t.trim().is_empty() {
-                    parts.push(t);
-                }
-            }
-        }
-    }
-    let collect = |parts: &mut Vec<String>, key: &str, field: &str| {
-        if let Some(arr) = skeleton.get(key).and_then(|v| v.as_array()) {
-            for it in arr {
-                if let Some(s) = it.get(field).and_then(|v| v.as_str()) {
-                    let t = s.trim();
-                    if !t.is_empty() {
-                        parts.push(t.to_string());
-                    }
-                }
-            }
-        }
-    };
-    collect(&mut parts, "locations", "name");
-    collect(&mut parts, "worldItems", "narrative");
-    collect(&mut parts, "hiddenContentPool", "template");
-    collect(&mut parts, "sideHookPool", "template");
-    collect(&mut parts, "storylines", "summary");
-
+    collect_narrative_text(skeleton, None, &mut parts);
     parts.join(" / ")
+}
+
+/// 递归收集叙事文本。`key` 是当前值在父对象里的键名（数组元素沿用父键名）。
+fn collect_narrative_text(v: &Value, key: Option<&str>, out: &mut Vec<String>) {
+    match v {
+        Value::String(s) => {
+            let t = s.trim();
+            if !t.is_empty() {
+                out.push(t.to_string());
+            }
+        }
+        Value::Array(arr) => {
+            for it in arr {
+                collect_narrative_text(it, key, out);
+            }
+        }
+        Value::Object(map) => {
+            for (k, child) in map {
+                if NON_NARRATIVE_LEAVES.contains(&k.as_str()) {
+                    continue;
+                }
+                // NPC 卡走 `card_scan_text` 的语义口径（与角色卡送审逐字一致），不做通用遍历。
+                if k == "card" {
+                    let t = safety::card_scan_text(child);
+                    if !t.trim().is_empty() {
+                        out.push(t);
+                    }
+                    continue;
+                }
+                collect_narrative_text(child, Some(k), out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// 顶层字段用途（§2.3 可审计 manifest 的字段粒度用途映射）。
@@ -784,7 +839,9 @@ mod tests {
     use axum::http::StatusCode;
     use serde_json::{json, Value};
 
+    use super::world_scan_text;
     use crate::auth::tests::{build_app, login_new_user, send};
+    use crate::safety;
 
     use muse_engine::character::types::{CardLifecycle, CharacterCardV2, Identity};
 
@@ -1017,6 +1074,87 @@ mod tests {
         // mine 列表回读 starRating。
         let (_st, mine) = send(&app, "GET", "/api/assets/worlds/mine", Some(&access), None, None).await;
         assert_eq!(mine[0]["starRating"], 2, "mine 列表应带 starRating");
+    }
+
+    // ---------------- 机审文本的覆盖面 ----------------
+    //
+    // 🔴 `world_scan_text` 是创作者模板**唯一**的机审入口（`moderate_and_queue` 的输入）。
+    // 它此前是**包含表**：逐个列出「要扫哪个字段」，于是漏一个字段 = 那个字段默认不过审，
+    // 且没有任何征兆。下面每一条都是实测漏掉过的、创作者可写且直达模型或玩家的自由文本。
+
+    /// 逐字段探针：每处放一句独一无二的话，全部必须出现在送审文本里。
+    #[test]
+    fn scan_text_covers_every_creator_writable_narrative_field() {
+        let sk = json!({
+            "sourceWork": { "sourceId": "src-1", "title": "源作品标题" },
+            "mainlineNodes": [ { "id": "m1", "summary": "主线摘要探针", "constraint": "hard" } ],
+            "identityPool": [ { "id": "envoy", "label": "身份标签探针", "hookAffinity": ["arc-A"] } ],
+            "realmTier": { "id": "t1", "label": "境界档名探针",
+                           "briefing": "戏服简报探针", "flavorNotes": ["戏服风味探针"] },
+            "forbiddenPredicates": [ { "id": "f1", "expression": "x == 1", "reason": "禁止理由探针" } ],
+            "locations": [ { "id": "loc1", "name": "地点名探针", "connections": [] } ],
+            "worldItems": [ { "id": "it1", "narrative": "目录道具叙事探针" } ],
+            "hiddenContentPool": [ { "id": "h1", "themes": ["主题词探针"], "template": "隐藏模板探针",
+                                     "rewardItem": { "id": "ri1", "narrative": "内联奖励叙事探针" } } ],
+            "sideHookPool": [ { "id": "s1", "template": "支线模板探针" } ],
+            "storylines": [ { "id": "sl1", "summary": "剧情线摘要探针" } ],
+            "payoutTable": { "worldlineTiers": [ { "label": "档位名探针",
+                                                   "item": { "id": "pi1", "narrative": "产出道具叙事探针" } } ] },
+        });
+        let text = world_scan_text(&sk);
+        for probe in [
+            "源作品标题",
+            "主线摘要探针",       // → OutlineNode.summary → 导演 prompt
+            "身份标签探针",       // → `唐三（户部主事）` → 感知层 brief → 模型
+            "境界档名探针",
+            "戏服简报探针",       // → RealmCostume → 导演 prompt
+            "戏服风味探针",
+            "禁止理由探针",
+            "地点名探针",
+            "目录道具叙事探针",
+            "主题词探针",
+            "隐藏模板探针",
+            "内联奖励叙事探针",   // 目录里的扫了，内联的这份此前没扫
+            "支线模板探针",
+            "剧情线摘要探针",
+            "档位名探针",
+            "产出道具叙事探针",
+        ] {
+            assert!(text.contains(probe), "机审文本漏了 `{probe}`——该字段的内容不会过任何审核\n实际: {text}");
+        }
+    }
+
+    /// 🔴 方向性红线：**新加的字段默认就被扫**（排除表，不是包含表）。
+    /// 若有人把实现改回「逐个列出要扫哪个字段」，这一条立刻红——那正是本组要防的形态。
+    #[test]
+    fn scan_text_covers_unknown_fields_by_default() {
+        let sk = json!({ "someFieldNobodyHasWrittenYet": "未来才会有的叙事字段探针" });
+        assert!(
+            world_scan_text(&sk).contains("未来才会有的叙事字段探针"),
+            "机审必须默认覆盖新字段：漏扫的代价是内容绕过审核，多扫的代价只是文本长一点"
+        );
+    }
+
+    /// 标识符 / 枚举 / 受限 DSL 不必进送审文本（送进去无害但无意义，且会稀释文本）。
+    #[test]
+    fn scan_text_skips_identifiers_and_enums() {
+        let sk = json!({
+            "mainlineNodes": [ { "id": "m1", "constraint": "hard", "advanceWhen": "x == 1" } ],
+            "worldItems": [ { "id": "gold_seal", "effectTags": ["memento:court"] } ],
+        });
+        let text = world_scan_text(&sk);
+        for skipped in ["m1", "hard", "x == 1", "gold_seal", "memento:court"] {
+            assert!(!text.contains(skipped), "标识符/枚举不该进送审文本: `{skipped}` in {text}");
+        }
+    }
+
+    /// NPC 卡仍走 `card_scan_text` 的语义口径（与角色卡送审逐字一致），不退化成通用遍历。
+    #[test]
+    fn scan_text_keeps_card_semantics_for_npc_cards() {
+        let card = json!({ "identity": { "name": "沈砚" }, "persona": { "background": "卡内背景探针" } });
+        let sk = json!({ "worldCharacters": [ { "card": card.clone() } ] });
+        let text = world_scan_text(&sk);
+        assert!(text.contains(safety::card_scan_text(&card).trim()), "NPC 卡须逐字复用 card_scan_text: {text}");
     }
 
     // ---------------- #12 预审核门：注入命中 → Pending + 单条入队/记险 ----------------

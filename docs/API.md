@@ -72,7 +72,7 @@
 | POST | `/api/assets/characters/{id}/withdraw` | JWT | 停止后续投放（幂等） |
 | DELETE | `/api/assets/characters/{id}` | JWT | 删除 |
 | GET | `/api/assets/objects/{*key}` | 公开 | 对象回读（头像等）。**能力 URL**：键含 128 位随机 id，`is_safe_object_key` 防路径穿越 |
-| POST | `/api/assets/worlds` | JWT | 创作者发布世界模板（超集冗余门 `MIN_REDUNDANCY_RATIO=3.0`） |
+| POST | `/api/assets/worlds` | JWT | 创作者发布世界模板（超集冗余门 `MIN_REDUNDANCY_RATIO=3.0`）。机审文本 `world_scan_text` 覆盖骨架里**一切字符串叶子**，只排除标识符/枚举/受限 DSL（排除表而非包含表——漏扫 = 内容绕过机审，见 VALIDATION §3.9） |
 | GET | `/api/assets/worlds/mine` | JWT | 我发布的世界。含 `viewCount`/`favoriteCount`（**仅属主可见**，migration 0029） |
 | GET | `/api/assets/worlds/{id}/status` | JWT | 审核状态 + `viewCount`/`favoriteCount`（owner 隔离，非本人 404） |
 | GET | `/api/assets/worlds/{id}/manifest` | JWT | 世界清单 |

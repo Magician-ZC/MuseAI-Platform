@@ -327,6 +327,57 @@ curl -sX POST 127.0.0.1:8787/api/auth/challenge -H 'Content-Type: application/js
 > Dev 桩,`is_dev_stub()` 为 `true`,运营面 `GET /admin/safety/recheck` 的 `honesty[]` 会明说
 > 这条链拦不住任何东西。配上真实服务商后这些字段自动翻面——**以那组字段为准,不以文档为准**。
 
+### 8.1 工程侧上线门(代码动作,与 §8 的运营动作并列)
+
+§8 列的是**运营/资质**动作。以下是**工程侧**必须完成或必须知情的,来自 2026-07-27 那一轮
+排查——它们此前散落在十几条提交信息里,到上线那天没人翻得全,故在此汇总。
+
+**必须配置**(不配即错,且错法各不相同):
+
+| 项 | 不配的后果 |
+|---|---|
+| `MUSE_DEV=0` | dev-login 开放、验证码打日志、审核直通 |
+| `MUSE_JWT_SECRET=<强随机>` | 默认值是公开的 `dev-secret-change-me` |
+| `MUSE_DATABASE_URL=postgres://…` | 内存库,重启即空 |
+| `MUSE_CORS_ORIGINS=<线上域名>` | **前端在浏览器里一个接口都调不通**(只放行本地开发来源) |
+| `MUSE_MODERATION_HTTP_*` | 内容审核仍是 Dev 桩,§15 第 3 层拦不住任何东西 |
+| `MUSE_LIVEGATE_SECRET`(若开 arena) | 礼物 webhook 验签 fail-closed |
+
+**必须知情的已知限制**(不是配置能解决的):
+
+1. 🔴 **Postgres 生产路径从未在真实部署下跑过。** 两个 feature 组合的测试在 PG 上全绿
+   (占位符与 `SUM()` 返回 `numeric` 两类根因已修完),但那只证明**SQL 可移植**;
+   连接池行为、超时、迁移锁、故障恢复**零验证**。按 §0.3 是 `Implemented`,不是 `Production-ready`。
+2. 🔴 **`MemQueue` 不持久**:第 3 层语义复核的在飞任务在进程重启时丢失,那一拍停在 `approved`
+   且无人复核。补法是 Redis 实现(trait 不变)或补偿轮询。
+3. 🔴 **多实例滚动发布期间 `world_events.sequence` 仍可能撞号**:发号器(迁移 `0043`)解决的是
+   同版本并发,而「旧实例继续往已登记世界写」是**发布纪律**问题,迁移解决不了。
+   撞号的后果是 WS 断线补偿会永久漏掉一条事件。
+4. ⚠️ **约 30 处 `ORDER BY` 排序键不唯一中,仍有未修项**(见 `docs/VALIDATION.md` §3.3)。
+   已修的是会**丢数据**的那批(分页游标);剩下的是顺序抖动,PG 上不保证稳定序。
+   `auth` 的 `sms_challenges` 是有意保留:该表无单调列、`id` 是 uuid v4,
+   补键只能把「不稳定的任意」变成「稳定的任意」,语义上仍不是「最新那条」。
+5. ⚠️ **`card_json` 读取面闸门默认关闭**(`MUSE_DISPOSAL_NAME_GATE`)。开着才会让被下架的卡
+   在存量世界的 roster/传记里显示占位名;关着时下架只断得掉「进新世界」与立绘下发。
+   开不开是产品决策(它改变运行中世界里每个玩家看到的内容)。
+6. ⚠️ **功能开关一律默认关**,按 `docs/VALIDATION.md` §2 的 T0-T5 逐层开闸,
+   不要一次全开——清单以 `flags::KNOWN_FLAGS` 为准。
+
+**上线前应当跑一遍**:
+
+```bash
+# 1. 在真实 PG 上跑全量(不是内存 SQLite)
+MUSE_TEST_DATABASE_URL=postgres://…  cargo test --manifest-path server/Cargo.toml
+MUSE_TEST_DATABASE_URL=postgres://…  cargo test --manifest-path server/Cargo.toml --features billing,arena
+# 2. 黄金世界回归(换模型 / Prompt / 引擎版本后必跑)
+cargo test --manifest-path server/Cargo.toml golden
+# 3. 配好审核 provider 后,确认它真的翻面了(而不是仍在用 Dev 桩)
+curl -H "Authorization: Bearer <admin>" localhost:8787/api/admin/safety/recheck | grep providerStub
+```
+
+第 3 条是**唯一能证明内容审核真的接上了**的检查:`providerStub` 为 `false`、`source` 为
+`production`,且 `honesty[]` 不再说「拦不住任何东西」。**以这组字段为准,不以任何文档为准。**
+
 ---
 
 ## 9. 已知 seam(明确标注,待接)
@@ -342,7 +393,7 @@ curl -sX POST 127.0.0.1:8787/api/auth/challenge -H 'Content-Type: application/js
 ## 10. 文档索引
 
 - `PRODUCT.md` — 产品定位一页纸(指向总规格)
-- `docs/API.md` — **平台后端 API 清单**(84 条路由、鉴权级别、feature 门控、admin 角色矩阵)
+- `docs/API.md` — **平台后端 API 清单**(鉴权级别、feature 门控、admin 角色矩阵。此处曾写「84 条路由」,是本仓库第六处过期计数——路由数以 `app.rs` 为准,本文不复述)
 - `docs/design/README.md` — **客户端与管理后台界面设计索引**(设计决策、页面规格、实现映射、验收图)
 - `docs/VALIDATION.md` — **商业验证分阶段计划**(T0-T5、双坐标功能台账、工程三约束、七档状态语言)
 - `docs/build/spec-world-ecosystem.md` — **世界生态总规格 v2**(24 条拍板,产品宪法+系统设计+衔接表+路线图,唯一权威产品文档)

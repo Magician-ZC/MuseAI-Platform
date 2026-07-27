@@ -4318,3 +4318,109 @@ async fn diagnostics_window_defaults_to_the_previous_behaviour() {
     let (_st, d) = get(&app, &format!("/api/admin/worlds/{wid}/diagnostics?limit=99999"), Some(&admin)).await;
     assert_eq!(n_of(&d), 25, "超出上界按上界截断（本世界只有 25 拍）");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 平台级健康汇总（GET /admin/worlds/summary）
+//
+// 它修的是一个**前端修不了**的 bug：三档此前按「已加载的那一页」现算，翻页没翻完就
+// 系统性偏小，而偏小幅度取决于用户翻到第几页。下面钉的三条正是这类聚合最容易出错的地方：
+// 全量而非一页 · 分档顺序（短路优先级）· 跨日计数器不算今天。
+// ═══════════════════════════════════════════════════════════════════════════
+
+async fn seed_budget(state: &AppState, world: &str, budget: i64, spent: i64, day: &str, fused: i64) {
+    // `create_world` 已经建了预算行（world_id 是主键），故 UPDATE 而不是 INSERT。
+    sqlx::query(
+        "UPDATE world_budgets SET daily_token_budget = $1, spent_tokens_today = $2, \
+         budget_day = $3, fused = $4, updated_at = $5 WHERE world_id = $6",
+    )
+    .bind(budget)
+    .bind(spent)
+    .bind(day)
+    .bind(fused)
+    .bind(now_ms())
+    .bind(world)
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+async fn mk_world(state: &AppState, title: &str, status: &str) -> String {
+    let mut p = crate::worlds::CreateWorldParams::official("tpl_hs", 1, title);
+    p.status = Some(status.into());
+    crate::worlds::create_world(&state.db, p).await.unwrap()
+}
+
+/// 🔴 **全量，不是当前页**；且分档顺序（熔断 > 库状态 > 预算 > 运行中）逐条保留前端原判定。
+#[tokio::test]
+async fn worlds_summary_counts_all_worlds_and_keeps_the_tier_order() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+    let today = crate::runtime::day_string(now_ms());
+
+    // ① 熔断（且预算也超了）→ 必须算 fused，不算 attention（熔断优先级最高）。
+    let w_fused = mk_world(&state, "熔断世界", "running").await;
+    seed_budget(&state, &w_fused, 1000, 999, &today, 1).await;
+    // ② 已暂停（且预算也超了）→ 算 paused，不算 attention（库状态优先于预算）。
+    let w_paused = mk_world(&state, "暂停世界", "paused").await;
+    seed_budget(&state, &w_paused, 1000, 999, &today, 0).await;
+    // ③ 预算 95% → attention。
+    let w_att = mk_world(&state, "吃紧世界", "running").await;
+    seed_budget(&state, &w_att, 1000, 950, &today, 0).await;
+    // ④ 预算 10% → running。
+    let w_ok = mk_world(&state, "健康世界", "running").await;
+    seed_budget(&state, &w_ok, 1000, 100, &today, 0).await;
+    // ⑤ 没有预算行（新房）→ running（不该因为「查不到预算」被算成需关注）。
+    let _w_nobudget = mk_world(&state, "无预算世界", "running").await;
+
+    let (st, b) = get(&app, "/api/admin/worlds/summary", Some(&admin)).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["total"], json!(5), "🔴 必须是全量，不是一页: {b}");
+    assert_eq!(b["fused"], json!(1), "熔断优先级最高: {b}");
+    assert_eq!(b["paused"], json!(1), "库状态优先于预算: {b}");
+    assert_eq!(b["attention"], json!(1), "{b}");
+    assert_eq!(b["running"], json!(2), "健康 + 无预算行的新房: {b}");
+
+    // 每一档带原因：不带原因的黄灯只会让运营再去翻诊断页。
+    let reasons = b["attentionReasons"].as_array().expect("attentionReasons");
+    assert_eq!(reasons[0]["code"], "budget_ratio");
+    assert_eq!(reasons[0]["count"], json!(1));
+    assert_eq!(reasons[0]["thresholdBp"], json!(9000), "阈值原样搬自前端的 0.9");
+}
+
+/// 🔴 **跨日的计数器不算今天**——这是本端点相对前端的一处**故意行为差异**（修 bug）。
+///
+/// `world_budgets.spent_tokens_today` 跨日后要等下一拍才归零。用原值会把
+/// 「昨天烧光预算、今天一拍没跑」的世界算成需关注，而它今天一个 token 都没花。
+/// 口径与 `diagnostics` 的 `spentTokensTodayEffective` 完全一致（既有的、已写明的口径）。
+#[tokio::test]
+async fn a_stale_budget_counter_does_not_make_a_world_look_busy_today() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+
+    let w = mk_world(&state, "昨天烧光的世界", "running").await;
+    // 计数器满额，但日标签是昨天。
+    let yesterday = crate::runtime::day_string(now_ms() - crate::admin_api::dashboards::DAY_MS);
+    seed_budget(&state, &w, 1000, 1000, &yesterday, 0).await;
+
+    let (_st, b) = get(&app, "/api/admin/worlds/summary", Some(&admin)).await;
+    assert_eq!(
+        b["attention"],
+        json!(0),
+        "🔴 昨天的消耗不得让世界今天看起来吃紧 —— 它今天一个 token 都没花: {b}"
+    );
+    assert_eq!(b["running"], json!(1), "{b}");
+}
+
+/// 阈值可由 env 调（§0.2 产品规则参数化）；「什么样算需关注」仍是产品待拍板项，
+/// 本端点只是让那个决定变成改一个环境变量，而不是改前端代码。
+#[test]
+fn attention_threshold_is_parameterised_and_defaults_to_the_frontend_value() {
+    assert_eq!(
+        crate::admin_api::worlds_ops::DEFAULT_ATTENTION_BUDGET_BP,
+        9_000,
+        "🔴 默认值必须等于前端原有的 ATTENTION_BUDGET_RATIO = 0.9 —— \
+         搬位置不得顺手改判定，否则运营会看到一个没人改过却变了的数"
+    );
+}

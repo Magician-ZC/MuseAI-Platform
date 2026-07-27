@@ -250,6 +250,142 @@ pub(super) async fn list_worlds(
     Ok(Json(json!({ "worlds": items, "nextCursor": next_cursor })))
 }
 
+// ---------------- 平台级健康汇总 ----------------
+
+/// 「需关注」的今日预算消耗比阈值（万分比整数，9000 = 90%）。
+///
+/// 🔴 **9000 不是我定的数**：它是把前端 `WorldsMonitorConsole.tsx` 里那个
+/// `ATTENTION_BUDGET_RATIO = 0.9` **原样搬过来**的。本端点做的是**把已有的规则搬到
+/// 正确的位置**，不是发明一条新规则——「什么样算需关注」仍然是产品待拍板项
+///（见 `docs/build/open-decisions.md` §1），本端点只是让那个决定变成**改一个环境变量**
+/// 而不是改前端代码。
+///
+/// 万分比整数而不是浮点：阈值判定必须逐位可复现（同抽样率、同 T5 门槛的口径）。
+const ENV_ATTENTION_BUDGET_BP: &str = "MUSE_ATTENTION_BUDGET_BP";
+pub(crate) const DEFAULT_ATTENTION_BUDGET_BP: i64 = 9_000;
+const BP_BASE: i64 = 10_000;
+
+fn attention_budget_bp() -> i64 {
+    std::env::var(ENV_ATTENTION_BUDGET_BP)
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v > 0 && *v <= BP_BASE)
+        .unwrap_or(DEFAULT_ATTENTION_BUDGET_BP)
+}
+
+/// GET /admin/worlds/summary：**全量**世界的健康分档汇总。
+///
+/// ════════════════════════════════════════════════════════════════════════════
+/// 🔴 它修的是一个前端修不了的 bug
+/// ════════════════════════════════════════════════════════════════════════════
+///
+/// 健康指标条（设计文档 §6.1）此前由前端按 **「已加载的那一页世界」** 现算，
+/// 于是**翻页没翻完时三档全部偏小**——而运营看这条指标恰恰是为了「现在有几个世界要管」。
+/// 一个系统性偏小、且偏小幅度取决于用户翻到第几页的数字，比没有这个数字更糟。
+///
+/// 分档规则**逐条保留前端原样**（`deriveStatus`）：
+/// `熔断 > 库状态(paused/ended) > 今日预算逼近上限(需关注) > 库状态`。
+/// 本端点没有改判定，只改了**在哪算、按多少世界算**。
+///
+/// ════════════════════════════════════════════════════════════════════════════
+/// ⚠️ 一处**故意的行为差异**（是修 bug，不是改口径）
+/// ════════════════════════════════════════════════════════════════════════════
+///
+/// 前端用的是 `spentTokensToday` 原值，而 `world_budgets.spent_tokens_today` 是
+/// **跨日后要等下一拍才归零**的计数器（`budget_day` 是它所属的 UTC 日标签）。
+/// 于是一个昨天烧光预算、今天一拍没跑的世界，在前端会被算成「需关注」——
+/// 而它今天**一个 token 都没花**。
+///
+/// 本端点按 `budget_day == 今天` 判定有效消耗（口径与 `diagnostics` 的
+/// `spentTokensTodayEffective` 完全一致，那是既有的、已经写明的口径）。
+/// 🔴 这不是我新定的规则，是**把同一套口径用到本来就该用的地方**。
+///
+/// ════════════════════════════════════════════════════════════════════════════
+/// 每一档都带 `reasons`，不只给数字
+/// ════════════════════════════════════════════════════════════════════════════
+///
+/// 这条指标存在的意义是「让运营知道下一步该点哪里」。一个不带原因的黄灯只会让人
+/// 再去翻诊断页——所以响应里把「需关注」拆到它是被哪条规则命中的。
+/// 目前只有一条（预算逼近上限），但结构先留出来：产品若要加维度
+///（失败率 / 停摆时长 / 连续 blocked，见 open-decisions §1），加的是 `reasons` 的一项，
+/// 而不是把一个不可解释的档位数字变得更不可解释。
+pub(super) async fn worlds_summary(
+    State(state): State<AppState>,
+    admin: AdminUser,
+) -> Result<Json<Value>, ApiError> {
+    require_role(&admin, &["operator"])?;
+    let bp = attention_budget_bp();
+    let today = utc_day_start_ms(now_ms());
+    let day = crate::runtime::day_string(now_ms());
+
+    // 一条 SQL 出全部分档。**绝不逐世界发查询**：这是被运营后台轮询的端点。
+    // 判定顺序与前端 `deriveStatus` 逐条对齐（CASE 从上到下短路）：
+    //   熔断 > paused/ended > 今日预算比 ≥ 阈值 > 其余按库状态。
+    // 预算比用**整数**比较（`spent * 10000 >= budget * bp`）而不是浮点除法：
+    // 阈值判定逐位可复现，且避开 budget=0 的除零分支。
+    let row = sqlx::query(
+        "SELECT \
+         CAST(COALESCE(SUM(CASE WHEN COALESCE(b.fused,0) <> 0 THEN 1 ELSE 0 END), 0) AS BIGINT) AS fused_n, \
+         CAST(COALESCE(SUM(CASE WHEN COALESCE(b.fused,0) = 0 AND w.status = 'paused' THEN 1 ELSE 0 END), 0) AS BIGINT) AS paused_n, \
+         CAST(COALESCE(SUM(CASE WHEN COALESCE(b.fused,0) = 0 AND w.status = 'ended' THEN 1 ELSE 0 END), 0) AS BIGINT) AS ended_n, \
+         CAST(COALESCE(SUM(CASE WHEN COALESCE(b.fused,0) = 0 AND w.status NOT IN ('paused','ended') \
+              AND COALESCE(b.daily_token_budget,0) > 0 AND b.budget_day = $1 \
+              AND COALESCE(b.spent_tokens_today,0) * $2 >= COALESCE(b.daily_token_budget,0) * $3 \
+              THEN 1 ELSE 0 END), 0) AS BIGINT) AS attention_n, \
+         CAST(COALESCE(SUM(CASE WHEN COALESCE(b.fused,0) = 0 AND w.status IN ('running','open') \
+              AND NOT (COALESCE(b.daily_token_budget,0) > 0 AND b.budget_day = $4 \
+                       AND COALESCE(b.spent_tokens_today,0) * $5 >= COALESCE(b.daily_token_budget,0) * $6) \
+              THEN 1 ELSE 0 END), 0) AS BIGINT) AS running_n, \
+         CAST(COUNT(*) AS BIGINT) AS total_n \
+         FROM worlds w LEFT JOIN world_budgets b ON b.world_id = w.id",
+    )
+    .bind(&day)
+    .bind(BP_BASE)
+    .bind(bp)
+    .bind(&day)
+    .bind(BP_BASE)
+    .bind(bp)
+    .fetch_one(&state.db)
+    .await?;
+    let n = |k: &str| row.try_get::<i64, _>(k).unwrap_or(0);
+
+    Ok(Json(json!({
+        "total": n("total_n"),
+        "fused": n("fused_n"),
+        "attention": n("attention_n"),
+        "running": n("running_n"),
+        "paused": n("paused_n"),
+        "ended": n("ended_n"),
+        // 🔴 「需关注」拆到是被哪条规则命中的。目前只有一条，结构先留出来——
+        // 产品若加维度，加的是这里的一项，而不是让一个档位数字变得更不可解释。
+        "attentionReasons": [
+            {
+                "code": "budget_ratio",
+                "count": n("attention_n"),
+                "meaning": "今日 token 预算消耗比 ≥ 阈值且未熔断",
+                "thresholdBp": bp,
+                "env": ENV_ATTENTION_BUDGET_BP,
+            }
+        ],
+        "rule": {
+            "order": "熔断 > 库状态(paused/ended) > 今日预算逼近上限(需关注) > 库状态",
+            "source": "逐条保留前端 WorldsMonitorConsole.deriveStatus 的判定，本端点只改「在哪算、按多少世界算」。",
+            "thresholdBp": bp,
+            "unit": "万分比整数（9000 = 90%），禁浮点：阈值判定必须逐位可复现。",
+            "🔴 openDecision": "「什么样算需关注」仍是产品待拍板项（docs/build/open-decisions.md §1）。\
+                                本端点让那个决定变成改一个环境变量，而不是改前端代码；\
+                                它没有替产品定过任何东西。",
+        },
+        "note": "**全量**世界，不是当前页。此前这三档由前端按已加载的那一页现算，\
+                 翻页没翻完时系统性偏小——而偏小幅度取决于用户翻到第几页，\
+                 那比没有这个数字更糟。",
+        "budgetDayCaveat": "预算比只认 budget_day = 今天（UTC）的计数器。\
+                            world_budgets.spent_tokens_today 跨日后要等下一拍才归零，\
+                            用原值会把「昨天烧光、今天一拍没跑」的世界算成需关注。\
+                            口径与 diagnostics 的 spentTokensTodayEffective 完全一致。",
+    })))
+}
+
 // ---------------- 脱敏诊断 ----------------
 
 /// GET /admin/worlds/{id}/diagnostics：卡死诊断视图。

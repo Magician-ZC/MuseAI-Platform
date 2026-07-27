@@ -128,6 +128,17 @@ interface ConsoleWorld extends WorldApiRow {
   lastActivityAt: number | null;
 }
 
+/** 平台级健康汇总（`GET /admin/worlds/summary`）。分档规则见 server 端同名函数。 */
+interface WorldsSummary {
+  total: number;
+  running: number;
+  attention: number;
+  fused: number;
+  paused: number;
+  ended: number;
+  attentionReasons: { code: string; count: number; thresholdBp: number }[];
+}
+
 interface TimelineEvent {
   key: string;
   at: number;
@@ -551,6 +562,27 @@ export default function WorldsMonitorConsole() {
     if (!designPreview) reload();
   }, [designPreview, reload, statusFilter]);
 
+  // 平台级健康汇总：与列表分开取，因为它**不随分页/筛选变化**（永远是全量）。
+  // 跟着 statusFilter 重取是刻意的——运营切了筛选之后仍应看到平台全貌，
+  // 但重取的代价只有一条聚合 SQL。
+  const [summary, setSummary] = useState<WorldsSummary | null>(null);
+  useEffect(() => {
+    if (designPreview) return undefined;
+    let cancelled = false;
+    adminFetch<WorldsSummary>('/admin/worlds/summary')
+      .then((r) => {
+        if (!cancelled) setSummary(r);
+      })
+      // 🔴 拿不到就置 null → 显示空态，**绝不回落到本页现算**：
+      // 那个数会以「全量」的名义显示一个页内的值，比空着更误导。
+      .catch(() => {
+        if (!cancelled) setSummary(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [designPreview, statusFilter]);
+
   const allWorlds = useMemo(
     () => (designPreview ? previewWorlds : list.items.map(apiRowToConsole)),
     [designPreview, list.items, previewWorlds],
@@ -763,23 +795,35 @@ export default function WorldsMonitorConsole() {
   const latestIncident = timelineEvents.find((event) => event.level !== 'info') ?? null;
 
   // ---------- 健康指标条（设计文档 §6.1） ----------
-  // TODO(接口缺字段): 平台级聚合 —— 运行中/需关注/熔断三档现按"已加载的世界"统计（翻页未完时偏小）；
-  // /admin/metrics/overview 的 worlds.active/fused 是另一套口径（库状态 + 熔断标记，无"需关注"档，
-  // 且与本页 deriveStatus 的派生态不一致），不能直接顶替。需 server 提供与本页同口径的全量汇总。
+  // ✅ 三档改读 **平台级全量汇总** `GET /admin/worlds/summary`（2026-07-27）。
+  //
+  // 此前这里按"已加载的世界"现算，于是**翻页没翻完时三档全部偏小**——而运营看这条指标
+  // 恰恰是为了「现在有几个世界要管」。一个系统性偏小、且偏小幅度取决于用户翻到第几页的
+  // 数字，比没有这个数字更糟。这不是前端能修的：本页永远只持有当前页。
+  //
+  // 分档规则由 server 逐条保留本页原有的 deriveStatus（熔断 > 库状态 > 预算 > 运行中），
+  // 阈值也原样搬过去（0.9 → MUSE_ATTENTION_BUDGET_BP=9000），**没有改判定**。
+  // ⚠️ 一处故意差异：server 只认 budget_day = 今天的计数器，于是「昨天烧光、今天没跑」的
+  // 世界不再被算成需关注——那是修 bug（口径同 diagnostics 的 spentTokensTodayEffective）。
+  //
+  // 🔴 汇总拿不到时**不回落到本页现算**：那个数会以「全量」的名义显示一个页内的值，
+  // 比空着更误导。拿不到就显示空态。
   // 今日成本已改读 cost.today（见上方 costTodayCny），不再走这里的 token 合计。
   const health = useMemo(() => {
-    let running = 0;
-    let attention = 0;
-    let fused = 0;
-    let tokens = 0;
-    for (const world of allWorlds) {
-      if (world.status === 'fused') fused += 1;
-      else if (world.status === 'attention') attention += 1;
-      else if (world.status === 'running' || world.status === 'open') running += 1;
-      tokens += world.spentTokensToday ?? 0;
+    if (designPreview) {
+      let running = 0;
+      let attention = 0;
+      let fused = 0;
+      for (const world of allWorlds) {
+        if (world.status === 'fused') fused += 1;
+        else if (world.status === 'attention') attention += 1;
+        else if (world.status === 'running' || world.status === 'open') running += 1;
+      }
+      return { running, attention, fused };
     }
-    return { running, attention, fused, tokens };
-  }, [allWorlds]);
+    if (!summary) return null;
+    return { running: summary.running, attention: summary.attention, fused: summary.fused };
+  }, [designPreview, allWorlds, summary]);
 
   const budget = diagnostics?.budget ?? null;
   // 进度取 server 的 usageRatio（token 与金额两维的较大者，即先触线的那条），两维都没设上限时为 null，
@@ -854,15 +898,15 @@ export default function WorldsMonitorConsole() {
           <section className="world-health-strip" aria-label="世界运行概览">
             <div className="world-health-strip__metric is-healthy">
               <span className="world-health-strip__dot" /><span>运行中</span>
-              <strong>{designPreview ? PREVIEW_HEALTH.running : health.running}</strong>
+              <strong>{designPreview ? PREVIEW_HEALTH.running : health?.running ?? EMPTY}</strong>
             </div>
             <div className="world-health-strip__metric is-warning">
               <span className="world-health-strip__dot" /><span>需关注</span>
-              <strong>{designPreview ? PREVIEW_HEALTH.attention : health.attention}</strong>
+              <strong>{designPreview ? PREVIEW_HEALTH.attention : health?.attention ?? EMPTY}</strong>
             </div>
             <div className="world-health-strip__metric is-danger">
               <span className="world-health-strip__dot" /><span>已熔断</span>
-              <strong>{designPreview ? PREVIEW_HEALTH.fused : health.fused}</strong>
+              <strong>{designPreview ? PREVIEW_HEALTH.fused : health?.fused ?? EMPTY}</strong>
             </div>
             <div
               className={`world-health-strip__metric is-cost${showCostSpark ? '' : ' has-no-chart'}`}
@@ -873,7 +917,10 @@ export default function WorldsMonitorConsole() {
               {showCostSpark && <ReactECharts option={costSparkOption} style={{ width: 82, height: 38 }} />}
               {costTodayCny == null && (
                 <p className="world-health-strip__note">
-                  今日 Token {formatCompact(health.tokens)} · 成本接口暂未返回
+                  {/* 🔴 这里**不再**给「今日 Token 合计」：三档已改读平台级全量汇总，
+                      而 token 合计只有当前页的值——两个口径混在同一栏里，
+                      读者会以为它们是同一个范围的数。成本接口没返回就直说没返回。 */}
+                  成本接口暂未返回
                 </p>
               )}
             </div>

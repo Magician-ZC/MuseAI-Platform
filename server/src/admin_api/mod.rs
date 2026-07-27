@@ -109,6 +109,8 @@ pub fn router() -> Router<AppState> {
         .route("/admin/content/{kind}/{id}/restore", post(takedown::restore))
         // 世界运营
         .route("/admin/worlds", get(worlds_ops::list_worlds).post(worlds_ops::create_world))
+        // 平台级健康汇总：修的是「三档由前端按已加载那一页现算、翻页没翻完就偏小」。
+        .route("/admin/worlds/summary", get(worlds_ops::worlds_summary))
         .route("/admin/worlds/{id}/diagnostics", get(worlds_ops::diagnostics))
         .route("/admin/worlds/{id}/pause", post(worlds_ops::pause))
         .route("/admin/worlds/{id}/resume", post(worlds_ops::resume))

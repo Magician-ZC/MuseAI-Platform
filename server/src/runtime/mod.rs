@@ -2710,6 +2710,11 @@ async fn commit_tick(
     // 无论本拍会不会真的走到终局结算都解析：解析本身经 flags 的整表快照缓存，代价可忽略，
     // 而放到 `if` 里会诱使后人把它挪进事务（那时才发现死锁）。
     let settlement_flags = crate::progression::SettlementFlags::resolve(&state.db, world_id).await;
+    // §15 第 2 层词库闸。**刻意不并进 `SettlementFlags`**：那个结构体的语义是「结算期的开关」，
+    // 而词库闸作用在**投影入库**这一步（比结算早得多，且与终局无关）。混进去会让
+    // 「结算时哪些开关是开的」这句话失去准确含义。
+    // 🔴 它只解析 global 档（审核链不按世界/按人灰度，见 `safety::lexicon::enabled`）。
+    let lexicon_on = crate::safety::lexicon::enabled(&state.db).await;
     let mut tx = state.db.begin().await?;
 
     // CAS：仅当世界仍处 base_revision 时推进；否则视为已被更早的 tick 处理 → 回滚 + 终态化（C-2）。
@@ -2800,7 +2805,8 @@ async fn commit_tick(
     // 第 2 层是纯本地词表匹配（≈0 成本、无 IO），放事务内安全；**第 3 层语义分类是网络调用，
     // 绝不能挪进来**（单连接池会死锁 PoolTimedOut，见 safety::moderate_runtime_projection 的 TODO）。
     let mut projected = events::project_domain_events(&outcome.scene.events, members);
-    crate::safety::moderate_runtime_projection(&mut tx, world_id, &mut projected).await?;
+    crate::safety::moderate_runtime_projection(&mut tx, world_id, &mut projected, lexicon_on)
+        .await?;
     let stored = events::insert_events_tx(&mut tx, world_id, tick_no, &projected).await?;
 
     // Q-3：只消费本 tick 实际喂入的 accepted 干预（按 id 精确置 applied），不 blanket 标全部 accepted。

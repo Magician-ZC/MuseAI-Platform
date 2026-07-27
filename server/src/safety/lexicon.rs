@@ -27,6 +27,7 @@
 //! ## 开关（`MUSE_SAFETY_LEXICON`，默认 **开启**）
 //! 见 `enabled()` 的注释：这是误伤应急阀，不是灰度开关——内容安全是恒开审核链。
 
+use sqlx::AnyPool;
 use std::sync::OnceLock;
 
 use super::inject::{compact_needle, fold_char, is_separator, INVISIBLE};
@@ -109,22 +110,51 @@ const ENV_ENABLED: &str = "MUSE_SAFETY_LEXICON";
 /// 词库层默认开关值。
 const DEFAULT_LEXICON_ENABLED: bool = true;
 
-/// 词库层是否启用（env 覆盖 + 默认常量，范式同 `runtime::token_cny_cents_per_1k`）。
+/// 🔴 **编译期钉死默认值的两个事实源**（本常量 + `flags::KNOWN_FLAGS`）。
+const _: () = assert!(
+    crate::flags::declared_default(ENV_ENABLED) == DEFAULT_LEXICON_ENABLED,
+    "flags::KNOWN_FLAGS 中 MUSE_SAFETY_LEXICON 的默认值必须与 DEFAULT_LEXICON_ENABLED 一致"
+);
+
+/// 词库层是否启用。
 ///
 /// **默认开启**，这是刻意的：VALIDATION.md §0.1「未验证功能默认关闭」约束的是**商业玩法功能**
 /// （托梦配额、死亡规则、赛事…），内容安全审核链属于合规主体责任（总规格 §15/§16）与平台红线，
 /// 是恒开设施；把它默认关闭等于「默认无审核上线」，方向正好反了。此开关的定位是**误伤应急阀**：
 /// 运营发现词表大面积误伤时可临时关停、修词表、再开回来，而不是一个等待验证的灰度位。
-pub fn enabled() -> bool {
-    env_flag(ENV_ENABLED, DEFAULT_LEXICON_ENABLED)
+///
+/// ════════════════════════════════════════════════════════════════════════════
+/// 🔴 已接入运行时开关体系 —— 但迁它的**理由与别的开关都不同**
+/// ════════════════════════════════════════════════════════════════════════════
+///
+/// `flags::MIGRATION_NOTES` 原本判定它「最后迁，或者干脆不迁」，两条理由：
+/// ① 消费点在 tick commit **事务内的闸**上，事务内查库风险最大；② 收益最小，
+/// 因为「按世界灰度关掉敏感词过滤」不是一个合理的运营动作。
+///
+/// 重新评估的结果是**迁**，因为那两条现在的分量变了：
+///
+/// - ① **已被解掉**：本函数收一个已解析好的 `bool`，由 `runtime::commit_tick`
+///   在 `db.begin()` **之前**解析一次传进来（同 `progression::SettlementFlags` 的做法）。
+///   事务里一次库都不查，风险归零。
+/// - ② **收益被低估了**：原注只想到「灰度」这一种收益，而对一个**审核链的急停阀**来说，
+///   最重要的收益是**留痕**——env 改一行就能关掉全平台的敏感词过滤，**没有任何审计记录**；
+///   接进体系后每一次开关变更都落 `audit_logs`（谁、何时、什么理由）。
+///   🔴 「谁在什么时候关掉了内容过滤」这件事必须查得到，这正是合规主体责任的一部分。
+///
+/// 🔴 **只允许 global 作用域**（`KNOWN_FLAGS` 里 `scopes: SCOPES_GLOBAL`，写入端点直接 400）。
+/// 原注那句「若一定要迁，只允许 global」被逐字执行：按世界/按人关掉敏感词过滤不是运营动作，
+/// 是内容安全事故。
+///
+/// 🔴 **fail-safe 方向不变**：`flags::is_enabled` 在查库失败 / 记录损坏时返回**声明的默认值**，
+/// 而本开关声明的默认值是 `true`（继续过滤）。于是「数据库出问题」永远不会变成「停止过滤」。
+/// 由红线用例 `red_line_lexicon_never_fails_open` 逐条注入损坏态验证。
+pub async fn enabled(db: &AnyPool) -> bool {
+    crate::flags::is_enabled(db, ENV_ENABLED, crate::flags::FlagCtx::global()).await
 }
 
-fn env_flag(name: &str, default: bool) -> bool {
-    match std::env::var(name) {
-        Ok(v) => parse_flag(&v, default),
-        Err(_) => default,
-    }
-}
+// `env_flag` 已随开关迁入 `crate::flags` 而删除：env 层的解析现在由 `flags::parse_env_bool`
+// 统一负责（与本模块原实现逐字同构），本模块不再自留一份。`parse_flag` 保留——
+// 它还被 `MUSE_SAFETY_LEXICON_EXTRA` 之外的用例直接调用，且是那条同构性的对照物。
 
 fn parse_flag(v: &str, default: bool) -> bool {
     match v.trim().to_ascii_lowercase().as_str() {
@@ -480,6 +510,105 @@ mod tests {
         assert!(!parse_flag("off", DEFAULT_LEXICON_ENABLED), "显式 off 才关闭");
         assert!(!parse_flag(" 0 ", DEFAULT_LEXICON_ENABLED));
         assert!(parse_flag("on", false), "显式 on 覆盖默认");
+    }
+
+    /// 🔴 **审核链永不 fail-open**：只有「显式、平台级、写对了的一条关闭记录」能关掉它，
+    /// 其余每一条路径——空表 / 记录损坏 / 时间窗未到或已过 / 写错作用域 / 查库失败——
+    /// 一律回到**继续过滤**。
+    ///
+    /// 这是 `MIGRATION_NOTES` 给这个开关定的迁移前提（「要有单独的红线用例断言它永远不能被
+    /// 关到 false 以外的路径上去」）的逐条落地。它比别的开关的 fail-closed 更要紧：
+    /// 别的开关失效方向是「功能不可用」，这个开关失效方向是**内容过滤停了而没人知道**。
+    #[tokio::test]
+    async fn red_line_lexicon_never_fails_open() {
+        let db = crate::testkit::test_pool().await;
+        let ins = |scope: &'static str, target: &'static str, enabled: i64, starts: i64, ends: i64| {
+            let db = db.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO runtime_flags (id, flag, scope, target_id, enabled, starts_at, \
+                     ends_at, updated_by, updated_at, reason, created_at) \
+                     VALUES ($1, 'MUSE_SAFETY_LEXICON', $2, $3, $4, $5, $6, 'test', $7, 'test', $8)",
+                )
+                .bind(crate::db::new_id("rf"))
+                .bind(scope)
+                .bind(target)
+                .bind(enabled)
+                .bind(starts)
+                .bind(ends)
+                .bind(crate::db::now_ms())
+                .bind(crate::db::now_ms())
+                .execute(&db)
+                .await
+                .unwrap();
+            }
+        };
+        let clear = |db: sqlx::AnyPool| async move {
+            sqlx::query("DELETE FROM runtime_flags").execute(&db).await.unwrap();
+        };
+
+        // ① 空表 → 开（env 未设时落到声明默认值 true）。
+        assert!(enabled(&db).await, "🔴 空表必须继续过滤");
+
+        let now = crate::db::now_ms();
+        // ② 逐条「本该关掉却不该生效」的记录：损坏 / 窗口外 / 写错作用域。
+        for (label, scope, target, en, starts, ends) in [
+            ("作用域拼错", "wrold", "", 0i64, 0i64, 0i64),
+            ("enabled 非 0/1", "global", "", 7, 0, 0),
+            ("时间窗反转", "global", "", 0, now + 60_000, now - 60_000),
+            ("时间窗未到", "global", "", 0, now + 60_000, 0),
+            ("时间窗已过", "global", "", 0, 0, now - 60_000),
+            ("global 却带 targetId", "global", "w1", 0, 0, 0),
+            // 🔴 写错作用域：world/user 档本模块**根本不解析**（写入端点也会 400 拦掉，
+            //    这里直插库是为了连「有人绕过端点直改数据库」这条路也堵上）。
+            ("按世界关（不解析）", "world", "w1", 0, 0, 0),
+            ("按人关（不解析）", "user", "u1", 0, 0, 0),
+        ] {
+            clear(db.clone()).await;
+            ins(scope, target, en, starts, ends).await;
+            assert!(enabled(&db).await, "🔴 「{label}」不得导致停止过滤");
+        }
+
+        // ③ 唯一能关掉它的形状：显式、global、enabled=0、无时间窗。
+        clear(db.clone()).await;
+        ins("global", "", 0, 0, 0).await;
+        assert!(!enabled(&db).await, "显式平台级关闭应当生效（它是误伤应急阀，必须真能关）");
+
+        // ④ 查库失败（把表删掉模拟）→ 仍然继续过滤。
+        sqlx::query("DROP TABLE runtime_flags").execute(&db).await.unwrap();
+        assert!(enabled(&db).await, "🔴 查库失败必须回到继续过滤，绝不 fail-open");
+    }
+
+    /// 🔴 **tick 里那一行必须真的解析开关，且必须在 `begin()` 之前解析。**
+    ///
+    /// 两件事各自的失败形态都不会被普通用例发现：
+    /// - 写死成 `true` → 误伤应急阀**失灵**（运营点了关闭，tick 照常过滤），而所有既有用例
+    ///   都是在闸开着的前提下写的，一条都不会红；
+    /// - 解析挪到 `begin()` 之后 → 单连接池自锁，症状是「tick 变慢 + 悄悄按默认值走」，
+    ///   也不报错（现象见 `subplot::tests::resolving_flags_inside_the_transaction_deadlocks_and_fails_closed`）。
+    ///
+    /// 采源码级断言，体例同 `worlds::tests::runtime_backfills_lethality_from_world_row`：
+    /// 这一段在 tick 事务深处，端到端断言要真实模型调用，成本不抵收益；而接线一旦被改，本条立刻红。
+    #[test]
+    fn red_line_commit_tick_resolves_the_gate_before_opening_the_transaction() {
+        let src = include_str!("../runtime/mod.rs");
+        let resolve = src
+            .find("let lexicon_on = crate::safety::lexicon::enabled(&state.db).await;")
+            .expect("🔴 commit_tick 必须解析词库闸，不得写死 —— 写死等于误伤应急阀失灵");
+        let apply = src
+            .find("moderate_runtime_projection(&mut tx, world_id, &mut projected, lexicon_on)")
+            .expect("🔴 第 2 层闸必须收那个解析结果");
+        assert!(resolve < apply, "解析必须在使用之前");
+        // 解析 → begin() → 使用：中间那个 begin 必须夹在两者之间。
+        let begin = src[resolve..apply]
+            .find("state.db.begin()")
+            .map(|i| resolve + i)
+            .expect("🔴 两者之间应当有 tick 事务的 begin()，否则本断言的前提就变了");
+        assert!(
+            resolve < begin,
+            "🔴 词库闸必须在 db.begin() **之前**解析：事务里查库 = 单连接池自锁，\
+             而那表现为「tick 变慢 + 悄悄按默认值走」，不报错"
+        );
     }
 
     #[test]

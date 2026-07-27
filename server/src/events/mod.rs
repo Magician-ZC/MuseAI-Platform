@@ -1332,8 +1332,12 @@ mod tests {
         assert_eq!(projected[0].summary, "他从怀里掏出一包冰毒。", "consequence 必须在过闸前就进投影");
 
         // commit_tick 的真实次序：同一事务内 投影 → 第 2 层闸 → 落库。
+        let lexicon_on = crate::safety::lexicon::enabled(&state.db).await;
         let mut tx = state.db.begin().await.unwrap();
-        let blocked = crate::safety::moderate_runtime_projection(&mut tx, "w1", &mut projected).await.unwrap();
+        let blocked =
+            crate::safety::moderate_runtime_projection(&mut tx, "w1", &mut projected, lexicon_on)
+                .await
+                .unwrap();
         let stored = insert_events_tx(&mut tx, "w1", 0, &projected).await.unwrap();
         tx.commit().await.unwrap();
 

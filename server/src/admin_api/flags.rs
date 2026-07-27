@@ -143,6 +143,9 @@ pub(super) async fn list_flags(
             "defaultEnabled": d.default_enabled,
             // false = 该开关目前仍是纯 env 读取，写记录对它暂时无效（见 flags::MIGRATION_NOTES）。
             "wired": d.wired,
+            // 🔴 该开关**实际解析**哪几档（不是「合法作用域」）。写它不解析的档 → 400。
+            // 运营后台据此只渲染可选的那几档，而不是把三档一律列出来让人踩空。
+            "scopes": d.scopes,
             // 全局生效值（无用户/世界灰度时的大盘状态）。
             "globalEffective": res.enabled,
             "globalSource": source_json(&res.source),
@@ -153,6 +156,8 @@ pub(super) async fn list_flags(
         "flags": defs,
         "records": records.iter().map(record_json).collect::<Vec<_>>(),
         "scopesByPriority": flags::SCOPES_BY_PRIORITY,
+        "note": "scopesByPriority 是**解析优先级**（窄的赢）。每个开关实际解析哪几档见 flags[].scopes —— \
+                 写一条它不解析的档会被 400 拒绝，而不是写进去毫无效果。",
         "notes": [
             "解析优先级：按用户 > 按世界 > 全局 > env > 代码内默认值（窄的赢）",
             "记录为空 = 完全按 env 现有语义，所有模块行为不变",
@@ -248,6 +253,21 @@ pub(super) async fn set_flag(
             flags::SCOPES_BY_PRIORITY.join(", ")
         )));
     }
+    // 🔴 **这个开关到底读不读这一档**（不只是「作用域名合法」）。
+    //
+    // 少了这一步，给一个只读 global 的开关写一条 world 记录会**写得进去、且毫无效果**——
+    // 正是下面那段注释点名的「配了但毫无效果，这套体系最难自查的失败模式」。
+    // 作用域名合法与「该开关的消费点会解析它」是两件事，此处校验后者。
+    if !def.scopes.contains(&req.scope.as_str()) {
+        return Err(ApiError::BadRequest(format!(
+            "开关「{}」不解析 {} 作用域，写了也不会生效。它实际解析：{}。\
+             （这不是权限限制，是该开关消费点的结构决定的——理由见对应模块开关函数的文档）",
+            req.flag,
+            req.scope,
+            def.scopes.join(" / ")
+        )));
+    }
+
     let target_id = req.target_id.clone().unwrap_or_default().trim().to_string();
     if req.scope == flags::SCOPE_GLOBAL {
         if !target_id.is_empty() {

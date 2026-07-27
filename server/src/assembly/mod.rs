@@ -4137,12 +4137,28 @@ mod container_tests {
         prev: Option<String>,
     }
 
+    static CONTAINER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     impl ContainerSwitch {
         pub(crate) fn set(on: bool) -> Self {
-            static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-            let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let prev = std::env::var(ENV_CONTAINER_ASSEMBLY).ok();
+            let sw = Self::take_lock();
             std::env::set_var(ENV_CONTAINER_ASSEMBLY, if on { "1" } else { "0" });
+            sw
+        }
+
+        /// 🔴 **移除 env 也必须拿同一把锁**。此前「测默认值」那条用例直接
+        /// `remove_var` + 手动存还，不进锁——它是 `#[test]` 时窗口极短还看不出来，
+        /// 改成 `#[tokio::test]`（建池要 await）后窗口一下子变宽，
+        /// 与并发的容器用例抢 env，表现为**偶发**红（单跑必绿，全跑偶尔红），最难查的一类。
+        pub(crate) fn cleared() -> Self {
+            let sw = Self::take_lock();
+            std::env::remove_var(ENV_CONTAINER_ASSEMBLY);
+            sw
+        }
+
+        fn take_lock() -> Self {
+            let guard = CONTAINER_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = std::env::var(ENV_CONTAINER_ASSEMBLY).ok();
             Self { _guard: guard, prev }
         }
     }
@@ -4262,12 +4278,9 @@ mod container_tests {
     async fn switch_defaults_to_off() {
         let db = crate::testkit::test_pool().await;
         // env 未设置时必须是关闭（VALIDATION §0.1 未验证功能默认关闭）。
-        let prev = std::env::var(ENV_CONTAINER_ASSEMBLY).ok();
-        std::env::remove_var(ENV_CONTAINER_ASSEMBLY);
+        // 🔴 经 `cleared()` 拿锁，不手搓 remove_var —— 理由见 `ContainerSwitch::cleared`。
+        let _sw = ContainerSwitch::cleared();
         let off = container_assembly_enabled(&db, None).await;
-        if let Some(v) = prev {
-            std::env::set_var(ENV_CONTAINER_ASSEMBLY, v);
-        }
         assert!(!off, "MUSE_CONTAINER_ASSEMBLY 默认必须关闭");
         assert!(!DEFAULT_CONTAINER_ASSEMBLY_ENABLED, "默认常量必须是 false");
         assert_eq!(

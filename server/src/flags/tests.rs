@@ -204,6 +204,85 @@ async fn red_line_empty_db_and_no_env_means_disabled() {
     assert!(!crate::onboarding::onboarding_enabled(&state.db, Some("usr_any")).await);
 }
 
+/// 🔴 **每个开关都必须声明它实际解析哪几档，且必须含 global。**
+///
+/// `scopes` 描述的是**代码现状**（消费点真的解析了哪几个维度），不是「允许配哪几档」。
+/// 少了这一列，给一个只读 global 的开关写一条 world 记录会**写得进去、且毫无效果**——
+/// 而 `admin_api::flags::set_flag` 自己的注释就把这种情形称作
+/// 「这套体系最难自查的失败模式」。必须含 global 是因为全局档是每个开关的兜底面：
+/// 不给它，这个开关就没法平台级开合，急停阀就没有阀门。
+#[test]
+fn every_flag_declares_scopes_including_global() {
+    for def in KNOWN_FLAGS {
+        assert!(!def.scopes.is_empty(), "🔴 {} 未声明 scopes", def.name);
+        assert!(
+            def.scopes.contains(&SCOPE_GLOBAL),
+            "🔴 {} 的 scopes 必须含 global —— 否则它没有平台级开合的阀门",
+            def.name
+        );
+        for sc in def.scopes {
+            assert!(
+                SCOPES_BY_PRIORITY.contains(sc),
+                "🔴 {} 声明了非法作用域「{sc}」",
+                def.name
+            );
+        }
+    }
+    // 🔴 审核链只允许平台级急停：按世界/按人关掉敏感词过滤不是运营动作，是内容安全事故。
+    let lex = find_flag("MUSE_SAFETY_LEXICON").expect("审核链必须在登记表里");
+    assert_eq!(
+        lex.scopes,
+        &[SCOPE_GLOBAL],
+        "🔴 MUSE_SAFETY_LEXICON 只允许 global 作用域（MIGRATION_NOTES 原注的迁移前提）"
+    );
+}
+
+/// 🔴 写一条**该开关根本不解析**的作用域记录 → 400，而不是写进去毫无效果。
+#[tokio::test]
+async fn writing_a_scope_the_flag_never_reads_is_rejected() {
+    let _g = env_guard(None, &[]);
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = token(&state, "admin1", "admin");
+    seed_world(&state.db, "wld_x").await;
+
+    // MUSE_ONBOARDING 只解析 user/global（微本世界是领礼包时才建的）。
+    let (st, body) = post(
+        &app,
+        "/api/admin/flags",
+        Some(&admin),
+        json!({ "flag": F, "scope": "world", "targetId": "wld_x", "enabled": true, "reason": "试" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "🔴 不解析的档必须被拒绝: {body}");
+    let msg = body["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("不解析"), "错误信息要说清是「读不到」而不是「没权限」: {msg}");
+    assert!(msg.contains("user"), "并要告诉运营它实际解析哪几档: {msg}");
+    assert_eq!(
+        count_flag_rows(&state.db).await,
+        0,
+        "🔴 被拒绝的写入一行都不许落库（否则就成了「有记录但不生效」）"
+    );
+
+    // 审核链：连 world/user 都不许写，只能平台级急停。
+    for scope in ["world", "user"] {
+        let target = if scope == "world" { "wld_x" } else { "usr_x" };
+        let (st, _) = post(
+            &app,
+            "/api/admin/flags",
+            Some(&admin),
+            json!({ "flag": "MUSE_SAFETY_LEXICON", "scope": scope, "targetId": target,
+                    "enabled": false, "reason": "试" }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "🔴 审核链不得按 {scope} 关闭");
+    }
+}
+
+async fn count_flag_rows(db: &AnyPool) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM runtime_flags").fetch_one(db).await.unwrap()
+}
+
 /// 🔴 登记表本身的红线：除审核链外，`default_enabled` 必须全为 false。
 /// 谁把某个未验证功能的默认值改成 true，这条立刻红。
 #[test]
@@ -844,21 +923,24 @@ async fn set_flag_is_upsert_not_append() {
     let state = test_state().await;
     let app = build_router(state.clone());
     let admin = token(&state, "admin1", "admin");
-    seed_world(&state.db, "wld_u").await;
+    // ⚠️ 用 **user** 档而不是 world：`MUSE_ONBOARDING` 的消费点只解析 user/global
+    //（微本世界是领礼包时**才建**的，判定发生在世界存在之前）。本用例原先写的是 world 档，
+    // 即一条**写得进去却永远不生效**的记录——`KNOWN_FLAGS.scopes` 校验上线后第一个抓到的就是它。
+    seed_user(&state.db, "usr_u").await;
 
     for (on, why) in [(true, "开灰度"), (false, "关灰度"), (true, "再开")] {
         let (st, _) = post(
             &app,
             "/api/admin/flags",
             Some(&admin),
-            json!({ "flag": F, "scope": "world", "targetId": "wld_u", "enabled": on, "reason": why }),
+            json!({ "flag": F, "scope": "user", "targetId": "usr_u", "enabled": on, "reason": why }),
         )
         .await;
         assert_eq!(st, StatusCode::OK);
     }
     let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runtime_flags").fetch_one(&state.db).await.unwrap();
     assert_eq!(n, 1, "同一目标只应有一行");
-    assert!(is_enabled(&state.db, F, FlagCtx::world("wld_u")).await, "最后一次写的赢");
+    assert!(is_enabled(&state.db, F, FlagCtx::user("usr_u")).await, "最后一次写的赢");
     // 三次变更三条留痕。
     let a: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_logs WHERE action = 'flag.set'")
         .fetch_one(&state.db)

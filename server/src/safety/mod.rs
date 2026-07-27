@@ -59,7 +59,7 @@ use crate::providers::ModerationVerdict;
 
 pub mod disposal;
 mod inject;
-mod lexicon;
+pub(crate) mod lexicon;
 /// §15 **第 3 层**：语义分类异步复核（tick 提交后、事务之外）。见该模块头——
 /// 🔴 它交付的是**管线**，不是防线：`ModerationProvider` 当前是 Dev 桩，一次真实语义分类都没发生。
 pub mod semantic;
@@ -341,8 +341,12 @@ pub async fn moderate_runtime_projection(
     tx: &mut sqlx::Transaction<'_, sqlx::Any>,
     world_id: &str,
     projected: &mut [ProjectedEvent],
+    // 🔴 由调用方在**进事务之前**解析好传入（`runtime::commit_tick` 的 `db.begin()` 之前）。
+    // 本函数在 tick 事务内，自己查库就是单连接池自锁——那正是 `MIGRATION_NOTES` 当初
+    // 判定「这个开关干脆不迁」的头号理由，收 bool 把它解掉了。
+    lexicon_on: bool,
 ) -> Result<usize, ApiError> {
-    if !lexicon::enabled() {
+    if !lexicon_on {
         return Ok(0);
     }
     let mut blocked = 0usize;
@@ -531,8 +535,11 @@ mod tests {
         world: &str,
         mut projected: Vec<ProjectedEvent>,
     ) -> (usize, Vec<StoredEvent>, Vec<ProjectedEvent>) {
+        // 🔴 开关**在进事务之前**解析（事务里查库 = 单连接池自锁）——与 `commit_tick` 同姿势。
+        let lexicon_on = lexicon::enabled(&state.db).await;
         let mut tx = state.db.begin().await.unwrap();
-        let blocked = moderate_runtime_projection(&mut tx, world, &mut projected).await.unwrap();
+        let blocked =
+            moderate_runtime_projection(&mut tx, world, &mut projected, lexicon_on).await.unwrap();
         let stored = insert_events_tx(&mut tx, world, 0, &projected).await.unwrap();
         tx.commit().await.unwrap();
         (blocked, stored, projected)

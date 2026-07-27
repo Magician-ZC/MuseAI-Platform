@@ -148,7 +148,30 @@ pub struct FlagDef {
     /// 是否已接入本体系（参考接线）。`false` = 该开关目前仍是纯 env，
     /// 本表登记它只为运营后台可见 + 作为迁移清单，**写记录对它暂时无效**。
     pub wired: bool,
+    /// 🔴 **这个开关的消费点实际会解析哪几档作用域**（不是「合法的作用域有哪些」）。
+    ///
+    /// 为什么要有这一列：写入端点原先只校验「作用域名是不是合法的三个之一」，
+    /// 于是给一个只读 global 的开关写一条 `world` 记录会**写得进去、且毫无效果**——
+    /// 而那正是本模块自己的注释点名的「这套体系最难自查的失败模式」
+    /// （见 `admin_api::flags::set_flag` 里「配了但毫无效果」那段）。
+    /// 有了这一列，写入端点能直接 400 并告诉运营这个开关到底读哪几档。
+    ///
+    /// 🔴 **必须含 `SCOPE_GLOBAL`**：全局档是每个开关的兜底面，不给它就没法平台级开关。
+    /// 由红线用例 `every_flag_declares_scopes_including_global` 钉死。
+    ///
+    /// ⚠️ 它描述的是**代码现状**，不是愿望：加一档之前先去改消费点，否则这一列会变成
+    /// 另一个「写下时是对的、之后每批开发让它更不对」的清单。
+    pub scopes: &'static [&'static str],
 }
+
+/// 三档全开（user > world > global）：消费点在三个位置都能拿到对应维度。
+const SCOPES_ALL: &[&str] = &[SCOPE_USER, SCOPE_WORLD, SCOPE_GLOBAL];
+/// 按人 + 全局：消费点只有「动作发起人」这一个维度。
+const SCOPES_USER: &[&str] = &[SCOPE_USER, SCOPE_GLOBAL];
+/// 按世界 + 全局：消费点只有「哪个世界」这一个维度。
+const SCOPES_WORLD: &[&str] = &[SCOPE_WORLD, SCOPE_GLOBAL];
+/// 只有全局：**刻意不给灰度维度**（各自的理由写在对应模块的开关函数文档里）。
+const SCOPES_GLOBAL: &[&str] = &[SCOPE_GLOBAL];
 
 /// 全部已知开关。写入端点按本表校验开关名（未登记 → 400），解析按本表取默认值。
 ///
@@ -163,6 +186,8 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
         desc: "新手动线（新人礼包 + 单人微本）。T0 被测对象",
         // 🔴 本批次唯一的参考接线。
         wired: true,
+        // 解析档：四个端点都按动作发起人解析；微本世界是领礼包时才建的，判定发生在世界存在之前。
+        scopes: SCOPES_USER,
     },
     FlagDef {
         name: "MUSE_SUBPLOT_CARDS",
@@ -173,6 +198,8 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
         // 结算铸卡按 **world**——结算是一个世界事件、多个卡主，按人解析就得在事务里逐 owner
         // 查库，而那正是单连接池自锁的来源。口径表见 `subplot::subplot_cards_enabled`。
         wired: true,
+        // 解析档：端点侧按 user、结算铸卡按 world。
+        scopes: SCOPES_ALL,
     },
     FlagDef {
         name: "MUSE_LETHALITY_DEATHMATCH",
@@ -184,6 +211,8 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
         // 于是「全局关、某世界单独开」时该世界的契约照常生效、而新的生死场建不出来，
         // 两者都对（回答的是两个问题）。口径表见 `worlds::deathmatch_enabled`。
         wired: true,
+        // 解析档：读取侧按 world；建房前门只能 global（那时世界还不存在）。
+        scopes: SCOPES_WORLD,
     },
     FlagDef {
         name: "MUSE_ROOM_INVITATIONS",
@@ -195,6 +224,8 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
         // 会让「给某个世界单独开闸」产出**一封谁都答不了的邀请**（发件侧开、收件侧关）。
         // 理由全文见 `invitations::invitations_enabled` 的「灰度粒度」一节。
         wired: true,
+        // 解析档：🔴 刻意不含 world：收件侧跨世界，world 档会造出一封谁都答不了的邀请。
+        scopes: SCOPES_USER,
     },
     FlagDef {
         name: "MUSE_CONTAINER_ASSEMBLY",
@@ -205,6 +236,8 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
         // 建模板前门只能按 **global**（建模板时没有世界，模板是世界的蓝图）。
         // 两侧不同在这里不会半开半关——全局关时模板根本声明不了 refs。
         wired: true,
+        // 解析档：装配期按 world；建模板前门只能 global（那时没有世界）。
+        scopes: SCOPES_WORLD,
     },
     FlagDef {
         name: "MUSE_MEMORIAL",
@@ -214,6 +247,8 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
         // 🔵 已接线。ctx 口径同副本卡：端点侧按 **user**，结算内自动封卷按 **world**
         // （经 `progression::SettlementFlags`）。口径表见 `memorial::memorial_enabled`。
         wired: true,
+        // 解析档：端点侧按 user、结算内自动封卷按 world。
+        scopes: SCOPES_ALL,
     },
     FlagDef {
         name: "MUSE_WORLD_SERIES_AUTOSCALE",
@@ -225,6 +260,8 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
         //    2 号却开不出 3 号）；② 逐系列的闸已经存在（`world_series.status`），
         // 再加一档就是第三道语义重叠、最容易被忘记的闸。🔴 两道闸都开才扩容。
         wired: true,
+        // 解析档：🔴 主动放弃灰度：逐系列的闸已经是 world_series.status。
+        scopes: SCOPES_GLOBAL,
     },
     FlagDef {
         name: "MUSE_WORLD_BE_BIOGRAPHY",
@@ -235,6 +272,8 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
         // 传记是公共事实（§0.3）不是个人资产，按人灰度会出现「同一份封卷 A 看得见 B 看不见」。
         // 于是它没有那两个开关的「产出了但看不见」不对称。封卷侧经 `SettlementFlags`。
         wired: true,
+        // 解析档：两侧都按 world：传记是公共事实，不是个人资产。
+        scopes: SCOPES_WORLD,
     },
     FlagDef {
         name: "MUSE_OOC_ANNOTATIONS",
@@ -245,6 +284,8 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
         // 🔵 本模块**从一开始就经本体系解析**（不是先 env 再迁移）：它是 R3 新建件，
         // 没有需要保留的历史 env 语义，直接接线是最省事的一次。
         wired: true,
+        // 解析档：解析函数收 user_id + world_id 两个可选维度。
+        scopes: SCOPES_ALL,
     },
     FlagDef {
         name: "MUSE_IFLINE_PARALLEL",
@@ -254,6 +295,8 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
                🔴 平行线不是改写——原世界线一个字节不动，且 if 线不产出任何可反哺原世界的资产",
         // 🔵 与 `MUSE_OOC_ANNOTATIONS` 同理：R3 新建件，没有需要保留的历史 env 语义，直接接线。
         wired: true,
+        // 解析档：同上。
+        scopes: SCOPES_ALL,
     },
     FlagDef {
         name: "MUSE_SOCIAL_IDENTITY_UNLOCK",
@@ -264,6 +307,8 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
         // 🔵 与 `MUSE_OOC_ANNOTATIONS` / `MUSE_IFLINE_PARALLEL` 同理：R3 新建件，
         // 没有需要保留的历史 env 语义，从建成之日起就经本体系解析。
         wired: true,
+        // 解析档：同上。
+        scopes: SCOPES_ALL,
     },
     FlagDef {
         name: "MUSE_LIVE_STAGE",
@@ -276,6 +321,8 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
         // 🔵 与 OOC 注解权 / if 线 / 真人社交解锁同理：R3 新建件，没有需要保留的历史 env 语义，
         // 从建成之日起就经本体系解析。
         wired: true,
+        // 解析档：同上。
+        scopes: SCOPES_ALL,
     },
     FlagDef {
         name: "MUSE_OFFPEAK_SCHEDULING",
@@ -288,6 +335,8 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
         // 于是错峰从「全局一刀切」变成可按世界灰度。`runtime/mod.rs` 的
         // `offpeak::enabled_for_world` 早已写好「已登记走体系、未登记退 env」的分支，故那边一行不用改。
         wired: true,
+        // 解析档：错峰是按世界排的（runtime::offpeak 只传 world）。
+        scopes: SCOPES_WORLD,
     },
     FlagDef {
         name: "MUSE_SAFETY_SEMANTIC_RECHECK",
@@ -307,6 +356,8 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
                `GET /admin/safety/recheck` 的 providerStub 一起走。不得据此表述为「五层漏斗已完整」",
         // 🔵 新建件，没有需要保留的历史 env 语义，建成即接线（同 OOC 注解权 / if 线 / 直播场）。
         wired: true,
+        // 解析档：按世界灰度是最自然的开闸单位；运营面读数走 global。
+        scopes: SCOPES_WORLD,
     },
     FlagDef {
         name: "MUSE_SAFETY_RECHECK_SWEEP",
@@ -324,6 +375,8 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
                `durability.justOutsideWindow` 把它量出来。🔴 单实例假设（多实例会重复补投）",
         // 🔵 新建件，无历史 env 语义，建成即接线。
         wired: true,
+        // 解析档：它是一个跨世界的进程级循环，没有可解析的维度。
+        scopes: SCOPES_GLOBAL,
     },
     FlagDef {
         name: "MUSE_SAFETY_LEXICON",
@@ -333,6 +386,8 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
         owner: "safety",
         desc: "运行时敏感词库（审核链，默认开启；fail-safe 方向是「继续过滤」）",
         wired: false,
+        // 解析档：🔴 审核链只允许平台级急停，按世界/按人关掉敏感词过滤不是合理运营动作。
+        scopes: SCOPES_GLOBAL,
     },
     FlagDef {
         name: "MUSE_DISPOSAL_NAME_GATE",
@@ -345,6 +400,8 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
                `world_events` / 已封卷传记快照一个字节不动（§0.3）",
         // 🔵 与 R3 那批新建件同理：新建件，没有需要保留的历史 env 语义，建成即接线。
         wired: true,
+        // 解析档：闸门作用在「查看者看到什么」上，故按查看者解析。
+        scopes: SCOPES_USER,
     },
 ];
 

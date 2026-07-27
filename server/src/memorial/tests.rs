@@ -1289,3 +1289,187 @@ async fn red_line_memorial_never_serves_unapproved_avatars() {
         );
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 🔴 跨 crate 线上契约：引擎写出来的 `pendingConsents`，封卷判据读得懂吗
+//
+// 死亡封卷的证据 (b) 是「引擎已落定」——判据是去 `narrative_state_json` 里看
+// `narrative.pendingConsents` 还含不含这张卡的 death 条目。
+//
+// 问题在于：**这个契约此前没有任何东西钉住**。引擎侧（`muse-engine`）与读侧
+// （`server::memorial`）各自按自己的假设写、各自测自己那一半，中间没人验证两边说的是同一件事。
+//
+// 🔴 而失败方向是**错的**：`NarrativeLayer.pending_consents` 带
+// `skip_serializing_if = "Vec::is_empty"`，于是「无待批」时那个键根本不出现——
+// 这是正常态。但也因此，引擎侧一旦改名 / 去掉 `rename_all` / 改字段，读侧看到的同样是
+// 「键不存在」，与「已落定」**完全无法区分**，于是 `still_pending = false` →
+// 证据 (b) 恒成立 → **卡会仅凭一条同意就被封卷**。
+//
+// 那正是本模块自己写明绝不能发生的事：「**授权 ≠ 死亡**，只看 (a) 会把活角色误封卷（捏造死亡）」。
+// 下面两条用**真实引擎类型 + 真实 serde**走一遍，把这条契约钉住：谁改了序列化，这里立刻红。
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 用**引擎自己的类型**造一份叙事态并序列化——不是手写 JSON。
+/// 手写 JSON 只能验「读侧认得我手写的形状」，验不到「引擎真的写出这个形状」。
+fn engine_state_json(pending: Vec<(&str, &str)>) -> String {
+    use muse_engine::narrative::types::{NarrativeState, PendingConsent};
+    let mut st = NarrativeState::default();
+    st.narrative.pending_consents = pending
+        .into_iter()
+        .map(|(subject, kind)| PendingConsent {
+            subject: subject.to_string(),
+            event_kind: kind.to_string(),
+        })
+        .collect();
+    serde_json::to_string(&st).expect("引擎叙事态可序列化")
+}
+
+/// 🔴 引擎**还挂着**这张卡的 death 待批 → 证据 (b) 不成立 → 不得封卷。
+#[tokio::test]
+async fn a_death_still_pending_in_the_engine_blocks_sealing() {
+    let state = test_state().await;
+    let _sw = MemorialSwitch::set(true);
+    seed_landed_death(&state).await;
+    // 用**引擎序列化出来的**状态覆盖：chA 的 death 仍在待批。
+    sqlx::query("UPDATE worlds SET narrative_state_json = $1 WHERE id = 'w1'")
+        .bind(engine_state_json(vec![("chA", "death")]))
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    let mut tx = state.db.begin().await.unwrap();
+    let sealed =
+        super::auto_seal_dead_participants_tx(&mut tx, "w1", &[("chA".into(), "u1".into())], true)
+            .await
+            .unwrap();
+    tx.commit().await.unwrap();
+
+    assert_eq!(
+        sealed, 0,
+        "🔴 引擎还没落定就封卷 = 捏造死亡。这条一旦红，多半是 muse-engine 侧改了 \
+         pendingConsents 的序列化（改名 / 去掉 rename_all / 改 eventKind 取值），\
+         而读侧对此**完全无法与「已落定」区分**——失败方向是 fail-open。"
+    );
+    assert_eq!(memorial_status_of(&state, "chA").await, "living");
+}
+
+/// 引擎**已清账**（`pending_consents` 空 ⇒ 那个键因 `skip_serializing_if` 根本不出现）
+/// → 证据 (b) 成立 → 封卷。
+///
+/// 这一条与上一条**必须成对**：只有前者，把判据写成恒 false 也能过；
+/// 只有后者，把判据写成恒 true 也能过。
+#[tokio::test]
+async fn an_engine_cleared_consent_allows_sealing() {
+    let state = test_state().await;
+    let _sw = MemorialSwitch::set(true);
+    seed_landed_death(&state).await;
+    let json = engine_state_json(vec![]);
+    assert!(
+        !json.contains("pendingConsents"),
+        "前提：空列表时该键被 skip_serializing_if 略去——这正是「键不存在」与「已落定」\
+         无法区分的根源，故上一条用例不可缺: {json}"
+    );
+    sqlx::query("UPDATE worlds SET narrative_state_json = $1 WHERE id = 'w1'")
+        .bind(json)
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    let mut tx = state.db.begin().await.unwrap();
+    let sealed =
+        super::auto_seal_dead_participants_tx(&mut tx, "w1", &[("chA".into(), "u1".into())], true)
+            .await
+            .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(sealed, 1, "两条证据齐备就该封卷");
+    assert_eq!(memorial_status_of(&state, "chA").await, "sealed");
+}
+
+/// 🔴 **别人的 death 待批不该挡住我**：判据必须按 `subject` 精确匹配，
+/// 而不是「只要还有任何待批就都不落定」。后者会让一个世界里先死的人永远封不了卷。
+#[tokio::test]
+async fn someone_elses_pending_death_does_not_block_my_sealing() {
+    let state = test_state().await;
+    let _sw = MemorialSwitch::set(true);
+    seed_landed_death(&state).await;
+    sqlx::query("UPDATE worlds SET narrative_state_json = $1 WHERE id = 'w1'")
+        .bind(engine_state_json(vec![("chB", "death")]))
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    let mut tx = state.db.begin().await.unwrap();
+    let sealed =
+        super::auto_seal_dead_participants_tx(&mut tx, "w1", &[("chA".into(), "u1".into())], true)
+            .await
+            .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(sealed, 1, "🔴 chB 的待批与 chA 无关——按 subject 精确匹配，不是「有待批就全挡」");
+}
+
+/// 🔴 **别的事件类别**（永久退场 / 永久关系变更）的待批也不该挡住 death 的落定判定。
+#[tokio::test]
+async fn a_pending_consent_of_another_kind_does_not_block_death_sealing() {
+    let state = test_state().await;
+    let _sw = MemorialSwitch::set(true);
+    seed_landed_death(&state).await;
+    sqlx::query("UPDATE worlds SET narrative_state_json = $1 WHERE id = 'w1'")
+        .bind(engine_state_json(vec![("chA", "permanent_relation_change")]))
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    let mut tx = state.db.begin().await.unwrap();
+    let sealed =
+        super::auto_seal_dead_participants_tx(&mut tx, "w1", &[("chA".into(), "u1".into())], true)
+            .await
+            .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(
+        sealed, 1,
+        "🔴 判据要同时匹配 subject 与 eventKind；只匹配 subject 会让一条无关的待批把封卷卡死"
+    );
+}
+
+/// 🔴 **死亡判据在本文件里有两份拷贝，必须逐字相同**。
+///
+/// `find_death_evidence`（池版，玩家主动认领走它）与 `death_evidence_holds_tx`（事务版，
+/// 结算内自动封卷走它）各有一份「(a) 有 approved 的 death 且 subject 精确含本卡
+/// + (b) pendingConsents 已不含本卡的 death 条目」。文件里那句
+/// 「任一侧改口径都必须同步改另一侧」是**一句注释**——没有任何东西执行它。
+///
+/// 而这两份**不是**普通重复：它们判的是「这张卡能不能被封卷」，
+/// 也就是一张角色卡能不能被永久转成只读传世卡。两份漂移的后果是
+/// **同一张卡在两条路径上得到不同结论**——玩家主动点封不了，结算却把它封了（或反过来），
+/// 而两边各自的用例都会绿。
+///
+/// ⚠️ 本条是**故障注入实测出来的**：往其中一份注入「不看 eventKind」，四条契约用例全绿，
+/// 因为它们走的是另一份。
+#[test]
+fn red_line_the_two_copies_of_the_death_criterion_stay_identical() {
+    let src = include_str!("mod.rs");
+    // (b) 的匹配式：subject 精确匹配 **且** eventKind 为 death。两处逐字相同。
+    const PENDING_MATCH: &str = "p.get(\"subject\").and_then(Value::as_str) == Some(character_id)";
+    const KIND_MATCH: &str =
+        "p.get(\"eventKind\").and_then(Value::as_str) == Some(EVENT_KIND_DEATH)";
+    assert_eq!(
+        src.matches(PENDING_MATCH).count(),
+        2,
+        "🔴 死亡判据 (b) 的 subject 匹配应当恰好两份（池版 + 事务版）。\
+         变成 1 份 = 某一侧被改过而另一侧没跟上；变成 3 份 = 又长出了第三条路径，\
+         那更该评审——三份靠注释同步是不可能维持的"
+    );
+    assert_eq!(
+        src.matches(KIND_MATCH).count(),
+        2,
+        "🔴 eventKind 匹配也必须两份都在。少一份 = 那一侧会把「永久退场/永久关系变更」的待批\
+         误当成 death 待批，于是那条路径上的卡永远封不了卷"
+    );
+    // (a) 的匹配式：绝不用子串包含（`chA` 会命中 `chAB`）。
+    assert_eq!(
+        src.matches("list.iter().any(|s| s == character_id)").count(),
+        2,
+        "🔴 subject 精确匹配也必须两份都在。任一侧退化成子串包含，都会让一张卡\
+         凭别人的同意被封卷"
+    );
+}

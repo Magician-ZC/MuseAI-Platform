@@ -704,7 +704,11 @@ pub(super) async fn advance_one_beat(
     // 单人平行线里唯一可能被伤到的人就是主人自己，而开这条线的动作本身就是同意。
     // 于是 if 线永不产 ConsentRequested，也就永不去写 `consent_requests`（被禁写入表之一）。
     let approved_consents = vec![row.character_id.clone()];
-    let lethality = effective_lethality(&origin.lethality);
+    // 生死档沿用**原世界**的生效档（分叉点忠实于原世界的契约），故按原世界解析开关。
+    let lethality = effective_lethality(
+        &origin.lethality,
+        crate::worlds::deathmatch_enabled(db, Some(&row.origin_world_id)).await,
+    );
 
     let model: Arc<dyn ModelClient> = match model_override {
         Some(m) => m,

@@ -161,7 +161,11 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
         default_enabled: false,
         owner: "worlds",
         desc: "生死状档（读取侧降级：关闭时既有生死场立即降为同意制）",
-        wired: false,
+        // 🔵 已接线。🔴 **两处 ctx 口径故意不同**：读取侧（join 契约门 / 引擎回灌 / 列表详情投影 /
+        // if 线）按 **world**；建房前门只能按 **global**——建房那一刻世界还不存在。
+        // 于是「全局关、某世界单独开」时该世界的契约照常生效、而新的生死场建不出来，
+        // 两者都对（回答的是两个问题）。口径表见 `worlds::deathmatch_enabled`。
+        wired: true,
     },
     FlagDef {
         name: "MUSE_ROOM_INVITATIONS",
@@ -376,10 +380,15 @@ pub const fn declared_default(name: &str) -> bool {
 ///   「跳过发卡而非报错」（`onboarding` 领礼包时也依赖这个「跳过」语义）。结算路径在
 ///   `runtime` 事务内，`is_enabled` 会查库，**必须确认它不在同一事务的锁持有区间内**，
 ///   否则 SQLite 单连接池会自锁。建议结算侧改用「进事务前解析一次、把 bool 传进事务」。
-/// - `MUSE_LETHALITY_DEATHMATCH`：作用在**读取侧**（`effective_lethality`），关掉后既有生死场
-///   立即降级为同意制。天然适合**按世界**作用域。但它同时被 `admin_api/worlds_ops.rs` 的建房
-///   前门校验读到——建房时世界还不存在，**那一处只能用 global 作用域**（ctx 无 world_id）。
-///   两处口径不同要写清楚，否则会出现「全局关但某世界开，却建不出那个世界」的困惑。
+/// - ~~`MUSE_LETHALITY_DEATHMATCH`~~ —— **已迁（2026-07-27）**。原注预判的两处口径差异全部命中：
+///   读取侧按 **world**，建房前门只能按 **global**（建房那一刻世界还不存在），
+///   于是「全局关但某世界开，却建不出那个世界」确实会发生——现已写进
+///   `worlds::deathmatch_enabled` 的 ctx 口径表并有用例钉住，不再是「困惑」而是有据可查的规则。
+///   🔵 原注没预判到的一条：`effective_lethality` **不能改成 async**。它的调用点里有列表投影的
+///   循环体与引擎回灌，将来还可能被搬进结算事务——一旦它自己会查库，任何一次「顺手挪进事务」
+///   都会在单连接池上自锁，而那种死锁在只跑内存 SQLite 的用例里不一定复现。
+///   故改成**收一个已解析好的 bool**：调用点必须先 `.await` 一次 `deathmatch_enabled` 才拿得到它，
+///   事务边界问题因此在编译期就摆到眼前。这条对下面剩余几个开关同样适用。
 /// - ~~`MUSE_ROOM_INVITATIONS`~~ —— **已迁**（2026-07-27）。当初判断的「第二容易」成立：
 ///   四个端点统一 404，无事务边界问题，改动就是 `ensure_enabled` 变 async + 四个调用点传
 ///   发起人的 user_id。🔵 但迁的时候多发现一条当初没写到的约束：这个开关**不能有 world 作用域**。

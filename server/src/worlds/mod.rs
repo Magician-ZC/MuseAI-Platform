@@ -61,23 +61,51 @@ const ENV_DEATHMATCH_ENABLED: &str = "MUSE_LETHALITY_DEATHMATCH";
 /// 必须运营显式打开本开关，生死状档才可能生效。
 const DEFAULT_DEATHMATCH_ENABLED: bool = false;
 
-/// 生死状档是否已由运营开启（env 覆盖 + 默认常量，范式同 `runtime::token_cny_cents_per_1k`
-/// 与 `interventions::dream_quota_per_stage`——本仓库尚无配置表，env 是当前唯一的运营开关形态；
-/// 将来配置表落地后只改本函数内部，调用点与降级语义不变）。
+/// 🔴 **编译期钉死默认值的两个事实源**（本常量 + `flags::KNOWN_FLAGS`）。
+const _: () = assert!(
+    crate::flags::declared_default(ENV_DEATHMATCH_ENABLED) == DEFAULT_DEATHMATCH_ENABLED,
+    "flags::KNOWN_FLAGS 中 MUSE_LETHALITY_DEATHMATCH 的默认值必须与 DEFAULT_DEATHMATCH_ENABLED 一致"
+);
+
+/// 生死状档是否已由运营开启。
 ///
-/// 开关的定位是**全局急停阀**，不是建房时的一次性校验：它在**读取侧**生效
+/// 开关的定位是**急停阀**，不是建房时的一次性校验：它在**读取侧**生效
 /// （`effective_lethality`），故关掉之后所有已建的生死状世界**立即**降级为同意制
 /// （join 不再要求签署、引擎收到 Consent），再打开则原样恢复。
-pub fn deathmatch_enabled() -> bool {
-    match std::env::var(ENV_DEATHMATCH_ENABLED) {
-        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "on" | "yes" => true,
-            "0" | "false" | "off" | "no" => false,
-            // 配错不静默开启高危档：回落默认（关闭）。
-            _ => DEFAULT_DEATHMATCH_ENABLED,
-        },
-        Err(_) => DEFAULT_DEATHMATCH_ENABLED,
-    }
+///
+/// ════════════════════════════════════════════════════════════════════════════
+/// 🔴 已接入运行时开关体系（`crate::flags`）—— 两处 ctx 口径**故意不同**
+/// ════════════════════════════════════════════════════════════════════════════
+///
+/// | 消费点 | ctx | 为什么 |
+/// |---|---|---|
+/// | 读取侧（`effective_lethality` 的全部调用点：join 契约门 / 引擎回灌 / 列表与详情投影 / if 线） | **world + global** | 问的是「**这个世界**的生死契约生不生效」，天然按世界 |
+/// | 建房前门（`admin_api::worlds_ops` 建/改房校验 `lethality=deathmatch`） | **只能 global** | 建房那一刻**世界还不存在**，没有 world 可解析。这是结构性的，不是选择 |
+///
+/// ⚠️ 由此产生一个必须写清楚的现象，否则会被当成 bug：**全局关、但世界 W 单独开**时，
+/// W 里的生死契约照常生效（读取侧命中 world 记录），而**新的生死场建不出来**（建房走 global）。
+/// 两者都是对的——它们回答的本来就是两个问题：「这个世界的契约算不算数」与
+/// 「现在还允不允许开新的生死场」。反过来（全局开、W 单独关）也自洽：能建新场，W 自己降级。
+///
+/// ════════════════════════════════════════════════════════════════════════════
+/// 🔴 为什么 `effective_lethality` **不改成 async**，而是收一个已解析好的 bool
+/// ════════════════════════════════════════════════════════════════════════════
+///
+/// `flags::is_enabled` 要查库。而 `effective_lethality` 的调用点里有**列表投影的循环体**
+/// 与**引擎回灌**，将来还可能被搬进结算事务——一旦它自己会查库，任何一次「顺手挪进事务」
+/// 都会在单连接池上变成 `PoolTimedOut` 自锁，而那种死锁在只跑内存 SQLite 的用例里
+/// **不一定复现**（见 `flags::MIGRATION_NOTES` 反复强调的那条共同的坑）。
+///
+/// 收 bool 则把「什么时候查库」这个决定**留在调用点、留在类型上**：调用点必须先 `.await`
+/// 一次本函数，才拿得到那个 bool。于是事务边界问题在编译期就被摆到眼前，而不是运行期。
+///
+/// 保留 `ENV_DEATHMATCH_ENABLED` / `DEFAULT_DEATHMATCH_ENABLED`：env 仍是解析链第 ④ 层。
+pub async fn deathmatch_enabled(db: &AnyPool, world_id: Option<&str>) -> bool {
+    let ctx = match world_id {
+        Some(w) => crate::flags::FlagCtx::world(w),
+        None => crate::flags::FlagCtx::global(),
+    };
+    crate::flags::is_enabled(db, ENV_DEATHMATCH_ENABLED, ctx).await
 }
 
 /// 测试专用：生死状运营开关的 RAII 夹具。
@@ -125,10 +153,11 @@ pub fn is_valid_lethality(raw: &str) -> bool {
 /// 两处降级（方向恒为更保守，绝不反向）：
 /// - 非法/未知值（脏数据、未来枚举回滚）→ `Consent`：默认档即现行机制，不放大死亡权限。
 /// - `deathmatch` 但运营开关未开 → `Consent`：未验证功能默认关闭（VALIDATION.md §0.1）。
-pub fn effective_lethality(stored: &str) -> Lethality {
+/// `deathmatch_on` 由调用方经 [`deathmatch_enabled`] 解析好传入（**不在此处查库**，理由见那里）。
+pub fn effective_lethality(stored: &str, deathmatch_on: bool) -> Lethality {
     match stored {
         LETHALITY_SANCTUARY => Lethality::Sanctuary,
-        LETHALITY_DEATHMATCH if deathmatch_enabled() => Lethality::Deathmatch,
+        LETHALITY_DEATHMATCH if deathmatch_on => Lethality::Deathmatch,
         // deathmatch 但开关未开 → 降级；其余（consent / 非法值）→ 默认档。
         _ => Lethality::Consent,
     }
@@ -137,8 +166,15 @@ pub fn effective_lethality(stored: &str) -> Lethality {
 /// 生效契约档的 JSON 投影值（字面量与落库枚举一致）。大厅/详情把它明示给玩家——
 /// 「join 前明示」（规格 §11）的前提是**列表页与详情页看得见档位**，冷静提示由前端据此渲染。
 /// 投影的是**生效档**而非落库原值：开关未开时玩家看到的就是同意制，所见即所签。
-pub fn lethality_label(stored: &str) -> &'static str {
-    match effective_lethality(stored) {
+pub fn lethality_label(stored: &str, deathmatch_on: bool) -> &'static str {
+    lethality_str(effective_lethality(stored, deathmatch_on))
+}
+
+/// 生效档 → 落库/投影字面量。抽出来是为了让**已经算过一次**的调用点能直接投影，
+/// 不必为了拿字符串再解析一遍开关（两次解析之间开关被翻，就会出现「签的那一档」与
+/// 「回执写的那一档」对不上）。
+pub fn lethality_str(l: Lethality) -> &'static str {
+    match l {
         Lethality::Sanctuary => LETHALITY_SANCTUARY,
         Lethality::Consent => LETHALITY_CONSENT,
         Lethality::Deathmatch => LETHALITY_DEATHMATCH,
@@ -370,7 +406,17 @@ const COVER_AND_TICK_COLUMNS: &str = "cover_url, cover_moderation, timeline_mode
 
 /// 列表项投影（new/hot 共用；hot 分支再追加 hotScore）。
 /// `now` 由调用方一次算好传入——同一页所有世界的"下一拍"基于同一个 now，页内自洽。
-fn world_list_item(row: &sqlx::any::AnyRow, id: &str, now: i64) -> Result<Value, ApiError> {
+///
+/// `deathmatch_on` 由调用方**逐世界**解析后传入（本函数保持同步、不查库）：生死状开关是
+/// **按世界**作用域的，同一页里 A 世界开着而 B 世界被单独关掉是合法状态，
+/// 整页共用一个 bool 会把其中一半世界的档位显示错。解析本身经 `flags` 的整表快照缓存，
+/// 一页 N 个世界不产生 N 次查库。
+fn world_list_item(
+    row: &sqlx::any::AnyRow,
+    id: &str,
+    now: i64,
+    deathmatch_on: bool,
+) -> Result<Value, ApiError> {
     let status: String = row.try_get("status")?;
     let tick_per_day: i64 = row.try_get("tick_per_day")?;
     let mut item = json!({
@@ -384,7 +430,7 @@ fn world_list_item(row: &sqlx::any::AnyRow, id: &str, now: i64) -> Result<Value,
         "tickPerDay": tick_per_day,
         "starRating": row.try_get::<i64, _>("star_rating")?,
         // 生死契约档（§11）：与 starRating 并列的独立维度，供大厅筛选「选难度 = 选星级 × 选契约」。
-        "lethality": lethality_label(&row.try_get::<String, _>("lethality")?),
+        "lethality": lethality_label(&row.try_get::<String, _>("lethality")?, deathmatch_on),
         "aiLabel": { "visible": true },
     });
 
@@ -491,7 +537,8 @@ async fn list_worlds_new(
         let created_at: i64 = row.try_get("created_at")?;
         let id: String = row.try_get("id")?;
         next_cursor = Some(format!("{created_at}:{id}"));
-        items.push(world_list_item(row, &id, now)?);
+        let dm = deathmatch_enabled(&state.db, Some(&id)).await;
+        items.push(world_list_item(row, &id, now, dm)?);
     }
     if !has_more {
         next_cursor = None;
@@ -552,7 +599,8 @@ async fn list_worlds_hot(
     let mut items = Vec::new();
     for row in &rows {
         let id: String = row.try_get("id")?;
-        let mut item = world_list_item(row, &id, now)?;
+        let dm = deathmatch_enabled(&state.db, Some(&id)).await;
+        let mut item = world_list_item(row, &id, now, dm)?;
         item["hotScore"] = json!(row.try_get::<i64, _>("hot_score")?);
         items.push(item);
     }
@@ -593,6 +641,10 @@ async fn world_detail(
 ) -> Result<Json<Value>, ApiError> {
     let world = load_world(&state.db, &id).await?;
     ensure_world_readable(&state.db, &world, &user).await?;
+    // 本世界的生死状开关（world > global > env > 默认）。整个详情投影共用这一次解析：
+    // 同一份响应里 `lethality` 与 `deathContractRequired` 必须出自同一个判定，
+    // 各解析一次会在开关被翻的瞬间产出「档位说同意制、却要求签生死状」的自相矛盾响应。
+    let detail_deathmatch_on = deathmatch_enabled(&state.db, Some(&id)).await;
 
     // 公开阵容：active 成员 + 角色公开名（AI 标识）+ 头像（仅过审才带）。
     // 🔴 次级键 `cloud_character_id` 不可省：`joined_at` 是毫秒，同毫秒入场的两名成员
@@ -663,10 +715,10 @@ async fn world_detail(
         "starRating": star_rating,
         // 生死契约档（§11【拍板 24】）：与星级正交的风险维度。**join 前明示**的载体——
         // 前端据此在投放前渲染档位说明与冷静提示；生死状档还须玩家二次确认（见 join 的 acceptDeathContract）。
-        "lethality": lethality_label(&world.lethality),
+        "lethality": lethality_label(&world.lethality, detail_deathmatch_on),
         // 生死状世界的入场契约要求（客户端不必硬编码规则）：true 时 join 必须带 acceptDeathContract=true，
         // 且仅已声明成年（真红线 §0.4 未成年禁入生死状）可入。
-        "deathContractRequired": lethality_label(&world.lethality) == LETHALITY_DEATHMATCH,
+        "deathContractRequired": lethality_label(&world.lethality, detail_deathmatch_on) == LETHALITY_DEATHMATCH,
         // 客户端干预用 expectedWorldRevision 做乐观并发校验（C1 集成缝）。
         "stateRevision": world.state_revision,
         "templateId": world.template_id,
@@ -926,7 +978,8 @@ async fn join_world(
     // ---------- 生死契约入场门（§11【拍板 24】，与星级/历练三维正交） ----------
     // 生效档由落库值经运营开关归一：开关未开的生死状降级为同意制 → 本段整体跳过。
     // 庇护/同意制世界（含**全部历史世界**，0026 默认 'consent'）本段零动作，行为与历史完全一致。
-    let lethality = effective_lethality(&world.lethality);
+    // 🔴 与列表/详情/引擎回灌同一口径：**按世界**解析（world > global > env > 默认）。
+    let lethality = effective_lethality(&world.lethality, deathmatch_enabled(&state.db, Some(&id)).await);
     if lethality == Lethality::Deathmatch {
         // 🔴 真红线 §0.4 未成年人保护：**未成年禁入生死状**。
         // fail-closed：仅 age_declared==1（已声明成年）放行；未声明(0)、未成年(2)、用户行缺失
@@ -1142,7 +1195,9 @@ async fn join_world(
         "cloudCharacterId": body.cloud_character_id,
         "status": "active",
         // 回执明示本次入场生效的契约档（生死状时即"你已签署"的凭据面）。
-        "lethality": lethality_label(&world.lethality),
+        // 复用上面契约门算出的那一个 `lethality`，**不重解析**——两次解析之间开关若被翻，
+        // 回执就会与刚刚生效的那一档不一致（玩家签的和回执写的对不上）。
+        "lethality": lethality_str(lethality),
     });
     guard.store_response(&state.db, &response.to_string()).await?;
     Ok(Json(response))

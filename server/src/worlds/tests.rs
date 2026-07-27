@@ -1038,7 +1038,7 @@ mod lethality {
         assert_eq!(stored_lethality(&state, &wid).await, LETHALITY_CONSENT, "历史行须落同意制");
         let world = load_world(&state.db, &wid).await.unwrap();
         assert_eq!(
-            effective_lethality(&world.lethality),
+            effective_lethality(&world.lethality, deathmatch_enabled(&state.db, Some(&wid)).await),
             Lethality::Consent,
             "历史世界生效档 = 同意制（引擎侧行为与迁移前完全一致）"
         );
@@ -1078,40 +1078,51 @@ mod lethality {
 
     // ---------- 枚举归一 + 运营开关（VALIDATION.md §0.1 未验证功能默认关闭） ----------
 
-    #[test]
-    fn deathmatch_switch_defaults_to_off() {
+    /// env 语义（解析链第 ④ 层）。接入 `flags` 体系后**这三条一字未改**——
+    /// 空 `runtime_flags` 表上解析必然落到 env，这正是「行为零变化」的回归保护。
+    #[tokio::test]
+    async fn deathmatch_switch_defaults_to_off() {
+        let state = test_state().await;
         let _sw = DeathmatchSwitch::set(false);
         std::env::remove_var("MUSE_LETHALITY_DEATHMATCH");
-        assert!(!deathmatch_enabled(), "生死状档必须默认关闭（未验证功能默认关闭）");
+        assert!(!deathmatch_enabled(&state.db, None).await, "生死状档必须默认关闭（未验证功能默认关闭）");
         // 配错的值不得静默开启高危档。
         std::env::set_var("MUSE_LETHALITY_DEATHMATCH", "maybe");
-        assert!(!deathmatch_enabled(), "非法开关值须回落关闭");
+        assert!(!deathmatch_enabled(&state.db, None).await, "非法开关值须回落关闭");
         std::env::set_var("MUSE_LETHALITY_DEATHMATCH", "on");
-        assert!(deathmatch_enabled(), "显式 on 应开启");
+        assert!(deathmatch_enabled(&state.db, None).await, "显式 on 应开启");
     }
 
+    /// 声明默认值与模块内常量同源（编译期已由 `const _: () = assert!(...)` 钉死）。
+    #[test]
+    fn deathmatch_flag_default_is_declared_consistently() {
+        assert!(!super::super::DEFAULT_DEATHMATCH_ENABLED, "🔴 §0.1：未验证功能默认关闭");
+        assert_eq!(
+            crate::flags::declared_default("MUSE_LETHALITY_DEATHMATCH"),
+            super::super::DEFAULT_DEATHMATCH_ENABLED
+        );
+    }
+
+    /// 归一化本身是**纯函数**（收一个已解析好的 bool，不查库）——这正是它不改成 async 的意义：
+    /// 事务边界由调用点负责，本函数在任何位置调用都不会自锁。
     #[test]
     fn effective_lethality_degrades_conservatively() {
-        {
-            let _sw = DeathmatchSwitch::set(false);
-            assert_eq!(
-                effective_lethality(LETHALITY_DEATHMATCH),
-                Lethality::Consent,
-                "开关未开 → 生死状降级为同意制"
-            );
-            assert_eq!(lethality_label(LETHALITY_DEATHMATCH), LETHALITY_CONSENT, "投影同步降级");
+        assert_eq!(
+            effective_lethality(LETHALITY_DEATHMATCH, false),
+            Lethality::Consent,
+            "开关未开 → 生死状降级为同意制"
+        );
+        assert_eq!(lethality_label(LETHALITY_DEATHMATCH, false), LETHALITY_CONSENT, "投影同步降级");
+        assert_eq!(effective_lethality(LETHALITY_DEATHMATCH, true), Lethality::Deathmatch);
+        assert_eq!(lethality_label(LETHALITY_DEATHMATCH, true), LETHALITY_DEATHMATCH);
+        // 开关无关的两档 + 脏数据兜底（`deathmatch_on` 取哪个值都一样）。
+        for on in [false, true] {
+            assert_eq!(effective_lethality(LETHALITY_SANCTUARY, on), Lethality::Sanctuary);
+            assert_eq!(effective_lethality(LETHALITY_CONSENT, on), Lethality::Consent);
+            assert_eq!(effective_lethality("", on), Lethality::Consent, "空值 → 默认档");
+            assert_eq!(effective_lethality("DEATHMATCH", on), Lethality::Consent, "大小写不匹配 → 默认档");
+            assert_eq!(effective_lethality("bogus", on), Lethality::Consent, "未知值 → 默认档");
         }
-        {
-            let _sw = DeathmatchSwitch::set(true);
-            assert_eq!(effective_lethality(LETHALITY_DEATHMATCH), Lethality::Deathmatch);
-            assert_eq!(lethality_label(LETHALITY_DEATHMATCH), LETHALITY_DEATHMATCH);
-        }
-        // 开关无关的两档 + 脏数据兜底。
-        assert_eq!(effective_lethality(LETHALITY_SANCTUARY), Lethality::Sanctuary);
-        assert_eq!(effective_lethality(LETHALITY_CONSENT), Lethality::Consent);
-        assert_eq!(effective_lethality(""), Lethality::Consent, "空值 → 默认档");
-        assert_eq!(effective_lethality("DEATHMATCH"), Lethality::Consent, "大小写不匹配 → 默认档");
-        assert_eq!(effective_lethality("bogus"), Lethality::Consent, "未知值 → 默认档");
     }
 
     // ---------- join 契约签署：二次确认 ----------
@@ -1296,7 +1307,8 @@ mod lethality {
         let wid = seed_world_with(&state, "被降级的生死场", LETHALITY_DEATHMATCH).await;
         assert_eq!(stored_lethality(&state, &wid).await, LETHALITY_DEATHMATCH, "落库值保留意图");
         let world = load_world(&state.db, &wid).await.unwrap();
-        assert_eq!(effective_lethality(&world.lethality), Lethality::Consent, "生效档降级为同意制");
+        let dm = deathmatch_enabled(&state.db, Some(&wid)).await;
+        assert_eq!(effective_lethality(&world.lethality, dm), Lethality::Consent, "生效档降级为同意制");
 
         let tk = token(&state, "usrOff");
         // 详情页所见即所签：显示的是降级后的同意制，且不要求签署。
@@ -1318,6 +1330,83 @@ mod lethality {
         assert_eq!(sign_audit_count(&state, &wid).await, 0, "未生效的生死状不得留签署痕");
     }
 
+    // ---------- 运行时开关体系：按世界灰度 + 两处 ctx 口径故意不同 ----------
+
+    /// 往 `runtime_flags` 写一条 enabled=1（不设 env，避免与并发用例互踩）。
+    async fn write_dm_flag(db: &sqlx::AnyPool, scope: &str, target: &str) {
+        sqlx::query(
+            "INSERT INTO runtime_flags (id, flag, scope, target_id, enabled, starts_at, ends_at, \
+             updated_by, updated_at, reason, created_at) \
+             VALUES ($1, 'MUSE_LETHALITY_DEATHMATCH', $2, $3, 1, 0, 0, 'test', $4, 'test', $5)",
+        )
+        .bind(crate::db::new_id("rf"))
+        .bind(scope)
+        .bind(target)
+        .bind(crate::db::now_ms())
+        .bind(crate::db::now_ms())
+        .execute(db)
+        .await
+        .expect("write flag");
+    }
+
+    /// 🔴 **按世界灰度真的生效，且只对那个世界生效**。这是接入 `flags` 体系的行为增量：
+    /// env 时代只能全局一刀切，于是「先在一个世界上试生死状」做不到。
+    #[tokio::test]
+    async fn deathmatch_grayscale_is_per_world() {
+        let _sw = DeathmatchSwitch::set(false); // 全局关（env 层）
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_user(&state, "usrG").await;
+        seed_char(&state, "chG", "usrG", "approved", 1).await;
+        let opened = seed_world_with(&state, "试点生死场", LETHALITY_DEATHMATCH).await;
+        let other = seed_world_with(&state, "另一个生死场", LETHALITY_DEATHMATCH).await;
+        write_dm_flag(&state.db, crate::flags::SCOPE_WORLD, &opened).await;
+
+        let tk = token(&state, "usrG");
+        let (_st, d1) = get_json(&app, &format!("/api/worlds/{opened}"), &tk).await;
+        assert_eq!(d1["lethality"], LETHALITY_DEATHMATCH, "被灰度选中的世界生效");
+        assert_eq!(d1["deathContractRequired"], true, "🔴 同一份响应里两个字段必须同源");
+
+        let (_st, d2) = get_json(&app, &format!("/api/worlds/{other}"), &tk).await;
+        assert_eq!(d2["lethality"], LETHALITY_CONSENT, "🔴 没被选中的世界不得跟着生效");
+        assert_eq!(d2["deathContractRequired"], false);
+    }
+
+    /// 🔴 **两处 ctx 口径故意不同，且这不是 bug**：全局关 + 世界 W 单独开时——
+    /// W 的契约照常生效（读取侧按 world），而**新的生死场建不出来**（建房前门只能按 global，
+    /// 因为建房那一刻世界还不存在）。两者回答的是两个不同的问题。
+    #[tokio::test]
+    async fn create_gate_reads_global_while_read_side_reads_world() {
+        let _sw = DeathmatchSwitch::set(false);
+        let state = test_state().await;
+        let app = build_router(state.clone());
+        seed_user(&state, "usrC").await;
+        seed_char(&state, "chC", "usrC", "approved", 1).await;
+        let wid = seed_world_with(&state, "试点生死场", LETHALITY_DEATHMATCH).await;
+        write_dm_flag(&state.db, crate::flags::SCOPE_WORLD, &wid).await;
+
+        // 读取侧：这个世界的生死状生效。
+        let dm = deathmatch_enabled(&state.db, Some(&wid)).await;
+        assert!(dm, "world 记录应当命中");
+        assert_eq!(effective_lethality(LETHALITY_DEATHMATCH, dm), Lethality::Deathmatch);
+
+        // 建房侧：世界还不存在 ⇒ 只能问 global ⇒ 仍是关的。
+        assert!(
+            !deathmatch_enabled(&state.db, None).await,
+            "🔴 建房前门读 global：给某个已存在世界开闸，不等于允许开新的生死场"
+        );
+        let admin = crate::auth::issue_access(&state.config.jwt_secret, "adm1", "admin", 3600).unwrap();
+        let (st, body) = post_json(
+            &app,
+            "/api/admin/worlds",
+            &admin,
+            None,
+            json!({ "templateId": "tpl", "title": "新生死场", "lethality": LETHALITY_DEATHMATCH }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "新的生死场应被前门拒绝: {body}");
+    }
+
     // ---------- 引擎回灌：runtime 从世界行取档，而非恒传默认 ----------
 
     /// runtime 组装 RoundInput 时必须**从世界行回灌**契约档，且必须复用 `effective_lethality`
@@ -1328,8 +1417,15 @@ mod lethality {
     fn runtime_backfills_lethality_from_world_row() {
         let runtime_src = include_str!("../runtime/mod.rs");
         assert!(
-            runtime_src.contains("lethality: effective_lethality(&world.lethality)"),
+            runtime_src.contains("lethality: effective_lethality(&world.lethality, tick_deathmatch_on)"),
             "runtime 组装 RoundInput 必须从 worlds.lethality 回灌生效档"
+        );
+        // 🔴 那个 bool 必须**在进事务之前**按本世界解析好。若有人图省事写成
+        // `deathmatch_enabled(&state.db, None)`（全局档），按世界的急停阀在引擎侧就失效了：
+        // 运营给某个世界单独关掉生死状，玩家 join 时看到同意制，引擎却仍按生死状跑。
+        assert!(
+            runtime_src.contains("deathmatch_enabled(&state.db, Some(world_id)).await"),
+            "🔴 引擎回灌必须按**本世界**解析开关，与 join 契约门同一口径"
         );
         assert!(
             !runtime_src.contains("lethality: Lethality::default()"),

@@ -330,10 +330,12 @@ async fn load_world_brief(db: &AnyPool, world_id: &str) -> Result<WorldBrief, Ap
 /// 真正的禁入判定仍在 join，本函数只是把侧路提前堵住，不替代 join。
 async fn deathmatch_age_gate_ok(
     db: &AnyPool,
+    world_id: &str,
     world: &WorldBrief,
     user_id: &str,
 ) -> Result<bool, ApiError> {
-    if effective_lethality(&world.lethality) != Lethality::Deathmatch {
+    let dm = crate::worlds::deathmatch_enabled(db, Some(world_id)).await;
+    if effective_lethality(&world.lethality, dm) != Lethality::Deathmatch {
         return Ok(true);
     }
     let age: Option<(i64,)> = sqlx::query_as("SELECT age_declared FROM users WHERE id = $1")
@@ -422,7 +424,7 @@ async fn create_invitation(
 
     // 🔴 未成年保护前门：不让未成年收到通往生死状世界的邀请。
     // 拒绝文案统一为 REFUSE_GENERIC —— 不得让邀请人从错误码里读出对方的年龄声明。
-    if !deathmatch_age_gate_ok(&state.db, &world, &invitee_user_id).await? {
+    if !deathmatch_age_gate_ok(&state.db, &world_id, &world, &invitee_user_id).await? {
         return Err(ApiError::Conflict(REFUSE_GENERIC.into()));
     }
 
@@ -687,7 +689,7 @@ async fn respond(
         }
         // 🔴 未成年保护读取侧复查（双保险）：世界中途升档、或运营把生死状开关打开时，
         // 已发出的邀请也不得成为侧路。403 = 永久禁入（口径同 join 的生死状红线分支）。
-        if !deathmatch_age_gate_ok(&state.db, &world, &user.user_id).await? {
+        if !deathmatch_age_gate_ok(&state.db, &world_id, &world, &user.user_id).await? {
             return Err(ApiError::Forbidden);
         }
         STATUS_ACCEPTED

@@ -223,7 +223,16 @@
   顺手传上——那样运营给某个世界单独开闸就会产出**一封谁都答不了的邀请**（发件侧命中 world
   记录而开，收件侧 `/me/invitations` 跨世界、结构上没有 world，落到 global 而关）。
   两条新用例钉住：按人灰度真的生效 · 写 world 记录时两侧**都不开**（不是开一半）。
-- 未迁：`MUSE_SUBPLOT_CARDS` · `MUSE_LETHALITY_DEATHMATCH` · `MUSE_CONTAINER_ASSEMBLY` ·
+- ~~`MUSE_LETHALITY_DEATHMATCH`~~ —— **已迁（2026-07-27）**。原注预判的两处口径差异全部命中：
+  读取侧（join 契约门 / 引擎回灌 / 列表详情投影 / if 线）按 **world**，建房前门只能按 **global**
+  （建房那一刻世界还不存在）。于是「全局关但某世界开、却建不出新的生死场」确实会发生——
+  现已写进 `worlds::deathmatch_enabled` 的 ctx 口径表并有用例钉住，不再是「困惑」而是规则。
+  🔵 原注没预判到的一条：**`effective_lethality` 不能改成 async**。它的调用点里有列表投影的
+  循环体与引擎回灌，将来还可能被搬进结算事务——一旦它自己会查库，任何一次「顺手挪进事务」
+  都会在单连接池上自锁，而那种死锁在只跑内存 SQLite 的用例里不一定复现。故改成**收一个
+  已解析好的 bool**：调用点必须先 `.await` 一次 `deathmatch_enabled` 才拿得到它，
+  事务边界问题因此在**编译期**摆到眼前。这条对下面剩余几个开关同样适用。
+- 未迁：`MUSE_SUBPLOT_CARDS` · `MUSE_CONTAINER_ASSEMBLY` ·
   `MUSE_MEMORIAL` · `MUSE_WORLD_SERIES_AUTOSCALE` · `MUSE_WORLD_BE_BIOGRAPHY` ·
   `MUSE_SAFETY_LEXICON`（🔴 最后迁或不迁）。
 
@@ -271,7 +280,7 @@
 `admin_api::audit::writeback_target` 现在返回回写坐标，`world_events` 上因此有了全仓
 **唯一一条放宽语句**（`SET` 只有 `moderation` 一列、按主键点名、CAS、起点白名单写死在 SQL 里），
 权限分 reviewer / admin 两档，三条写入路径由源码级红线用例全仓盘点 ·
-**其余存量 env 开关接入运行时开关体系**（房间邀请已迁，清单与注意事项见上）·
+**其余存量 env 开关接入运行时开关体系**（生死状档与房间邀请已迁，清单与注意事项见上）·
 **处置申诉只覆盖 `character` / `character_avatar` 两类主体**（如实的范围，不是遗漏：
 `world_cover` 属于世界、`world_templates` 根本没有 owner 列，给它们开申诉入口只会得到一个
 没人有资格提交的端点；要覆盖需先定义"世界封面 / 模板的作者是谁"这条产品口径）。

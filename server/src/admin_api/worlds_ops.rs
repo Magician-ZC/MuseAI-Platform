@@ -251,6 +251,9 @@ pub(super) async fn diagnostics(
 ) -> Result<Json<Value>, ApiError> {
     require_role(&admin, &["operator"])?;
     let world = load_world(&state.db, &id).await?; // 不存在 → NotFound
+    // 生效档要照**这个世界**的开关算（world > global > env > 默认）——运营看的就是
+    // 「落库意图 vs 实际生效」这一对，用全局值算会让按世界的急停阀在诊断页上看不见。
+    let dm_on = deathmatch_enabled(&state.db, Some(&id)).await;
 
     // 最近 10 个 tick 的元数据（含错误码），不含叙事产物。
     let tick_rows = sqlx::query(
@@ -397,7 +400,7 @@ pub(super) async fn diagnostics(
             // 生死契约档（§11）：lethality = 落库原值（建房意图）；effectiveLethality = 实际生效档。
             // 二者不一致即「运营开关正在把生死状降级为同意制」，运营一眼可辨急停阀是否生效。
             "lethality": world.lethality,
-            "effectiveLethality": crate::worlds::lethality_label(&world.lethality),
+            "effectiveLethality": crate::worlds::lethality_label(&world.lethality, dm_on),
         },
         "ticks": ticks,
         "budget": budget_json,
@@ -606,7 +609,11 @@ pub(super) async fn create_world(
         // 代码合并不等于对用户开放——必须运营先打开开关（MUSE_LETHALITY_DEATHMATCH），才允许建生死场。
         // 建房这一道是"前门拒绝"（建不出来），读取侧 worlds::effective_lethality 还有一道
         // "后门降级"（开关关掉后既有生死场立即按同意制跑），两道都在，开关才是真的急停阀。
-        if l == LETHALITY_DEATHMATCH && !deathmatch_enabled() {
+        //
+        // 🔴 **这一处只能用 global 作用域**：建房那一刻世界还不存在，没有 world 可解析。
+        // 于是「全局关、但世界 W 单独开」时 W 里的契约照常生效，而新的生死场建不出来——
+        // 两者都对，它们回答的是两个问题（见 `worlds::deathmatch_enabled` 的 ctx 口径表）。
+        if l == LETHALITY_DEATHMATCH && !deathmatch_enabled(&state.db, None).await {
             return Err(ApiError::BadRequest(
                 "生死状档尚未开启：该档属未验证功能，需运营先显式打开开关（MUSE_LETHALITY_DEATHMATCH）后方可建生死场"
                     .into(),

@@ -2519,6 +2519,11 @@ async fn process_tick_inner(
             model: model.clone(),
         };
         let engine = NarrativeEngine::new(Arc::new(host));
+        // 🔴 生死状开关**在这里、进事务之前**解析一次（`flags::is_enabled` 要查库，
+        // 而下面的引擎回合与随后的 `commit_tick` 事务之间不能再插入查库操作——
+        // 单连接池上那是 `PoolTimedOut` 自锁，且未必在内存 SQLite 用例里复现）。
+        // 按**本世界**解析，与 join 契约门、列表/详情投影同一口径：玩家签的那一档就是引擎跑的那一档。
+        let tick_deathmatch_on = crate::worlds::deathmatch_enabled(&state.db, Some(world_id)).await;
         let input = RoundInput {
             run_id: run_id.clone(),
             mode: RunMode::Observe,
@@ -2558,7 +2563,7 @@ async fn process_tick_inner(
             // 不可能出现"签了生死状却跑同意制"或反过来的错配。
             // 两处保守降级都在该函数内：非法/未知值 → 同意制；生死状但运营开关未开 → 同意制
             //（未验证功能默认关闭，VALIDATION.md §0.1）。历史世界落库即 'consent'，行为零变化。
-            lethality: effective_lethality(&world.lethality),
+            lethality: effective_lethality(&world.lethality, tick_deathmatch_on),
             // 境界档 / 本篇戏服（总规格 §6【拍板 3】「戏服原则」）：装配钉住的戏服 → 引擎入场导演。
             // 「境界档全员统一，入场导演统一设定」——所以是一个 Option 而不是 per-character 的表，
             // 多地点组时每组导演也拿同一件（分地点分化就成了数值差）。

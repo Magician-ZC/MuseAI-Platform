@@ -948,6 +948,11 @@ async fn list_endpoint_reports_effective_global_state() {
         wired,
         vec![
             F,
+            // 🔵 `MUSE_LETHALITY_DEATHMATCH` / `MUSE_ROOM_INVITATIONS` 是 `MIGRATION_NOTES`
+            // 清单上迁走的头两个。前者的 ctx 口径**两处不同**（读取侧按 world、建房前门只能按
+            // global），理由见 `worlds::deathmatch_enabled`；后者刻意**不含 world**，
+            // 理由见 `invitations::invitations_enabled`——两条相反的结论，都不是随手定的。
+            "MUSE_LETHALITY_DEATHMATCH",
             // 🔵 `MUSE_ROOM_INVITATIONS` 是 `MIGRATION_NOTES` 清单上迁走的第一个
             // （0036 参考接线之后）。它排在这里而不是队尾，是因为登记表按**归属模块**分组、
             // 不按接线时间排——本断言比的是 `KNOWN_FLAGS` 的声明顺序。

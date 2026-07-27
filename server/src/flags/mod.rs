@@ -154,7 +154,10 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
         default_enabled: false,
         owner: "subplot",
         desc: "副本卡（结算铸卡 + 同星合成）",
-        wired: false,
+        // 🔵 已接线。🔴 **两处 ctx 口径故意不同**：端点侧（读/合成）按 **user**，
+        // 结算铸卡按 **world**——结算是一个世界事件、多个卡主，按人解析就得在事务里逐 owner
+        // 查库，而那正是单连接池自锁的来源。口径表见 `subplot::subplot_cards_enabled`。
+        wired: true,
     },
     FlagDef {
         name: "MUSE_LETHALITY_DEATHMATCH",

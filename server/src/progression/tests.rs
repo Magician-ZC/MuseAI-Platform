@@ -1035,8 +1035,9 @@ async fn settlement_path_seals_biography_only_on_collapse() {
     let participants =
         vec![("c_be1".to_string(), "u_be1".to_string()), ("c_be2".to_string(), "u_be2".to_string())];
 
+    let f = SettlementFlags::resolve(&state.db, &collapsed_world).await;
     let mut tx = state.db.begin().await.unwrap();
-    settle_idle_world_ending_tx(&mut tx, &collapsed_world, &participants, true).await.unwrap();
+    settle_idle_world_ending_tx(&mut tx, &collapsed_world, &participants, true, f).await.unwrap();
     tx.commit().await.unwrap();
 
     // ① 保底层减半（§9 崩塌：③归零 + ①减半 + ②已锁定保留）。
@@ -1052,8 +1053,9 @@ async fn settlement_path_seals_biography_only_on_collapse() {
     .await
     .unwrap();
     seed_world_ended_audit(&state, &normal_world, "mainline_complete", "ending_ok").await;
+    let f = SettlementFlags::resolve(&state.db, &normal_world).await;
     let mut tx = state.db.begin().await.unwrap();
-    settle_idle_world_ending_tx(&mut tx, &normal_world, &participants, false).await.unwrap();
+    settle_idle_world_ending_tx(&mut tx, &normal_world, &participants, false, f).await.unwrap();
     tx.commit().await.unwrap();
     assert!(biography_rows(&state, &normal_world).await.is_empty(), "正常终局不产出 BE 传记");
 }
@@ -1066,12 +1068,14 @@ async fn be_biography_rolls_back_with_failed_settlement() {
     let wid = seed_played_world(&state).await;
     seed_world_ended_audit(&state, &wid, "key_character_exit", "none").await;
 
+    let f = SettlementFlags::resolve(&state.db, &wid).await;
     let mut tx = state.db.begin().await.unwrap();
     settle_idle_world_ending_tx(
         &mut tx,
         &wid,
         &[("c_be1".to_string(), "u_be1".to_string())],
         true,
+        f,
     )
     .await
     .unwrap();

@@ -350,14 +350,48 @@ pub(crate) fn resolve_payout_tier(table: &PayoutTable, score: f64) -> Option<&Pa
 /// 副本卡一律 `subplot::grant_card_tx`（自带 DB 幂等键），一律不直插任何表。
 ///
 /// 返回已发放明细（供 chapters::finish 回给前端；无产出表 / 无贡献者 → 空 Vec，不报错）。
+/// 🔴 **结算期需要的全部运营开关，在进事务之前解析好的一份快照。**
+///
+/// 为什么要这么一个结构体，而不是给结算函数各加一个 `bool` 参数：
+///
+/// 1. **事务边界**：结算路径（`chapters::finish`、`runtime::finalize_ending_tx`）全程持有一个
+///    事务，而 `flags::is_enabled` 要查库——单连接池上在事务里再借连接就是 `PoolTimedOut`
+///    自锁，且那种死锁**在只跑内存 SQLite 的用例里不一定复现**。所以只能在事务外解析。
+/// 2. **参数不爆炸**：结算事务里挂着的开关不止一个（副本卡铸卡 / 传世卡自动封卷 /
+///    BE 结局传记，见 `flags::MIGRATION_NOTES`）。一个一个加 bool，
+///    `settle_idle_world_ending_tx` 迟早变成七个 bool 的函数，且调用点没人看得出哪个是哪个。
+/// 3. **一处可查**：「结算这一刻，哪些开关是开的」变成一个能打印、能断言、能进日志的值。
+///
+/// 🔴 **ctx 一律取 world**：结算是**一个世界事件、多个卡主**。要按人解析就得在事务里
+/// 逐 owner 查库——正是第 1 条要避开的东西。端点侧仍按人解析（见各模块自己的说明）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct SettlementFlags {
+    /// 副本卡铸卡（`MUSE_SUBPLOT_CARDS`）。关 = 结算一张不铸，**不报错**。
+    pub(crate) subplot_cards: bool,
+}
+
+impl SettlementFlags {
+    /// 在**进事务之前**解析（按世界）。调用点：每个 `db.begin()` 的上方。
+    pub(crate) async fn resolve(db: &AnyPool, world_id: &str) -> Self {
+        Self {
+            subplot_cards: crate::subplot::subplot_cards_enabled(
+                db,
+                crate::flags::FlagCtx::world(world_id),
+            )
+            .await,
+        }
+    }
+}
+
 pub(crate) async fn settle_worldline_tx(
     tx: &mut Transaction<'_, Any>,
     world_id: &str,
     participants: &[(String, String)],
     collapsed: bool,
+    flags: SettlementFlags,
 ) -> Result<Vec<Value>, ApiError> {
     let ctx = load_payout_context_tx(tx, world_id).await?;
-    settle_worldline_with_ctx_tx(tx, world_id, participants, collapsed, &ctx).await
+    settle_worldline_with_ctx_tx(tx, world_id, participants, collapsed, &ctx, flags).await
 }
 
 async fn settle_worldline_with_ctx_tx(
@@ -366,6 +400,7 @@ async fn settle_worldline_with_ctx_tx(
     participants: &[(String, String)],
     collapsed: bool,
     ctx: &PayoutContext,
+    flags: SettlementFlags,
 ) -> Result<Vec<Value>, ApiError> {
     // 未声明产出表 / 表内无档位 → ③ 层默认关闭（VALIDATION §0.1），不发放也不报错。
     let Some(table) = ctx.table.as_ref().filter(|t| !t.worldline_tiers.is_empty()) else {
@@ -451,6 +486,7 @@ async fn settle_worldline_with_ctx_tx(
             user_id,
             score,
             ctx.star_rating,
+            flags.subplot_cards,
         )
         .await?;
 
@@ -497,6 +533,7 @@ pub(crate) async fn settle_idle_world_ending_tx(
     world_id: &str,
     participants: &[(String, String)],
     collapsed: bool,
+    flags: SettlementFlags,
 ) -> Result<(), ApiError> {
     let ctx = load_payout_context_tx(tx, world_id).await?;
 
@@ -509,7 +546,7 @@ pub(crate) async fn settle_idle_world_ending_tx(
     }
 
     // ③ 世界线层：里程碑推动者按贡献分查公示产出表确定发放（崩塌归零）。
-    settle_worldline_with_ctx_tx(tx, world_id, participants, collapsed, &ctx).await?;
+    settle_worldline_with_ctx_tx(tx, world_id, participants, collapsed, &ctx, flags).await?;
 
     // 崩塌 → 封卷出一份「BE 结局传记」（§9「坏结局也是内容，封卷收藏」）。与结算同事务：
     // 结算回滚则传记同滚，绝不出现"奖罚没落地但墓志铭已刻好"。正常终局不产出（有输才有痛）。

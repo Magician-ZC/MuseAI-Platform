@@ -1307,12 +1307,14 @@ async fn chapter_worldline_settlement_pays_by_table_and_never_double_pays() {
     assert_eq!(hook_grants(&state, "usrW2", &format!("{wid}:chW2:worldline")).await, 0);
 
     // 幂等防线②：直接再调 ③ 层结算入口（绕过 chapters 的通关转变沿）→ settled_at CAS 0 行命中 → 空发放。
+    let f = crate::progression::SettlementFlags::resolve(&state.db, &wid).await;
     let mut tx = state.db.begin().await.unwrap();
     let again = crate::progression::settle_worldline_tx(
         &mut tx,
         &wid,
         &[("chW1".into(), "usrW1".into()), ("chW2".into(), "usrW2".into())],
         false,
+        f,
     )
     .await
     .unwrap();

@@ -68,6 +68,27 @@ pub async fn test_pool() -> AnyPool {
     }
 }
 
+/// **短连接获取超时**的单连接池：只给「故意在事务里再借连接、量出自锁后果」的用例使用。
+///
+/// 🔴 为什么需要它：单连接池上，事务持有唯一连接期间任何再借连接的操作都会**挂满连接获取
+/// 超时**（默认 30 秒）再 fail-closed，症状是「莫名变慢 + 悄悄拿到默认值」而不是显式报错。
+/// 这个失败模式**必须有可执行的证据**——它是 `progression::SettlementFlags`
+/// 与 `flags::MIGRATION_NOTES` 里「一律进事务前解析」那条约束的全部依据。
+/// 但用默认 30 秒去演示它，等于给每次全量测试加 30 秒；把超时压到几百毫秒即可，
+/// 现象一模一样（**取不到连接**这件事与等多久无关）。
+///
+/// ⚠️ 别拿它跑普通用例：超时压这么短，正常的慢查询也会变成假红。
+pub async fn test_pool_short_acquire(acquire_timeout_ms: u64) -> AnyPool {
+    INIT.call_once(sqlx::any::install_default_drivers);
+    let url = test_database_url();
+    let d = std::time::Duration::from_millis(acquire_timeout_ms.max(1));
+    if is_postgres(&url) {
+        postgres_pool_tuned(&url, 1, Some(d)).await
+    } else {
+        sqlite_pool_tuned(&url, Some(d)).await
+    }
+}
+
 /// **多连接**测试池：只给需要「两个事务真的同时在跑」的并发用例使用。
 ///
 /// 🔴 **不要改 [`test_pool`] 的 `max_connections`**。那里的 1 是刻意的（见 `postgres_pool`
@@ -92,11 +113,21 @@ pub async fn test_pool_concurrent(max_connections: u32) -> AnyPool {
 
 /// 单连接 + 永不回收：`:memory:` 每连接一个独立库，换连接 = 换成空库。
 async fn sqlite_pool(url: &str) -> AnyPool {
-    let pool = AnyPoolOptions::new()
+    sqlite_pool_tuned(url, None).await
+}
+
+/// `acquire_timeout = None` 走 sqlx 默认（30s）；`Some(d)` 只给
+/// [`test_pool_short_acquire`] 用。
+async fn sqlite_pool_tuned(url: &str, acquire_timeout: Option<std::time::Duration>) -> AnyPool {
+    let mut opts = AnyPoolOptions::new()
         .max_connections(1)
         .min_connections(1)
         .idle_timeout(None)
-        .max_lifetime(None)
+        .max_lifetime(None);
+    if let Some(d) = acquire_timeout {
+        opts = opts.acquire_timeout(d);
+    }
+    let pool = opts
         .connect(url)
         .await
         .expect("connect sqlite memory");
@@ -106,6 +137,14 @@ async fn sqlite_pool(url: &str) -> AnyPool {
 
 /// `max_connections`：默认 1（见下方注释）；只有 [`test_pool_concurrent`] 会传 >1。
 async fn postgres_pool(url: &str, max_connections: u32) -> AnyPool {
+    postgres_pool_tuned(url, max_connections, None).await
+}
+
+async fn postgres_pool_tuned(
+    url: &str,
+    max_connections: u32,
+    acquire_timeout: Option<std::time::Duration>,
+) -> AnyPool {
     let n = SCHEMA_SEQ.fetch_add(1, Ordering::SeqCst);
     let prefix =
         std::env::var("MUSE_TEST_SCHEMA_PREFIX").unwrap_or_else(|_| "muse_test".to_string());
@@ -138,11 +177,15 @@ async fn postgres_pool(url: &str, max_connections: u32) -> AnyPool {
     // 例外只有 `test_pool_concurrent`：并发正确性（如 `world_event_seq` 发号）在单连接池上
     // **根本无法验证**——两个事务从来不会同时在跑。那类用例按需索取连接数，其余一律走 1。
     let hook_schema = schema.clone();
-    let pool = AnyPoolOptions::new()
+    let mut opts = AnyPoolOptions::new()
         .max_connections(max_connections)
         .min_connections(1)
         .idle_timeout(None)
-        .max_lifetime(None)
+        .max_lifetime(None);
+    if let Some(d) = acquire_timeout {
+        opts = opts.acquire_timeout(d);
+    }
+    let pool = opts
         .after_connect(move |conn, _meta| {
             let schema = hook_schema.clone();
             Box::pin(async move {

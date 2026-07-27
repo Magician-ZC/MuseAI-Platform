@@ -262,6 +262,9 @@ async fn chapter_finish(
         wrapper["chapterState"] = cs;
 
         // 事务：CAS 占位（推进 state_revision + 写 chapterState）→ 命中后发货，全成或全败。
+        // 🔴 结算期开关**在进事务之前**解析（理由见 progression::SettlementFlags）。
+        let settlement_flags =
+            crate::progression::SettlementFlags::resolve(&state.db, &world_id).await;
         let mut tx = state.db.begin().await?;
         let cas = sqlx::query(
             "UPDATE worlds SET assembled_json = $1, state_revision = $2, updated_at = $3 \
@@ -330,7 +333,7 @@ async fn chapter_finish(
             // 章节房正常通关不构成世界线崩塌（崩塌是关键角色退场类终局，见 progression 常量区），
             // 故 collapsed=false；未声明产出表 / 无里程碑贡献者 → 返回空，不发放也不报错。
             worldline_payouts =
-                crate::progression::settle_worldline_tx(&mut tx, &world_id, &participants, false)
+                crate::progression::settle_worldline_tx(&mut tx, &world_id, &participants, false, settlement_flags)
                     .await?;
         }
         tx.commit().await?;

@@ -401,6 +401,12 @@ async fn claim_gift(
     let card_json = serde_json::to_string(&card).map_err(ApiError::internal)?;
     let now = now_ms();
 
+    // 🔴 副本卡开关**在进事务之前**解析（事务里查库 = 单连接池自锁）。ctx 取本人：
+    // 礼包只有一个卡主，故这里按人解析，与世界结算那条路径（按世界）不同——
+    // 差异的理由见 `subplot::subplot_cards_enabled` 的 ctx 口径表。
+    let starter_card_on =
+        crate::subplot::subplot_cards_enabled(&state.db, crate::flags::FlagCtx::user(&user.user_id))
+            .await;
     let mut tx = state.db.begin().await?;
 
     // 1) 预制卡落库。
@@ -477,7 +483,7 @@ async fn claim_gift(
     // 回执由纯函数 `grant_response` 构造，且被「首次领取」与「重复领取读回」两条路径共用——
     // 若把发卡结果塞进去，重复领取那条路径就得再查一次库才能拼出同样的回执，
     // 幂等回执"逐字节相同"这条性质会被打破。玩家在 `GET /me/subplot-cards` 看得到卡，够了。
-    let _starter_card_id = if crate::subplot::subplot_cards_enabled() {
+    let _starter_card_id = if starter_card_on {
         crate::subplot::grant_card_tx(
             &mut tx,
             &crate::subplot::NewSubplotCard {

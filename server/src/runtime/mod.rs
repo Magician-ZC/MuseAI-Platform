@@ -1776,6 +1776,7 @@ async fn finalize_ending_tx(
     reason: &str,
     ending: Option<&str>,
     participants: &[(String, String)],
+    flags: crate::progression::SettlementFlags,
 ) -> Result<(), ApiError> {
     // 终局审计留痕（reason + 选定结局）。
     sqlx::query(
@@ -1795,7 +1796,8 @@ async fn finalize_ending_tx(
     // 系数与判定全在 progression。发放逻辑收在 progression 模块——本文件（RoundInput 组装处）
     // 不引用任何成长数值字段，红线「成长数值不进引擎决策」grep 级可验。
     let collapsed = crate::progression::is_collapse_reason(reason);
-    crate::progression::settle_idle_world_ending_tx(tx, world_id, participants, collapsed).await?;
+    crate::progression::settle_idle_world_ending_tx(tx, world_id, participants, collapsed, flags)
+        .await?;
 
     // 终局荣誉奖励：每位在场成员角色获一枚「结局」荣誉（label=选定结局 id）。无强度、无购买。
     if let Some(ending_id) = ending {
@@ -1857,6 +1859,9 @@ async fn conclude_world_no_round(
     members: &[ProjectionMember],
 ) -> Result<TickStatus, ApiError> {
     let now = now_ms();
+    // 🔴 结算期开关**在进事务之前**解析（事务里查库 = 单连接池自锁，见 SettlementFlags）。
+    let settlement_flags =
+        crate::progression::SettlementFlags::resolve(&state.db, world_id).await;
     let mut tx = state.db.begin().await?;
     sqlx::query(
         "UPDATE world_ticks SET status='done', cost_tokens=0, error=$1, \
@@ -1875,7 +1880,7 @@ async fn conclude_world_no_round(
         // (cid, user_id)：③ 世界线层产出发给卡的主人，故 user_id 必须一并带上。
         let participants: Vec<(String, String)> =
             members.iter().map(|m| (m.character_key.clone(), m.user_id.clone())).collect();
-        finalize_ending_tx(&mut tx, world_id, reason, ending, &participants).await?;
+        finalize_ending_tx(&mut tx, world_id, reason, ending, &participants, settlement_flags).await?;
     }
     tx.commit().await?;
     if concluded {
@@ -2701,6 +2706,10 @@ async fn commit_tick(
     // interval 模式恒为 0，不推进时钟）。与 narrative_state_json 同事务原子写，保证 game_time 与状态一致。
     let game_time = outcome.new_state.timeline.now;
 
+    // 🔴 结算期开关**在进事务之前**解析（事务里查库 = 单连接池自锁，见 SettlementFlags）。
+    // 无论本拍会不会真的走到终局结算都解析：解析本身经 flags 的整表快照缓存，代价可忽略，
+    // 而放到 `if` 里会诱使后人把它挪进事务（那时才发现死锁）。
+    let settlement_flags = crate::progression::SettlementFlags::resolve(&state.db, world_id).await;
     let mut tx = state.db.begin().await?;
 
     // CAS：仅当世界仍处 base_revision 时推进；否则视为已被更早的 tick 处理 → 回滚 + 终态化（C-2）。
@@ -2758,7 +2767,7 @@ async fn commit_tick(
                 // (cid, user_id)：③ 世界线层产出发给卡的主人，故 user_id 必须一并带上。
                 let participants: Vec<(String, String)> =
                     members.iter().map(|m| (m.character_key.clone(), m.user_id.clone())).collect();
-                finalize_ending_tx(&mut tx, world_id, reason, ending, &participants).await?;
+                finalize_ending_tx(&mut tx, world_id, reason, ending, &participants, settlement_flags).await?;
                 final_status = TickStatus::Concluded;
             }
         }

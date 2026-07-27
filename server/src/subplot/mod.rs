@@ -53,7 +53,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sqlx::{Any, Row, Transaction};
+use sqlx::{Any, AnyPool, Row, Transaction};
 
 use crate::app::AppState;
 use crate::auth::AuthUser;
@@ -75,28 +75,50 @@ const ENV_SUBPLOT_CARDS_ENABLED: &str = "MUSE_SUBPLOT_CARDS";
 /// T4「平台生态」才验证的范围；代码合并不等于对用户开放，必须运营显式打开本开关。
 const DEFAULT_SUBPLOT_CARDS_ENABLED: bool = false;
 
-/// 副本卡能力是否已由运营开启（env 覆盖 + 默认常量，范式同 `worlds::deathmatch_enabled`
-/// 与 `invitations::invitations_enabled`——本仓库尚无配置表，env 是当前唯一的运营开关形态；
-/// 将来配置表落地后只改本函数内部，调用点与降级语义不变）。
+/// 🔴 **编译期钉死默认值的两个事实源**（本常量 + `flags::KNOWN_FLAGS`）。
+const _: () = assert!(
+    crate::flags::declared_default(ENV_SUBPLOT_CARDS_ENABLED) == DEFAULT_SUBPLOT_CARDS_ENABLED,
+    "flags::KNOWN_FLAGS 中 MUSE_SUBPLOT_CARDS 的默认值必须与 DEFAULT_SUBPLOT_CARDS_ENABLED 一致"
+);
+
+/// 副本卡能力是否已由运营开启。
 ///
-/// 开关是**全局急停阀**，作用在读取侧与发放侧：关掉之后结算立刻不再铸卡、已有卡读不出也合不了，
+/// 开关是**急停阀**，作用在读取侧与发放侧：关掉之后结算立刻不再铸卡、已有卡读不出也合不了，
 /// 再打开则原样恢复（已铸出的卡不因关阀而丢失——那是资产，不是功能）。
-pub fn subplot_cards_enabled() -> bool {
-    match std::env::var(ENV_SUBPLOT_CARDS_ENABLED) {
-        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "on" | "yes" => true,
-            "0" | "false" | "off" | "no" => false,
-            // 配错不静默开启未验证的经济闭环：回落默认（关闭）。
-            _ => DEFAULT_SUBPLOT_CARDS_ENABLED,
-        },
-        Err(_) => DEFAULT_SUBPLOT_CARDS_ENABLED,
-    }
+///
+/// ════════════════════════════════════════════════════════════════════════════
+/// 🔴 已接入运行时开关体系（`crate::flags`）—— 两处 ctx 口径**故意不同**
+/// ════════════════════════════════════════════════════════════════════════════
+///
+/// | 消费点 | ctx | 为什么 |
+/// |---|---|---|
+/// | 端点侧（`GET /me/subplot-cards`、合成） | **user + global** | 动作发起人就是卡主，按人灰度是「先给这批人开经济闭环」的自然单位（同 `onboarding` 的 T0 邀请制） |
+/// | 铸卡侧（世界结算 / 新手礼包） | **world + global**（结算） · **user + global**（礼包） | 结算是**一个世界事件、多个卡主**：要按人解析就得在事务里逐 owner 查库，而那正是单连接池自锁的来源。礼包只有一个人，故仍按人 |
+///
+/// ⚠️ 由此产生的**如实边界**：世界 W 开着而卡主 U 关着时，U 的卡照铸不误，只是 U 暂时读不出来。
+/// 这不是缺陷，它与本模块既有的口径**同源**——「已铸出的卡不因关阀而丢失，那是资产，不是功能」。
+/// 反过来（U 开着、W 关着）也自洽：U 看得见旧卡、能合成，只是 W 这局不产新卡。
+/// 🔵 与 `invitations` 那条相反的结论（那里 world 作用域被明确禁掉）不矛盾：那里的不对称会造出
+/// **一封谁都答不了的邀请**——一次坏掉的交互；这里的不对称只是**资产先记账、界面后可见**。
+///
+/// ════════════════════════════════════════════════════════════════════════════
+/// 🔴 铸卡侧收 bool，不在事务里查库
+/// ════════════════════════════════════════════════════════════════════════════
+///
+/// `settle_subplot_card_tx` 跑在结算事务内。`flags::is_enabled` 要查库，单连接池上在事务里
+/// 再借连接就是 `PoolTimedOut` 自锁。故结算路径一律**进事务前解析一次**，经
+/// [`crate::progression::SettlementFlags`] 传进去——那个结构体是结算期全部开关的统一落点，
+/// 免得每迁一个开关就往结算函数上再加一个 bool 参数。
+///
+/// 保留 `ENV_SUBPLOT_CARDS_ENABLED` / `DEFAULT_SUBPLOT_CARDS_ENABLED`：env 仍是解析链第 ④ 层。
+pub async fn subplot_cards_enabled(db: &AnyPool, ctx: crate::flags::FlagCtx<'_>) -> bool {
+    crate::flags::is_enabled(db, ENV_SUBPLOT_CARDS_ENABLED, ctx).await
 }
 
 /// 开关门：关闭时整块能力**不存在**（404，而非 403）——不向外泄露「平台有这个未开放功能」。
-/// 每个端点第一行都调它，读端点同样调（读取侧降级）。
-fn ensure_enabled() -> Result<(), ApiError> {
-    if subplot_cards_enabled() {
+/// 每个端点第一行都调它，读端点同样调（读取侧降级）。ctx 取**动作发起人**（= 卡主）。
+async fn ensure_enabled(db: &AnyPool, user_id: &str) -> Result<(), ApiError> {
+    if subplot_cards_enabled(db, crate::flags::FlagCtx::user(user_id)).await {
         Ok(())
     } else {
         Err(ApiError::NotFound)
@@ -400,9 +422,12 @@ pub(crate) async fn settle_subplot_card_tx(
     owner_id: &str,
     score: f64,
     star_cap: i64,
+    cards_on: bool,
 ) -> Result<Option<Value>, ApiError> {
     // 开关未开 → 结算侧一张不铸（前门 404 之外的第二道保险：产出路径不经过端点）。
-    if !subplot_cards_enabled() || payouts.is_empty() {
+    // `cards_on` 由 `progression::SettlementFlags` 在**进事务之前**解析好传入——
+    // 本函数在结算事务内，自己查库就是单连接池自锁（见 `subplot_cards_enabled` 的说明）。
+    if !cards_on || payouts.is_empty() {
         return Ok(None);
     }
     let Some((tier, spec)) = payouts.resolve(score) else {
@@ -508,7 +533,7 @@ async fn my_subplot_cards(
     user: AuthUser,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    ensure_enabled()?;
+    ensure_enabled(&state.db, &user.user_id).await?;
     let filter = q.status.unwrap_or_else(|| STATUS_OWNED.to_string());
     if !matches!(filter.as_str(), STATUS_OWNED | STATUS_CONSUMED | "all") {
         return Err(ApiError::BadRequest("status 只接受 owned / consumed / all".into()));
@@ -572,7 +597,7 @@ async fn synthesize(
     headers: HeaderMap,
     Json(body): Json<SynthesizeRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    ensure_enabled()?;
+    ensure_enabled(&state.db, &user.user_id).await?;
 
     // ---- 前门校验（纯参数，不碰库） ----
     let required = synthesis_source_count();

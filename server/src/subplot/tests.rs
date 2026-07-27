@@ -91,8 +91,12 @@ async fn seed_contribution(state: &AppState, world_id: &str, cid: &str, mileston
 
 /// 走真实结算入口（三层结算 ③ 世界线层）。
 async fn settle(state: &AppState, world_id: &str, participants: &[(String, String)]) -> Vec<Value> {
+    // 🔴 **必须在 begin() 之前**。把它挪到事务里，单连接池会 PoolTimedOut（实测挂满
+    // 30 秒后 fail-closed 返回 false，于是「一张卡都不铸」——症状是用例莫名变慢又变红，
+    // 而不是显式报错）。这正是 `SettlementFlags` 存在的理由。
+    let f = crate::progression::SettlementFlags::resolve(&state.db, world_id).await;
     let mut tx = state.db.begin().await.unwrap();
-    let out = crate::progression::settle_worldline_tx(&mut tx, world_id, participants, false)
+    let out = crate::progression::settle_worldline_tx(&mut tx, world_id, participants, false, f)
         .await
         .expect("settle");
     tx.commit().await.unwrap();
@@ -182,7 +186,7 @@ async fn switch_defaults_off_and_gates_all_endpoints() {
         // env 未设置时的**默认值**必须是关闭。
         let _sw = SubplotSwitch::cleared();
         assert!(
-            !subplot_cards_enabled(),
+            !subplot_cards_enabled(&state.db, crate::flags::FlagCtx::global()).await,
             "副本卡必须默认关闭（未验证功能默认关闭；副本卡属 VALIDATION §2 T4 才验证的范围）"
         );
     }
@@ -213,8 +217,87 @@ async fn switch_defaults_off_and_gates_all_endpoints() {
     // 非法开关值不静默开启。
     {
         let _sw = SubplotSwitch::raw("maybe");
-        assert!(!subplot_cards_enabled(), "非法开关值须回落关闭");
+        assert!(
+            !subplot_cards_enabled(&state.db, crate::flags::FlagCtx::global()).await,
+            "非法开关值须回落关闭"
+        );
     }
+}
+
+/// 🔴 **按世界灰度真的生效**（接入 `flags` 体系的行为增量：env 时代只能全局一刀切）。
+/// 同时钉住「端点侧按人、结算侧按世界」这对**故意不同**的口径。
+#[tokio::test]
+async fn subplot_cards_grayscale_is_per_world_on_the_mint_side() {
+    let _sw = SubplotSwitch::set(false); // 全局关（env 层）
+    let state = test_state().await;
+    seed_settlement_world(&state, "w_gray", "u_gray", "c_gray", 3, 4_000).await;
+    sqlx::query(
+        "INSERT INTO runtime_flags (id, flag, scope, target_id, enabled, starts_at, ends_at, \
+         updated_by, updated_at, reason, created_at) \
+         VALUES ($1, 'MUSE_SUBPLOT_CARDS', 'world', 'w_gray', 1, 0, 0, 'test', $2, 'test', $3)",
+    )
+    .bind(crate::db::new_id("rf"))
+    .bind(crate::db::now_ms())
+    .bind(crate::db::now_ms())
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    let granted = settle(&state, "w_gray", &[("c_gray".into(), "u_gray".into())]).await;
+    assert!(
+        !granted[0]["subplotCard"].is_null(),
+        "🔴 被灰度选中的世界应当照常铸卡，全局开关关着也一样: {granted:?}"
+    );
+    // 端点侧按**人**解析：卡主没被单独开 ⇒ 读不出来（如实边界，见 subplot_cards_enabled 的口径表）。
+    let (st, _) = send(&state, "GET", "/api/me/subplot-cards", "u_gray", None, None).await;
+    assert_eq!(
+        st,
+        StatusCode::NOT_FOUND,
+        "🔴 「资产先记账、界面后可见」是本模块既有口径（已铸出的卡不因关阀而丢失）"
+    );
+}
+
+/// 🔴 **`SettlementFlags` 必须在 `begin()` 之前解析**——这条约束不是理论上的。
+///
+/// 本用例把它挪进事务里，直接量出后果：单连接池上 `flags::is_enabled` 再借连接会
+/// **挂满整个获取超时**，然后按 fail-closed 返回默认值（关）。于是症状是
+/// 「结算莫名变慢 + 一张卡都不铸」，**不是**一个显式报错——最难查的那一类。
+///
+/// （这不是推演：迁移这个开关时我就把 `resolve` 写在了 `begin()` 之后，
+/// 四个用例同时变红且各跑 30 秒，才发现是它。）
+#[tokio::test]
+async fn resolving_flags_inside_the_transaction_deadlocks_and_fails_closed() {
+    let _sw = SubplotSwitch::set(true); // 开关**开着**——排除「本来就该不铸」的解释
+    // 🔴 用**短连接获取超时**的池：现象与默认 30 秒完全一样（取不到连接与等多久无关），
+    // 但不会给每次全量测试加 30 秒。
+    let mut state = test_state().await;
+    state.db = crate::testkit::test_pool_short_acquire(300).await;
+    seed_settlement_world(&state, "w_dl", "u_dl", "c_dl", 3, 4_000).await;
+
+    let t0 = std::time::Instant::now();
+    let mut tx = state.db.begin().await.unwrap();
+    // 🔴 反面示范：事务已开，再去查库解析开关。
+    let f = crate::progression::SettlementFlags::resolve(&state.db, "w_dl").await;
+    let elapsed = t0.elapsed();
+    let granted =
+        crate::progression::settle_worldline_tx(&mut tx, "w_dl", &[("c_dl".into(), "u_dl".into())], false, f)
+            .await
+            .unwrap();
+    tx.rollback().await.unwrap();
+
+    assert!(
+        !f.subplot_cards,
+        "🔴 事务内解析取不到连接 ⇒ fail-closed 回落默认（关）——而开关明明是开着的"
+    );
+    assert!(
+        granted.is_empty() || granted[0]["subplotCard"].is_null(),
+        "于是结算一张卡都不铸，且没有任何报错"
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_millis(250),
+        "🔴 它不是立刻失败，而是**挂满连接获取超时**才 fail-closed——症状是「变慢」不是「报错」。\
+         本用例把超时压到 300ms 以便快速演示；生产/默认配置下这一挂就是 30 秒。实测 {elapsed:?}"
+    );
 }
 
 /// 开关关闭时**结算不铸卡**（前门 404 之外的第二道保险：产出路径根本不经过端点）。
@@ -379,11 +462,17 @@ async fn card_grant_rolls_back_with_failed_settlement() {
     let state = test_state().await;
     seed_settlement_world(&state, "w_rb", "u_rb", "c_rb", 3, 4_000).await;
 
+    let f = crate::progression::SettlementFlags::resolve(&state.db, "w_rb").await;
     let mut tx = state.db.begin().await.unwrap();
-    let granted =
-        crate::progression::settle_worldline_tx(&mut tx, "w_rb", &[("c_rb".into(), "u_rb".into())], false)
-            .await
-            .unwrap();
+    let granted = crate::progression::settle_worldline_tx(
+        &mut tx,
+        "w_rb",
+        &[("c_rb".into(), "u_rb".into())],
+        false,
+        f,
+    )
+    .await
+    .unwrap();
     assert!(!granted[0]["subplotCard"].is_null(), "事务内已铸出");
     tx.rollback().await.unwrap(); // 模拟结算失败（CAS 不命中 / 后续发货报错）
 

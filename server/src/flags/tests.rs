@@ -948,6 +948,10 @@ async fn list_endpoint_reports_effective_global_state() {
         wired,
         vec![
             F,
+            // 🔵 `MUSE_SUBPLOT_CARDS` 是 `MIGRATION_NOTES` 上迁走的第三个。它的结算侧消费点
+            // 在事务内，故 bool 经 `progression::SettlementFlags`（结算期开关的统一落点）传入，
+            // 免得每迁一个开关就往结算函数上再加一个 bool 参数。
+            "MUSE_SUBPLOT_CARDS",
             // 🔵 `MUSE_LETHALITY_DEATHMATCH` / `MUSE_ROOM_INVITATIONS` 是 `MIGRATION_NOTES`
             // 清单上迁走的头两个。前者的 ctx 口径**两处不同**（读取侧按 world、建房前门只能按
             // global），理由见 `worlds::deathmatch_enabled`；后者刻意**不含 world**，

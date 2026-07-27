@@ -232,7 +232,16 @@
   都会在单连接池上自锁，而那种死锁在只跑内存 SQLite 的用例里不一定复现。故改成**收一个
   已解析好的 bool**：调用点必须先 `.await` 一次 `deathmatch_enabled` 才拿得到它，
   事务边界问题因此在**编译期**摆到眼前。这条对下面剩余几个开关同样适用。
-- 未迁：`MUSE_SUBPLOT_CARDS` · `MUSE_CONTAINER_ASSEMBLY` ·
+- ~~`MUSE_SUBPLOT_CARDS`~~ —— **已迁（2026-07-27）**。原注两条预判命中：两个消费点语义不同
+  （端点 404 / 结算跳过不报错，新手礼包也依赖那个「跳过」），且结算路径在事务内。
+  🔵 迁的时候多做了一件事：那个 bool 不是裸参数，而是 **`progression::SettlementFlags`**——
+  结算事务里挂着的开关不止一个（还有下面的传世卡自动封卷与 BE 传记），一个一个加 bool，
+  `settle_idle_world_ending_tx` 迟早变成七个 bool 的函数。后两个迁的时候往它加字段即可。
+  🔵 **「事务里解析会自锁」这条现在有可执行证据了**：`resolving_flags_inside_the_transaction_deadlocks_and_fails_closed`
+  故意把解析放进事务，量出「挂满连接获取超时 → fail-closed 回落默认（关）→ 一张卡不铸、
+  且不报错」。这不是推演——迁移时我就写错过一次，四个用例同时变红且各跑 30 秒才定位到。
+  用例走 `testkit::test_pool_short_acquire(300)`，现象不变而耗时从 30s 降到 0.4s。
+- 未迁：`MUSE_CONTAINER_ASSEMBLY` ·
   `MUSE_MEMORIAL` · `MUSE_WORLD_SERIES_AUTOSCALE` · `MUSE_WORLD_BE_BIOGRAPHY` ·
   `MUSE_SAFETY_LEXICON`（🔴 最后迁或不迁）。
 
@@ -280,7 +289,7 @@
 `admin_api::audit::writeback_target` 现在返回回写坐标，`world_events` 上因此有了全仓
 **唯一一条放宽语句**（`SET` 只有 `moderation` 一列、按主键点名、CAS、起点白名单写死在 SQL 里），
 权限分 reviewer / admin 两档，三条写入路径由源码级红线用例全仓盘点 ·
-**其余存量 env 开关接入运行时开关体系**（生死状档与房间邀请已迁，清单与注意事项见上）·
+**其余存量 env 开关接入运行时开关体系**（副本卡 / 生死状档 / 房间邀请已迁，清单与注意事项见上）·
 **处置申诉只覆盖 `character` / `character_avatar` 两类主体**（如实的范围，不是遗漏：
 `world_cover` 属于世界、`world_templates` 根本没有 owner 列，给它们开申诉入口只会得到一个
 没人有资格提交的端点；要覆盖需先定义"世界封面 / 模板的作者是谁"这条产品口径）。

@@ -940,10 +940,44 @@ camelCase 与 snake_case 同形。`known_to` 才受影响，而那一处是类�
 `shape.unknownTopLevelKeys`（`GET /admin/sagas/{sagaId}`）——因为这类错的症状与「运营就是没写主线」
 完全一样：一排 0、零报错，两者必须在同一屏上可分辨。
 
-⚠️ **边界（别把这条读成"拼错已经不会发生了"）**：这道闸只管**顶层**键。嵌套层仍是静默的——
-`mainlineNodes[].advanceWhen` 拼成 `advanceWhen2`，谓词就只是悄悄消失（`runtime` 那里是
-`.get("advanceWhen").and_then(..)`）。覆盖嵌套需要把每个嵌套类型的键集都登记一遍，改动面另论，
-本批次**未做**，如实登记在此。
+**再下一层：`mainlineNodes[]`（同一批次补上）**。这一层的知识裂得比顶层更开——
+`struct MainlineNode` 只认 `id` / `fated` / `variantGroup` / `arcTags`（装配层要的），
+而 `runtime` 从**同一批对象**上手读另外四个：`summary` / `constraint` / `threshold` / `advanceWhen`。
+两侧各测各的一半，都绿。失败方向全部朝坏的一边：
+
+| 拼错的键 | 静默后果 |
+|---|---|
+| `constraint` | 落到 `_ => Soft` 分支 ⇒ **本该 `hard` 的硬约束静默降级** |
+| `advanceWhen` | 推进谓词悄悄消失，节点退回纯阈值门 |
+| `threshold` | 里程碑节点变回普通节点 |
+| `summary` | 大纲节点文本为空——模型拿不到这个节点是干什么的 |
+| `fated` / `variantGroup` | 宿命节点不再宿命 / 互斥失效，同组变体可能同时出现 |
+
+**第三层：`forbiddenPredicates[]`（同批次）**。它**没有任何类型化读者**——`Skeleton` 压根没这个字段，
+只有 `runtime` 手读 `id` / `expression` / `reason` 三个。失败方向是三层里最坏的：`expression` 拼错 →
+`let (Some(id), Some(expr)) = … else { continue }` ⇒ **整条禁止谓词被丢弃**，世界照常开，
+那条内容约束从来没生效过，且没有任何日志。
+
+清单分别是 `assembly::MAINLINE_NODE_KEYS`（8 个 = 两个读者的并集）与 `FORBIDDEN_PREDICATE_KEYS`（3 个）；
+**「哪些层已被覆盖」本身也只有一处** —— `SKELETON_NESTED_KEY_SETS`，建模板期校验与运营台发现面都遍历它。
+各抄一份的话，加一层就得记得改两处，而漏改的表现是「运营台说这个模板没问题」——那正是本节在修的缺陷，
+不能在修它的提交里再造一个。（故障注入实测：从该表摘掉 `forbiddenPredicates`，**校验与运营台同时失灵**。）
+
+三层的未知键校验共用一份实现（`reject_unknown_keys`）。报错点名到具体那一条
+（有 `id` 报 id，无 `id` 报序号——否则运营不知道该改哪一行）。
+
+「是不是想写 X？」的建议**用编辑距离**（阈值 `max(1, len/4)`），不只归一化：`constrait`
+（漏一个 `n`）归一化后仍不等于 `constraint`，而漏 / 多 / 错一个字母恰是最常见的拼法错误。
+没有这个提示，报错就只是「这个键没人读」，运营还得自己猜正确写法。
+
+⚠️ **边界（别把这条读成"拼错已经不会发生了"）**：只覆盖了**顶层** + `mainlineNodes[]` + `forbiddenPredicates[]` 三层。
+其余嵌套类型（结局池 / 内容池 / 地点 / 身份池 / 产出表 / storylines……）同样是手读与类型化混用，**未覆盖**。
+选这三层先做的理由是失败方向：约束降级、谓词丢弃、整块功能消失，都朝坏的一边且无日志。
+其余各类要一一登记键集（`SKELETON_NESTED_KEY_SETS` 加一行 + 一份键集常量 + 源码层红线），
+改动面另论，本批次**未做**，如实记在此。
+
+⚠️ 另一条边界：**存量模板不会被回头校验**，闸只在写入路径上。存量的发现面是运营台的
+`shape.unknownTopLevelKeys` / `shape.unknownNestedKeys` 两栏——**看得见，但不会自动修**。
 
 ## 4. 验证基建三件套（优先于新增功能）
 

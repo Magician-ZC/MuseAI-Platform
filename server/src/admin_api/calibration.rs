@@ -292,6 +292,32 @@ fn skeleton_shape(raw: &str) -> Value {
     };
     let pool = parse_identity_pool(raw);
     let realm = parse_realm_tier(raw);
+    // 嵌套层无人读取的键，形如 `mainlineNodes[mn-1].constrait`（无 `id` 的元素报 `#序号`）。
+    // 覆盖哪些层由 `assembly::SKELETON_NESTED_KEY_SETS` 单点决定（不在此处另抄一份）。
+    let unknown_nested: Vec<String> = crate::assembly::SKELETON_NESTED_KEY_SETS
+        .iter()
+        .flat_map(|(field, allowed)| {
+            v.get(field)
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+                .iter()
+                .enumerate()
+                .filter_map(|(i, item)| item.as_object().map(|o| (i, o)))
+                .flat_map(move |(i, o)| {
+                    let who = o
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("#{}", i + 1));
+                    o.keys()
+                        .filter(|k| !k.starts_with("__") && !allowed.contains(&k.as_str()))
+                        .map(move |k| format!("{field}[{who}].{k}"))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
     json!({
         "parsed": true,
         "skeletonBytes": raw.len() as i64,
@@ -324,6 +350,11 @@ fn skeleton_shape(raw: &str) -> Value {
                 .cloned()
                 .collect::<Vec<_>>()
         }).unwrap_or_default(),
+        // 同上，但**嵌套层**：形如 `mainlineNodes[mn-1].constrait`（无 `id` 的元素报 `#序号`）。
+        // 这一层的静默后果比顶层更隐蔽——`constraint` 拼错不会让节点消失，只会让**硬约束降级成 Soft**；
+        // `forbiddenPredicates[].expression` 拼错则让整条禁止谓词被丢弃。两种情况下上面那排计数都是对的，
+        // 光看计数根本发现不了。覆盖哪些层由 `assembly::SKELETON_NESTED_KEY_SETS` 单点决定（不在此处另抄一份）。
+        "unknownNestedKeys": unknown_nested,
     })
 }
 
@@ -1416,6 +1447,39 @@ mod tests {
         );
         assert_eq!(clean["mainlineNodes"], 1);
         assert_eq!(clean["unknownTopLevelKeys"], serde_json::json!([]), "合法键不得被误报");
+    }
+
+    /// 嵌套层的拼错**光看计数发现不了**：主线数依旧是对的，只是约束悄悄降了级 /
+    /// 禁止谓词悄悄没了。
+    #[test]
+    fn skeleton_shape_names_unknown_nested_keys() {
+        let sk = skeleton_shape(
+            r#"{"mainlineNodes":[
+                 {"id":"mn-1","constrait":"hard"},
+                 {"summry":"缺 id 的节点"},
+                 {"id":"mn-3","summary":"好的","constraint":"hard","threshold":2,"advanceWhen":"x==1",
+                  "fated":true,"variantGroup":"g","arcTags":["a"]}
+               ],
+               "forbiddenPredicates":[{"id":"fp-1","expresion":"x==1"}]}"#,
+        );
+        assert_eq!(sk["mainlineNodes"], 3, "计数是对的——正是这一点让这类错难以发现");
+        let bad: Vec<String> = serde_json::from_value(sk["unknownNestedKeys"].clone()).unwrap();
+        assert_eq!(
+            bad,
+            vec![
+                "mainlineNodes[mn-1].constrait".to_string(),
+                "mainlineNodes[#2].summry".to_string(),
+                "forbiddenPredicates[fp-1].expresion".to_string(),
+            ],
+            "{bad:?}"
+        );
+
+        // 合法骨架不得被误报。
+        let clean = skeleton_shape(
+            r#"{"mainlineNodes":[{"id":"mn-1","summary":"a","constraint":"soft"}],
+                "forbiddenPredicates":[{"id":"fp-1","expression":"x==1","reason":"剧透"}]}"#,
+        );
+        assert_eq!(clean["unknownNestedKeys"], serde_json::json!([]));
     }
 
     // ---------------- 维度三：境界档 ----------------

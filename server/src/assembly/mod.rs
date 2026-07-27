@@ -2596,11 +2596,112 @@ pub(crate) const SKELETON_TOP_LEVEL_KEYS: &[&str] = &[
     "forbiddenPredicates", // runtime::…（禁止谓词）
 ];
 
-/// 键名归一化（仅用于「是不是想写 X？」的提示）：去掉大小写与非字母数字，
-/// 于是 `mainLineNodes` / `mainline_nodes` / `MainlineNodes` 都能指回 `mainlineNodes`——
-/// 这三种正是最可能的写法错误（Rust 侧字段是 snake_case，线上格式是 camelCase）。
+/// `mainlineNodes[]` 元素的**全部合法键**——同 `SKELETON_TOP_LEVEL_KEYS`，是本仓库唯一知道这个集合的地方。
+///
+/// 🔴 这一层的知识裂得比顶层更开：`struct MainlineNode` 只认 `id` / `fated` / `variantGroup` / `arcTags`
+/// 四个（装配层要的），而 `runtime` 从**同一批对象**上手读另外四个——`summary`（大纲文本）、
+/// `constraint`、`threshold`（里程碑阈值）、`advanceWhen`（推进谓词）。两侧各测各的一半，都绿。
+///
+/// 拼错的失败方向全部朝坏的一边：
+///
+/// | 拼错的键 | 静默后果 |
+/// |---|---|
+/// | `constraint` | 落到 `_ => Soft` 分支 ⇒ **本该 `hard` 的硬约束静默降级** |
+/// | `advanceWhen` | 推进谓词悄悄消失，节点退回纯阈值门 |
+/// | `threshold` | 里程碑节点变回普通节点 |
+/// | `summary` | 大纲节点文本为空——模型拿不到这个节点是干什么的 |
+/// | `fated` | 宿命节点不再宿命；`variantGroup` | 互斥失效，同组变体可能同时出现 |
+///
+/// ⚠️ **只做了 `mainlineNodes[]` 这一层**。其余嵌套类型（结局池 / 内容池 / 地点 / 身份池……）
+/// 同样是手读与类型化混用，尚未登记，见 `docs/VALIDATION.md` §3.8 的边界段。
+/// 选它先做是因为：它是唯一被两个模块分头手读的嵌套类型，且 `constraint` 那条是 fail-open 的约束降级。
+pub(crate) const MAINLINE_NODE_KEYS: &[&str] = &[
+    // ---- `struct MainlineNode` 的字段 ----
+    "id",
+    "fated",
+    "variantGroup",
+    "arcTags",
+    // ---- 不在 `MainlineNode` 里、由 runtime 手读的 ----
+    "summary",     // 大纲节点文本
+    "constraint",  // hard / soft / free
+    "threshold",   // 里程碑阈值
+    "advanceWhen", // 推进谓词
+];
+
+/// `forbiddenPredicates[]` 元素的全部合法键。**没有任何类型化读者**——`Skeleton` 压根没有这个字段，
+/// 只有 `runtime` 手读这三个。
+///
+/// 🔴 这一层的失败方向是三层里最坏的：`expression` 拼错 → `runtime` 那里
+/// `let (Some(id), Some(expr)) = … else { continue }` **整条禁止谓词被丢弃**，
+/// 世界照常开，只是那条内容约束从来没生效过，且没有任何日志。
+pub(crate) const FORBIDDEN_PREDICATE_KEYS: &[&str] = &["id", "expression", "reason"];
+
+/// 已登记键集的**嵌套数组**：`(顶层字段名, 该数组元素的合法键集)`。
+///
+/// 🔴 唯一一处知道「哪些嵌套层已被覆盖」——`validate_skeleton_refs`（建模板期拦）与
+/// `admin_api::calibration::skeleton_shape`（存量模板的发现面）都遍历它。
+/// 各抄一份的话，加一层就得记得改两处，而漏改的表现是「运营台说这个模板没问题」——
+/// 那正是本批次在修的那类缺陷，不能在修它的提交里再造一个。
+///
+/// ⚠️ 表外的嵌套类型（结局池 / 内容池 / 地点 / 身份池 / 产出表……）**尚未覆盖**，
+/// 见 `docs/VALIDATION.md` §3.8 的边界段。
+pub(crate) const SKELETON_NESTED_KEY_SETS: &[(&str, &[&str])] =
+    &[("mainlineNodes", MAINLINE_NODE_KEYS), ("forbiddenPredicates", FORBIDDEN_PREDICATE_KEYS)];
+
+/// 未知键校验（三层共用一份实现——每层各写一遍正是本次要修的那类问题）。
+/// `__` 前缀豁免（注释键）。返回首个冒犯者的中文说明。
+fn reject_unknown_keys(v: &Value, allowed: &[&str], whose: &str) -> Result<(), String> {
+    let Some(obj) = v.as_object() else { return Ok(()) };
+    for key in obj.keys() {
+        if key.starts_with("__") || allowed.contains(&key.as_str()) {
+            continue;
+        }
+        let hint = nearest_key(key, allowed)
+            .map(|k| format!("（是不是想写 `{k}`？）"))
+            .unwrap_or_default();
+        return Err(format!(
+            "{whose}出现无人读取的键 `{key}`{hint}——它不会报错，只会让对应功能静默退化到默认值"
+        ));
+    }
+    Ok(())
+}
+
+/// 键名归一化：去掉大小写与非字母数字，于是 `mainLineNodes` / `mainline_nodes` / `MainlineNodes`
+/// 都归到同一形——这三种正是最可能的写法错误（Rust 侧字段是 snake_case，线上格式是 camelCase）。
 fn squash_key(k: &str) -> String {
     k.chars().filter(char::is_ascii_alphanumeric).flat_map(char::to_lowercase).collect()
+}
+
+/// 「是不是想写 X？」的候选：在归一化形上取编辑距离最近的一个，阈值 `max(1, len/4)`。
+///
+/// ⚠️ 只归一化是不够的——`constrait`（漏一个 `n`）归一化后仍不等于 `constraint`，
+/// 而漏 / 多 / 错一个字母恰恰是最常见的拼法错误。没有这个提示，报错就只是「这个键没人读」，
+/// 运营还得自己去猜正确写法是什么；提示才是这条错误信息真正有用的部分。
+fn nearest_key<'a>(key: &str, allowed: &[&'a str]) -> Option<&'a str> {
+    let a = squash_key(key);
+    let budget = (a.len() / 4).max(1);
+    allowed
+        .iter()
+        .map(|k| (edit_distance(&a, &squash_key(k)), *k))
+        .filter(|(d, _)| *d <= budget)
+        .min_by_key(|(d, k)| (*d, k.len()))
+        .map(|(_, k)| k)
+}
+
+/// Levenshtein 距离（滚动一行）。键名都是几十字符以内的短串，不值得引依赖。
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let sub = prev[j] + usize::from(ca != cb);
+            cur[j + 1] = sub.min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
 }
 
 /// 建模板期引用完整性校验（Phase 3，`worlds_ops::create_template` 调用）：把 skeleton_json 试解析为
@@ -2614,24 +2715,19 @@ fn squash_key(k: &str) -> String {
 /// 宽松边界：解析失败（类型不符）→ Ok（沿用 load_skeleton 的防御式 unwrap_or_default 语义，不因无关字段拦截合法模板）；
 /// 只在结构成立时对「明确写了引用」的字段判悬空，避免误伤退化路径（空目录 / 无地点的老模板全部放行）。
 pub(crate) fn validate_skeleton_refs(skeleton: &Value, container_on: bool) -> Result<(), String> {
-    // 0) 未知顶层键（见 `SKELETON_TOP_LEVEL_KEYS`）。**必须在下面那句防御式解析之前**——
-    //    它正是这一段要拦的东西：拼错的键不会让 `from_value::<Skeleton>` 失败，只会让对应字段静默取默认值。
-    if let Some(obj) = skeleton.as_object() {
-        for key in obj.keys() {
-            if key.starts_with("__") {
-                continue; // `__doc` 之类的注释键（golden fixture 在用），不参与校验。
-            }
-            if SKELETON_TOP_LEVEL_KEYS.contains(&key.as_str()) {
-                continue;
-            }
-            let hint = SKELETON_TOP_LEVEL_KEYS
-                .iter()
-                .find(|k| squash_key(k) == squash_key(key))
-                .map(|k| format!("（是不是想写 `{k}`？）"))
-                .unwrap_or_default();
-            return Err(format!(
-                "skeleton_json 顶层出现无人读取的键 `{key}`{hint}——它不会报错，只会让对应功能静默退化到默认值"
-            ));
+    // 0) 未知键（顶层见 `SKELETON_TOP_LEVEL_KEYS`，节点级见 `MAINLINE_NODE_KEYS`）。
+    //    **必须在下面那句防御式解析之前**——它正是这一段要拦的东西：拼错的键不会让
+    //    `from_value::<Skeleton>` 失败，只会让对应字段静默取默认值。
+    reject_unknown_keys(skeleton, SKELETON_TOP_LEVEL_KEYS, "skeleton_json 顶层")?;
+    for (field, allowed) in SKELETON_NESTED_KEY_SETS {
+        let Some(items) = skeleton.get(field).and_then(Value::as_array) else { continue };
+        for (i, item) in items.iter().enumerate() {
+            // 点名到具体那一条：有 `id` 报 id，无 `id` 报序号——否则运营不知道该改哪一行。
+            let whose = match item.get("id").and_then(Value::as_str) {
+                Some(id) => format!("{field} 里的 `{id}` 这一条"),
+                None => format!("{field} 里的第 {} 条", i + 1),
+            };
+            reject_unknown_keys(item, allowed, &whose)?;
         }
     }
 
@@ -4061,6 +4157,90 @@ mod sampling_tests {
                 "`Skeleton` 的字段 `{f}` 不在 SKELETON_TOP_LEVEL_KEYS 里——用到它的模板会被建模板期校验拒掉"
             );
         }
+    }
+
+    // ---------- 建模板期校验：`mainlineNodes[]` 的节点级键 ----------
+
+    #[test]
+    fn validate_rejects_misspelled_mainline_node_key() {
+        // `constraint` 拼错 → runtime 落到 `_ => Soft`，本该 hard 的约束静默降级。
+        let v = json!({ "mainlineNodes": [ { "id": "mn-1", "constrait": "hard" } ] });
+        let err = validate_skeleton_refs(&v, false).unwrap_err();
+        assert!(err.contains("mn-1"), "须点名是哪个节点: {err}");
+        assert!(err.contains("constrait"), "{err}");
+        assert!(err.contains("是不是想写 `constraint`"), "{err}");
+    }
+
+    #[test]
+    fn validate_names_node_by_index_when_id_missing() {
+        let v = json!({ "mainlineNodes": [ { "id": "mn-1" }, { "summry": "缺 id 的节点" } ] });
+        let err = validate_skeleton_refs(&v, false).unwrap_err();
+        assert!(err.contains("第 2 条"), "无 id 时须给序号，否则运营找不到是哪一条: {err}");
+    }
+
+    /// 🔴 三层里失败方向最坏的一层：`expression` 拼错 → runtime 那里直接 `continue`，
+    /// **整条禁止谓词被丢弃**，世界照常开，只是那条内容约束从来没生效过，且没有任何日志。
+    #[test]
+    fn validate_rejects_misspelled_forbidden_predicate_key() {
+        let v = json!({ "forbiddenPredicates": [ { "id": "fp-1", "expresion": "x == 1" } ] });
+        let err = validate_skeleton_refs(&v, false).unwrap_err();
+        assert!(err.contains("fp-1"), "{err}");
+        assert!(err.contains("是不是想写 `expression`"), "{err}");
+
+        let ok = json!({ "forbiddenPredicates": [
+            { "id": "fp-1", "expression": "x == 1", "reason": "剧透" }
+        ] });
+        assert!(validate_skeleton_refs(&ok, false).is_ok(), "{:?}", validate_skeleton_refs(&ok, false));
+    }
+
+    /// 装配层与 runtime 各读一半——两边的键都得放行，任何一侧被误拦都是线上事故。
+    #[test]
+    fn validate_accepts_the_union_of_both_readers_node_keys() {
+        let v = json!({ "mainlineNodes": [ {
+            "id": "mn-1", "fated": true, "variantGroup": "g1", "arcTags": ["arc-A"],   // 装配层读
+            "summary": "开局", "constraint": "hard", "threshold": 3.0, "advanceWhen": "x == 1", // runtime 读
+        } ] });
+        assert!(validate_skeleton_refs(&v, false).is_ok(), "{:?}", validate_skeleton_refs(&v, false));
+    }
+
+    /// 源码层红线：`struct MainlineNode` 的每个字段都必须在 `MAINLINE_NODE_KEYS` 里。
+    #[test]
+    fn mainline_node_keys_covers_every_mainline_node_field() {
+        let src = include_str!("mod.rs");
+        let start = src.find("struct MainlineNode {").expect("找不到 struct MainlineNode");
+        let body = &src[start..start + src[start..].find("\n}").expect("找不到结构体结尾")];
+        let mut n = 0;
+        for line in body.lines() {
+            if !line.starts_with("    ") || line.starts_with("     ") {
+                continue;
+            }
+            let t = line.trim();
+            if t.starts_with('#') || t.starts_with("//") {
+                continue;
+            }
+            let Some((name, _)) = t.split_once(':') else { continue };
+            if !name.chars().all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit()) {
+                continue;
+            }
+            let mut camel = String::new();
+            let mut up = false;
+            for c in name.chars() {
+                match c {
+                    '_' => up = true,
+                    _ if up => {
+                        camel.extend(c.to_uppercase());
+                        up = false;
+                    }
+                    _ => camel.push(c),
+                }
+            }
+            assert!(
+                MAINLINE_NODE_KEYS.contains(&camel.as_str()),
+                "`MainlineNode` 的字段 `{camel}` 不在 MAINLINE_NODE_KEYS 里——用到它的模板会被建模板期校验拒掉"
+            );
+            n += 1;
+        }
+        assert!(n >= 4, "字段解析疑似失效，只解出 {n} 个");
     }
 
     /// 端到端：黄金世界的真实骨架必须通过这道新校验。

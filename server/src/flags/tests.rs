@@ -1021,59 +1021,29 @@ async fn list_endpoint_reports_effective_global_state() {
     //   - `MUSE_DISPOSAL_NAME_GATE`：新建件，建成即接线（`safety::disposal::NameGate::resolve`）。
     //     ⚠️ 它守的是**读取面显示**而不是一项功能的开合：关闭 = 各读取面逐字节维持今天的输出。
     // 其余存量开关仍是纯 env，迁移清单见 `flags::MIGRATION_NOTES`。
-    let wired: Vec<&str> = arr
+    // 🔴 **迁移清单走完之后，这条断言换了形态**：原先比对一份手维护的「已接线名单」，
+    // 而那份名单每迁一个开关就要改一次——正是本仓库反复栽跟头的那类会过期的清单
+    // （CLAUDE.md 里去掉的那几处硬编码计数是同一个病）。现在登记表里**每一个**开关都已接线，
+    // 于是不变式可以写成自维护的形式：
+    //
+    //   **登记表里不允许存在 `wired=false` 的开关。**
+    //
+    // 新增一个未接线的开关会让本条立刻红——那正是要的：登记一个「写记录对它无效」的开关
+    // 必须是一次显式决定，而不是顺手留下的半成品。若确有理由暂不接线，改本断言并在此写明理由。
+    let unwired: Vec<&str> = arr
         .iter()
-        .filter(|f| f["wired"] == json!(true))
+        .filter(|f| f["wired"] != json!(true))
         .map(|f| f["name"].as_str().unwrap())
         .collect();
+    assert!(
+        unwired.is_empty(),
+        "🔴 登记表里出现了未接线的开关 {unwired:?} —— 它们的运行时记录写了也不生效。\
+         接线，或在本断言处写明为什么暂不接"
+    );
     assert_eq!(
-        wired,
-        vec![
-            F,
-            // 🔵 `MUSE_SUBPLOT_CARDS` 是 `MIGRATION_NOTES` 上迁走的第三个。它的结算侧消费点
-            // 在事务内，故 bool 经 `progression::SettlementFlags`（结算期开关的统一落点）传入，
-            // 免得每迁一个开关就往结算函数上再加一个 bool 参数。
-            "MUSE_SUBPLOT_CARDS",
-            // 🔵 `MUSE_LETHALITY_DEATHMATCH` / `MUSE_ROOM_INVITATIONS` 是 `MIGRATION_NOTES`
-            // 清单上迁走的头两个。前者的 ctx 口径**两处不同**（读取侧按 world、建房前门只能按
-            // global），理由见 `worlds::deathmatch_enabled`；后者刻意**不含 world**，
-            // 理由见 `invitations::invitations_enabled`——两条相反的结论，都不是随手定的。
-            "MUSE_LETHALITY_DEATHMATCH",
-            // 🔵 `MUSE_ROOM_INVITATIONS` 是 `MIGRATION_NOTES` 清单上迁走的第一个
-            // （0036 参考接线之后）。它排在这里而不是队尾，是因为登记表按**归属模块**分组、
-            // 不按接线时间排——本断言比的是 `KNOWN_FLAGS` 的声明顺序。
-            "MUSE_ROOM_INVITATIONS",
-            // 🔵 `MUSE_CONTAINER_ASSEMBLY` 是 `MIGRATION_NOTES` 上最后一个**被迁**的
-            // （`MUSE_SAFETY_LEXICON` 按原注留着不迁）。装配期按 world、建模板前门只能按
-            // global——建模板时没有世界，模板是世界的蓝图。
-            "MUSE_CONTAINER_ASSEMBLY",
-            // 🔵 `MUSE_MEMORIAL` 与副本卡共用 `progression::SettlementFlags`——迁它只往那个
-            // 结构体加了一个字段，没有给结算函数新增 bool 参数。那正是上一条迁移时
-            // 建这个结构体的理由。
-            "MUSE_MEMORIAL",
-            // 🔵 `MUSE_WORLD_SERIES_AUTOSCALE` 是这批里**唯一只接 global 档**的：
-            // 逐系列的闸已经是 `world_series.status`，再加一档 world 作用域就是第三道
-            // 语义重叠的闸；且系列是一串世界实例，按世界灰度会让它半开半关。
-            "MUSE_WORLD_SERIES_AUTOSCALE",
-            // 🔵 `MUSE_WORLD_BE_BIOGRAPHY` 是 `SettlementFlags` 的第三个字段。它也是这批里
-            // 唯一**两侧 ctx 同档**（都按 world）的——传记是公共事实不是个人资产，
-            // 按人灰度会出现「同一份封卷 A 看得见 B 看不见」。
-            "MUSE_WORLD_BE_BIOGRAPHY",
-            "MUSE_OOC_ANNOTATIONS",
-            "MUSE_IFLINE_PARALLEL",
-            "MUSE_SOCIAL_IDENTITY_UNLOCK",
-            "MUSE_LIVE_STAGE",
-            "MUSE_OFFPEAK_SCHEDULING",
-            "MUSE_SAFETY_SEMANTIC_RECHECK",
-            //   - `MUSE_SAFETY_RECHECK_SWEEP`：第 3 层的补偿轮询，新建件、建成即接线
-            //     （`safety::semantic::sweep::spawn_sweeper`）。⚠️ 它默认关闭还有一条别的开关
-            //     没有的理由：轮询是全仓唯一一处**凭数据自发烧 token** 的路径——不需要有人
-            //     推进世界就能发起送审。这类东西默认开着，等于让一次合并抬高成本曲线。
-            "MUSE_SAFETY_RECHECK_SWEEP",
-            "MUSE_DISPOSAL_NAME_GATE"
-        ],
-        "已接线清单：0036 的参考接线 + R3 新建的 OOC 注解权 / if 线 / 真人社交解锁 / 直播场 + \
-         迁入体系的错峰调度 + §15 第 3 层语义复核 + 被处置内容的卡名读取面闸门"
+        arr.len(),
+        KNOWN_FLAGS.len(),
+        "列表端点应当把登记表逐条报出来（含未接线的，运营要看得见全貌）"
     );
     assert!(b["records"].as_array().unwrap().is_empty());
 }

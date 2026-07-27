@@ -354,7 +354,6 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
                🔴 **接通 ≠ 生效**：`ModerationProvider` 当前唯一实现是 Dev 桩，真实语义分类一次都没发生；\
                「当前是桩」随 `safety_recheck_runs.provider_stub` / 每条 risk_events / \
                `GET /admin/safety/recheck` 的 providerStub 一起走。不得据此表述为「五层漏斗已完整」",
-        // 🔵 新建件，没有需要保留的历史 env 语义，建成即接线（同 OOC 注解权 / if 线 / 直播场）。
         wired: true,
         // 解析档：按世界灰度是最自然的开闸单位；运营面读数走 global。
         scopes: SCOPES_WORLD,
@@ -384,8 +383,13 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
         // 所以对它而言「安全的那一侧」是开着，fail-closed 返回 true 才是 fail-**safe**。
         default_enabled: true,
         owner: "safety",
-        desc: "运行时敏感词库（审核链，默认开启；fail-safe 方向是「继续过滤」）",
-        wired: false,
+        desc: "运行时敏感词库（审核链，默认开启；fail-safe 方向是「继续过滤」）。\
+               🔴 只允许 **global** 作用域：按世界/按人关掉过滤不是运营动作，是内容安全事故。\
+               迁进体系的首要收益不是灰度而是**留痕**——env 改一行就能关掉全平台过滤且无任何\
+               审计记录，接进来后每次变更都落 audit_logs",
+        // 🔵 已接线（2026-07-27）。闸收已解析好的 bool，由 `commit_tick` 在 `db.begin()`
+        // 之前解析——事务里一次库都不查，`MIGRATION_NOTES` 原注的头号顾虑因此不成立。
+        wired: true,
         // 解析档：🔴 审核链只允许平台级急停，按世界/按人关掉敏感词过滤不是合理运营动作。
         scopes: SCOPES_GLOBAL,
     },
@@ -463,10 +467,14 @@ pub const fn declared_default(name: &str) -> bool {
 ///
 /// 逐个的注意事项：
 ///
-/// - `MUSE_SUBPLOT_CARDS`：**两个消费点语义不同**——端点侧关闭是 404，而结算铸卡侧关闭是
-///   「跳过发卡而非报错」（`onboarding` 领礼包时也依赖这个「跳过」语义）。结算路径在
-///   `runtime` 事务内，`is_enabled` 会查库，**必须确认它不在同一事务的锁持有区间内**，
-///   否则 SQLite 单连接池会自锁。建议结算侧改用「进事务前解析一次、把 bool 传进事务」。
+/// - ~~`MUSE_SUBPLOT_CARDS`~~ —— **已迁（2026-07-27）**。原注两条预判全中：两个消费点语义不同
+///   （端点 404 / 结算跳过不报错，`onboarding` 领礼包也依赖那个「跳过」），且结算路径在事务内、
+///   必须「进事务前解析一次、把 bool 传进去」。
+///   🔵 多做的一件事：那个 bool 不是裸参数，而是 [`crate::progression::SettlementFlags`]——
+///   结算事务里挂着的开关不止一个（还有传世卡自动封卷、BE 传记），一个一个加 bool，
+///   `settle_idle_world_ending_tx` 迟早变成七个 bool 的函数。
+///   🔵 「事务里解析会自锁」现在有可执行证据：
+///   `subplot::tests::resolving_flags_inside_the_transaction_deadlocks_and_fails_closed`。
 /// - ~~`MUSE_LETHALITY_DEATHMATCH`~~ —— **已迁（2026-07-27）**。原注预判的两处口径差异全部命中：
 ///   读取侧按 **world**，建房前门只能按 **global**（建房那一刻世界还不存在），
 ///   于是「全局关但某世界开，却建不出那个世界」确实会发生——现已写进
@@ -510,13 +518,20 @@ pub const fn declared_default(name: &str) -> bool {
 ///   于是没有副本卡/传世卡那种「产出了但看不见」的不对称。
 ///   ⚠️ 「关阀期间崩塌的世界不产传记，再打开也不追溯补写」这条语义**一个字没变**——
 ///   传记是封卷那一刻的快照，补写会把「当时的事实」换成「今天重算的事实」。
-/// - `MUSE_SAFETY_LEXICON`：🔴 **最后迁，或者干脆不迁**。它是审核链、默认开启，
-///   且消费点在 `runtime` commit **事务内的闸**上——事务内查库风险最大，收益最小
-///   （审核链本就该恒开，「按世界灰度关掉敏感词过滤」不是一个合理的运营动作）。
-///   若一定要迁，只允许 global 作用域，且要有单独的红线用例断言它**永远不能被关到 false**
-///   以外的路径上去。
+/// - ~~`MUSE_SAFETY_LEXICON`~~ —— **已迁（2026-07-27）**，但**理由与别的开关都不同**。
+///   原注判它「最后迁或干脆不迁」，依据：① 消费点在 commit 事务内的闸上，事务内查库风险最大；
+///   ② 收益最小（「按世界灰度关掉敏感词过滤」不是合理的运营动作）。重新评估后仍然迁：
+///   - ① **已被解掉**：闸收已解析好的 `bool`，`commit_tick` 在 `db.begin()` 之前解析，
+///     事务里一次库都不查。这套做法是迁前面几个开关时才成型的，原注写下时还没有。
+///   - ② **收益被低估**：原注只想到「灰度」。而对一个**审核链的急停阀**来说最重要的收益是
+///     **留痕**——env 改一行就能关掉全平台的敏感词过滤，**没有任何审计记录**；
+///     接进体系后每次变更都落 `audit_logs`。🔴「谁在什么时候关掉了内容过滤」必须查得到。
+///   原注的两个前提逐字执行：只允许 global（`scopes: SCOPES_GLOBAL`，写入端点直接 400）+
+///   单独红线用例 `lexicon::tests::red_line_lexicon_never_fails_open`。
 pub const MIGRATION_NOTES: &str =
-    "尚未接线的开关（wired=false）仍是纯 env；迁移清单与逐个注意事项见 flags::MIGRATION_NOTES 的文档注释";
+    "迁移清单已于 2026-07-27 走完：登记表里的存量 env 开关全部接入本体系（wired=true）。\
+     本常量与上方文档注释保留为**已完成的施工记录**——每条注意事项都标注了当初的预判\
+     对没对，其中三条被证伪。留着是因为它说明：这类清单本身也会过期，动手前先按当前代码复核";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 解析上下文

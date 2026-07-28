@@ -146,8 +146,38 @@ interface CalibrationReadings {
   };
 }
 
+/**
+ * **一个 SLO 指标块**（服务端 `slo/mod.rs`，随 `narrativeSlo.metrics` 下发）。
+ *
+ * 🔴 `status` 是一套**七态**，只有 `ok` 该显示数值，其余一律显示 `—`：
+ * `ok`（有样本，**可以是真的 0%**）/ `no_data_in_window`（分窗口，本窗口零样本）/
+ * `no_data_yet`（全生命周期口径，至今零样本）/ `entry_not_open`（入口从未开过）/
+ * `no_data_source`（口径未拍板，压根算不出）/ `skipped_too_large`（超扫描上限）/
+ * `skipped_by_request`（调用方传了 `?slo=0`）。
+ *
+ * 显示 `—` 与显示 `0%` 是两个完全不同的经营判断。服务端 2026-07-28 之前有四项在空平台上
+ * 报 `0%`（见 `docs/VALIDATION.md` §3.36）——`forcedRate: 0` 像好消息、
+ * `repeatEntryRate: 0` 像事故，而它们来自同一个空库。前端这一侧的纪律就是本注释这条：
+ * **status ≠ ok 一律不画数字**。
+ */
+interface SloMetricBlock {
+  metric?: string;
+  /** 中文标题**由服务端给**（不在前端另维护一张名字表，见 `SLO_HEADLINE` 的注释）。 */
+  title?: string;
+  status: string;
+  value?: number | null;
+  notes?: string[];
+  reason?: string;
+  [key: string]: unknown;
+}
+
 interface NarrativeSlo {
   status: string;
+  windowDays?: number;
+  /** 七项指标，键 = metric 名。**前端不假设有哪几项**，见 `sloRows`。 */
+  metrics?: Record<string, SloMetricBlock> | null;
+  /** 「没有数据源」的指标名单，与 `metrics` 里那几项的 `no_data_source` 一致。 */
+  unavailable?: string[];
   calibration?: CalibrationReadings | null;
 }
 
@@ -286,6 +316,43 @@ function ReadingCell({
   // 有区间的读数附「这个区间怎么读」，没区间的读数附「为什么不给区间」——两种都要看得见。
   const note = r.ciNoteRef ? notes?.[r.ciNoteRef] : null;
   return note ? <Tooltip title={note}>{body}</Tooltip> : body;
+}
+
+/** 七态 → 中文标签。`ok` 不在表里（它走数值分支）。未知状态原样显示，不吞掉。 */
+const SLO_STATUS_LABEL: Record<string, string> = {
+  no_data_in_window: '窗口内零样本',
+  no_data_yet: '至今零样本',
+  entry_not_open: '入口未开',
+  no_data_source: '无数据源',
+  skipped_too_large: '数据量超限，已跳过',
+  skipped_by_request: '本次未计算',
+};
+
+/**
+ * 每项指标的**头条数字与样本量**取哪个字段。
+ *
+ * 🔴 这张表**只做增强，不做筛选**：渲染遍历的是服务端实际下发的 `metrics` 的每一个键，
+ * 表里没登记的指标照样出现在表格里（标题走服务端的 `title`，数值回落到通用的 `value`）。
+ * 反过来写成「渲染这七项」的话，服务端上线第八项时前端会**静默地不显示它**——
+ * 而这一段的全部意义就是让指标能被人看见。判据方向见 `docs/VALIDATION.md` §3.8.1。
+ */
+const SLO_HEADLINE: Record<
+  string,
+  { field: string; kind: 'percent' | 'ratio'; label: string; sample: string; unit: string }
+> = {
+  attentionGini: { field: 'overThresholdRate', kind: 'percent', label: '越门槛世界占比', sample: 'worldsCounted', unit: '个世界' },
+  silentStreak: { field: 'overThresholdRate', kind: 'percent', label: '越门槛成员占比', sample: 'membersCounted', unit: '名成员' },
+  forcedConclusionRate: { field: 'forcedRate', kind: 'percent', label: '强制收尾占比', sample: 'endedWorlds', unit: '个已收尾世界' },
+  repeatEntryRate: { field: 'repeatEntryRate', kind: 'percent', label: '二次入世占比', sample: 'charactersTotal', unit: '张云角色卡' },
+  stateTextContradictionRate: { field: 'value', kind: 'percent', label: '矛盾拍占比', sample: 'ticksTotal', unit: '拍' },
+  oocAppealRate: { field: 'value', kind: 'percent', label: '申诉占比', sample: 'memberStagesCounted', unit: '人次·阶段' },
+  plotRepetitionRate: { field: 'value', kind: 'percent', label: '重复占比', sample: '', unit: '' },
+};
+
+/** 从指标块里取一个数值字段；不是有限数就当没有（NaN/Inf 不许流到界面上）。 */
+function sloNum(block: SloMetricBlock, field: string): number | null {
+  const v = block[field];
+  return typeof v === 'number' && Number.isFinite(v) ? v : null;
 }
 
 /** 维度整块的空态：把服务端下发的第一条 note 原样显示（「没测过」不是「很均衡」）。 */
@@ -473,6 +540,19 @@ export default function Metrics() {
   };
 
   // ---------- 校准维度读数（narrativeSlo.calibration） ----------
+  const slo = data?.narrativeSlo ?? null;
+  // 🔴 遍历服务端**实际下发**的每一个键，不是前端写死的七项：新指标一上线就自动出现。
+  // 排序取 SLO_HEADLINE 的登记顺序（可读顺序），未登记的排在后面、按名字定序。
+  const sloOrder = Object.keys(SLO_HEADLINE);
+  const sloRows = Object.entries(slo?.metrics ?? {})
+    .map(([key, block]) => ({ key, block }))
+    .sort((a, b) => {
+      const ia = sloOrder.indexOf(a.key);
+      const ib = sloOrder.indexOf(b.key);
+      if (ia !== ib) return (ia < 0 ? 999 : ia) - (ib < 0 ? 999 : ib);
+      return a.key.localeCompare(b.key);
+    });
+
   const calibration = data?.narrativeSlo?.calibration ?? null;
   const identityDim = calibration?.dimensions?.identityShareBalance;
   const realmDim = calibration?.dimensions?.realmTierWorldQuality;
@@ -638,6 +718,118 @@ export default function Metrics() {
                   延后时长由进程内存态计时，server 重启会让在途延后账清零（方向为低估，不会虚报）。
                 </Typography.Paragraph>
               </>
+            )}
+
+            {/* ---- 叙事质量 SLO（narrativeSlo.metrics，VALIDATION §4.2 八项表） ---- */}
+            <Typography.Title level={5} style={{ margin: '24px 0 12px' }}>
+              叙事质量 SLO
+              {slo?.windowDays ? (
+                <Typography.Text type="secondary" style={{ fontWeight: 400, marginLeft: 8 }}>
+                  滚动窗口 {slo.windowDays} 日（强制收尾率与二次入世率是全生命周期口径，不切窗口）
+                </Typography.Text>
+              ) : null}
+            </Typography.Title>
+
+            {!slo || slo.status !== 'ok' ? (
+              <Card size="small">
+                <Empty description={slo ? `本次未计算叙事质量 SLO：${slo.status}` : '服务端未返回叙事质量 SLO（narrativeSlo）'} />
+              </Card>
+            ) : sloRows.length === 0 ? (
+              <Card size="small"><Empty description="服务端返回了 SLO 段但一项指标都没有" /></Card>
+            ) : (
+              <Card size="small">
+                <Table
+                  size="small"
+                  rowKey="key"
+                  pagination={false}
+                  dataSource={sloRows}
+                  columns={[
+                    {
+                      title: '指标',
+                      dataIndex: 'key',
+                      render: (_: unknown, r: { key: string; block: SloMetricBlock }) => (
+                        <Space size={4} wrap>
+                          {/* 标题由服务端给：前端不另维护一张名字表，改口径时不会两边打架。 */}
+                          <span>{r.block.title ?? r.key}</span>
+                          {!SLO_HEADLINE[r.key] && (
+                            <Tooltip title="服务端新上线的指标，前端还没给它配头条字段与样本口径；这里按通用形态显示，不会漏掉它。">
+                              <Tag>新指标</Tag>
+                            </Tooltip>
+                          )}
+                        </Space>
+                      ),
+                    },
+                    {
+                      title: '读数',
+                      dataIndex: 'value',
+                      width: 200,
+                      render: (_: unknown, r: { key: string; block: SloMetricBlock }) => {
+                        // 🔴 status ≠ ok 一律不画数字（见 SloMetricBlock 注释）。
+                        if (r.block.status !== 'ok') {
+                          const label = SLO_STATUS_LABEL[r.block.status] ?? r.block.status;
+                          const why = r.block.reason ?? r.block.notes?.[0];
+                          const cell = (
+                            <Space size={4}>
+                              <span>—</span>
+                              <Typography.Text type="secondary" style={{ fontSize: 12 }}>{label}</Typography.Text>
+                            </Space>
+                          );
+                          return why ? <Tooltip title={why}>{cell}</Tooltip> : cell;
+                        }
+                        const spec = SLO_HEADLINE[r.key];
+                        const v = sloNum(r.block, spec?.field ?? 'value');
+                        return (
+                          <Space size={4} wrap>
+                            <strong>{readingText(v, spec?.kind ?? 'percent')}</strong>
+                            {spec?.label && (
+                              <Typography.Text type="secondary" style={{ fontSize: 12 }}>{spec.label}</Typography.Text>
+                            )}
+                          </Space>
+                        );
+                      },
+                    },
+                    {
+                      title: '样本',
+                      dataIndex: 'sample',
+                      width: 180,
+                      render: (_: unknown, r: { key: string; block: SloMetricBlock }) => {
+                        const spec = SLO_HEADLINE[r.key];
+                        const n = spec?.sample ? sloNum(r.block, spec.sample) : null;
+                        // 样本量永远画出来（同 ReadingCell 的纪律）：一个比例压在几个观察上，必须看得见。
+                        return n == null ? <span>—</span> : (
+                          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                            {formatNumber(n)} {spec?.unit}
+                          </Typography.Text>
+                        );
+                      },
+                    },
+                    {
+                      title: '门槛',
+                      dataIndex: 'threshold',
+                      width: 120,
+                      render: (_: unknown, r: { key: string; block: SloMetricBlock }) => {
+                        const t = sloNum(r.block, 'threshold') ?? sloNum(r.block, 'thresholdMax');
+                        if (t == null) return <span>—</span>;
+                        const over = r.block.overThreshold === true;
+                        // 🔴 只标「越线了」这个事实，不作判断、不给结论（同 ReadingCell）。
+                        return (
+                          <Space size={4}>
+                            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                              {r.key === 'silentStreak' ? `${formatNumber(t)} 拍` : readingText(t, 'ratio')}
+                            </Typography.Text>
+                            {over && <Tag color="warning" style={{ marginInlineEnd: 0 }}>越线</Tag>}
+                          </Space>
+                        );
+                      },
+                    },
+                  ]}
+                />
+                <Typography.Paragraph type="secondary" style={{ margin: '12px 0 0' }}>
+                  🔴 <strong>「—」和「0%」是两句完全不同的话</strong>：前者是「没测过」，后者是测出来的真数。
+                  零样本、无数据源、超上限一律显示 —，把鼠标停在上面能看到服务端给的原因。
+                  本段全部为<strong>只读观测</strong>，不写库、不回灌引擎。
+                </Typography.Paragraph>
+              </Card>
             )}
 
             {/* ---- 校准维度读数（narrativeSlo.calibration，只读观测，绝不回灌引擎） ---- */}

@@ -1057,3 +1057,108 @@ fn validation_doc_mentions_every_calibration_dimension() {
     }
 }
 
+
+// ============================================================================
+// 前后端接缝：后台那张 SLO 表读的字段，服务端必须真的下发
+// ============================================================================
+
+/// 🔴 **`admin/src/pages/Metrics.tsx` 的 `SLO_HEADLINE` 里登记的每一个字段名，
+/// 在服务端实际下发的对应指标块里必须存在。**
+///
+/// # 为什么这道门在服务端而不是后台
+///
+/// `admin/` 没有任何测试基建（只有 `tsc`），而 tsc 拦不住这类错——指标块在 TS 里带索引签名，
+/// 读一个不存在的字段类型上完全合法，运行时只是渲染成 `—`。于是「后台悄悄显示 —」
+/// 会被当成「零样本」，而真相是**字段名对不上**。这两件事在界面上长得一模一样。
+///
+/// 这条接缝正是 §3.8.1 的第三种形态：两侧各自都对，**中间那道缝没有主人**。
+/// 把它钉在服务端，是因为改坏它的通常是服务端（改字段名、改块形状），
+/// 而服务端这边有测试能立刻红。
+///
+/// # 判据只管 `status == "ok"` 的块
+///
+/// 与后台的渲染分支逐字对应：`status ≠ ok` 时它压根不读这些字段（只读 status）。
+/// 故先播种把多数指标推到 ok，再断言——并断言**至少有几项真的 ok**，
+/// 否则这道门会在一个空库上静默变成空断言。
+#[tokio::test]
+async fn admin_slo_table_reads_only_fields_the_server_actually_sends() {
+    // ---- 解析后台源码里的 SLO_HEADLINE 登记表 ----
+    const TSX: &str = include_str!("../../../admin/src/pages/Metrics.tsx");
+    let table = TSX
+        .split("const SLO_HEADLINE: Record<")
+        .nth(1)
+        .expect("后台源码里找不到 SLO_HEADLINE —— 那张表被改名或删了，本用例的口径已失效");
+    let table = table.split("\n};").next().expect("SLO_HEADLINE 没有结束大括号");
+
+    let mut registered: Vec<(String, String, String)> = Vec::new();
+    for line in table.lines() {
+        let line = line.trim();
+        let Some((key, rest)) = line.split_once(": { field: ") else { continue };
+        let key = key.trim().trim_matches(',').to_string();
+        let pick = |src: &str, needle: &str| -> String {
+            src.split(needle)
+                .nth(1)
+                .and_then(|s| s.split('\'').nth(1))
+                .unwrap_or_default()
+                .to_string()
+        };
+        let field = rest.split('\'').nth(1).unwrap_or_default().to_string();
+        let sample = pick(rest, "sample: ");
+        registered.push((key, field, sample));
+    }
+    assert!(
+        registered.len() >= 6,
+        "只从后台源码解析出 {} 条登记（{registered:?}）——解析口径坏了，这道门正在静默失效",
+        registered.len()
+    );
+
+    // ---- 播种：把尽量多的指标推到 ok ----
+    let db = test_db().await;
+    ins_world(&db, "w_seam", "open").await;
+    for c in ["s_a", "s_b"] {
+        ins_character(&db, c, 0).await;
+        ins_member(&db, "w_seam", c).await;
+        ins_contribution(&db, "w_seam", c, 500, IN_WINDOW).await;
+    }
+    for t in 0..3 {
+        ins_tick(&db, "w_seam", t, "done", 100, IN_WINDOW).await;
+        ins_event(&db, "w_seam", t, t, "action", &["s_a"]).await;
+    }
+    ins_world(&db, "w_seam_done", "ended").await;
+    ins_world_ended_audit(&db, "w_seam_done", "mainline_complete|ending=e_x").await;
+
+    let slo = narrative_slo(&db, &cfg()).await.unwrap();
+    let metrics = slo["metrics"].as_object().expect("metrics 是对象");
+
+    let mut ok_checked = 0usize;
+    for (key, field, sample) in &registered {
+        let block = metrics.get(key).unwrap_or_else(|| {
+            panic!(
+                "🔴 后台的 SLO_HEADLINE 登记了 `{key}`，但服务端一项都没下发这个名字。\n\
+                 指标改名时两边必须一起改，否则后台会把它整行漏掉。\n\
+                 现有指标：{:?}",
+                metrics.keys().collect::<Vec<_>>()
+            )
+        });
+        if block["status"] != "ok" {
+            continue;
+        }
+        ok_checked += 1;
+        assert!(
+            block.get(field.as_str()).is_some(),
+            "🔴 `{key}` 是 ok 状态，但后台要读的头条字段 `{field}` 不在下发的块里。\n\
+             后台会把它渲染成 `—`，而那和「零样本」在界面上长得一模一样：{block}"
+        );
+        if !sample.is_empty() {
+            assert!(
+                block.get(sample.as_str()).is_some(),
+                "🔴 `{key}.{sample}`（样本量字段）不存在 —— 后台的「样本」列会空着，\n\
+                 而「一个比例压在几个观察上必须看得见」正是那一列的全部意义：{block}"
+            );
+        }
+    }
+    assert!(
+        ok_checked >= 3,
+        "只有 {ok_checked} 项指标处于 ok 状态，断言几乎没跑到——播种不足，这道门是空的"
+    );
+}

@@ -1269,6 +1269,10 @@ fn beat_response(o: &runner::BeatOutcome, row: &IflineRow) -> Value {
             "terminalReason": o.ending_reason,
             "endingLabel": o.ending_label,
             "note": o.note,
+            // 🔴 AI 生成标识（平台红线 §0.6，《AI 生成合成内容标识办法》）：
+            // if 线正文是**整段模型生成**的付费内容，标识不可省、不可参数化、不可绕过。
+            // 口径与 `events` / `clips` / `worlds` 逐字一致。
+            "aiLabel": { "visible": true },
         },
         "ifline": {
             "id": row.id,
@@ -1338,6 +1342,8 @@ async fn list_beats(
             "terminalReason": r.try_get::<String, _>("terminal_reason").unwrap_or_default(),
             "note": r.try_get::<Option<String>, _>("note").unwrap_or(None),
             "createdAt": r.try_get::<i64, _>("created_at").unwrap_or(0),
+            // AI 生成标识（同上）：列表面与单拍面必须一致，否则「换个接口就没标识了」。
+            "aiLabel": { "visible": true },
         }));
     }
 

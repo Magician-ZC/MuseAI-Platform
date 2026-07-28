@@ -158,6 +158,9 @@ async fn host_tick_reuses_runtime_and_requires_host() {
     // 红线佐证：触发回合绝不设置 winner（胜者只由 settle 收敛产生）。
     let (_, rep) = get(&state, "/api/arena/w/report", "host").await;
     assert!(rep["match"]["winnerCharId"].is_null(), "触发回合不得产生胜者");
+    // 🔴 AI 生成标识（平台红线 §0.6）：战报里每条 summary 都是模型写的。
+    // 此前这份响应没有标识，而 `clips` / `events` 有——同一批内容换个接口就没标识了。
+    assert_eq!(rep["aiLabel"]["visible"], json!(true), "🔴 战报必须带 AI 生成标识");
 
     // 再次触发排 tick 1。
     let (_, v2) = post(&state, "/api/arena/w/host/tick", "host", json!({})).await;

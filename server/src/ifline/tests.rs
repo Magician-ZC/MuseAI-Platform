@@ -1352,6 +1352,15 @@ async fn red_line_ifline_ending_grants_nothing() {
         "终局产物 = 可读的正文（内容），这就是玩家买到的全部东西"
     );
 
+    // 🔴 AI 生成标识（平台红线 §0.6）：if 线正文是**整段模型生成**的付费内容。
+    // 它此前一直没有标识，而同为叙事读取面的 `events` / `clips` / `worlds` 都有——
+    // 「显式标注已实现」这句话曾经只对其中一部分成立。
+    assert_eq!(
+        beats["items"][0]["aiLabel"]["visible"],
+        json!(true),
+        "🔴 if 线正文必须带 AI 生成标识"
+    );
+
     // 审计必须把「什么都没发」这件事记下来（将来任何人翻记录都能一眼确认）。
     let reason: String = sqlx::query_scalar(
         "SELECT reason FROM audit_logs WHERE action = 'ifline.ended' AND subject = $1",

@@ -52,7 +52,11 @@ pub async fn generate_report(
             "public_fact": "公开事实",
             "private_view": "角色私密视角（仅你可见）",
             "model_inference": "模型推断"
-        }
+        },
+        // 🔴 AI 生成标识（平台红线 §0.6）。⚠️ 它与 `provenanceLegend` **不是一回事**：
+        // 后者标的是「这条信息从哪来」（供玩家判断可信度），前者标的是「这是 AI 生成内容」
+        // （合规义务，面向监管与知情权）。日报的独白与摘要都出自模型，故整份带标识。
+        "aiLabel": { "visible": true }
     });
 
     let id = crate::db::new_id("rpt");
@@ -346,6 +350,30 @@ mod tests {
             .fetch_one(db)
             .await
             .unwrap()
+    }
+
+    /// 🔴 AI 生成标识（平台红线 §0.6，《AI 生成合成内容标识办法》）。
+    ///
+    /// 日报的独白与摘要都出自模型，此前这份 content 里**没有标识**——
+    /// 而同为叙事读取面的 `events` / `clips` / `worlds` 都有。
+    /// ⚠️ 它与 `provenanceLegend` 不是一回事：后者标「这条信息从哪来」（供玩家判断可信度），
+    /// 前者标「这是 AI 生成内容」（合规义务）。两者都要，缺一不可互相顶替。
+    #[tokio::test]
+    async fn daily_report_carries_the_ai_label() {
+        let state = test_state().await;
+        seed_user(&state.db, "u1").await;
+        let id = generate_report(&state, "w1", "u1", "c1", "2026-07-20").await.unwrap();
+        let raw: String = sqlx::query_scalar("SELECT content_json FROM daily_reports WHERE id = $1")
+            .bind(&id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["aiLabel"]["visible"], json!(true), "🔴 日报必须带 AI 生成标识");
+        assert!(
+            v["provenanceLegend"]["model_inference"].is_string(),
+            "来源图例照常在——它与 AI 标识并存，不互相顶替"
+        );
     }
 
     #[tokio::test]

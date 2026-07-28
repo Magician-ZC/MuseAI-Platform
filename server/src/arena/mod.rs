@@ -307,6 +307,9 @@ async fn get_report(
             "winnerCharId": m.winner_char_id,
         },
         "rounds": rounds_out,
+        // 🔴 AI 生成标识（平台红线 §0.6）：战报里的每条 `summary` 都是模型写的世界事实投影。
+        // 口径与 `events` / `clips` / `ifline` 逐字一致。
+        "aiLabel": { "visible": true },
         "environment": environment, // 全部礼物/环境日志（含尚未注入回合的 seam 记录）
         // 合规展示：仲裁公开承诺 + AI 生成标识（对抗「是不是剧本」质疑，§2.1/§9.4）。
         "compliance": { "arbitrationPublic": true, "aiGenerated": true },
@@ -421,6 +424,8 @@ async fn get_replay(
             "winnerCharId": m.winner_char_id,
         },
         "events": events,
+        // AI 生成标识（同上）：分页事件流与整份战报必须一致，否则「换个接口就没标识了」。
+        "aiLabel": { "visible": true },
         "nextCursor": next_cursor,
         "startedAt": started,
         "endedAt": ended,

@@ -1177,16 +1177,63 @@ mod tests {
         assert_eq!(r.notes, vec!["原注记".to_string()], "🔴 不许顺手往 notes 里塞东西");
     }
 
+    /// 从 `parse_path` 的源码里解析某一族的白名单字段名。
+    ///
+    /// 锚点是该族**拒绝分支的错误文案**（如 `"characters 需 <id>.<field>"`）——
+    /// 它就在那个 `match` 的上方几行，且是这一族独有的。
+    /// 取锚点之后到最近一个 `_ =>` 之间的全部字符串字面量。
+    fn whitelisted_fields(src: &str, anchor: &str) -> Vec<String> {
+        let from = src.find(anchor).unwrap_or_else(|| {
+            panic!("🔴 在 reducer 源码里找不到锚点 `{anchor}` —— parse_path 的结构变了，本用例的解析口径已失效")
+        });
+        // ⚠️ 从锚点后的 `match` 开始扫，不从锚点紧后面开始 —— 锚点自身的**收尾引号**
+        // 会让后面所有引号配对整体错位一位（第一版就是这么写的，解析出 0 个字段）。
+        let after = &src[from + anchor.len()..];
+        let mstart = after.find("match ").unwrap_or_else(|| {
+            panic!("🔴 锚点 `{anchor}` 之后找不到 match —— parse_path 的结构变了")
+        });
+        let rest = &after[mstart..];
+        let end = rest.find("_ =>").unwrap_or(rest.len());
+        let mut out = Vec::new();
+        let seg = &rest[..end];
+        let mut i = 0usize;
+        while let Some(rel) = seg[i..].find('"') {
+            let start = i + rel + 1;
+            let Some(len) = seg[start..].find('"') else { break };
+            let lit = &seg[start..start + len];
+            if lit.chars().all(|c| c.is_ascii_alphanumeric()) && !lit.is_empty() {
+                out.push(lit.to_string());
+            }
+            i = start + len + 1;
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
     /// 反向配对：**白名单里的每一个字段都必须真的有分发分支**。
     ///
     /// 只测「未知字段要报错」的话，把分发全改成 `Err` 也能全绿——那等于把 reducer 废掉。
     /// 这里遍历 `parse_path` 实际放行的字段名逐个验，加字段时它自动进入判据。
     #[test]
     fn every_whitelisted_field_actually_has_a_dispatch_arm() {
+        // 🔴 **字段名从 `parse_path` 的源码里解析出来，不手列。**
+        //
+        // 这道门要防的正是「往白名单加了字段却忘了分发」。若这里手写一张表，
+        // 加字段的人同样不会想到来改它 —— 于是门**看不见那个新字段**，
+        // 而正向那条（未知字段要报错）也覆盖不到它，两条加起来仍然漏。
+        // 「还看得见几个」不等于「要看的那个还在视野里」（同 §3.54 的教训）。
+        let src = include_str!("reducer.rs");
+        let char_fields = whitelisted_fields(src, "characters 需 <id>.<field>");
+        assert!(
+            char_fields.len() >= 8,
+            "🔴 只从 parse_path 解析出 {} 个角色字段，解析口径坏了：{char_fields:?}",
+            char_fields.len()
+        );
+
         let c = CharacterState::default();
-        for field in
-            ["goals", "emotions", "resources", "secrets", "misconceptions", "plans", "location", "arcStage"]
-        {
+        for field in &char_fields {
+            let field = field.as_str();
             assert!(
                 parse_path(&format!("characters.x.{field}")).is_ok(),
                 "前提：{field} 应在 parse_path 白名单里"
@@ -1206,7 +1253,14 @@ mod tests {
             known_to: vec![],
             notes: vec![],
         };
-        for field in ["trust", "affinity", "fear", "debt", "knownTo", "notes"] {
+        let rel_fields = whitelisted_fields(src, "关系语法");
+        assert!(
+            rel_fields.len() >= 6,
+            "🔴 只从 parse_path 解析出 {} 个关系字段，解析口径坏了：{rel_fields:?}",
+            rel_fields.len()
+        );
+        for field in &rel_fields {
+            let field = field.as_str();
             assert!(
                 parse_path(&format!("relations[a->b].{field}")).is_ok(),
                 "前提：{field} 应在白名单里"

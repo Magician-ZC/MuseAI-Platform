@@ -438,9 +438,12 @@ curl -H "Authorization: Bearer <admin>" localhost:8787/api/admin/safety/recheck 
 > 📄 **每一条的选项、代价与建议见 `docs/build/open-decisions.md`**。那份文档做的事是
 > 「让决定变得可以做」——本节只登记**有哪些**,不复述怎么权衡(复述必然与那边漂移)。
 
-- **礼物→LLM 回合真实注入**:gift boon 已记入 `arena_env_events` + 进战报 + **已扣费**,
-  唯独不进引擎回合——`RoundInput` 现有字段里没有环境事件位。🔴 难点不是工程是**平权红线**
-  (「不卖胜负与数值平权」),见 open-decisions §5。
+- ~~**礼物→LLM 回合真实注入**~~ —— **已定并已实现**(2026-07-28,open-decisions §5 选项 A:
+  观众打赏买到的是一个**被看见的机会**,不是任何形式的优势)。
+  🔴 上一版本条目里那句「`RoundInput` 现有字段里没有环境事件位」**已经不成立**——
+  现在有 `ambient_events`。留着这行订正是因为:**一条会过期的声明,过期之后比没有更糟**
+  (它会让人以为还有事没做,或者更糟——以为红线还没被处理过)。
+  形态、两道红线与默认关闭见 `docs/VALIDATION.md` §3.41。
 - ~~**复活/礼物实际扣费**~~ —— **早已接完,本条是过期声明**(2026-07-27 核准订正)。
   复活走 `arena::revive` 的 `ledger::charge`(P2 就做了,与写 grant 同一事务原子,
   余额不足 409 零副作用);站内打赏走 `livegate` 的 `ledger::charge`(world→模板作者分成、

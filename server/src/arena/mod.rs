@@ -14,9 +14,13 @@
 //! - POST /arena/{worldId}/settle         结算：仅同意 approved 才落定淘汰，declined/超时保守免淘汰；落定后重算唯一胜者。
 //!
 //! 红线（规格 §2.5，写进实现+测试）：买过程不买结果；无免死端点；胜者奖励非强度；淘汰不可逆需同意门控。
-//! seam（诚实标注）：礼物→引擎回合真实影响——arena_env_events 已记录并进战报，注入 LLM RoundInput 需
-//!   runtime 扩展（HA 域），本期不接；arbiter rule_refs 注入 world_events.arbiter_note 亦为 runtime seam，
-//!   report 读取该列作判定依据。
+//! ~~seam：礼物→引擎回合真实影响~~ —— **已接（2026-07-28，open-decisions §5 拍板选项 A）**。
+//!   礼物的 `label` 经 `RoundInput.ambient_events` 进引擎**展示层**（`ambient` 一格），
+//!   提交时按 id 精确回写 `arena_env_events.applied_tick`——**那就是本文件战报里的显式标注**。
+//!   🔴 它买到的是「被看见」不是「影响力」：仲裁 / 不变量 / reducer / 同意门控 / 关系演化 /
+//!   里程碑强度一律不读它（引擎侧源码级红线 `ambient_events_never_leave_the_presentation_layer` 扫死），
+//!   且**默认关闭**（`MUSE_AMBIENT_GIFT_EVENTS`）。见 `docs/VALIDATION.md` §3.41。
+//!   arbiter rule_refs 注入 world_events.arbiter_note 仍为 runtime seam，report 读取该列作判定依据。
 //!
 //! 复活扣费（P2，feature=arena → ledger 恒在）：复活「资格」价从世界模板 `revive_price_cents` 读
 //!   （题材维度定价；模板缺失/未定价 → 0 → 免费复活，保留旧行为）。经 `ledger::charge` 扣钱包，
@@ -204,7 +208,8 @@ async fn host_tick(
         .await?;
 
     // 复用 runtime（勿改）：schedule_tick(due=now) 排下一 tick 入队；worker 跑一次 P2 回合循环。
-    // seam：礼物 boon（arena_env_events）真实注入本回合 RoundInput 需 runtime 扩展，本期只记录+进战报。
+    // 礼物注入已接（2026-07-28）：`runtime::load_pending_ambient` 在起回合前取
+    // `applied_tick IS NULL` 的 gift_boon，只取 `label` 进展示层；默认关闭。见模块头。
     let tick_no = crate::runtime::schedule_tick(&state, &world_id).await?;
 
     let resp = json!({

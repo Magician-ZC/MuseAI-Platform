@@ -736,6 +736,9 @@ pub(super) async fn advance_one_beat(
         };
         let engine = NarrativeEngine::new(Arc::new(host));
         let input = RoundInput {
+            // 观众礼物（open-decisions §5）：**if 线没有观众**——它是单人付费内容，
+            // 没有直播间、没有打赏入口。恒空不是「暂未接线」，是这条链上不存在这个概念。
+            ambient_events: Vec::new(),
             run_id: row.id.clone(),
             mode: RunMode::Observe,
             active_cards: active_cards.clone(),

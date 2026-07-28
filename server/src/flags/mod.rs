@@ -378,6 +378,29 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
         scopes: SCOPES_GLOBAL,
     },
     FlagDef {
+        name: "MUSE_AMBIENT_GIFT_EVENTS",
+        // 🔴 默认关，理由与本表里任何一个都不同，而且是全表最重的一条：
+        // 这一项一旦上线并**被玩家感知为「打赏有用」，撤回就等于承认平台卖过优势**。
+        // 平台红线第一条是「不卖胜负与数值平权」。它必须是**有人按过开关**才生效，
+        // 而不是一次代码合并的副作用。
+        default_enabled: false,
+        owner: "runtime",
+        desc: "观众礼物 → 引擎回合的**展示层**注入（open-decisions §5，2026-07-28 产品拍板选项 A：\
+               观众打赏买到的是一个**被看见的机会**，不是任何形式的优势）。\
+               开启后 `arena_env_events(kind='gift_boon', applied_tick IS NULL)` 的 `label` \
+               会进 `RoundInput.ambient_events` → 引擎可见上下文的 `ambient` 一格，\
+               并在提交时按 id 精确回写 `applied_tick`（**这就是战报的显式标注**，对所有观众可见）。\
+               🔴 边界由引擎侧源码级红线 `ambient_events_never_leave_the_presentation_layer` 扫死：\
+               仲裁 / 确定性不变量 / reducer / StatePatch / 同意门控 / 关系演化 / 里程碑强度\
+               **一律不得引用它**，它也绝不写回 NarrativeState。\
+               🔴 只取礼物的 `label`（展示文案），**绝不取 `boon`**——那里面是 kind/effectTag 之类的\
+               效果语义，喂给模型就等于在暗示「这个礼物该起什么作用」。",
+        wired: true,
+        // 解析档：礼物是**场上公开**的东西，全体看到同一份。按用户/世界分档会造出\
+        // 「谁的观众多谁看到更多」这条可优化的差异通道，那正是本项要避免的。
+        scopes: SCOPES_GLOBAL,
+    },
+    FlagDef {
         name: "MUSE_ATTENTION_TICK_FAILURE",
         // 🔴 默认关：它改的是运营看板上「需关注」这个数**的含义**。开着合并 = 没人按过开关，
         // 而某天早上那个数字自己变大了（§0.1）。三个维度共用这条理由。

@@ -4057,3 +4057,92 @@ fn parse_realm_costume_keeps_only_briefing_and_flavor_notes() {
         assert!(!dumped.contains(leaked), "「{leaked}」不该进模型上下文：{dumped}");
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 观众礼物 → 引擎展示层（open-decisions §5 选项 A，2026-07-28 拍板）
+// ═══════════════════════════════════════════════════════════════════════════
+
+async fn mk_env_table(db: &AnyPool) {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS arena_env_events (\
+         id TEXT PRIMARY KEY, world_id TEXT NOT NULL, applied_tick INTEGER, kind TEXT NOT NULL, \
+         payload_json TEXT NOT NULL DEFAULT '{}', aggregated_count INTEGER NOT NULL DEFAULT 1, \
+         created_at BIGINT NOT NULL)",
+    )
+    .execute(db)
+    .await
+    .ok();
+}
+
+async fn seed_gift(db: &AnyPool, id: &str, world: &str, payload: &str, count: i64, at: i64) {
+    sqlx::query(
+        "INSERT INTO arena_env_events (id, world_id, applied_tick, kind, payload_json, aggregated_count, created_at) \
+         VALUES ($1, $2, NULL, 'gift_boon', $3, $4, $5)",
+    )
+    .bind(id)
+    .bind(world)
+    .bind(payload)
+    .bind(count)
+    .bind(at)
+    .execute(db)
+    .await
+    .unwrap();
+}
+
+/// 🔴 **开关没开 → 恒空**。这一项一旦被玩家感知为「打赏有用」，撤回等于承认平台卖过优势，
+/// 所以它必须是**有人按过开关**才生效，而不是一次代码合并的副作用（§0.1 在这里赌注最大）。
+#[tokio::test]
+async fn audience_gifts_do_not_reach_the_engine_until_someone_turns_the_flag_on() {
+    let state = test_state().await;
+    mk_env_table(&state.db).await;
+    seed_gift(&state.db, "g1", "w1", r#"{"label":"有人送上一束火把"}"#, 3, 100).await;
+
+    let (events, ids) = super::load_pending_ambient(&state, "w1").await;
+    assert!(events.is_empty(), "🔴 开关未开时礼物绝不许进引擎上下文：{events:?}");
+    assert!(ids.is_empty(), "开关未开时也不该有任何行被标记");
+}
+
+/// 开关打开后：只取 `label`、**绝不取 `boon`**、按 `created_at` 定序、封顶。
+#[tokio::test]
+async fn once_enabled_only_the_display_label_reaches_the_engine() {
+    let state = test_state().await;
+    mk_env_table(&state.db).await;
+    crate::flags::set_flag(
+        &state.db,
+        crate::flags::SetFlag {
+            flag: "MUSE_AMBIENT_GIFT_EVENTS",
+            scope: "global",
+            target_id: "",
+            enabled: true,
+            starts_at: 0,
+            ends_at: 0,
+            actor_id: "test",
+            reason: "用例",
+        },
+    )
+    .await
+    .unwrap();
+
+    // 后送的排在后面；带 boon 效果语义的那条，boon 不许出现在任何地方。
+    seed_gift(&state.db, "g2", "w1", r#"{"label":"第二个","boon":{"kind":"advantage","effectTag":"reroll"}}"#, 1, 200).await;
+    seed_gift(&state.db, "g1", "w1", r#"{"label":"第一个"}"#, 5, 100).await;
+    // 空 label / 别的世界 → 都不该进来。
+    seed_gift(&state.db, "g3", "w1", r#"{"label":"   "}"#, 1, 300).await;
+    seed_gift(&state.db, "g4", "w2", r#"{"label":"别人的世界"}"#, 1, 50).await;
+
+    let (events, ids) = super::load_pending_ambient(&state, "w1").await;
+    let labels: Vec<&str> = events.iter().map(|e| e.label.as_str()).collect();
+    assert_eq!(labels, vec!["第一个", "第二个"], "按 created_at 定序，空白与他人世界剔除");
+    assert_eq!(events[0].count, 5, "count 是聚合计数（不是强度）");
+    assert_eq!(ids, vec!["g1".to_string(), "g2".to_string()], "回写用的 id 与事件一一对应");
+
+    // 🔴 boon 的效果语义一个字都不许流到引擎：喂给模型就等于在暗示「这个礼物该起什么作用」，
+    // 而本字段的全部约定是「它不起任何作用」。
+    let dumped = format!("{events:?}");
+    for leaked in ["advantage", "reroll", "boon", "effectTag"] {
+        assert!(
+            !dumped.contains(leaked),
+            "🔴 礼物的效果语义 `{leaked}` 流进了引擎入参：{dumped}"
+        );
+    }
+}

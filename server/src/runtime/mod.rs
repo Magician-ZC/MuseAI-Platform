@@ -2572,6 +2572,9 @@ async fn process_tick_inner(
         // 单连接池上那是 `PoolTimedOut` 自锁，且未必在内存 SQLite 用例里复现）。
         // 按**本世界**解析，与 join 契约门、列表/详情投影同一口径：玩家签的那一档就是引擎跑的那一档。
         let tick_deathmatch_on = crate::worlds::deathmatch_enabled(&state.db, Some(world_id)).await;
+        // 观众礼物同样**在这里、进事务之前**解析并取数（理由同上一行：单连接池上，
+        // 引擎回合与 commit 事务之间再插查库就是自锁）。
+        let (ambient_events, fed_ambient_ids) = load_pending_ambient(state, world_id).await;
         let input = RoundInput {
             run_id: run_id.clone(),
             mode: RunMode::Observe,
@@ -2619,6 +2622,16 @@ async fn process_tick_inner(
             //    不开权限、不调难度；不进 active_cards（卡不可变），不进 CharacterState.resources。
             // None（老世界 / 未声明 / 文案皆空）→ 导演 prompt 与接线前逐字节一致。
             realm_costume: realm_costume.clone(),
+            // 观众礼物 → 场上环境（总规格红线 1「不卖胜负与数值平权」，open-decisions §5 选项 A）。
+            //
+            // 🔴 **它买到的是「被看见」，不是「影响力」**：只进引擎的展示层上下文，
+            //    仲裁 / 不变量 / reducer / 同意门控 / 关系演化 / 里程碑强度一律不读它
+            //    （引擎侧由源码级红线 `ambient_events_never_leave_the_presentation_layer` 扫死）。
+            // 🔴 **默认关闭**（`MUSE_AMBIENT_GIFT_EVENTS`）：这一项一旦被玩家感知为「打赏有用」，
+            //    撤回等于承认平台卖过优势——所以它必须是**有人按过开关**才生效，
+            //    而不是一次代码合并的副作用。
+            // 空 = 开关未开 / 本拍没有待落地的礼物 → 引擎上下文里不出现 `ambient`，逐字节同接线前。
+            ambient_events: ambient_events.clone(),
         };
         let cancel = CancelFlag::new();
         // 时间线模式分派（第二块 Phase 2）：event 世界走 DES 调度器 run_event_step（内部做 cohort 过滤 +
@@ -2693,6 +2706,7 @@ async fn process_tick_inner(
                     &members_projection,
                     cost,
                     &fed_intervention_ids,
+                    &fed_ambient_ids,
                     &endgame_policy,
                     terminal.as_ref(),
                     selected_ending.as_deref(),
@@ -2728,6 +2742,60 @@ async fn process_tick_inner(
 /// tick_no），过 `policy.enabled`(严格门 idle) + `min_world_ticks` 地板 → 事务内 `end_world_tx` 停机、返回
 /// `TickStatus::Concluded`。**终局与状态 CAS 同事务保原子**（不裂：状态提交与停机同成同败）。
 #[allow(clippy::too_many_arguments)]
+/// 取本世界**待落地**的观众礼物（`arena_env_events.applied_tick IS NULL`），
+/// 折成引擎的展示层入参。
+///
+/// 🔴 **默认关闭**（`MUSE_AMBIENT_GIFT_EVENTS`，`flags::KNOWN_FLAGS`）：开关没开 → 恒空，
+/// 一条 SQL 都不发，引擎上下文里不出现 `ambient`，逐字节与接线前一致。
+/// 这一项一旦被玩家感知为「打赏有用」，撤回等于承认平台卖过优势（open-decisions §5），
+/// 所以它必须是**有人按过开关**才生效。
+///
+/// 🔴 **查库失败一律当作「没有礼物」**，而不是中断这一拍：礼物是锦上添花的展示层，
+/// 让它有能力弄挂一个付费世界的推进，是把优先级搞反了。
+///
+/// 定序：`created_at, id` 升序（确定性契约——同一份数据每次拼出同一段上下文）。
+/// 上限 [`AMBIENT_MAX`]：礼物是外部可无限触发的输入，不封顶等于给了一条把上下文撑爆的路。
+async fn load_pending_ambient(
+    state: &AppState,
+    world_id: &str,
+) -> (Vec<muse_engine::narrative::AmbientEvent>, Vec<String>) {
+    if !crate::flags::is_enabled(&state.db, "MUSE_AMBIENT_GIFT_EVENTS", crate::flags::FlagCtx::global())
+        .await
+    {
+        return (Vec::new(), Vec::new());
+    }
+    let rows = sqlx::query(
+        "SELECT id, payload_json, aggregated_count FROM arena_env_events \
+         WHERE world_id = $1 AND kind = 'gift_boon' AND applied_tick IS NULL \
+         ORDER BY created_at ASC, id ASC LIMIT $2",
+    )
+    .bind(world_id)
+    .bind(AMBIENT_MAX)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    rows.iter()
+        .filter_map(|r| {
+            let id = r.try_get::<String, _>("id").ok()?;
+            let payload: Value =
+                serde_json::from_str(&r.try_get::<String, _>("payload_json").ok()?).ok()?;
+            // 🔴 只取 `label`（展示文案）。**绝不取 `boon`**——那里面是 kind/effectTag 之类的
+            // 效果语义，把它喂给模型就等于在暗示「这个礼物该起什么作用」，
+            // 而本字段的全部约定是「它不起任何作用」。
+            let label = payload.get("label").and_then(Value::as_str)?.trim().to_string();
+            if label.is_empty() {
+                return None;
+            }
+            let count = r.try_get::<i64, _>("aggregated_count").unwrap_or(1).clamp(1, i64::from(u32::MAX));
+            Some((muse_engine::narrative::AmbientEvent { label, count: count as u32 }, id))
+        })
+        .unzip()
+}
+
+/// 一拍最多带几条环境事件进上下文。礼物是**外部可无限触发**的输入。
+const AMBIENT_MAX: i64 = 20;
+
 async fn commit_tick(
     state: &AppState,
     world_id: &str,
@@ -2737,6 +2805,8 @@ async fn commit_tick(
     members: &[ProjectionMember],
     cost_tokens: u64,
     fed_intervention_ids: &[String],
+    // 本拍**实际喂进上下文**的观众礼物行 id。见下方回写处的注释。
+    fed_ambient_ids: &[String],
     policy: &RoomEndgamePolicy,
     terminal: Option<&Terminal>,
     ending: Option<&str>,
@@ -2867,6 +2937,27 @@ async fn commit_tick(
             .bind(world_id)
             .execute(&mut *tx)
             .await?;
+    }
+
+    // 观众礼物落地：**按 id 精确**把本拍实际喂进上下文的那几行标 `applied_tick`
+    //（口径与上面 `fed_intervention_ids` 完全一致，理由也一样）。
+    //
+    // 🔴 **这就是「战报显式标注」**：`arena/mod.rs` 的透明战报直接读 `applied_tick`，
+    // 于是「这一拍场上有观众送的东西」对**所有观众**可见——不标注就是隐性优待
+    // （open-decisions §5 的原话）。
+    //
+    // 🔴 **绝不 blanket 标全部 `applied_tick IS NULL`**：礼物可能在这一拍**跑的过程中**送到，
+    // 它没进过这一拍的上下文。blanket 标记会让战报声称一件没发生过的事，
+    // 而战报的全部价值就是「它说的是真的」。
+    for gid in fed_ambient_ids {
+        sqlx::query(
+            "UPDATE arena_env_events SET applied_tick=$1 WHERE id=$2 AND world_id=$3 AND applied_tick IS NULL",
+        )
+        .bind(tick_no)
+        .bind(gid)
+        .bind(world_id)
+        .execute(&mut *tx)
+        .await?;
     }
 
     // 预算累计（B-1：实测 token）。

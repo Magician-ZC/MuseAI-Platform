@@ -129,6 +129,35 @@ pub struct RoundInput {
     /// 「不传即默认」由 `Default for RoundInput` 保证。
     /// 确定性：`BTreeMap` 键有序，纯读纯拼接，无随机、不依赖迭代序产生分支。
     pub self_identities: BTreeMap<String, String>,
+    /// **观众礼物等环境事件**（平台 `livegate` 注入；桌面壳恒空）。
+    ///
+    /// # 🔴 这个字段买到的是「被看见」，不是「影响力」
+    ///
+    /// 产品 2026-07-28 拍板（`docs/build/open-decisions.md` §5 选项 A）：
+    /// **观众打赏买到的是一个被看见的机会，不是任何形式的优势。**
+    /// 平台红线第一条是「不卖胜负与数值平权」——礼物一旦影响判定，平台就是在卖优势，
+    /// 而那件事**一旦被玩家感知为「打赏有用」，撤回就等于承认平台卖过优势**。
+    ///
+    /// 因此本字段的边界与 [`RoundInput::self_identities`] **同等强度**，且逐条列明：
+    ///
+    /// - **只**流向 `decide::assemble_visible_context` 的展示层 JSON（`ambient` 一格）；
+    /// - 引擎内**没有任何判定读它**：仲裁（rule / model）、确定性不变量、reducer / `StatePatch`、
+    ///   同意门控、关系演化、里程碑强度**一律不引用**；
+    /// - **绝不写回** `NarrativeState`；
+    /// - 不进 `active_cards`（不可变卡快照），不进 `whispers`
+    ///   （那是「主人托梦」，有配额、会被标 `applied`，语义完全不同）。
+    ///
+    /// 🔴 **命名刻意不叫 `boons`**：`boon`（增益）这个词本身就暗示数值好处，
+    /// 而它恰恰**不是**增益。名字是给下一个人看的第一道边界。
+    ///
+    /// # 为什么是 `Vec` 而不是按角色的 map
+    ///
+    /// 礼物是**公开的、场上的**——所有人看到同一份，没有「谁的观众多谁看到更多」这回事。
+    /// 按角色分发会立刻造出一条可优化的差异通道，那正是要避免的。
+    ///
+    /// 默认空 = 桌面壳 / 未开启该通道 → 上下文里根本不出现 `ambient`，逐字节退化为接线前。
+    /// 确定性：`Vec` 由调用方定序（server 侧按 `created_at, id` 取），纯读纯拼接、无随机。
+    pub ambient_events: Vec<AmbientEvent>,
     /// 各角色的主人托梦（可空；平台/交互模式注入）
     pub whispers: BTreeMap<String, String>,
     /// 各角色本回合检索片段（P1 集成；由调用方按绑定与时间边界取得）
@@ -192,6 +221,8 @@ impl Default for RoundInput {
             other_cards_brief: BTreeMap::new(),
             // 自身开局站位默认空 = 不传 → 可见上下文里根本不出现该字段，行为与接线前逐字节一致。
             self_identities: BTreeMap::new(),
+            // 环境事件默认空 = 桌面壳 / 通道未开 → 上下文里不出现 `ambient`，逐字节退化为接线前。
+            ambient_events: Vec::new(),
             whispers: BTreeMap::new(),
             fragments: BTreeMap::new(),
             temperature_decide: 0.0,
@@ -209,6 +240,19 @@ impl Default for RoundInput {
             realm_costume: None,
         }
     }
+}
+
+/// 一条**观众礼物等环境事件**的展示形态。见 [`RoundInput::ambient_events`] 的边界声明。
+///
+/// 🔴 **这个结构里永远不该出现数值字段**（加成、权重、成功率、优先级……）。
+/// 它只有「场上出现了什么」和「出现了几次」；`count` 是聚合计数（同回合同 SKU 合并，
+/// 防事件风暴），**不是强度**——引擎里没有任何地方拿它做乘除或比较。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmbientEvent {
+    /// 展示文案（如「有人送上一束火把」）。由调用方给定，引擎原样透出。
+    pub label: String,
+    /// 同回合聚合次数。**计数，不是强度**。
+    pub count: u32,
 }
 
 #[derive(Debug)]
@@ -423,6 +467,9 @@ impl NarrativeEngine {
                         let ctx = decide::assemble_visible_context(
                             cur_ref, cid, card, &dctx.brief, &dctx.situation, frags, whisper,
                             self_identity,
+                            // 🔴 全体同一份：礼物是公开的、场上的，不按角色分发
+                            //（按角色分发会造出「谁的观众多谁看到更多」这条差异通道）。
+                            &inp_ref.ambient_events,
                         )?;
                         decide::role_decide(
                             host, decide_stage, dp_ref, inp_ref.temperature_decide,
@@ -513,6 +560,7 @@ impl NarrativeEngine {
                         input.fragments.get(cid).unwrap_or(&empty_frags),
                         input.whispers.get(cid).map(|s| s.as_str()),
                         input.self_identities.get(cid).map(|s| s.as_str()),
+                        &input.ambient_events,
                     )?;
                     let ctx = decide::append_bottom_line_rejection(
                         &base,
@@ -1970,6 +2018,7 @@ mod tests {
             other_cards_brief: BTreeMap::new(),
             // 默认档 = 不传自身身份：既有全部用例走的都是历史路径（回归保护）。
             self_identities: BTreeMap::new(),
+            ambient_events: Vec::new(),
             whispers: BTreeMap::new(),
             fragments: BTreeMap::new(),
             temperature_decide: 0.0,
@@ -2625,6 +2674,7 @@ mod tests {
             other_cards_brief: BTreeMap::new(),
             // 默认档 = 不传自身身份：既有全部用例走的都是历史路径（回归保护）。
             self_identities: BTreeMap::new(),
+            ambient_events: Vec::new(),
             whispers: BTreeMap::new(),
             fragments: BTreeMap::new(),
             temperature_decide: 0.0,
@@ -3583,6 +3633,7 @@ mod tests {
             other_cards_brief: BTreeMap::new(),
             // 默认档 = 不传自身身份：既有全部用例走的都是历史路径（回归保护）。
             self_identities: BTreeMap::new(),
+            ambient_events: Vec::new(),
             whispers: BTreeMap::new(),
             fragments: BTreeMap::new(),
             temperature_decide: 0.0,

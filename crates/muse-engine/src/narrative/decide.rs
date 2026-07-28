@@ -56,6 +56,7 @@ pub fn assemble_visible_context(
     fragments: &[RetrievedFragment],
     whisper: Option<&str>,
     self_identity: Option<&str>,
+    ambient: &[crate::narrative::AmbientEvent],
 ) -> Result<String, EngineError> {
     // 1) 自己的私有状态：只取自己这一格（缺失视为空态），不触碰任何他人条目。
     let own = state.characters.get(character_id).cloned().unwrap_or_default();
@@ -139,6 +140,40 @@ pub fn assemble_visible_context(
 所有人一律平等，戏份要靠你自己玩出来。",
                 }),
             );
+        }
+    }
+
+    // 8) 环境事件（观众礼物等，平台总规格红线 1「不卖胜负与数值平权」）。
+    //
+    // 🔴 **它买到的是「被看见」，不是「影响力」**（产品 2026-07-28 拍板，open-decisions §5 选项 A）。
+    //    与 `yourIdentity` 同款处理：**纯展示层**，只影响场景里出现了什么、角色可以提到什么；
+    //    引擎内**没有任何判定读它**——仲裁（rule/model）、确定性不变量、reducer/StatePatch、
+    //    同意门控、关系演化、里程碑强度全都不引用它，它也绝不写回 `NarrativeState`。
+    //
+    // 🔴 **所有角色看到同一份**：礼物是公开的、场上的，不按角色分发。
+    //    按角色分发会立刻造出「谁的观众多谁看到更多」这条可优化的差异通道。
+    //
+    // 🔴 `count` 是**聚合计数不是强度**：note 里明写「送得多不等于更管用」，
+    //    因为模型是会自己脑补数值语义的——不写死这句话，「×5」就会被演成「效果更强」。
+    //
+    // 退化：空切片 → 该字段完全不出现，产物与接线前逐字节一致。
+    // 确定性：按调用方给定的顺序原样拼接，无随机、不排序、不依赖任何 map 迭代序。
+    if !ambient.is_empty() {
+        if let Some(obj) = ctx.as_object_mut() {
+            let items: Vec<Value> = ambient
+                .iter()
+                .filter(|e| !e.label.trim().is_empty())
+                .map(|e| json!({ "what": e.label.trim(), "times": e.count }))
+                .collect();
+            if !items.is_empty() {
+                obj.insert(
+                    "ambient".to_string(),
+                    json!({
+                        "items": items,
+                        "note": "这些是场外的人送进来的东西，场上确实出现了，你可以看见、可以提到、可以用它做戏。它**不给任何人优势**：不改变成败判定、不提高成功率、不带来豁免或特权，也不代表谁更重要。times 只是同一样东西被送了几次，**送得多不等于更管用**。谁也没有因为它变强，戏还是要自己演。",
+                    }),
+                );
+            }
         }
     }
 
@@ -326,7 +361,7 @@ mod tests {
             [("A".to_string(), "A 是一名沉默寡言的侍卫。".to_string())].into_iter().collect();
 
         let ctx =
-            assemble_visible_context(&s, "B", &card_b, &brief, "宫廷大厅", &[], None, None).unwrap();
+            assemble_visible_context(&s, "B", &card_b, &brief, "宫廷大厅", &[], None, None, &[]).unwrap();
 
         // A 的 secrets / plans / misconceptions / goals 原文一律不得出现在 B 的上下文里。
         assert!(!ctx.contains("私生子"), "泄漏了 A 的 secret：{ctx}");
@@ -352,7 +387,7 @@ mod tests {
             [("B".to_string(), "B 是宫廷侍女。".to_string())].into_iter().collect();
 
         let ctx =
-            assemble_visible_context(&s, "A", &card_a, &brief, "宫廷大厅", &[], None, None).unwrap();
+            assemble_visible_context(&s, "A", &card_a, &brief, "宫廷大厅", &[], None, None, &[]).unwrap();
 
         // A 自己能看到自己的私密（证明组装器确实注入了自身状态，只是不注入他人的）。
         assert!(ctx.contains("私生子"));
@@ -380,7 +415,7 @@ mod tests {
             notes: vec!["公开的同僚关系".into()],
         });
         let card_b = minimal_card("B");
-        let ctx = assemble_visible_context(&s, "B", &card_b, &BTreeMap::new(), "场景", &[], None, None)
+        let ctx = assemble_visible_context(&s, "B", &card_b, &BTreeMap::new(), "场景", &[], None, None, &[])
             .unwrap();
         assert!(ctx.contains("公开的同僚关系"), "已知情客体应能看到关系：{ctx}");
     }
@@ -397,8 +432,7 @@ mod tests {
             "场景",
             &[],
             Some("主人提示：小心那个侍卫"),
-            None,
-        )
+            None, &[],)
         .unwrap();
         assert!(ctx.contains("小心那个侍卫"));
     }
@@ -416,7 +450,7 @@ mod tests {
             score: 1.0,
         }];
         let ctx =
-            assemble_visible_context(&s, "B", &card_b, &BTreeMap::new(), "场景", &frags, None, None)
+            assemble_visible_context(&s, "B", &card_b, &BTreeMap::new(), "场景", &frags, None, None, &[])
                 .unwrap();
         assert!(ctx.contains("宫廷礼仪"));
         assert!(ctx.contains("躬身礼"));
@@ -434,7 +468,7 @@ mod tests {
             [("A".to_string(), "A 是一名沉默寡言的侍卫。".to_string())].into_iter().collect();
 
         let ctx =
-            assemble_visible_context(&s, "B", &card_b, &brief, "宫廷大厅", &[], None, None).unwrap();
+            assemble_visible_context(&s, "B", &card_b, &brief, "宫廷大厅", &[], None, None, &[]).unwrap();
 
         assert!(!ctx.contains("yourIdentity"), "不传身份 → 该字段必须完全不出现：{ctx}");
         let v: Value = serde_json::from_str(&ctx).unwrap();
@@ -447,7 +481,7 @@ mod tests {
 
         // 空白展示名同样退化（与 server 侧 brief 拼接的空白口径一致）。
         let blank =
-            assemble_visible_context(&s, "B", &card_b, &brief, "宫廷大厅", &[], None, Some("  "))
+            assemble_visible_context(&s, "B", &card_b, &brief, "宫廷大厅", &[], None, Some("  "), &[])
                 .unwrap();
         assert_eq!(blank, ctx, "空白身份 → 与不传时逐字节一致");
     }
@@ -465,8 +499,7 @@ mod tests {
             "宫廷大厅",
             &[],
             None,
-            Some("户部主事"),
-        )
+            Some("户部主事"), &[],)
         .unwrap();
 
         let v: Value = serde_json::from_str(&ctx).unwrap();
@@ -478,6 +511,64 @@ mod tests {
     }
 
     /// 🔴 红线：身份只挂上下文顶层，**绝不写进 DNA 卡视图**（`active_cards` 是不可变快照）。
+    /// 🔴 **礼物只改上下文的那一格，别的一个字节都不动。**
+    ///
+    /// 源码扫描（`lib.rs::ambient_events_never_leave_the_presentation_layer`）证明的是
+    /// 「没有别的地方**引用**它」；这条从行为侧补另一半：**同一份状态、加与不加礼物，
+    /// 产出的上下文除了 `ambient` 这一格之外逐键相同**。
+    ///
+    /// 两条一起才封得住：只有源码扫描的话，「在 decide.rs 里顺手把礼物拼进 situation」
+    /// 不会被它拦下（那仍然只出现在允许的文件里）。
+    #[test]
+    fn ambient_only_changes_the_ambient_key_of_the_context() {
+        use crate::narrative::AmbientEvent;
+        let s = state_with_secrets();
+        let card_b = minimal_card("B");
+        let brief = BTreeMap::new();
+
+        let plain = assemble_visible_context(
+            &s, "B", &card_b, &brief, "宫廷大厅", &[], None, None, &[],
+        )
+        .unwrap();
+        let gifts = vec![
+            AmbientEvent { label: "有人送上一束火把".into(), count: 3 },
+            AmbientEvent { label: "  ".into(), count: 9 }, // 空白项应被剔除
+        ];
+        let with = assemble_visible_context(
+            &s, "B", &card_b, &brief, "宫廷大厅", &[], None, None, &gifts,
+        )
+        .unwrap();
+
+        let a: Value = serde_json::from_str(&plain).unwrap();
+        let mut b: Value = serde_json::from_str(&with).unwrap();
+        let amb = b.as_object_mut().unwrap().remove("ambient").expect("应有 ambient 一格");
+        assert_eq!(
+            a, b,
+            "🔴 除 `ambient` 外还有别的键被礼物改动了 —— 那就不再是「纯展示层」。\n             最容易发生的形态是把礼物拼进 `situation` 或 `world`：源码扫描拦不住它（仍在允许的文件里），\n             这条用例才拦得住。"
+        );
+
+        // 空白 label 被剔除；`times` 是计数不是强度，且 note 必须把这句话说给模型听。
+        let items = amb["items"].as_array().expect("items");
+        assert_eq!(items.len(), 1, "空白展示文案不该出现在上下文里：{amb}");
+        assert_eq!(items[0]["what"], "有人送上一束火把");
+        assert_eq!(items[0]["times"], 3);
+        let note = amb["note"].as_str().unwrap_or_default();
+        for must in ["不给任何人优势", "送得多不等于更管用"] {
+            assert!(
+                note.contains(must),
+                "🔴 note 里必须明说「{must}」。模型会自己脑补数值语义——\n                 不把这句话写死，`times: 5` 就会被演成「效果更强」，那就是在卖优势。实得：{note}"
+            );
+        }
+
+        // 全空 / 全空白 → 该键完全不出现，与接线前逐字节一致。
+        let blank = vec![AmbientEvent { label: "   ".into(), count: 1 }];
+        let degraded = assemble_visible_context(
+            &s, "B", &card_b, &brief, "宫廷大厅", &[], None, None, &blank,
+        )
+        .unwrap();
+        assert_eq!(degraded, plain, "🔴 没有有效礼物时必须逐字节退化为接线前");
+    }
+
     #[test]
     fn self_identity_never_touches_dna_redline() {
         let s = state_with_secrets();
@@ -490,8 +581,7 @@ mod tests {
             "场景",
             &[],
             None,
-            Some("户部主事"),
-        )
+            Some("户部主事"), &[],)
         .unwrap();
         let v: Value = serde_json::from_str(&ctx).unwrap();
         assert_eq!(v["yourDna"]["identity"]["name"], json!("B"), "卡上的名字必须原样");
@@ -521,8 +611,7 @@ mod tests {
             "场景",
             &[],
             None,
-            Some("户部主事"),
-        )
+            Some("户部主事"), &[],)
         .unwrap();
         let ctx_b = assemble_visible_context(
             &s,
@@ -532,15 +621,14 @@ mod tests {
             "场景",
             &[],
             None,
-            Some("漕帮商贾"),
-        )
+            Some("漕帮商贾"), &[],)
         .unwrap();
 
         assert!(ctx_a.contains("户部主事") && !ctx_a.contains("漕帮商贾"), "A 不得看见 B 的自身身份");
         assert!(ctx_b.contains("漕帮商贾") && !ctx_b.contains("户部主事"), "B 不得看见 A 的自身身份");
         // 本人有身份、他人没传 → 上下文里也不得凭空出现他人的身份字段。
         let plain =
-            assemble_visible_context(&s, "B", &card_b, &BTreeMap::new(), "场景", &[], None, None)
+            assemble_visible_context(&s, "B", &card_b, &BTreeMap::new(), "场景", &[], None, None, &[])
                 .unwrap();
         assert!(!plain.contains("yourIdentity"), "未传身份的角色不得被别人的身份污染");
     }
@@ -556,7 +644,7 @@ mod tests {
         let brief: BTreeMap<String, String> =
             [("A".to_string(), "A 是一名沉默寡言的侍卫。".to_string())].into_iter().collect();
         let base =
-            assemble_visible_context(&s, "B", &card_b, &brief, "宫廷大厅", &[], None, None).unwrap();
+            assemble_visible_context(&s, "B", &card_b, &brief, "宫廷大厅", &[], None, None, &[]).unwrap();
 
         let ctx = append_bottom_line_rejection(&base, "不替人做伪证", "替裴照做伪证").unwrap();
         let v: Value = serde_json::from_str(&ctx).unwrap();
@@ -584,7 +672,7 @@ mod tests {
         let s = state_with_secrets();
         let card_b = minimal_card("B");
         let base =
-            assemble_visible_context(&s, "B", &card_b, &BTreeMap::new(), "场景", &[], None, None)
+            assemble_visible_context(&s, "B", &card_b, &BTreeMap::new(), "场景", &[], None, None, &[])
                 .unwrap();
         let a = append_bottom_line_rejection(&base, "不做伪证", "做伪证").unwrap();
         let b = append_bottom_line_rejection(&base, "不做伪证", "做伪证").unwrap();

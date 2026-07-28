@@ -345,6 +345,13 @@ fn red_line_only_safety_chain_defaults_on() {
     // 运营会去追一个并不存在的事故。§0.1 在这里挡的是「口径静默漂移」而不是「功能静默上线」。
     // 🔵 三条各自还带自己的阈值 env（§0.2 参数化），开关只管开不开。
     //
+    // 21 → 22：`MUSE_AMBIENT_GIFT_EVENTS`（观众礼物 → 引擎回合的**展示层**注入，
+    // open-decisions §5 于 2026-07-28 拍板选项 A）。
+    // 🔴 这是全表**赌注最大**的一个默认关闭：其它开关关错了是功能没上线或多烧点 token，
+    // 这一个一旦上线并被玩家感知为「打赏有用」，**撤回就等于承认平台卖过优势**——
+    // 而平台红线第一条正是「不卖胜负与数值平权」。它必须是有人按过开关才生效。
+    // 边界另有引擎侧源码级红线扫死（`ambient_events_never_leave_the_presentation_layer`）。
+    //
     // 这些都是登记表**新增了默认关闭的开关**，不是断言被放宽——上面那个循环仍逐条钉死
     // 「除审核链外默认值必须为 false」，新开关同样在其中。
     //
@@ -355,7 +362,7 @@ fn red_line_only_safety_chain_defaults_on() {
     // （过期即报警，正是它要的）。
     assert_eq!(
         KNOWN_FLAGS.len(),
-        21,
+        22,
         "登记表应覆盖 9 个存量 env 开关 + R3 新建的 MUSE_OOC_ANNOTATIONS / MUSE_IFLINE_PARALLEL / \
          MUSE_SOCIAL_IDENTITY_UNLOCK / MUSE_LIVE_STAGE + MUSE_DISPOSAL_NAME_GATE + \
          MUSE_SAFETY_SEMANTIC_RECHECK + MUSE_SAFETY_RECHECK_SWEEP + MUSE_IFLINE_ADVANCE_SWEEP \

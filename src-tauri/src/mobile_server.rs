@@ -1737,6 +1737,106 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
+    /// 🔴 **手机端每一个碰会话的端点都必须带同一道会话种类限制。**
+    ///
+    /// 手机是**受限面**：只许碰伴侣会话与故事会话，穿书（bookTravel）与写作 agent 的会话
+    /// 一律不可见、不可存。这条限制目前是**手工抄在五处**的
+    /// （list / load / save / analyze-memory / archive）——2026-07-28 逐个核过，五处一致，
+    /// `load` 还在读回记录后**再查一次** `session_kind`（纵深，因为 id 前缀本身说明不了种类）。
+    ///
+    /// 本条不是修缺陷，是**防下一个**：第六个碰会话的端点漏抄这一道，手机端就能读到
+    /// 它不该看见的会话，而没有任何用例会红。
+    ///
+    /// ⚠️ 扫描前必须剥掉测试模块——本用例就写在本文件里，断言里逐字出现
+    /// `partner-session-`，不剥的话它会命中自己写的那句话（这个坑本 session 踩过一次）。
+    #[test]
+    fn red_line_every_mobile_session_endpoint_checks_the_session_prefix() {
+        let full = include_str!("mobile_server.rs");
+        let src = full.split("#[cfg(test)]").next().unwrap_or(full);
+
+        // 路由表里所有路径含 `/sessions` 的处理函数名。
+        //
+        // ⚠️ **按 `.route(` 切、再跳过空白**，不能用 `.route("` 直接匹配：
+        // 本文件里长路由是**跨行**写的（`.route(\n    "/api/mobile/sessions/{id}",`），
+        // 用后者会把它们全部漏掉——本 session 我在这上面栽过两次（第一次是手工 grep 路由，
+        // 第二次就是这条用例的第一版，扫出 0 个端点）。
+        let mut handlers: Vec<&str> = Vec::new();
+        for seg in src.split(".route(").skip(1) {
+            let seg = seg.trim_start();
+            let Some(rest) = seg.strip_prefix('"') else { continue };
+            let Some(uri) = rest.split('"').next() else { continue };
+            if !uri.contains("/sessions") {
+                continue;
+            }
+            // 路由段形如 `get(list_sessions::<R>).post(save_session::<R>)`——
+            // 按非标识符字符切开，凡是能对上 `async fn <name>` 的就是处理函数。
+            let window = &rest[..rest.len().min(400)];
+            for m in window.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                // `get` / `post` 是 axum 的路由方法，不是本模块的处理函数——
+                // 但它们**恰好也能对上** `async fn get(...)` 之类（第一版就这么误报了）。
+                if m.is_empty()
+                    || handlers.contains(&m)
+                    || matches!(m, "get" | "post" | "put" | "delete" | "patch" | "R")
+                {
+                    continue;
+                }
+                if src.contains(&format!("async fn {m}")) {
+                    handlers.push(m);
+                }
+            }
+        }
+        assert!(
+            handlers.len() >= 5,
+            "只解析出 {} 个会话端点，扫描口径疑似坏了：{handlers:?}",
+            handlers.len()
+        );
+
+        for h in &handlers {
+            let i = src.find(&format!("async fn {h}")).expect("handler 应存在");
+            // 🔴 **按花括号配平取函数体**，不能用「到下一个 `async fn` 为止」——
+            // 后者在 handler 是最后一个、或与别的 handler 相邻时，窗口里会混进**别人**的检查，
+            // 于是漏抄的那个也被顶成绿。第一版就是这么写的，故障注入当场证明它是弱断言：
+            // 真删掉 `archive_session_memory` 的前缀检查，它照样绿。
+            let open = i + src[i..].find('{').expect("函数体应有左花括号");
+            let mut depth = 0usize;
+            let mut end = open;
+            for (k, c) in src[open..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = open + k + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let body = &src[i..end];
+            // 🔴 断言**否定形式的守卫**，不是「出现过这个字符串」。
+            //
+            // 第一版写的是 `body.contains("partner-session-")`——太松：
+            // `archive_session_memory` 里还有一句 `if id.starts_with("partner-session-")` 的
+            // **业务分支**（决定 card_ids），守卫被删掉、业务分支还在，断言照样绿。
+            // 故障注入连着三次没红，才发现问题在断言本身而不在注入。
+            //
+            // 现有两种守卫写法：`!X.starts_with("partner-session-")`（按 id）与
+            // `prefix != "partner-session-"`（按查询参数）。第六个端点若用第三种写法，
+            // 本条会红——那正是要的：让作者要么对齐既有写法，要么在此显式登记。
+            let guarded = body.contains("!id.starts_with(\"partner-session-\")")
+                || body.contains("!record.id.starts_with(\"partner-session-\")")
+                || body.contains("!= \"partner-session-\"");
+            assert!(
+                guarded,
+                "🔴 会话端点 `{h}` 没有会话种类**守卫** —— 手机端会读到/写到它不该碰的会话\n\
+                 （穿书与写作 agent 的会话必须对手机不可见）。\n\
+                 ⚠️ 注意区分守卫与业务分支：`if id.starts_with(..)` 是分支，\n\
+                 守卫是 `if !id.starts_with(..) {{ return Err(FORBIDDEN) }}`。"
+            );
+        }
+    }
+
     /// 🔴 **免鉴权的 `/api/mobile/status` 绝不能回令牌**（否则 token 鉴权整体失效）。
     ///
     /// 它在 `is_public_path` 白名单里，用途只是「服务起来了吗」。而 `MobileServiceStatus`

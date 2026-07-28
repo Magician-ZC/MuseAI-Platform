@@ -544,12 +544,27 @@ impl AgentRunOptions {
         }
     }
 
-    pub fn subagent(parent_tool_call_id: Option<String>) -> Self {
+    /// 子代理的运行选项。
+    ///
+    /// 🔴 **必须继承父级的 `allowed_tools`**。此前这里写死 `None`（= 全部工具放行），
+    /// 于是父级的能力限制**不被继承**：写作 agent 的白名单是
+    /// `[read, write, edit, grep, glob, skill, subagent, todo]`——**刻意不含 `bash`**——
+    /// 但它可以调 `subagent`，而子代理拿到的是「全部工具」，其中就有 `bash`。
+    ///
+    /// 也就是说「不给这个模式 bash」这条限制，被一次 `subagent` 调用就绕过了。
+    /// 而子代理的任务文本来自父模型的一次工具调用——被读入的文档里的提示注入可以指定它。
+    ///
+    /// 语义保持不变的那一半：父级 `None`（不限制）→ 子级仍 `None`，既有行为逐字不变。
+    /// `excluded_tools` 仍钉着 `subagent`，子代理不得再派生子代理（防递归）。
+    pub fn subagent(
+        parent_tool_call_id: Option<String>,
+        inherited_allowed_tools: Option<Vec<String>>,
+    ) -> Self {
         Self {
             max_tool_rounds: MAX_SUBAGENT_TOOL_ROUNDS,
             emit_events: parent_tool_call_id.is_some(),
             emit_todo_updates: false,
-            allowed_tools: None,
+            allowed_tools: inherited_allowed_tools,
             excluded_tools: vec!["subagent".to_string()],
             parent_tool_call_id,
         }
@@ -703,10 +718,70 @@ mod tests {
 
     #[test]
     fn test_agent_run_options_subagent_excludes_subagent() {
-        let opts = AgentRunOptions::subagent(None);
+        let opts = AgentRunOptions::subagent(None, None);
         assert!(opts.allows_tool("read"));
         assert!(opts.allows_tool("write"));
         assert!(!opts.allows_tool("subagent"));
+    }
+
+    /// 🔴 **子代理必须继承父级的工具白名单**，否则一次 `subagent` 调用就绕过了整套限制。
+    ///
+    /// 用写作 agent 的**真实**白名单演一遍：它是
+    /// `[read, write, edit, grep, glob, skill, subagent, todo]`——**刻意不含 `bash`**，
+    /// 却含 `subagent`。此前 `AgentRunOptions::subagent` 写死 `allowed_tools: None`（全部放行），
+    /// 于是父级不能用 bash、子代理可以。而子代理的任务文本来自父模型的一次工具调用
+    /// ——被读入文档里的提示注入可以指定它。
+    #[test]
+    fn subagent_inherits_the_parent_tool_whitelist() {
+        // 写作 agent（`AgentChat.tsx`）实际下发的白名单，逐字照抄。
+        let parent_allowed: Vec<String> = ["read", "write", "edit", "grep", "glob", "skill", "subagent", "todo"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let child = AgentRunOptions::subagent(Some("call_1".into()), Some(parent_allowed.clone()));
+
+        assert!(
+            !child.allows_tool("bash"),
+            "🔴 父级没有 bash，子代理却拿到了 —— 一次 subagent 调用绕过整套白名单"
+        );
+        for t in ["read", "write", "edit", "grep", "glob", "skill", "todo"] {
+            assert!(child.allows_tool(t), "父级允许的工具，子代理应当照常可用：{t}");
+        }
+        assert!(
+            !child.allows_tool("subagent"),
+            "🔴 子代理不得再派生子代理（防递归），这一条不因继承而放宽"
+        );
+    }
+
+    /// 🔴 **接线红线**：光有继承参数没用，派生点必须真的把父级白名单传进去。
+    ///
+    /// 改动前的形态是「函数签名里根本没有这个参数」；改动后可能的退化是
+    /// 「有参数、但调用点传 `None`」——两者对玩家的后果一模一样，而后者更难看出来。
+    /// 故扫源码：`agent/mod.rs` 里每一处 `AgentRunOptions::subagent(` 都必须带上
+    /// `child_request.allowed_tools`。
+    #[test]
+    fn red_line_subagent_call_sites_pass_the_parent_whitelist() {
+        let src = include_str!("agent/mod.rs");
+        let calls: Vec<usize> = src.match_indices("AgentRunOptions::subagent(").map(|(i, _)| i).collect();
+        assert_eq!(calls.len(), 2, "派生点数量变了（当前 {}），请确认每一处都继承了白名单", calls.len());
+        for i in calls {
+            let window = &src[i..(i + 260).min(src.len())];
+            assert!(
+                window.contains("child_request.allowed_tools"),
+                "🔴 有一处派生子代理时没有传父级白名单 —— 那一处的子代理拿到全部工具：\n{window}"
+            );
+        }
+    }
+
+    /// 不限制的父级（`None`）→ 子级仍不限制：既有行为**逐字不变**。
+    #[test]
+    fn subagent_of_an_unrestricted_parent_stays_unrestricted() {
+        let child = AgentRunOptions::subagent(Some("call_1".into()), None);
+        for t in ["read", "write", "bash", "grep"] {
+            assert!(child.allows_tool(t), "不限制的父级不该因为本次改动被收紧：{t}");
+        }
+        assert!(!child.allows_tool("subagent"), "递归仍然禁止");
     }
 
     #[test]

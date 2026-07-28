@@ -1209,7 +1209,11 @@ fn run_subagent_agent_loop<'a>(
                     app,
                     run_id,
                     &child_request,
-                    AgentRunOptions::subagent(Some(parent_tool_call_id)),
+                    AgentRunOptions::subagent(
+                        Some(parent_tool_call_id),
+                        // 🔴 继承父级限制：不继承 = 一次 subagent 调用就绕过了整套白名单。
+                        child_request.allowed_tools.clone(),
+                    ),
                 )
                 .await
             }
@@ -1218,7 +1222,11 @@ fn run_subagent_agent_loop<'a>(
                     app,
                     run_id,
                     &child_request,
-                    AgentRunOptions::subagent(Some(parent_tool_call_id)),
+                    AgentRunOptions::subagent(
+                        Some(parent_tool_call_id),
+                        // 🔴 继承父级限制：不继承 = 一次 subagent 调用就绕过了整套白名单。
+                        child_request.allowed_tools.clone(),
+                    ),
                 )
                 .await
             }

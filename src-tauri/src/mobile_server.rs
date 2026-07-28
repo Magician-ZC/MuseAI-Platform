@@ -1522,12 +1522,22 @@ async fn start_run_endpoint<R: Runtime>(
             "App handle not initialized".to_string(),
         )
     })?;
-    let run_id = crate::agent::sessions::start_chat_stream_inner(app_wry, chat_request)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
-    let (tx, rx) = unbounded_channel();
-    sse_dispatcher().lock().unwrap().insert(run_id.clone(), tx);
-    sse_receivers().lock().unwrap().insert(run_id.clone(), rx);
+    // 🔴 **注册 SSE 通道必须发生在 run 起跑之前**，故用 `_with` 的 pre-start 钩子。
+    //
+    // 派生任务的第一句就是 emit `start` 事件，而 `dispatch_stream_event` 在调度表里查不到
+    // run_id 时**静默丢弃**（没有 else 分支）。此前这里是「先起 run、拿到 run_id 后再注册」，
+    // 那两行之间任务已经在跑——手机端因此收不到 `start`（以及此后到注册完成为止的一切事件）。
+    // 注册之后的事件不会丢：`UnboundedSender` 会一直缓冲到玩家真的来订阅。
+    let run_id = crate::agent::sessions::start_chat_stream_inner_with(
+        app_wry,
+        chat_request,
+        |run_id| {
+            let (tx, rx) = unbounded_channel();
+            sse_dispatcher().lock().unwrap().insert(run_id.to_string(), tx);
+            sse_receivers().lock().unwrap().insert(run_id.to_string(), rx);
+        },
+    )
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     let resp = json!({ "runId": run_id });
     Ok(Response::builder()
@@ -1736,6 +1746,95 @@ mod tests {
     ///
     /// 本用例把一个可辨识的令牌塞进状态，然后断言响应体里**一个字节都找不到它**
     /// （不逐字段断言：将来加字段时，逐字段的写法会漏掉新字段）。
+    /// 🔴 **没注册通道时，事件是静默丢弃的**——这一条把那个失败模式本身钉下来。
+    ///
+    /// `dispatch_stream_event` 里 `if let Some(sender)` 没有 else 分支：调度表里查不到 run_id
+    /// 就什么都不做、不报错、不留日志。它本身是合理的（桌面态本来就没有 SSE 订阅者），
+    /// 但正因为如此，**注册的时机就变成了正确性问题**：早一步事件都在，晚一步事件就没了。
+    ///
+    /// 有了这一条，下面那条顺序红线的意义才写得明白。
+    #[test]
+    fn events_dispatched_before_registration_are_silently_dropped() {
+        let run_id = "run-drop-probe";
+        clean_stream(run_id); // 确保未注册
+
+        // 未注册时派发：不 panic、不报错，事件就这么没了。
+        let app = create_mock_app();
+        let probe = |t: &str| ChatStreamEvent {
+            run_id: run_id.to_string(),
+            event_type: t.to_string(),
+            delta: None,
+            message: None,
+            tool_call_id: None,
+            tool_name: None,
+            tool_status: None,
+            tool_arguments: None,
+            todos: None,
+            context_compaction: None,
+        };
+        dispatch_stream_event(&app, run_id, probe("lost"));
+
+        // 现在注册，再派发一条，然后取回 —— 只能收到注册**之后**那一条。
+        let (tx, rx) = unbounded_channel();
+        sse_dispatcher().lock().unwrap().insert(run_id.to_string(), tx);
+        sse_receivers().lock().unwrap().insert(run_id.to_string(), rx);
+        dispatch_stream_event(&app, run_id, probe("kept"));
+
+        let mut rx = sse_receivers().lock().unwrap().remove(run_id).expect("receiver 应在");
+        let mut got = 0;
+        while rx.try_recv().is_ok() {
+            got += 1;
+        }
+        assert_eq!(
+            got, 1,
+            "🔴 注册前派发的事件必须是丢了的（这正是本失败模式）；注册后的必须还在"
+        );
+        clean_stream(run_id);
+    }
+
+    /// 🔴 **SSE 通道必须在 run 起跑之前注册**（源码级，体例同 `lexicon` 那条闸的顺序断言）。
+    ///
+    /// 派生任务的第一句就是 emit `start`，而未注册时事件静默丢弃（见上一条）。
+    /// 此前 `start_run_endpoint` 是「先起 run、拿到 run_id 后再注册」，那两行之间任务已经在跑
+    /// ——手机端因此收不到 `start`。端到端复现要真实模型调用，成本不抵收益；
+    /// 而接线一旦被改回去，本条立刻红。
+    #[test]
+    fn red_line_sse_channel_is_registered_before_the_run_starts() {
+        // 🔴 **必须剥掉测试模块再扫**：本用例就写在 `mobile_server.rs` 里，而断言里逐字出现
+        // `start_chat_stream_inner_with(` 这个字面量。不剥的话 `find` 永远命中自己写的那句话
+        // ——接线被改回去了它照样绿。第一版就是这么写的，故障注入当场证明它是个恒真断言。
+        let strip_tests = |src: &str| -> String {
+            src.split("#[cfg(test)]").next().unwrap_or(src).to_string()
+        };
+
+        let sessions = strip_tests(include_str!("agent/sessions.rs"));
+        let sessions = sessions.as_str();
+        let hook = sessions
+            .find("on_run_id(&run_id);")
+            .expect("🔴 `start_chat_stream_inner_with` 必须在 spawn 前调用 pre-start 钩子");
+        let spawn = sessions[hook..]
+            .find("tauri::async_runtime::spawn")
+            .map(|i| hook + i)
+            .expect("🔴 找不到派生任务的 spawn —— 本断言的前提变了，请重新确认顺序");
+        assert!(hook < spawn, "🔴 钩子必须在 spawn 之前：晚一步，`start` 事件就落进静默丢弃分支");
+
+        let me = strip_tests(include_str!("mobile_server.rs"));
+        let me = me.as_str();
+        let call = me
+            .find("start_chat_stream_inner_with(")
+            .expect("🔴 手机端必须走带 pre-start 钩子的那个入口，否则注册注定晚于起跑");
+        let insert = me[call..]
+            .find("sse_dispatcher().lock().unwrap().insert")
+            .map(|i| call + i)
+            .expect("🔴 找不到 SSE 注册语句");
+        let call_end = me[call..].find("\n    )\n").map(|i| call + i).unwrap_or(me.len());
+        assert!(
+            insert < call_end,
+            "🔴 注册必须在 `start_chat_stream_inner_with(...)` 的**参数闭包内**（= 起跑前），\
+             不得挪到调用返回之后"
+        );
+    }
+
     /// 🔴 **新增的密钥字段默认就被抹掉**（判据按模式，不靠有人记得来加名字）。
     #[test]
     fn newly_added_secret_fields_are_sanitized_by_default() {

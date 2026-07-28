@@ -1049,6 +1049,42 @@ camelCase 与 snake_case 同形。`known_to` 才受影响，而那一处是类�
 ⚠️ 另一条边界：**存量模板不会被回头校验**，闸只在写入路径上。存量的发现面是运营台的
 `shape.unknownTopLevelKeys` / `shape.unknownNestedKeys` 两栏——**看得见，但不会自动修**。
 
+### 3.20 手机端收不到 `start` 事件：SSE 通道注册晚于 run 起跑（**修于 2026-07-28**）
+
+`dispatch_stream_event` 在 SSE 调度表里查不到 run_id 时**静默丢弃**事件
+（`if let Some(sender)` 没有 else 分支）。这本身是合理的——桌面态本来就没有 SSE 订阅者——
+但**正因为如此，注册的时机就成了正确性问题**：早一步事件都在，晚一步事件就没了。
+
+而 `start_run_endpoint` 此前的顺序是：
+
+1. `start_chat_stream_inner(...)` 起 run（**派生任务的第一句就是 emit `start` 事件**）
+2. 拿到 run_id 之后，才 `sse_dispatcher().insert(run_id, tx)`
+
+两行之间任务已经在跑，于是手机端**收不到 `start`**（以及此后到注册完成为止的一切事件）。
+注册之后的事件不会丢——`UnboundedSender` 会一直缓冲到玩家真的来订阅。
+
+修：给 `start_chat_stream_inner` 加一个 **pre-start 钩子**（`_with` 变体），手机端在钩子里注册通道，
+钩子调用点在 `spawn` **之前**。
+⚠️ 用钩子而不是「无条件注册」：无条件注册会让**桌面**每次跑 run 都挂一个没人读的
+`UnboundedSender`，整段 run 的事件全缓冲在内存里直到 `clean_stream`——
+为修手机端的丢事件而给桌面端加一份无人消费的缓冲，是拆东墙补西墙。
+
+两条用例：一条把「未注册即静默丢弃」这个失败模式**本身**钉下来（否则下面那条顺序红线的意义写不明白），
+一条在源码层钉顺序（体例同 `lexicon` 那条闸的 `resolve < begin < apply`）。
+
+#### 🔴 顺序红线第一版是**恒真**的，故障注入当场证明
+
+`include_str!("mobile_server.rs")` 把**测试自身的文本**也包了进来，而断言里逐字出现
+`start_chat_stream_inner_with(` 这个字面量——于是 `find` 永远命中自己写的那句话，
+**把接线改回改动前的形态，它照样绿**。剥掉 `#[cfg(test)]` 之后重做注入才变红。
+
+这条值得单独记：**源码级红线扫自己所在的文件时，会读到断言自身的字面量**。
+本 session 的 server 侧红线都走 `testkit::production_sources()`（会剥测试模块），
+不会有这个问题；`src-tauri` 没有那套设施，手写 `include_str!` 就踩上了。
+
+⚠️ 另有一处注入（给静默丢弃补兜底）**没能验成**：兜底新建的通道随即被用例自己的 `insert` 覆盖，
+观测结果不变。如实记下——那次注入没有证明任何东西。
+
 ### 3.19 密钥抹除与回写保护是**两份手工拷贝**，漂开就会抹掉用户的 API Key（**修于 2026-07-28**）
 
 接着 §3.18 往同一文件里查。`mobile_server` 里有一对**配套**的判断，各写了一遍

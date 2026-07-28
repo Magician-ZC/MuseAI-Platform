@@ -365,7 +365,28 @@ pub fn delete_agent_session(app: AppHandle, id: String) -> Result<(), String> {
 /// so the Arc reference count is correct – no unsafe transmute_copy required.
 pub fn start_chat_stream_inner(
     app: AppHandle,
+    request: ChatStreamRequest,
+) -> Result<String, String> {
+    start_chat_stream_inner_with(app, request, |_| {})
+}
+
+/// 同上，但多一个**在 spawn 之前**拿到 run_id 的钩子。
+///
+/// 🔴 **这个「之前」是本函数存在的全部理由。** 派生任务的第一句就是
+/// `emit_chat_event(..., "start", ...)`，而 `dispatch_stream_event` 在 SSE 调度表里
+/// 查不到 run_id 时是**静默丢弃**的（`if let Some(sender)` 没有 else 分支）。
+///
+/// 手机端此前是「先调本函数起 run、拿到 run_id 之后再注册 SSE 通道」——
+/// 那两行之间任务已经在跑了，`start` 事件必然（或高概率）落进那个静默丢弃分支。
+/// 桌面端不受影响：它走 `app.emit` 的全局事件总线，不经过这张表。
+///
+/// 钩子而不是「无条件注册」：无条件注册会让**桌面**每次跑 run 都挂一个没人读的
+/// `UnboundedSender`，整段 run 的事件全缓冲在内存里直到 `clean_stream`——
+/// 为了修手机端的丢事件，不该给桌面端加一份无人消费的缓冲。
+pub fn start_chat_stream_inner_with(
+    app: AppHandle,
     mut request: ChatStreamRequest,
+    on_run_id: impl FnOnce(&str),
 ) -> Result<String, String> {
     if request.api_key.trim().is_empty() {
         let error = String::from("API Key 不能为空");
@@ -400,6 +421,10 @@ pub fn start_chat_stream_inner(
     // Clone properly so the Arc refcount is incremented for each owner.
     let task_app = app.clone();
     let cleanup_app = app.clone();
+
+    // 🔴 **必须在 spawn 之前**：派生任务的第一句就是 emit `start`，
+    // 而 SSE 调度表里没有这个 run_id 时事件是静默丢弃的。见本函数的文档注释。
+    on_run_id(&run_id);
 
     let handle = tauri::async_runtime::spawn(async move {
         emit_chat_event(

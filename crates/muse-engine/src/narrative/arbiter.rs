@@ -262,6 +262,30 @@ pub fn rule_arbitrate(
 /// 底线拦截写入 `ArbiterOutcome.rule_refs` 的规则标记（透明战报可见「为什么这一步没发生」）。
 pub const BOTTOM_LINE_RULE_REF: &str = "rule:bottom_line";
 
+/// 模型**真的判过**这条决策时写入的判定依据。
+pub const MODEL_ARBITER_RULE_REF: &str = "model:arbiter";
+
+/// 🔴 模型**没提过**这条决策、由本函数兜底为 `Success` 时写入的判定依据。
+///
+/// # 为什么必须与上一条分开
+///
+/// `rule_refs` 是**透明战报的「判定依据」那一栏**（`arena::report` 直接读它，
+/// 那一栏存在的全部意义是回答观众「这是不是剧本」）。而在此之前，
+/// 「模型判定它成功了」和「模型压根没提过这件事、被兜底成成功」
+/// **在数据上完全一样**——两条都写 `model:arbiter`。
+///
+/// 于是一次模型返回空 `outcomes` 的故障，症状是**这一拍所有人做什么都成功**，
+/// 而战报会逐条声称「判定依据：model:arbiter」。读起来像「今天裁决很宽松」，
+/// 不像「裁决没跑」。这正是本仓反复遇到的那个形态：
+/// **两件截然不同的事在数据上长得一模一样**（同 `docs/VALIDATION.md` §3.36 的 0 与 —）。
+///
+/// # 🔴 兜底值仍然是 `Success`，本次**不改行为**
+///
+/// 「模型漏判该算成功还是失败」是**产品口径**：改成 Failure 会让一次模型抖动
+/// 变成「全场都失败」，那未必更好。这里只把**沉默**变成可见——
+/// 有了这条标记，「兜底了多少条」才第一次成为可数、可报警、可用来定那个口径的量。
+pub const MODEL_ARBITER_UNJUDGED_RULE_REF: &str = "model:arbiter:unjudged";
+
 /// 规则层可判定的「禁止行为」最短片段（Unicode 字符数）。**误伤控制闸②**：
 /// 低于此长度的底线（「不逃」→「逃」、「不杀人」→「杀人」）字面匹配会大面积误伤
 /// （「逃出火场」也算「逃」），一律不进规则层。**参数化集中点**（VALIDATION §0.2）。
@@ -603,17 +627,45 @@ pub async fn model_arbitrate(
         }
     }
 
-    // 覆盖每个 pending 决策（模型漏判则回退 Success）；character_id 以本地决策为准，防篡改。
+    // 覆盖每个 pending 决策；character_id 以本地决策为准，防篡改。
+    //
+    // 🔴 模型漏判仍然兜底为 `Success`（不改行为，见 `MODEL_ARBITER_UNJUDGED_RULE_REF` 的注释），
+    // 但**判定依据必须写成另一条标记**——否则「模型判它成功」与「模型没提过它」
+    // 在战报上一模一样，而一次返回空 outcomes 的故障就会伪装成「今天裁决很宽松」。
     let mut out: Vec<ArbiterOutcome> = Vec::with_capacity(pending.len());
+    let mut unjudged = 0usize;
     for d in pending {
+        let judged = by_id.get(&d.decision_id).cloned();
+        if judged.is_none() {
+            unjudged += 1;
+        }
         let (result, consequence) =
-            by_id.get(&d.decision_id).cloned().unwrap_or((ArbiterResult::Success, String::new()));
+            judged.unwrap_or((ArbiterResult::Success, String::new()));
         out.push(ArbiterOutcome {
             decision_id: d.decision_id.clone(),
             character_id: d.character_id.clone(),
             result,
-            rule_refs: vec!["model:arbiter".to_string()],
+            rule_refs: vec![if by_id.contains_key(&d.decision_id) {
+                MODEL_ARBITER_RULE_REF
+            } else {
+                MODEL_ARBITER_UNJUDGED_RULE_REF
+            }
+            .to_string()],
             consequence,
+        });
+    }
+    // 兜底不是常态。有一条就发一条可观测记录：**空 outcomes 是一个系统性故障**
+    // （prompt 改坏、模型换版、JSON 结构漂移），而它此前唯一的症状是「大家运气都很好」。
+    if unjudged > 0 {
+        host.events.emit(crate::host::EngineEvent::Narrative {
+            run_id: run_id.to_string(),
+            payload: serde_json::json!({
+                "type": "arbiterUnjudged",
+                "unjudged": unjudged,
+                "pending": pending.len(),
+                "note": "模型未对这些决策给出裁决，已兜底为 Success 并标记 model:arbiter:unjudged。\
+                         全部未判（unjudged == pending）通常意味着裁决环节整体失效，而不是运气好。",
+            }),
         });
     }
     Ok(out)
@@ -933,6 +985,113 @@ mod tests {
         assert_eq!(out[1].decision_id, "d2");
         assert_eq!(out[1].result, ArbiterResult::Success); // 漏判回退
         assert!(out.iter().all(|o| o.decision_id != "ghost"));
+        // 🔴 兜底的那一条**判定依据必须与真判过的那条不同**（详见下一条用例）。
+        assert_eq!(out[0].rule_refs, vec![MODEL_ARBITER_RULE_REF.to_string()]);
+        assert_eq!(out[1].rule_refs, vec![MODEL_ARBITER_UNJUDGED_RULE_REF.to_string()]);
+    }
+
+    /// 🔴 **「模型判它成功」与「模型压根没提过它」不许在战报上长成同一句话。**
+    ///
+    /// `rule_refs` 是透明战报的**「判定依据」那一栏**（`arena::report` 直接读它，
+    /// 而那一栏存在的全部意义是回答观众「这是不是剧本」）。改动前两者都写 `model:arbiter`，
+    /// 于是**一次模型返回空 `outcomes` 的故障**，症状是「这一拍所有人做什么都成功」，
+    /// 而战报逐条声称「判定依据：model:arbiter」——读起来像「今天裁决很宽松」，
+    /// 不像「裁决根本没跑」。
+    ///
+    /// ⚠️ 兜底值**仍然是 `Success`**，本用例不改那个口径（那是产品的：改成 Failure
+    /// 会让一次模型抖动变成「全场都失败」，未必更好）。这里钉的是**沉默变可见**。
+    #[tokio::test]
+    async fn a_totally_unjudged_round_is_not_allowed_to_look_like_a_lenient_one() {
+        // 模型返回一个**合法但空**的裁决批次——最常见的故障形态（prompt 改坏 / 模型换版）。
+        let (host, ev) = test_host(vec![Ok(r#"{"outcomes":[]}"#.to_string())]);
+        let s = base_state();
+        let pending = vec![decision("d1", "li", "a", vec![]), decision("d2", "wang", "b", vec![])];
+        let out = model_arbitrate(
+            host.as_ref(),
+            &dummy_profile(),
+            &prompts(),
+            "run-1",
+            &s,
+            "局势",
+            &pending,
+            &CancelFlag::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.len(), 2, "每条 pending 仍必须有结果（行为不变）");
+        for o in &out {
+            assert_eq!(o.result, ArbiterResult::Success, "兜底口径不变，本次只改可见性");
+            assert_eq!(
+                o.rule_refs,
+                vec![MODEL_ARBITER_UNJUDGED_RULE_REF.to_string()],
+                "🔴 一条都没判过的回合，战报上必须看得出来是兜底而不是裁决通过：{o:?}"
+            );
+            assert_ne!(
+                o.rule_refs,
+                vec![MODEL_ARBITER_RULE_REF.to_string()],
+                "🔴 与「真判过」共用同一条依据 = 把系统性故障伪装成宽松裁决"
+            );
+        }
+
+        // 兜底不是常态：有一条就该留下可观测记录，否则「大家运气都很好」是唯一症状。
+        // ⚠️ 断言走**结构**而不是 Debug 串：Debug 里数字长成 `Number(2)`，
+        // 按 `"unjudged":2` 找会恒不命中——那样这条断言会一直红（写它的时候就红过一次），
+        // 或者被改成一个更宽松的 `contains` 而悄悄变成空断言。
+        let evs = ev.0.lock().unwrap();
+        let warn = evs
+            .iter()
+            .find_map(|e| match e {
+                crate::host::EngineEvent::Narrative { payload, .. }
+                    if payload.get("type").and_then(|v| v.as_str()) == Some("arbiterUnjudged") =>
+                {
+                    Some(payload.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("🔴 全员兜底必须发一条可观测记录，实得：{evs:?}"));
+        assert_eq!(warn["unjudged"], 2, "🔴 记录里要带条数，否则区分不出「漏了一条」和「整环节没跑」");
+        assert_eq!(warn["pending"], 2);
+    }
+
+    /// 反向配对：模型**全判了**的回合不许被误标成兜底，也不该发那条告警。
+    ///
+    /// 只测「兜底要标记」的话，把 `rule_refs` 恒置成 unjudged 也能全绿——
+    /// 那会让每一条真裁决都在战报上自称「没判过」，比原缺陷更糟。
+    #[tokio::test]
+    async fn a_fully_judged_round_is_not_marked_as_fallback() {
+        let resp = r#"{"outcomes":[
+            {"decisionId":"d1","result":"success","consequence":"成了"},
+            {"decisionId":"d2","result":"failure","consequence":"没成"}
+        ]}"#;
+        let (host, ev) = test_host(vec![Ok(resp.to_string())]);
+        let s = base_state();
+        let pending = vec![decision("d1", "li", "a", vec![]), decision("d2", "wang", "b", vec![])];
+        let out = model_arbitrate(
+            host.as_ref(),
+            &dummy_profile(),
+            &prompts(),
+            "run-1",
+            &s,
+            "局势",
+            &pending,
+            &CancelFlag::new(),
+        )
+        .await
+        .unwrap();
+
+        for o in &out {
+            assert_eq!(
+                o.rule_refs,
+                vec![MODEL_ARBITER_RULE_REF.to_string()],
+                "🔴 真判过的裁决不许自称兜底：{o:?}"
+            );
+        }
+        let evs = ev.0.lock().unwrap();
+        assert!(
+            !format!("{evs:?}").contains("arbiterUnjudged"),
+            "🔴 一条都没兜底时不该发告警——狼来了叫多了就没人看了"
+        );
     }
 
     // ===== R7 底线硬约束（人设保险第 1 级·事前，总规格 §7）=====

@@ -1,7 +1,13 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { MessageOutlined, FireOutlined, HeartOutlined, WifiOutlined } from '@ant-design/icons';
-import { appInvoke, clearMobileToken, getMobileToken, setMobileToken } from '../utils/runtime';
+import {
+  appInvoke,
+  clearMobileToken,
+  getMobileToken,
+  setMobileToken,
+  stripMobileTokenFromUrl,
+} from '../utils/runtime';
 import { usePartnerChatStore } from '../stores/usePartnerChatStore';
 import { usePartnerStore } from '../stores/usePartnerStore';
 import { useStoryStore } from '../stores/useStoryStore';
@@ -69,6 +75,10 @@ const MobileHome: React.FC = () => {
       usePartnerChatStore.getState().setSessions(chatSessions);
       useStoryStore.getState().setSessions(storySessions);
       setConnectionStatus('verified');
+      // 🔴 验证成功后立刻把 `?token=` 从地址栏抹掉。此时服务端已把令牌落成 HttpOnly cookie，
+      // URL 里那份不再需要；留着它会随浏览器历史、书签、截图投屏、以及「把链接发给别人」一起泄露。
+      // ⚠️ 只抹 URL、不清内存（那是失效路径 `clearMobileToken` 的语义）。
+      stripMobileTokenFromUrl();
     } catch {
       clearMobileToken();
       setConnectionStatus('invalid');

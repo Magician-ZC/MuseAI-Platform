@@ -11,6 +11,10 @@ const runtimeMocks = vi.hoisted(() => ({
   clearMobileToken: vi.fn(),
   getMobileToken: vi.fn(),
   setMobileToken: vi.fn(),
+  // 验证成功后把 `?token=` 从地址栏抹掉（见 `mobile-token-url-hygiene.test.ts`）。
+  // ⚠️ 整模块 mock 一旦漏掉某个被 import 的导出，调用它就会抛，
+  // 症状是「成功路径整条断掉」而不是「少做了一件事」——这次就是这么红的。
+  stripMobileTokenFromUrl: vi.fn(),
 }));
 
 vi.mock('../utils/runtime', () => runtimeMocks);
@@ -24,6 +28,7 @@ describe('MobileHome navigation buttons', () => {
   beforeEach(() => {
     runtimeMocks.appInvoke.mockReset();
     runtimeMocks.clearMobileToken.mockReset();
+    runtimeMocks.stripMobileTokenFromUrl.mockReset();
     runtimeMocks.getMobileToken.mockReset();
     runtimeMocks.setMobileToken.mockReset();
     vi.spyOn(usePartnerStore.persist, 'rehydrate').mockResolvedValue();
@@ -153,5 +158,9 @@ describe('MobileHome navigation buttons', () => {
 
     fireEvent.click(chatEntry);
     expect(screen.getByTestId('current-path')).toHaveTextContent('/chat');
+
+    // 🔴 验证成功后必须把地址栏里的 token 抹掉（改动前只有失败分支才抹，
+    // 令牌整个会话留在 URL 里：历史 / 书签 / 截图 / 转发都会带走它）。
+    expect(runtimeMocks.stripMobileTokenFromUrl).toHaveBeenCalled();
   });
 });

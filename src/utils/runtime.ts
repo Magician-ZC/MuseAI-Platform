@@ -177,17 +177,37 @@ export const setMobileToken = (token: string): void => {
   }
 };
 
+/**
+ * 🔴 把 `?token=` 从地址栏抹掉，**不动内存里的令牌**。
+ *
+ * 手机端是扫码打开 `http://<内网 IP>:<端口>/?token=xxx` 进来的，令牌就写在 URL 里。
+ * 服务端在首次加载 `/` 时会把它落成 `HttpOnly; SameSite=Lax` 的 cookie
+ * （见 `mobile_server` 的鉴权中间件），此后请求靠 cookie（`credentials: 'same-origin'`）即可，
+ * **URL 里那份已经不需要了**。
+ *
+ * 留着它的代价是实打实的：浏览器历史、书签、截图与投屏、以及「把这个链接发给另一台设备」
+ * ——每一样都会把访问令牌一起带走。而拿到令牌的人可以调用手机端的全部接口。
+ *
+ * ⚠️ 与 `clearMobileToken` 的区别：那个是**登出**语义（连内存一起清，用于令牌失效时），
+ * 本函数是**清理 URL**语义（用于验证成功后）。成功路径上把内存一起清掉会让
+ * cookie 尚未生效的那一瞬失去回退凭据，故分成两个函数而不是复用一个。
+ */
+export const stripMobileTokenFromUrl = (): void => {
+  if (typeof window === 'undefined') return;
+  const params = new URLSearchParams(window.location.search);
+  if (!params.has('token')) return;
+  params.delete('token');
+  const query = params.toString();
+  const pathname = window.location.pathname || '/';
+  const hash = window.location.hash || '';
+  window.history.replaceState(null, '', `${pathname}${query ? `?${query}` : ''}${hash}`);
+};
+
+/** 登出语义：内存与 URL 都清掉（令牌失效时用）。 */
 export const clearMobileToken = (): void => {
   if (typeof window !== 'undefined') {
     transientMobileToken = '';
-    const params = new URLSearchParams(window.location.search);
-    if (params.has('token')) {
-      params.delete('token');
-      const query = params.toString();
-      const pathname = window.location.pathname || '/';
-      const hash = window.location.hash || '';
-      window.history.replaceState(null, '', `${pathname}${query ? `?${query}` : ''}${hash}`);
-    }
+    stripMobileTokenFromUrl();
   }
 };
 

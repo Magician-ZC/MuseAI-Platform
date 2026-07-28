@@ -572,3 +572,125 @@ where
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod sms_ordering_red_line {
+    //! 🔴 **不许给 `sms_challenges` 的排序补 `id` 充数。**
+    //!
+    //! # 这道门守的是一条**禁令**，而禁令此前只写在注释里
+    //!
+    //! `docs/VALIDATION.md` §3.3 第 ② 项对这处的处置是「**第 3 类：不补假确定性，
+    //! 原样保留并写清原因**」，并明写「在此之前**不得**给它补 `id DESC` 充数」。
+    //!
+    //! 理由是：`id` 是 uuid v4，**大小与时间无关**——按它排序只是把「不稳定的任意」
+    //! 变成「稳定的任意」，选中的那一行并不因此更「新」。而它会让**看起来确定**
+    //! 掩盖掉真正的问题（限频 TOCTOU 造成的同毫秒并列，修法在写入侧 + 迁移）。
+    //!
+    //! ⚠️ 危险的是这种改动**长得像改进**：做「排序确定性」清扫的人会很自然地补上
+    //! `, id DESC`，全部用例照常绿，而那段解释为什么不能补的注释会被略过。
+    //! 于是一条有意的、写清了理由的保留，被一次善意的清扫悄悄改成了假确定性。
+    //!
+    //! # 这道门**不修**那个并发问题
+    //!
+    //! 它只挡住**错误的修法**。真正的修法要迁移 + 评审（§3.3 列了两条候选），
+    //! 且整条短信通道当前是 Dev 桩（§0.3 本就不可上线）。说清这一点是为了
+    //! 不让这道门被误读成「这处已经修好了」。
+
+    /// 生产源码里所有 `sms_challenges` 相关的 SQL。
+    fn sms_sql_statements() -> Vec<String> {
+        let src = crate::testkit::production_sources()
+            .into_iter()
+            .filter(|(rel, _)| rel.starts_with("auth"))
+            .map(|(_, s)| s)
+            .collect::<Vec<_>>()
+            .join("\n");
+        // 取每一段含 `sms_challenges` 的字符串字面量（跨行拼接的 SQL 在源码里仍是一个字面量）。
+        let mut out = Vec::new();
+        let bytes: Vec<char> = src.chars().collect();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i] == '"' {
+                let start = i + 1;
+                let mut j = start;
+                while j < bytes.len() && bytes[j] != '"' {
+                    if bytes[j] == '\\' {
+                        j += 1;
+                    }
+                    j += 1;
+                }
+                let lit: String = bytes[start..j.min(bytes.len())].iter().collect();
+                if lit.contains("sms_challenges") {
+                    out.push(lit);
+                }
+                i = j + 1;
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn no_fake_determinism_in_sms_challenge_ordering() {
+        let stmts = sms_sql_statements();
+        assert!(
+            stmts.len() >= 3,
+            "🔴 只解析出 {} 条 sms_challenges 语句，解析口径坏了，这道门正在静默失效：{stmts:?}",
+            stmts.len()
+        );
+
+        // 🔴 **光有「条数下限」不够** —— 这一条是被一次没变红的注入逼出来的。
+        //
+        // 把那条取行 SELECT 改成 `format!("… FROM {} …", "sms_chal".to_string() + "lenges")`
+        // 之后，字面量里不再有表名 → 探测器看不见它，而 `len() >= 3` 仍然满足
+        //（INSERT / UPDATE / 限频那几条还在）。于是**门静默地不再检查它唯一要检查的那条语句**，
+        // 偷偷补上的 `id DESC` 就这么过去了。
+        //
+        // 所以判据必须钉住**那条语句本身还在视野里**，而不只是「还看得见几条」。
+        let ordered: Vec<&String> = stmts.iter().filter(|s| s.contains("ORDER BY")).collect();
+        assert_eq!(
+            ordered.len(),
+            1,
+            "🔴 恰好应有**一条**按序取行的 sms_challenges 查询在视野里，实得 {}。\n\
+             为 0 通常意味着那条 SQL 不再是一个含表名的字面量（如改成了 format! 拼接），\n\
+             此时这道门**看不见它了却仍然全绿** —— 那比没有门更糟。\n\
+             解析出的语句：{stmts:?}",
+            ordered.len()
+        );
+
+        for sql in &stmts {
+            let Some(order_at) = sql.find("ORDER BY") else { continue };
+            let order_clause = &sql[order_at..];
+            assert!(
+                !order_clause.contains(" id ") && !order_clause.contains("id DESC") && !order_clause.contains("id ASC"),
+                "🔴 `sms_challenges` 的排序里出现了 `id`：\n  {sql}\n\n\
+                 `id` 是 uuid v4，**大小与时间无关**——按它排序只是把「不稳定的任意」\n\
+                 变成「稳定的任意」，选中的那行并不因此更新。这是**假确定性**，\n\
+                 它会掩盖真正的问题（限频 TOCTOU 的同毫秒并列，修法在写入侧 + 迁移）。\n\
+                 见 docs/VALIDATION.md §3.3 第 ② 项与本处的代码注释。"
+            );
+        }
+    }
+
+    /// 反向配对：限频那半边**必须仍然是聚合**，不许被「统一写法」改回 `ORDER BY … LIMIT 1`。
+    ///
+    /// §3.3 说得很清楚：那一半要的是一个**值**（最近一次发码的时刻），不是某一**行**——
+    /// 换成 `MAX()` 之后「行序」这件事根本不存在。若有人为了让两处「看起来一致」
+    /// 把它改回排序取行，等于把一个已经真正修掉的问题重新引入。
+    #[test]
+    fn the_rate_limit_half_stays_an_aggregate() {
+        let stmts = sms_sql_statements();
+        let rate = stmts
+            .iter()
+            .find(|s| s.contains("created_at") && s.contains("WHERE phone"))
+            .filter(|s| s.contains("MAX("))
+            .unwrap_or_else(|| {
+                panic!(
+                    "🔴 找不到「用 MAX(created_at) 做限频」那条语句。\n\
+                     若它被改回 `ORDER BY created_at DESC LIMIT 1`，就是把一个**已经真正修掉**的\n\
+                     排序稳定性问题重新引入（见 §3.3）。实得：{stmts:?}"
+                )
+            });
+        assert!(!rate.contains("ORDER BY"), "限频查询不该有排序：{rate}");
+    }
+}

@@ -1080,6 +1080,22 @@ worldItems[].narrative · hiddenContentPool[].template · sideHookPool[].templat
 🔵 故障注入用的是**改动前的真实实现**（`git show HEAD:…` 取回后原样替换）：
 `主线摘要探针` 确实不在送审文本里。这条是实测缺陷，不是推断。
 
+**同一形状的第二处：NPC 卡的装配期机审**（补于 2026-07-28）。
+`assembly::npc_scan_text` 也是包含表——只拼四个字段（名字 / 核心矛盾 / 表层目标 / 长期议程），
+而 `CharacterCardV2` 有约 50 个创作者可写的叙事文本字段（`plotSeeds` / `bottomLines` / `stakes` /
+`hiddenNeed` / `outburstPattern` / `forbiddenPhrases`……），**整张卡都会进模型**
+（`WorldCharacterEntry.card` → runtime 逐 tick 注入）。于是那道写着「未复核内容不进实例」的门
+漏看了其中约 46 个字段，且原注释只描述了选哪四个、没给过理由。
+
+🔴 更要紧的是：**同一张卡本来就有两份送审实现**——模板发布走 `world_scan_text` → `card_scan_text`
+（全量），装配期走 `npc_scan_text`（四字段），而窄的那份恰好在安全路径上。现收归一处
+（`npc_scan_text` 直接复用 `card_scan_text`），并加了一条用例钉住「两者逐字相等」。
+
+🔴 序列化失败返回 `None` 而不是空串，调用方按**未通过**处理：空串会被 provider 判过 ⇒ fail-open，
+等于让一张读不出来的卡直接进实例。
+
+🔵 故障注入用的是**改动前的真实实现**（原样贴回）：`隐藏需求探针` 确实不在送审文本里。
+
 ⚠️ **与 `MUSE_MODERATION_HTTP_MAX_CHARS` 的交互**：送审文本变长，更容易撞上客户端截断。
 该项**默认 0 = 不截断**（注释已写明理由：让厂商侧的长度拒绝变成一次 `Err` → fail-closed，
 比悄悄送半截文本过审安全），故默认配置下本改动的方向是安全的。但若运营把它调成正数，

@@ -3160,11 +3160,17 @@ async fn assemble_world_characters(
             continue; // 无 id 的 NPC 无法被 runtime 注入/区分，跳过。
         }
         // S-3：NPC 卡可叙述文本过机审门，仅 Approved 钉入（未复核内容不进实例）。
+        // 🔴 送审文本取不出来（卡序列化失败）→ 按**未通过**处理，不是按空文本送审：
+        // 空串会被 provider 判过，等于让一张读不出来的卡直接进实例。
+        let Some(scan_text) = npc_scan_text(&wc.card) else {
+            tracing::warn!(world = %world_id, npc = %npc_id, "NPC 卡无法序列化为送审文本，按未通过处理");
+            continue;
+        };
         let verdict = crate::safety::moderate_and_queue(
             state,
             "assembly_npc",
             &format!("{world_id}:{npc_id}"),
-            &npc_scan_text(&wc.card),
+            &scan_text,
         )
         .await?;
         if verdict != ModerationVerdict::Approved {
@@ -3186,22 +3192,22 @@ async fn assemble_world_characters(
     Ok(entries)
 }
 
-/// NPC 卡的机审文本：拼接可叙述字段（名字 / 核心矛盾 / 表层目标 / 长期议程），供预审核门判定。
-fn npc_scan_text(card: &CharacterCardV2) -> String {
-    let dc = &card.dramatic_core;
-    let mut parts: Vec<String> = Vec::new();
-    for s in [
-        card.identity.name.as_str(),
-        dc.core_contradiction.as_str(),
-        dc.surface_goal.as_str(),
-        card.agency.long_term_agenda.as_str(),
-    ] {
-        let t = s.trim();
-        if !t.is_empty() {
-            parts.push(t.to_string());
-        }
-    }
-    parts.join(" / ")
+/// NPC 卡的机审文本。**复用 `safety::card_scan_text`**（递归收全部字符串叶子）。
+///
+/// 🔴 它此前是**包含表**——只拼四个字段（名字 / 核心矛盾 / 表层目标 / 长期议程），
+/// 而 `CharacterCardV2` 有约 50 个创作者可写的叙事文本字段（`plotSeeds` / `bottomLines` /
+/// `stakes` / `hiddenNeed` / `outburstPattern` / `forbiddenPhrases` …），**整张卡都会进模型**
+/// （`WorldCharacterEntry.card` → runtime 逐 tick 注入）。于是这道「未复核内容不进实例」的门
+/// 漏看了其中约 46 个字段，且注释里只描述了选了哪四个、没给过理由。
+///
+/// 同一张卡在**模板发布**时走的是 `assets::worlds::world_scan_text` → `card_scan_text`（全量），
+/// 也就是说同一判定本来就有两份实现，而窄的那份恰好在安全路径上。现收归一处。
+/// 取舍与 VALIDATION §3.9 逐字相同：漏扫 = 内容绕过机审，多扫 = 送审文本长一点，两者不对称。
+///
+/// 🔴 序列化失败返回 `None` 而不是空串：空串会被 provider 判过 ⇒ **fail-open**。
+/// 调用方按「未通过」处理（该 NPC 不钉入实例），与其它非 Approved 分支同一出口。
+fn npc_scan_text(card: &CharacterCardV2) -> Option<String> {
+    serde_json::to_value(card).ok().map(|v| crate::safety::card_scan_text(&v))
 }
 
 /// 角色执念词条：恐惧 / 被否认的欲望 / 核心矛盾 / 隐藏需求 / 剧情种子 / 拒绝规则。
@@ -3961,6 +3967,68 @@ mod sampling_tests {
             created_at: 0,
             updated_at: 0,
         }
+    }
+
+    // ---------- NPC 卡送审文本的覆盖面 ----------
+    //
+    // 🔴 `npc_scan_text` 此前是**包含表**（只拼四个字段），而整张卡都会进模型。
+    // 这一组钉的是「送审文本必须覆盖创作者可写的全部叙事字段」。
+
+    /// 逐字段探针：卡上各处的文字都必须出现在送审文本里。
+    /// 改动前只有 `identity.name` / `coreContradiction` / `surfaceGoal` / `longTermAgenda` 四处在。
+    #[test]
+    fn npc_scan_text_covers_the_whole_card_not_four_fields() {
+        use muse_engine::character::types::{Agency, DramaticCore, ExpressionFingerprint};
+        let mut c = card("npc1", "恐惧探针", &["剧情种子探针"]);
+        c.dramatic_core = DramaticCore {
+            core_contradiction: "核心矛盾探针".into(),
+            surface_goal: "表层目标探针".into(),
+            hidden_need: "隐藏需求探针".into(),
+            core_fear: "恐惧探针".into(),
+            stakes: "赌注探针".into(),
+            bottom_lines: vec!["底线探针".into()],
+            ..Default::default()
+        };
+        c.agency = Agency {
+            long_term_agenda: "长期议程探针".into(),
+            plot_seeds: vec!["剧情种子探针".into()],
+            refusal_rules: vec!["拒绝规则探针".into()],
+            ..Default::default()
+        };
+        c.expression_fingerprint = ExpressionFingerprint {
+            forbidden_phrases: vec!["禁用语探针".into()],
+            ..Default::default()
+        };
+
+        let text = npc_scan_text(&c).expect("卡必须序列化得出送审文本");
+        for probe in [
+            "npc1",             // identity.name（旧口径已覆盖）
+            "核心矛盾探针",     // 旧口径已覆盖
+            "表层目标探针",     // 旧口径已覆盖
+            "长期议程探针",     // 旧口径已覆盖
+            "隐藏需求探针",     // ↓ 以下全是旧口径**漏掉**的
+            "恐惧探针",
+            "赌注探针",
+            "底线探针",
+            "剧情种子探针",
+            "拒绝规则探针",
+            "禁用语探针",
+        ] {
+            assert!(text.contains(probe), "NPC 送审文本漏了 `{probe}`——该字段的内容不过任何机审\n实际: {text}");
+        }
+    }
+
+    /// 🔴 与云端角色卡、模板发布走的是**同一个实现**（`safety::card_scan_text`）。
+    /// 谁把它改回自己拼几个字段，这一条立刻红——同一判定的第二份实现正是缺陷本身。
+    #[test]
+    fn npc_scan_text_is_the_same_implementation_as_card_scan_text() {
+        let c = card("npc2", "怕黑", &["种子甲", "种子乙"]);
+        let v = serde_json::to_value(&c).unwrap();
+        assert_eq!(
+            npc_scan_text(&c).unwrap(),
+            crate::safety::card_scan_text(&v),
+            "🔴 NPC 送审文本必须逐字复用 card_scan_text，不得另拼一套"
+        );
     }
 
     /// 素阵容（无内核匹配词条）：只验分配协议本身。

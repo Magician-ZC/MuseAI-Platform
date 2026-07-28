@@ -264,15 +264,17 @@ fn apply_operation(next: &mut NarrativeState, op: &PatchOperation) -> Result<(),
         }
         ParsedPath::NarrativeList { field } => match field.as_str() {
             "foreshadowing" => apply_str_list(&mut next.narrative.foreshadowing, op),
-            _ => {
+            "pacingNotes" => {
                 apply_str_list(&mut next.narrative.pacing_notes, op)?;
                 trim_pacing_notes(&mut next.narrative.pacing_notes);
                 Ok(())
             }
+            _ => Err(unknown_field(field)),
         },
         ParsedPath::AuthoringList { field } => match field.as_str() {
             "lockedSceneIds" => apply_str_list(&mut next.authoring.locked_scene_ids, op),
-            _ => apply_str_list(&mut next.authoring.branch_snapshot_ids, op),
+            "branchSnapshotIds" => apply_str_list(&mut next.authoring.branch_snapshot_ids, op),
+            _ => Err(unknown_field(field)),
         },
     }
 }
@@ -313,13 +315,35 @@ fn read_current(state: &NarrativeState, parsed: &ParsedPath) -> Result<Value, En
         }
         ParsedPath::NarrativeList { field } => Ok(match field.as_str() {
             "foreshadowing" => serde_json::to_value(&state.narrative.foreshadowing)?,
-            _ => serde_json::to_value(&state.narrative.pacing_notes)?,
+            "pacingNotes" => serde_json::to_value(&state.narrative.pacing_notes)?,
+            _ => return Err(unknown_field(field)),
         }),
         ParsedPath::AuthoringList { field } => Ok(match field.as_str() {
             "lockedSceneIds" => serde_json::to_value(&state.authoring.locked_scene_ids)?,
-            _ => serde_json::to_value(&state.authoring.branch_snapshot_ids)?,
+            "branchSnapshotIds" => serde_json::to_value(&state.authoring.branch_snapshot_ids)?,
+            _ => return Err(unknown_field(field)),
         }),
     }
+}
+
+/// 🔴 **字段分发不许有兜底**。
+///
+/// 这些 `match` 曾以 `_ => <某个具体字段>` 收尾（读侧兜到 `arcStage`/`notes`/`pacingNotes`/
+/// `branchSnapshotIds`，写侧同）。今天它是安全的——`parse_path` 是严格白名单，
+/// 只有已知字段名到得了这里，`_` 恰好等于最后那个。
+///
+/// **但它的失效方式是静默读写错字段**：往 `parse_path` 的白名单里加一个新字段
+/// （比如 `reputation`）却忘了加分发，`characters.X.reputation` 会**不报错地**
+/// 落到 `arcStage` 上——读出别人的值、写坏另一个字段，而且**两边都不会有任何提示**。
+///
+/// 改成显式列全 + `_ => Err`：今天行为逐字节不变（那条分支到不了），
+/// 明天加字段忘了分发就**当场报错**而不是悄悄写错地方。
+/// 由 `field_dispatch_has_no_silent_fallthrough` 钉住。
+fn unknown_field(field: &str) -> EngineError {
+    EngineError::Validation(format!(
+        "字段 `{field}` 在 parse_path 白名单里、却没有对应的分发分支 —— \
+         这是登记与分发漂开了（加字段时只改了一处）。补上分发，不要靠兜底。"
+    ))
 }
 
 fn char_field_value(c: &CharacterState, field: &str) -> Result<Value, EngineError> {
@@ -331,7 +355,8 @@ fn char_field_value(c: &CharacterState, field: &str) -> Result<Value, EngineErro
         "misconceptions" => serde_json::to_value(&c.misconceptions)?,
         "plans" => serde_json::to_value(&c.plans)?,
         "location" => Value::String(c.location.clone()),
-        _ => Value::String(c.arc_stage.clone()), // arcStage
+        "arcStage" => Value::String(c.arc_stage.clone()),
+        _ => return Err(unknown_field(field)),
     })
 }
 
@@ -342,7 +367,8 @@ fn rel_field_value(r: &RelationState, field: &str) -> Result<Value, EngineError>
         "fear" => serde_json::to_value(r.fear)?,
         "debt" => serde_json::to_value(r.debt)?,
         "knownTo" => serde_json::to_value(&r.known_to)?,
-        _ => serde_json::to_value(&r.notes)?, // notes
+        "notes" => serde_json::to_value(&r.notes)?,
+        _ => return Err(unknown_field(field)),
     })
 }
 
@@ -369,7 +395,8 @@ fn apply_character(c: &mut CharacterState, field: &str, op: &PatchOperation) -> 
         "emotions" => apply_emotions(&mut c.emotions, op),
         // location（Phase 2）：标量 Set 单值（非 list append），与 arcStage 同款；movement 落定路径。
         "location" => apply_scalar_string(&mut c.location, op),
-        _ => apply_scalar_string(&mut c.arc_stage, op), // arcStage
+        "arcStage" => apply_scalar_string(&mut c.arc_stage, op),
+        _ => Err(unknown_field(field)),
     }
 }
 
@@ -380,7 +407,8 @@ fn apply_relation(r: &mut RelationState, field: &str, op: &PatchOperation) -> Re
         "fear" => apply_num(&mut r.fear, op),
         "debt" => apply_num(&mut r.debt, op),
         "knownTo" => apply_str_list(&mut r.known_to, op),
-        _ => apply_str_list(&mut r.notes, op), // notes
+        "notes" => apply_str_list(&mut r.notes, op),
+        _ => Err(unknown_field(field)),
     }
 }
 
@@ -1100,6 +1128,91 @@ mod tests {
         }
         assert_eq!(st.narrative.pacing_notes.len(), 5, "远未到上限时一条都不该丢");
         assert_eq!(st.narrative.pacing_notes[0], "第 0 拍");
+    }
+
+    /// 🔴 **字段分发不许有兜底：登记与分发漂开时必须当场报错，而不是悄悄写错字段。**
+    ///
+    /// 这些 `match` 曾以 `_ => <某个具体字段>` 收尾。今天安全（`parse_path` 是严格白名单，
+    /// `_` 恰好等于最后那个字段），**但失效方式是静默读写错字段**：
+    /// 往白名单里加一个新字段却忘了加分发，`characters.X.reputation` 会**不报错地**
+    /// 落到 `arcStage` 上——读出别人的值、写坏另一个字段，两边都没有任何提示。
+    ///
+    /// 本用例**绕过 `parse_path` 直接喂一个白名单外的字段名**给分发函数，
+    /// 那正是「加了字段却忘了分发」时会发生的事。
+    #[test]
+    fn field_dispatch_has_no_silent_fallthrough() {
+        let mut c = CharacterState::default();
+        c.arc_stage = "原值".into();
+        assert!(
+            char_field_value(&c, "reputation").is_err(),
+            "🔴 未知角色字段读取必须报错，而不是兜底读出 arcStage"
+        );
+        let set = PatchOperation {
+            op: PatchOp::Set,
+            path: String::new(),
+            value: Some(serde_json::json!("被写坏的值")),
+            precondition: None,
+        };
+        assert!(apply_character(&mut c, "reputation", &set).is_err(), "未知字段写入必须报错");
+        assert_eq!(c.arc_stage, "原值", "🔴 报错的同时绝不许已经把别的字段改掉");
+
+        let mut r = RelationState {
+            from: "a".into(),
+            to: "b".into(),
+            trust: 0.0,
+            affinity: 0.0,
+            fear: 0.0,
+            debt: 0.0,
+            known_to: vec![],
+            notes: vec!["原注记".into()],
+        };
+        assert!(rel_field_value(&r, "respect").is_err(), "未知关系字段读取必须报错");
+        let append = PatchOperation {
+            op: PatchOp::Append,
+            path: String::new(),
+            value: Some(serde_json::json!("污染")),
+            precondition: None,
+        };
+        assert!(apply_relation(&mut r, "respect", &append).is_err(), "未知关系字段写入必须报错");
+        assert_eq!(r.notes, vec!["原注记".to_string()], "🔴 不许顺手往 notes 里塞东西");
+    }
+
+    /// 反向配对：**白名单里的每一个字段都必须真的有分发分支**。
+    ///
+    /// 只测「未知字段要报错」的话，把分发全改成 `Err` 也能全绿——那等于把 reducer 废掉。
+    /// 这里遍历 `parse_path` 实际放行的字段名逐个验，加字段时它自动进入判据。
+    #[test]
+    fn every_whitelisted_field_actually_has_a_dispatch_arm() {
+        let c = CharacterState::default();
+        for field in
+            ["goals", "emotions", "resources", "secrets", "misconceptions", "plans", "location", "arcStage"]
+        {
+            assert!(
+                parse_path(&format!("characters.x.{field}")).is_ok(),
+                "前提：{field} 应在 parse_path 白名单里"
+            );
+            assert!(
+                char_field_value(&c, field).is_ok(),
+                "🔴 白名单放行了 `{field}`，分发却没有对应分支 —— 那正是会静默写错字段的形态"
+            );
+        }
+        let r = RelationState {
+            from: "a".into(),
+            to: "b".into(),
+            trust: 0.0,
+            affinity: 0.0,
+            fear: 0.0,
+            debt: 0.0,
+            known_to: vec![],
+            notes: vec![],
+        };
+        for field in ["trust", "affinity", "fear", "debt", "knownTo", "notes"] {
+            assert!(
+                parse_path(&format!("relations[a->b].{field}")).is_ok(),
+                "前提：{field} 应在白名单里"
+            );
+            assert!(rel_field_value(&r, field).is_ok(), "🔴 关系字段 `{field}` 缺分发分支");
+        }
     }
 
 }

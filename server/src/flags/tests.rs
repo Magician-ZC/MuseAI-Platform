@@ -337,6 +337,14 @@ fn red_line_only_safety_chain_defaults_on() {
     // 模型调用。故它除了默认关闭，还自带补投次数封顶（`MUSE_IFLINE_SWEEP_MAX_REDELIVERIES`）：
     // 一个每次都在清标记前就死掉的 worker，配上无封顶的补投，就是个无限烧钱的循环。
     //
+    // 18 → 21：`MUSE_ATTENTION_TICK_FAILURE` / `MUSE_ATTENTION_BLOCKED_STREAK` /
+    // `MUSE_ATTENTION_STALLED`（健康档三个新维度，open-decisions §1 于 2026-07-28 产品选定）。
+    // ⚠️ 这三个与前面所有开关都**不同类**：它们既不改变用户可见范围，也不烧任何 token——
+    // 它们只改运营看板上「需关注」这个数**的含义**。默认关闭的理由因此也不同：
+    // 开着合并意味着**没有人按过开关，而某天早上那个数字自己变大了**，
+    // 运营会去追一个并不存在的事故。§0.1 在这里挡的是「口径静默漂移」而不是「功能静默上线」。
+    // 🔵 三条各自还带自己的阈值 env（§0.2 参数化），开关只管开不开。
+    //
     // 这些都是登记表**新增了默认关闭的开关**，不是断言被放宽——上面那个循环仍逐条钉死
     // 「除审核链外默认值必须为 false」，新开关同样在其中。
     //
@@ -347,10 +355,11 @@ fn red_line_only_safety_chain_defaults_on() {
     // （过期即报警，正是它要的）。
     assert_eq!(
         KNOWN_FLAGS.len(),
-        18,
+        21,
         "登记表应覆盖 9 个存量 env 开关 + R3 新建的 MUSE_OOC_ANNOTATIONS / MUSE_IFLINE_PARALLEL / \
          MUSE_SOCIAL_IDENTITY_UNLOCK / MUSE_LIVE_STAGE + MUSE_DISPOSAL_NAME_GATE + \
-         MUSE_SAFETY_SEMANTIC_RECHECK + MUSE_SAFETY_RECHECK_SWEEP + MUSE_IFLINE_ADVANCE_SWEEP，\
+         MUSE_SAFETY_SEMANTIC_RECHECK + MUSE_SAFETY_RECHECK_SWEEP + MUSE_IFLINE_ADVANCE_SWEEP \
+         + 健康档三维度（MUSE_ATTENTION_TICK_FAILURE / _BLOCKED_STREAK / _STALLED），\
          其中 MUSE_OFFPEAK_SCHEDULING 已由纯 env 迁入体系"
     );
 }

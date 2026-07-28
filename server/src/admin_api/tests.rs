@@ -4455,3 +4455,217 @@ fn attention_threshold_is_parameterised_and_defaults_to_the_frontend_value() {
          搬位置不得顺手改判定，否则运营会看到一个没人改过却变了的数"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 健康档新增三维度（open-decisions §1，2026-07-28 产品选定）——**默认全关**
+// ═══════════════════════════════════════════════════════════════════════════
+
+async fn turn_on(state: &AppState, flag: &str) {
+    crate::flags::set_flag(
+        &state.db,
+        crate::flags::SetFlag {
+            flag,
+            scope: "global",
+            target_id: "",
+            enabled: true,
+            starts_at: 0,
+            ends_at: 0,
+            actor_id: "test",
+            reason: "用例",
+        },
+    )
+    .await
+    .unwrap();
+}
+
+async fn seed_tick(state: &AppState, world: &str, tick_no: i64, status: &str, error: Option<&str>, created_at: i64) {
+    sqlx::query(
+        "INSERT INTO world_ticks (id, world_id, tick_no, base_revision, status, error, cost_tokens, created_at) \
+         VALUES ($1, $2, $3, 0, $4, $5, 0, $6)",
+    )
+    .bind(format!("tk_{world}_{tick_no}"))
+    .bind(world)
+    .bind(tick_no)
+    .bind(status)
+    .bind(error)
+    .bind(created_at)
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+/// 🔴 **三维度默认全关时，端点行为与接线前一致**：`attentionAny == attention`，
+/// 三条新原因一律 `enabled: false` 且 **count 为 null 而不是 0**。
+///
+/// null 与 0 的区别不是洁癖：0 会被后台读成「这一维一个世界都没有」，
+/// 而真相是「这一维压根没开过」——同 §3.36 那条「显示 — 与显示 0% 是两个判断」。
+#[tokio::test]
+async fn the_new_attention_dimensions_are_off_by_default_and_report_null_not_zero() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+    let today = crate::runtime::day_string(now_ms());
+
+    let w = mk_world(&state, "吃紧世界", "running").await;
+    seed_budget(&state, &w, 1000, 950, &today, 0).await;
+    // 一个「怎么看都该被新维度抓到」的世界：连续 blocked + 从未活动。
+    let bad = mk_world(&state, "全是问题的世界", "running").await;
+    for i in 0..5 {
+        seed_tick(&state, &bad, i, "done", Some("blocked"), now_ms() - 10 * 86_400_000).await;
+    }
+
+    let (st, b) = get(&app, "/api/admin/worlds/summary", Some(&admin)).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["attention"], json!(1), "只有预算那一条在起作用: {b}");
+    assert_eq!(b["attentionAny"], json!(1), "🔴 全关时 attentionAny 必须恒等于 attention: {b}");
+
+    let reasons = b["attentionReasons"].as_array().expect("attentionReasons");
+    let by = |code: &str| reasons.iter().find(|r| r["code"] == code).unwrap_or_else(|| panic!("缺 {code}: {b}"));
+    assert_eq!(by("budget_ratio")["enabled"], json!(true));
+    for code in ["tick_failure_rate", "blocked_streak", "stalled"] {
+        assert_eq!(by(code)["enabled"], json!(false), "{code} 应默认关: {b}");
+        assert!(
+            by(code)["count"].is_null(),
+            "🔴 {code} 未启用时 count 必须是 null 而不是 0 —— 0 会被读成「一个都没有」: {b}"
+        );
+    }
+}
+
+/// 停摆维度：**刚建、还没跑过拍的新世界不算停摆**。
+///
+/// 🔴 这是这一维最容易写错的地方：`MAX(world_ticks.created_at)` 对新世界是 NULL，
+/// 不用 `worlds.created_at` 兜底的话，一个五分钟前建的世界会立刻亮黄灯。
+#[tokio::test]
+async fn a_brand_new_world_is_not_counted_as_stalled() {
+    let state = test_state().await;
+    turn_on(&state, "MUSE_ATTENTION_STALLED").await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+
+    let _fresh = mk_world(&state, "刚建的世界", "running").await;
+    let stale = mk_world(&state, "早就不动的世界", "running").await;
+    seed_tick(&state, &stale, 0, "done", None, now_ms() - 10 * 86_400_000).await;
+
+    let (_st, b) = get(&app, "/api/admin/worlds/summary", Some(&admin)).await;
+    let reasons = b["attentionReasons"].as_array().unwrap();
+    let stalled = reasons.iter().find(|r| r["code"] == "stalled").unwrap();
+    assert_eq!(stalled["enabled"], json!(true), "{b}");
+    assert_eq!(
+        stalled["count"],
+        json!(1),
+        "🔴 只有真正停摆的那个该被数到；刚建的新世界不算（否则每个新房一建就亮黄灯）: {b}"
+    );
+    assert_eq!(b["attentionAny"], json!(1), "{b}");
+}
+
+/// 连续 blocked 维度：判据是**尾部连续**，不是窗口内占比。
+///
+/// 🔴 「上周堵过三拍、之后一直正常」的世界**已经好了**，不该继续亮灯。
+/// 占比口径会把它算进来，尾部口径不会——这条用例就是把两种口径分开的那把尺。
+#[tokio::test]
+async fn the_blocked_streak_counts_only_the_tail_not_history() {
+    let state = test_state().await;
+    turn_on(&state, "MUSE_ATTENTION_BLOCKED_STREAK").await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+    let t = now_ms();
+
+    // ① 一直堵到现在 → 该数。
+    let stuck = mk_world(&state, "一直堵着", "running").await;
+    for i in 0..4 {
+        seed_tick(&state, &stuck, i, "done", Some("blocked"), t).await;
+    }
+    // ② 以前堵过 4 拍，之后正常跑了 2 拍 → **不该数**（尾部连续为 0）。
+    let recovered = mk_world(&state, "堵过但好了", "running").await;
+    for i in 0..4 {
+        seed_tick(&state, &recovered, i, "done", Some("blocked"), t).await;
+    }
+    for i in 4..6 {
+        seed_tick(&state, &recovered, i, "done", None, t).await;
+    }
+    // ③ 尾部只堵了 2 拍（阈值 3）→ 不该数。
+    let mild = mk_world(&state, "只堵了两拍", "running").await;
+    seed_tick(&state, &mild, 0, "done", None, t).await;
+    for i in 1..3 {
+        seed_tick(&state, &mild, i, "done", Some("blocked"), t).await;
+    }
+
+    let (_st, b) = get(&app, "/api/admin/worlds/summary", Some(&admin)).await;
+    let reasons = b["attentionReasons"].as_array().unwrap();
+    let streak = reasons.iter().find(|r| r["code"] == "blocked_streak").unwrap();
+    assert_eq!(
+        streak["count"],
+        json!(1),
+        "🔴 只有「一直堵到现在」那个该被数到。「堵过但好了」被数进来 = 判据退化成了占比: {b}"
+    );
+}
+
+/// 失败率维度：**样本下限是判据的一部分**。
+///
+/// 🔴 只跑了 1 拍且失败 = 100% 失败率，但那不是一个红灯——它是一个刚开的世界。
+/// 没有样本下限，每个「第一拍就失败」的新世界都会亮灯。
+#[tokio::test]
+async fn the_failure_rate_needs_a_minimum_sample_before_it_lights_up() {
+    let state = test_state().await;
+    turn_on(&state, "MUSE_ATTENTION_TICK_FAILURE").await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+    let t = now_ms();
+
+    // ① 只跑了 1 拍且失败（100%）→ 样本不足，不该数。
+    let tiny = mk_world(&state, "只跑过一拍", "running").await;
+    seed_tick(&state, &tiny, 0, "failed", Some("boom"), t).await;
+    // ② 跑了 10 拍失败 5 拍（50% ≥ 30%）→ 该数。
+    let bad = mk_world(&state, "真的在报错", "running").await;
+    for i in 0..10 {
+        let (st, err) = if i < 5 { ("failed", Some("boom")) } else { ("done", None) };
+        seed_tick(&state, &bad, i, st, err, t).await;
+    }
+    // ③ 跑了 10 拍全是 blocked → **不该**进失败率（blocked 是另一维，不是失败）。
+    let blocked = mk_world(&state, "全被拦下", "running").await;
+    for i in 0..10 {
+        seed_tick(&state, &blocked, i, "done", Some("blocked"), t).await;
+    }
+
+    let (_st, b) = get(&app, "/api/admin/worlds/summary", Some(&admin)).await;
+    let reasons = b["attentionReasons"].as_array().unwrap();
+    let fr = reasons.iter().find(|r| r["code"] == "tick_failure_rate").unwrap();
+    assert_eq!(
+        fr["count"],
+        json!(1),
+        "🔴 只有真的在报错那个该被数到：单拍失败是样本不足，全 blocked 属于另一维: {b}"
+    );
+}
+
+/// 🔴 `attentionAny` **去重**：一个世界同时命中两条规则只数一次。
+///
+/// 各条 `reasons[].count` 天然重叠、不可相加——这条用例把「不可相加」变成可执行的事实。
+#[tokio::test]
+async fn attention_any_deduplicates_worlds_that_hit_several_rules() {
+    let state = test_state().await;
+    turn_on(&state, "MUSE_ATTENTION_STALLED").await;
+    turn_on(&state, "MUSE_ATTENTION_BLOCKED_STREAK").await;
+    let app = build_router(state.clone());
+    let admin = admin_token(&state);
+    let today = crate::runtime::day_string(now_ms());
+    let long_ago = now_ms() - 10 * 86_400_000;
+
+    // 同一个世界：预算逼近上限 + 尾部连续 blocked + 早就没动过。三条全中。
+    let w = mk_world(&state, "样样都占", "running").await;
+    seed_budget(&state, &w, 1000, 999, &today, 0).await;
+    for i in 0..4 {
+        seed_tick(&state, &w, i, "done", Some("blocked"), long_ago).await;
+    }
+
+    let (_st, b) = get(&app, "/api/admin/worlds/summary", Some(&admin)).await;
+    let reasons = b["attentionReasons"].as_array().unwrap();
+    let c = |code: &str| reasons.iter().find(|r| r["code"] == code).unwrap()["count"].clone();
+    assert_eq!(c("budget_ratio"), json!(1), "{b}");
+    assert_eq!(c("blocked_streak"), json!(1), "{b}");
+    assert_eq!(c("stalled"), json!(1), "{b}");
+    assert_eq!(
+        b["attentionAny"],
+        json!(1),
+        "🔴 三条都命中的是**同一个世界**，attentionAny 必须去重（相加会得到 3）: {b}"
+    );
+}

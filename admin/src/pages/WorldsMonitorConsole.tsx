@@ -136,8 +136,38 @@ interface WorldsSummary {
   fused: number;
   paused: number;
   ended: number;
-  attentionReasons: { code: string; count: number; thresholdBp: number }[];
+  /**
+   * 命中**任意一条已启用规则**的世界数（去重）。新维度全关时恒等于 `attention`。
+   *
+   * 🔴 与 `attention` 的区别是刻意的：`attention` 的口径**永远只是预算那一条**，
+   * 于是运营开一个新维度不会让一个既有数字的含义悄悄变掉；新维度进的是这个字段。
+   */
+  attentionAny?: number;
+  /**
+   * 「需关注」拆到是被哪条规则命中的。
+   *
+   * 🔴 各条**互相重叠**（一个世界可以同时预算逼近上限、失败率高、又停摆），
+   * **不可相加**——要总数请用 `attentionAny`（server 侧 UNION 去重）。
+   * 🔴 `enabled: false` 的维度 `count` 是 `null` 而不是 0：0 会被读成「一个都没有」，
+   * 而真相是「这一维压根没开过」。
+   */
+  attentionReasons: {
+    code: string;
+    count: number | null;
+    meaning?: string;
+    thresholdBp?: number;
+    enabled?: boolean;
+    note?: string;
+  }[];
 }
+
+/** 原因码 → 中文短名。表里没有的码原样显示（server 新加一条不会被静默吞掉）。 */
+const ATTENTION_REASON_LABEL: Record<string, string> = {
+  budget_ratio: '预算逼近上限',
+  tick_failure_rate: 'tick 失败率',
+  blocked_streak: '连续被拦',
+  stalled: '停摆',
+};
 
 interface TimelineEvent {
   key: string;
@@ -825,6 +855,22 @@ export default function WorldsMonitorConsole() {
     return { running: summary.running, attention: summary.attention, fused: summary.fused };
   }, [designPreview, allWorlds, summary]);
 
+  /**
+   * 「需关注」的构成。遍历 server **实际下发**的每一条原因，不是前端写死的四项——
+   * server 新加一维时后台会自动显示它（码没登记就原样显示码），而不是静默漏掉。
+   * 这是 `docs/VALIDATION.md` §3.37 那条教训的同款：算了、发了、却没人显示，等于没算。
+   */
+  const attentionBreakdown = useMemo(
+    () =>
+      (summary?.attentionReasons ?? []).map((r) => ({
+        code: r.code,
+        label: ATTENTION_REASON_LABEL[r.code] ?? r.code,
+        // enabled === false → 「未启用」；count 为 null 同样不画数字（两者都不是 0）。
+        text: r.enabled === false || r.count == null ? '未启用' : String(r.count),
+      })),
+    [summary],
+  );
+
   const budget = diagnostics?.budget ?? null;
   // 进度取 server 的 usageRatio（token 与金额两维的较大者，即先触线的那条），两维都没设上限时为 null，
   // 此时不画进度条——0% 会被读成"今天几乎没花钱"，而真相是"根本没有上限可比"。
@@ -908,6 +954,19 @@ export default function WorldsMonitorConsole() {
               <span className="world-health-strip__dot" /><span>已熔断</span>
               <strong>{designPreview ? PREVIEW_HEALTH.fused : health?.fused ?? EMPTY}</strong>
             </div>
+            {/* 「需关注」的构成。🔴 各条重叠、不可相加，总数用 attentionAny（server 已去重）。
+                未启用的维度显示「未启用」而不是 0——0 会被读成「一个都没有」。 */}
+            {!designPreview && attentionBreakdown.length > 0 && (
+              <div className="world-health-strip__metric is-warning" title="各条规则互相重叠，不可相加；总数见括号里的去重值">
+                <span>需关注构成</span>
+                <strong style={{ fontSize: 13, fontWeight: 500 }}>
+                  {attentionBreakdown.map((r) => `${r.label} ${r.text}`).join(' · ')}
+                  {summary?.attentionAny != null && summary.attentionAny !== summary.attention
+                    ? `（合计 ${summary.attentionAny}）`
+                    : ''}
+                </strong>
+              </div>
+            )}
             <div
               className={`world-health-strip__metric is-cost${showCostSpark ? '' : ' has-no-chart'}`}
               title={costTodayCny != null && costTrendDays > 0 ? `平台今日成本（UTC 日界）· 迷你曲线为近 ${costTrendDays} 日趋势` : undefined}

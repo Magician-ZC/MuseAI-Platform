@@ -378,6 +378,45 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
         scopes: SCOPES_GLOBAL,
     },
     FlagDef {
+        name: "MUSE_ATTENTION_TICK_FAILURE",
+        // 🔴 默认关：它改的是运营看板上「需关注」这个数**的含义**。开着合并 = 没人按过开关，
+        // 而某天早上那个数字自己变大了（§0.1）。三个维度共用这条理由。
+        default_enabled: false,
+        owner: "worlds_ops",
+        desc: "健康档新增维度：**tick 失败率**超阈值（open-decisions §1，2026-07-28 产品选定）。\
+               判据 = 最近窗口内 `status='failed'` 或 `error` 非空且非 `blocked` 的拍占比 ≥ \
+               `MUSE_ATTENTION_TICK_FAILURE_BP`（默认 3000 = 30%），且样本 ≥ \
+               `MUSE_ATTENTION_MIN_TICKS`（默认 5）——样本下限是为了不让「今天只跑了 1 拍且失败」\
+               变成一个红灯。⚠️ 开它会让 `attentionAny` 变大（`attention` 口径不动）。",
+        wired: true,
+        // 解析档：它是平台级看板的一个统计维度，没有「对某个用户开、对另一个关」的语义。
+        scopes: SCOPES_GLOBAL,
+    },
+    FlagDef {
+        name: "MUSE_ATTENTION_BLOCKED_STREAK",
+        default_enabled: false,
+        owner: "worlds_ops",
+        desc: "健康档新增维度：**尾部连续 blocked 拍数**达阈值（`MUSE_ATTENTION_BLOCKED_STREAK_MIN`，\
+               默认 3）。与失败率不是一回事：这类世界看起来「在跑」，引擎每回合都跑完了，\
+               只是**一拍都提交不了**——所有成功率指标都正常。\
+               ⚠️ 判据是**真·尾部连续**（相关子查询取「最后一个非 blocked 拍之后的全部 blocked 拍」），\
+               不是窗口内占比；代价是这条查询比另外两条重，故只在开关打开时才发。",
+        wired: true,
+        scopes: SCOPES_GLOBAL,
+    },
+    FlagDef {
+        name: "MUSE_ATTENTION_STALLED",
+        default_enabled: false,
+        owner: "worlds_ops",
+        desc: "健康档新增维度：**停摆时长**——`running`/`open` 的世界最后一次活动早于 \
+               `MUSE_ATTENTION_STALLED_MS`（默认 24 小时）。既没失败也没被拦，就是不动了\
+               （等玩家、等同意门）。🔴 最容易被漏掉的一类，因为其它所有指标都正常。\
+               ⚠️ 「最后一次活动」= `COALESCE(MAX(world_ticks.created_at), worlds.created_at)`——\
+               不带 worlds.created_at 兜底的话，**刚建、还没跑过拍的新世界会被算成停摆**。",
+        wired: true,
+        scopes: SCOPES_GLOBAL,
+    },
+    FlagDef {
         name: "MUSE_IFLINE_ADVANCE_SWEEP",
         // 🔴 默认关闭的理由与 `MUSE_SAFETY_RECHECK_SWEEP` 同源，且更重：if 线是**付费**内容，
         // 补投是这条链上唯一一处「凭数据自发调模型」的路径。默认开着 = 一次代码合并直接抬起

@@ -273,6 +273,45 @@ fn attention_budget_bp() -> i64 {
         .unwrap_or(DEFAULT_ATTENTION_BUDGET_BP)
 }
 
+// ---------------- 新增的三个「需关注」维度（2026-07-28 产品选定，默认全关）----------------
+//
+// 🔴 **三条都默认关闭**（`flags::KNOWN_FLAGS` 里 `default_enabled: false`），理由同 §0.1：
+// 它们改的是运营看板上「需关注」这个数**的含义**。默认开着 = 没人按过开关，
+// 而某天早上那个数字自己变大了。
+//
+// 🔴 **`attention` 这个字段的口径一个字都不动**（仍然只按预算规则），新维度进的是
+// `attentionAny`。既有消费者读到的数不会因为运营开了个开关就改变含义；
+// 「哪些维度算进头条数字」本身是 open-decisions §1 剩下的那半个问题，本批不替产品定。
+//
+// 🔴 **三条规则互相重叠**：一个世界可以同时预算逼近上限、失败率高、又停摆。
+// 故 `attentionReasons[].count` **不可相加**——响应里显式写了这句话，
+// 因为「把几个 count 加起来」是看板前端最自然也最错的动作。
+
+/// tick 失败率阈值（万分比整数，3000 = 30%）。
+const ENV_TICK_FAILURE_BP: &str = "MUSE_ATTENTION_TICK_FAILURE_BP";
+const DEFAULT_TICK_FAILURE_BP: i64 = 3_000;
+/// 失败率判定的最小样本拍数。**样本下限是判据的一部分**：没有它，
+/// 「今天只跑了 1 拍且失败」会变成一个 100% 失败率的红灯。
+const ENV_MIN_TICKS: &str = "MUSE_ATTENTION_MIN_TICKS";
+const DEFAULT_MIN_TICKS: i64 = 5;
+/// 失败率的统计窗口（默认 24 小时）。
+const ENV_FAILURE_WINDOW_MS: &str = "MUSE_ATTENTION_FAILURE_WINDOW_MS";
+const DEFAULT_FAILURE_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
+/// 尾部连续 blocked 达到几拍算需关注。
+const ENV_BLOCKED_STREAK_MIN: &str = "MUSE_ATTENTION_BLOCKED_STREAK_MIN";
+const DEFAULT_BLOCKED_STREAK_MIN: i64 = 3;
+/// 多久没有任何活动算停摆（默认 24 小时）。
+const ENV_STALLED_MS: &str = "MUSE_ATTENTION_STALLED_MS";
+const DEFAULT_STALLED_MS: i64 = 24 * 60 * 60 * 1000;
+
+fn env_positive(key: &str, default: i64, max: Option<i64>) -> i64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|v| *v > 0 && max.is_none_or(|m| *v <= m))
+        .unwrap_or(default)
+}
+
 /// GET /admin/worlds/summary：**全量**世界的健康分档汇总。
 ///
 /// ════════════════════════════════════════════════════════════════════════════
@@ -348,6 +387,113 @@ pub(super) async fn worlds_summary(
     .await?;
     let n = |k: &str| row.try_get::<i64, _>(k).unwrap_or(0);
 
+    // ---- 三个新维度：每条只在自己的开关打开时才发查询（全关 = 与接线前逐字节一致）----
+    let g = crate::flags::FlagCtx::global;
+    let now = now_ms();
+    let mut reasons = vec![json!({
+        "code": "budget_ratio",
+        "count": n("attention_n"),
+        "meaning": "今日 token 预算消耗比 ≥ 阈值且未熔断",
+        "thresholdBp": bp,
+        "env": ENV_ATTENTION_BUDGET_BP,
+        "enabled": true,
+        "note": "这一条恒开：它是接线前就在跑的原判定，也是 `attention` 字段的唯一口径。",
+    })];
+    // 命中任意一条已启用规则的世界（去重）。SQL 片段随开关拼装，各自绑定自己的参数。
+    let mut any_parts: Vec<String> = vec![format!(
+        "SELECT w.id AS wid FROM worlds w LEFT JOIN world_budgets b ON b.world_id = w.id \
+         WHERE COALESCE(b.fused,0) = 0 AND w.status NOT IN ('paused','ended') \
+           AND COALESCE(b.daily_token_budget,0) > 0 AND b.budget_day = '{}' \
+           AND COALESCE(b.spent_tokens_today,0) * {} >= COALESCE(b.daily_token_budget,0) * {}",
+        day.replace('\'', "''"),
+        BP_BASE,
+        bp
+    )];
+
+    if crate::flags::is_enabled(&state.db, "MUSE_ATTENTION_TICK_FAILURE", g()).await {
+        let fail_bp = env_positive(ENV_TICK_FAILURE_BP, DEFAULT_TICK_FAILURE_BP, Some(BP_BASE));
+        let min_ticks = env_positive(ENV_MIN_TICKS, DEFAULT_MIN_TICKS, None);
+        let since = now - env_positive(ENV_FAILURE_WINDOW_MS, DEFAULT_FAILURE_WINDOW_MS, None);
+        let sql = tick_failure_worlds_sql(since, min_ticks, fail_bp);
+        let c: i64 = sqlx::query_scalar(&format!("SELECT CAST(COUNT(*) AS BIGINT) FROM ({sql}) q"))
+            .fetch_one(&state.db)
+            .await?;
+        reasons.push(json!({
+            "code": "tick_failure_rate",
+            "count": c,
+            "meaning": "最近窗口内失败拍占比 ≥ 阈值（failed 或 error 非空且非 blocked），且样本达下限",
+            "thresholdBp": fail_bp,
+            "minTicks": min_ticks,
+            "windowMs": now - since,
+            "env": ENV_TICK_FAILURE_BP,
+            "enabled": true,
+        }));
+        any_parts.push(sql);
+    }
+    if crate::flags::is_enabled(&state.db, "MUSE_ATTENTION_BLOCKED_STREAK", g()).await {
+        let min_streak = env_positive(ENV_BLOCKED_STREAK_MIN, DEFAULT_BLOCKED_STREAK_MIN, None);
+        let sql = blocked_streak_worlds_sql(min_streak);
+        let c: i64 = sqlx::query_scalar(&format!("SELECT CAST(COUNT(*) AS BIGINT) FROM ({sql}) q"))
+            .fetch_one(&state.db)
+            .await?;
+        reasons.push(json!({
+            "code": "blocked_streak",
+            "count": c,
+            "meaning": "尾部连续 blocked 拍数 ≥ 阈值 —— 引擎每回合都跑完了，但一拍都提交不了",
+            "minStreak": min_streak,
+            "env": ENV_BLOCKED_STREAK_MIN,
+            "enabled": true,
+            "note": "判据是**真·尾部连续**（最后一个非 blocked 拍之后的全部 blocked 拍），不是窗口内占比。",
+        }));
+        any_parts.push(sql);
+    }
+    if crate::flags::is_enabled(&state.db, "MUSE_ATTENTION_STALLED", g()).await {
+        let stalled_ms = env_positive(ENV_STALLED_MS, DEFAULT_STALLED_MS, None);
+        let sql = stalled_worlds_sql(now - stalled_ms);
+        let c: i64 = sqlx::query_scalar(&format!("SELECT CAST(COUNT(*) AS BIGINT) FROM ({sql}) q"))
+            .fetch_one(&state.db)
+            .await?;
+        reasons.push(json!({
+            "code": "stalled",
+            "count": c,
+            "meaning": "running/open 的世界最后一次活动早于阈值 —— 既没失败也没被拦，就是不动了",
+            "stalledMs": stalled_ms,
+            "env": ENV_STALLED_MS,
+            "enabled": true,
+            "note": "「最后一次活动」= COALESCE(MAX(world_ticks.created_at), worlds.created_at)；\
+                     不带 worlds.created_at 兜底的话，刚建、还没跑过拍的新世界会被算成停摆。",
+        }));
+        any_parts.push(sql);
+    }
+    // 只有一条规则时不必再发 UNION 查询——那与 `attention` 恒等。
+    let attention_any = if any_parts.len() == 1 {
+        n("attention_n")
+    } else {
+        let union = any_parts.join(" UNION ");
+        sqlx::query_scalar::<_, i64>(&format!("SELECT CAST(COUNT(*) AS BIGINT) FROM ({union}) u"))
+            .fetch_one(&state.db)
+            .await?
+    };
+    // 关掉的维度也如实登记一条，`enabled: false`、`count: null`——
+    // 后台据此显示「这一维没开」，而不是显示 0（0 会被读成「一个都没有」）。
+    for (code, flag, meaning) in [
+        ("tick_failure_rate", "MUSE_ATTENTION_TICK_FAILURE", "tick 失败率超阈值"),
+        ("blocked_streak", "MUSE_ATTENTION_BLOCKED_STREAK", "尾部连续 blocked 达阈值"),
+        ("stalled", "MUSE_ATTENTION_STALLED", "长时间没有任何活动"),
+    ] {
+        if reasons.iter().any(|r| r["code"] == code) {
+            continue;
+        }
+        reasons.push(json!({
+            "code": code,
+            "count": Value::Null,
+            "meaning": meaning,
+            "enabled": false,
+            "flag": flag,
+            "note": "这一维**未启用**，count 为 null 而不是 0 —— 0 会被读成「一个都没有」。",
+        }));
+    }
+
     Ok(Json(json!({
         "total": n("total_n"),
         "fused": n("fused_n"),
@@ -357,15 +503,12 @@ pub(super) async fn worlds_summary(
         "ended": n("ended_n"),
         // 🔴 「需关注」拆到是被哪条规则命中的。目前只有一条，结构先留出来——
         // 产品若加维度，加的是这里的一项，而不是让一个档位数字变得更不可解释。
-        "attentionReasons": [
-            {
-                "code": "budget_ratio",
-                "count": n("attention_n"),
-                "meaning": "今日 token 预算消耗比 ≥ 阈值且未熔断",
-                "thresholdBp": bp,
-                "env": ENV_ATTENTION_BUDGET_BP,
-            }
-        ],
+        // 🔴 命中**任意一条已启用规则**的世界数（去重）。全部新维度关闭时恒等于 `attention`。
+        "attentionAny": attention_any,
+        // 🔴 各条规则**互相重叠**（一个世界可以同时预算逼近上限、失败率高、又停摆），
+        // 故这些 count **不可相加**——把它们加起来是看板前端最自然也最错的动作。
+        // 未启用的维度 count 为 null 而非 0。
+        "attentionReasons": reasons,
         "rule": {
             "order": "熔断 > 库状态(paused/ended) > 今日预算逼近上限(需关注) > 库状态",
             "source": "逐条保留前端 WorldsMonitorConsole.deriveStatus 的判定，本端点只改「在哪算、按多少世界算」。",
@@ -383,6 +526,70 @@ pub(super) async fn worlds_summary(
                             用原值会把「昨天烧光、今天一拍没跑」的世界算成需关注。\
                             口径与 diagnostics 的 spentTokensTodayEffective 完全一致。",
     })))
+}
+
+// ---------------- 新维度的取世界 SQL（各自独立，只在开关打开时才被拼进查询）----------------
+//
+// 三个函数都返回一段**只选 `wid` 一列**的 SQL，于是它们既能单独 COUNT，也能 UNION 去重。
+// ⚠️ 参数**直接格式化进串**而不是 `.bind()`：它们全部是本文件内部算出来的 i64
+// （阈值 / 时间戳 / 万分比），没有任何一个来自请求——`worlds_summary` 不接受任何查询参数。
+// 唯一的字符串是 `day`（`runtime::day_string` 产出的 `YYYY-MM-DD`），已额外做了引号转义。
+// 这样写是因为 UNION 片段的数量随开关变化，逐段绑定参数会让参数序号随开关组合漂移。
+
+/// 失败率超阈值的世界。样本下限 `min_ticks` 是判据的一部分（见 `ENV_MIN_TICKS`）。
+fn tick_failure_worlds_sql(since: i64, min_ticks: i64, fail_bp: i64) -> String {
+    format!(
+        "SELECT t.world_id AS wid FROM world_ticks t \
+         JOIN worlds w ON w.id = t.world_id \
+         LEFT JOIN world_budgets b ON b.world_id = w.id \
+         WHERE t.created_at >= {since} AND COALESCE(b.fused,0) = 0 \
+           AND w.status NOT IN ('paused','ended') \
+         GROUP BY t.world_id \
+         HAVING COUNT(*) >= {min_ticks} \
+            AND SUM(CASE WHEN t.status = 'failed' \
+                          OR (t.error IS NOT NULL AND t.error <> 'blocked') \
+                         THEN 1 ELSE 0 END) * {BP_BASE} >= COUNT(*) * {fail_bp}"
+    )
+}
+
+/// 尾部连续 blocked 达阈值的世界。
+///
+/// 🔴 判据是**真·尾部连续**而不是窗口内占比：相关子查询取「最后一个非 blocked 拍的 tick_no」，
+/// 只数它之后的 blocked 拍。占比口径会把「上周堵过三拍、这周一直正常」也算进来，
+/// 而那恰恰是**已经好了**的世界。
+///
+/// ⚠️ 代价：相关子查询比另两条重。这就是它必须挂在开关后面的原因之一
+/// （另一个原因是 §0.1）。`world_ticks(world_id, tick_no)` 上有唯一索引，子查询走它。
+fn blocked_streak_worlds_sql(min_streak: i64) -> String {
+    format!(
+        "SELECT t.world_id AS wid FROM world_ticks t \
+         JOIN worlds w ON w.id = t.world_id \
+         LEFT JOIN world_budgets b ON b.world_id = w.id \
+         WHERE t.error = 'blocked' AND COALESCE(b.fused,0) = 0 \
+           AND w.status NOT IN ('paused','ended') \
+           AND t.tick_no > (SELECT COALESCE(MAX(t2.tick_no), -1) FROM world_ticks t2 \
+                            WHERE t2.world_id = t.world_id \
+                              AND (t2.error IS NULL OR t2.error <> 'blocked')) \
+         GROUP BY t.world_id \
+         HAVING COUNT(*) >= {min_streak}"
+    )
+}
+
+/// 停摆世界：`running`/`open` 且最后一次活动早于 `before`。
+///
+/// 🔴 `COALESCE(MAX(t.created_at), w.created_at)`——**不带 `w.created_at` 兜底的话，
+/// 刚建、还没跑过拍的新世界会被算成停摆**（MAX 为 NULL）。那是这一维最容易写错的地方：
+/// 一个五分钟前建的世界会立刻亮黄灯。
+/// `GROUP BY w.id, w.created_at`：PG 要求非聚合列进 GROUP BY（SQLite 宽松，但得按严的写）。
+fn stalled_worlds_sql(before: i64) -> String {
+    format!(
+        "SELECT w.id AS wid FROM worlds w \
+         LEFT JOIN world_budgets b ON b.world_id = w.id \
+         LEFT JOIN world_ticks t ON t.world_id = w.id \
+         WHERE COALESCE(b.fused,0) = 0 AND w.status IN ('running','open') \
+         GROUP BY w.id, w.created_at \
+         HAVING COALESCE(MAX(t.created_at), w.created_at) < {before}"
+    )
 }
 
 // ---------------- 脱敏诊断 ----------------

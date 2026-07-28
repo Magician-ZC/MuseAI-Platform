@@ -3030,7 +3030,13 @@ async fn narrative_slo_marks_remaining_metrics_as_no_data_source() {
     );
 }
 
-/// 空平台：SLO 段不除零、不报错、不 panic，四项可算指标一律 ok 且计数为 0。
+/// 空平台：SLO 段不除零、不报错、不 panic，且**在 HTTP 出口上**也说「没测过」而不是 0%。
+///
+/// ⚠️ **2026-07-28 改过判据**。此前这里断言 `forcedRate == 0.0` / `repeatEntryRate == 0.0`，
+/// 与 `slo::tests::empty_database_is_zero_safe` 一模一样地把**错的答案**钉住了。
+/// 同一个错判被两个文件里的两道用例各钉一遍，正是它活到今天的原因——
+/// 改对一处会被另一处判红，而两处都写着「这是对的」。
+/// 判据本身见 `slo::tests::empty_database_says_no_data_rather_than_zero`。
 #[tokio::test]
 async fn narrative_slo_is_zero_safe_on_empty_platform() {
     let state = test_state().await;
@@ -3041,8 +3047,14 @@ async fn narrative_slo_is_zero_safe_on_empty_platform() {
     assert_eq!(slo["status"], "ok");
     assert_eq!(slo["metrics"]["attentionGini"]["worldsCounted"], 0);
     assert_eq!(slo["metrics"]["silentStreak"]["membersCounted"], 0);
-    assert_eq!(slo["metrics"]["forcedConclusionRate"]["forcedRate"], 0.0);
-    assert_eq!(slo["metrics"]["repeatEntryRate"]["repeatEntryRate"], 0.0);
+    // 🔴 空平台上这两项必须是 null + 非 ok：显示 0% 会被当成测出来的真数
+    // （forcedRate=0 像好消息、repeatEntryRate=0 像事故，而它们来自同一个空库）。
+    for key in ["forcedConclusionRate", "repeatEntryRate"] {
+        let b = &slo["metrics"][key];
+        assert_ne!(b["status"], "ok", "空平台上 {key} 不得报 ok：{b}");
+    }
+    assert!(slo["metrics"]["forcedConclusionRate"]["forcedRate"].is_null());
+    assert!(slo["metrics"]["repeatEntryRate"]["repeatEntryRate"].is_null());
     // 均值类无数据时给 null（"没数据"不是"均值为 0"）。
     assert!(slo["metrics"]["attentionGini"]["meanGini"].is_null());
     assert!(slo["metrics"]["silentStreak"]["meanStreak"].is_null());

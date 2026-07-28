@@ -708,8 +708,13 @@ async fn ooc_appeal_rate_never_reads_moderation_appeals() {
     );
 }
 
-/// 空库：不除零、不 panic、不报错，四个可算指标一律 status=ok 且计数为 0，
-/// 均值类给 null（"没数据"不是"均值为 0"）。
+/// 空库：不除零、不 panic、不报错，计数为 0，均值类给 null。
+///
+/// ⚠️ **本用例 2026-07-28 改过判据**。它此前断言四个指标在空库上一律 `status == "ok"` 且
+/// 比率 `== 0.0`，理由写的是「0/0 → 0，不得 NaN」。躲开 NaN 是对的，但它顺手把**错的答案**
+/// 钉住了：`status: "ok"` + `forcedRate: 0` 在后台上就是「强制收尾率 0%」这句话，
+/// 而真相是一个世界都还没结束过。这正是本文件头那条红线说的「混同即事故」——
+/// 一道绿着的用例，绿的理由却不是它要守的那件事。
 #[tokio::test]
 async fn empty_database_is_zero_safe() {
     let db = test_db().await;
@@ -717,24 +722,92 @@ async fn empty_database_is_zero_safe() {
     assert_eq!(slo["status"], "ok");
 
     let g = m(&slo, "attentionGini");
-    assert_eq!(g["status"], "ok");
     assert_eq!(g["worldsCounted"], 0);
-    assert_eq!(g["overThresholdRate"], 0.0);
     assert!(g["meanGini"].is_null() && g["medianGini"].is_null() && g["maxGini"].is_null());
     assert!(g["worstWorlds"].as_array().unwrap().is_empty());
 
     let s = m(&slo, "silentStreak");
     assert_eq!(s["membersCounted"], 0);
-    assert_eq!(s["overThresholdRate"], 0.0);
     assert!(s["meanStreak"].is_null());
 
     let f = m(&slo, "forcedConclusionRate");
     assert_eq!(f["endedWorlds"], 0);
-    assert_eq!(f["forcedRate"], 0.0, "无已结束世界时强制收尾率为 0/0 → 0，不得 NaN");
 
     let r = m(&slo, "repeatEntryRate");
-    assert_eq!(r["repeatEntryRate"], 0.0);
-    assert_eq!(r["repeatAmongJoinedRate"], 0.0);
+    assert_eq!(r["charactersTotal"], 0);
+}
+
+/// 🔴 **空库上，没有任何一项指标可以说 `ok`，也没有任何一个比率可以是 0。**
+///
+/// # 为什么这是红线而不是「更好看的空态」
+///
+/// 本文件头那条规矩写着：不可算的指标必须显式标注，「后台显示 `—` 与显示 `0%` 是两个完全
+/// 不同的经营判断，混同即事故」。而 0 的欺骗方向**不统一**，所以「往好里读」和「往坏里读」
+/// 都救不了读的人：
+///
+/// | 空库上的 0 | 会被读成 | 真相 |
+/// |---|---|---|
+/// | `forcedRate: 0` | 收尾都很自然，一切健康 | 一个世界都没结束过 |
+/// | `repeatEntryRate: 0` | 留存崩了，要立刻处理 | 一张云角色卡都还没有 |
+///
+/// 同一个空库，一个看起来是好消息、一个看起来是紧急事故。只有 `null` 是对的。
+///
+/// # 判据方向：遍历**实际下发的全部指标**，不是手列清单
+///
+/// 手列「这四项要判空」的话，将来新加的第五项不在清单里 → 静默放行。这里遍历
+/// `metrics` 对象的每一个键，新指标一上线就自动进入判据；**遗漏往红的方向失败**
+/// （`docs/VALIDATION.md` §3.8.1）。
+///
+/// 比率字段按后缀 `Rate` / `Share` 识别，并断言至少识别出若干个——否则命名一变，
+/// 这道门会静默变成空断言。
+#[tokio::test]
+async fn empty_database_says_no_data_rather_than_zero() {
+    let db = test_db().await;
+    let slo = narrative_slo(&db, &cfg()).await.unwrap();
+    let metrics = slo["metrics"].as_object().expect("metrics 是对象");
+    assert!(metrics.len() >= 6, "只下发了 {} 个指标，遍历口径疑似坏了", metrics.len());
+
+    let mut rates_seen = 0usize;
+    for (name, block) in metrics {
+        assert_ne!(
+            block["status"], "ok",
+            "🔴 空库上 `{name}` 报了 status=ok —— 后台会把它当成一个测出来的真数。\n             零样本必须是 no_data_in_window（分窗口的指标）或 no_data_yet（全生命周期口径），\n             不可算则是 no_data_source。判据见本用例头注释与本文件头那条红线。"
+        );
+        for (field, value) in block.as_object().expect("每个指标是对象") {
+            if !(field.ends_with("Rate") || field.ends_with("Share")) {
+                continue;
+            }
+            rates_seen += 1;
+            assert!(
+                value.is_null(),
+                "🔴 空库上 `{name}.{field}` = {value}，应为 null。\n                 0 与「没测过」在后台上是两句完全不同的话，而 0 的欺骗方向还不统一：\n                 forcedRate=0 像好消息，repeatEntryRate=0 像事故，它们来自同一个空库。"
+            );
+        }
+    }
+    assert!(
+        rates_seen >= 4,
+        "只认出 {rates_seen} 个比率字段——比率的命名后缀可能变了，这道门正在静默失效"
+    );
+}
+
+/// 分母不为零时，0 就是**真的 0**，必须照常报出来（上一条红线不得把真数也吞掉）。
+///
+/// 这是那道门的反向配对：只断言「空库要 null」的话，把所有比率恒置 null 也能全绿。
+#[tokio::test]
+async fn a_real_zero_rate_is_still_reported_as_zero() {
+    let db = test_db().await;
+    // 两个成员、贡献完全均等 → 基尼 0，越线世界 0 —— 这是一个**测出来的** 0%。
+    ins_world(&db, "w_fair", "open").await;
+    for c in ["fa", "fb"] {
+        ins_member(&db, "w_fair", c).await;
+        ins_contribution(&db, "w_fair", c, 100, IN_WINDOW).await;
+    }
+
+    let slo = narrative_slo(&db, &cfg()).await.unwrap();
+    let g = m(&slo, "attentionGini");
+    assert_eq!(g["status"], "ok", "有样本就该是 ok");
+    assert_eq!(g["worldsCounted"], 1);
+    assert_eq!(g["overThresholdRate"], 0.0, "🔴 真的 0% 必须报成 0，不能被判空逻辑吞成 null");
 }
 
 /// 世界有成员但一拍未跑 / 全员零贡献：仍不除零、不误报不公平。
@@ -783,9 +856,13 @@ async fn scan_row_cap_skips_metric_instead_of_returning_partial_numbers() {
         assert_eq!(x["rowCap"], 2);
         assert!(x["reason"].as_str().unwrap().contains("sloDays"), "应告诉运营怎么办");
     }
-    // 两个 GROUP BY 指标与行数无关，照常出数。
-    assert_eq!(m(&slo, "forcedConclusionRate")["status"], "ok");
-    assert_eq!(m(&slo, "repeatEntryRate")["status"], "ok");
+    // 两个 GROUP BY 指标与行数无关：扫描上限**不许波及**它们。
+    // ⚠️ 这里断言的是「不是超限跳过」而不是「status == ok」——本例只播了 open 世界、
+    // 没播 cloud_characters，这两项的分母本来就是 0，正确答案是 no_data_yet。
+    // 写成 `== "ok"` 会把「零样本该显示 —」那条红线在这里反着钉一遍。
+    for key in ["forcedConclusionRate", "repeatEntryRate"] {
+        assert_ne!(m(&slo, key)["status"], "skipped_too_large", "{key} 与扫描行数无关");
+    }
 }
 
 /// `?slo=0` 的跳过态与"无数据源""超上限"三态互不混淆。
@@ -979,3 +1056,4 @@ fn validation_doc_mentions_every_calibration_dimension() {
         );
     }
 }
+

@@ -21,6 +21,23 @@
 //! 🔴 **不可算的指标必须显式标注为「无数据源」而不是 0 或空**（`SloStatus::NoDataSource`，
 //! `value` 恒为 `null`）——后台显示 `—` 与显示 `0%` 是两个完全不同的经营判断，混同即事故。
 //!
+//! **同一条规矩也管「有数据源但零样本」**（2026-07-28 补齐；此前四项在空库上报 `status: "ok"`
+//! 且比率 0.0，且被两个文件里的两道用例各钉了一遍）。每个指标块的 `status` 取值：
+//!
+//! | status | 含义 | 后台 |
+//! |---|---|---|
+//! | `ok` | 有样本，数是测出来的（**可以是真的 0%**） | 显示数值 |
+//! | `no_data_in_window` | 分窗口的指标，本窗口内零样本 | `—`（可提示换窗口） |
+//! | `no_data_yet` | **全生命周期口径**的指标至今零样本（换窗口没用） | `—` |
+//! | `entry_not_open` | 入口从未开过（OOC 注解权） | `—` |
+//! | `no_data_source` | 口径未拍板 / 无埋点，压根算不出 | `—` |
+//! | `skipped_too_large` | 扫描行数超上限，明说跳过而非给残缺数 | `—` |
+//! | `skipped_by_request` | 调用方传了 `?slo=0` | `—` |
+//!
+//! 🔴 零样本时**比率字段一律 `null`**（[`rate_or_null`]），因为 0 的欺骗方向不统一：
+//! `forcedRate: 0` 看起来是好消息、`repeatEntryRate: 0` 看起来是紧急事故，
+//! 而它们可以来自同一个空库。「往好里读」和「往坏里读」都救不了读的人，只有 `null` 是对的。
+//!
 //! **参数化（VALIDATION §0.2 禁写死）**：门槛与扫描上限全部落在 `SloConfig`，env 可覆盖，
 //! 测试直接构造。T2 门槛「基尼 ≤0.35」是 VALIDATION §2 T2 的原文数值，作为**默认值**而非常量语义。
 //!
@@ -427,6 +444,33 @@ fn rate(numer: i64, denom: i64) -> f64 {
     }
 }
 
+/// 除法，但**分母为 0 时给 `null` 而不是 0.0**。
+///
+/// 🔴 [`rate`] 返回 `0.0` 是给「分子分母都要单独出现在同一个对象里、由调用方判空」的场景用的
+/// （`calibration::proportion_reading` 那种信封）。**平铺进 JSON 的比率不能用它**：
+/// 后台读到 `forcedRate: 0`（且 `status: "ok"`）会当成「一个强制收尾都没有」，
+/// 而真相是「一个世界都还没结束过」——本文件头那条红线说的正是这个，「混同即事故」。
+///
+/// 两个方向都会骗人，所以「往好里读」或「往坏里读」都救不了：
+/// `forcedRate = 0` 看起来是好消息，`repeatEntryRate = 0` 看起来是坏消息，
+/// 而它们可以来自同一个空库。只有 `null` 是对的。
+pub(crate) fn rate_or_null(numer: i64, denom: i64) -> Value {
+    if denom > 0 {
+        json!(numer as f64 / denom as f64)
+    } else {
+        Value::Null
+    }
+}
+
+/// 零样本时的 `status`。**分窗口的指标**用它，全生命周期口径的用 [`NO_DATA_YET`]——
+/// 区别不是文字游戏：告诉运营「近 7 天没有数据」而这个指标压根不切窗口，
+/// 会把人送去改窗口选择器，而那改不动任何东西。
+const NO_DATA_IN_WINDOW: &str = "no_data_in_window";
+
+/// 零样本时的 `status`，用于**全生命周期口径**（强制收尾率、二次入世率）：
+/// 不是「这个窗口里没有」，是「至今还没发生过」。
+const NO_DATA_YET: &str = "no_data_yet";
+
 /// 最近秩百分位（不插值）。空集 → None（不除零、不编 0）。
 fn percentile(sorted: &[f64], p: f64) -> Option<f64> {
     if sorted.is_empty() {
@@ -552,14 +596,16 @@ async fn attention_gini_block(db: &AnyPool, cfg: &SloConfig) -> Result<Value, Ap
     Ok(json!({
         "metric": METRIC,
         "title": TITLE,
-        "status": "ok",
+        // 窗口内一个「≥2 名成员」的世界都没有 → 没有基尼可报。哪怕全是单人世界也一样：
+        // meanGini 早已是 null，status 若还说 ok，读的人只会看见 overThresholdRate: 0。
+        "status": if counted > 0 { "ok" } else { NO_DATA_IN_WINDOW },
         "source": "world_contributions ∩ world_members（交集即 NPC 过滤器）",
         "threshold": cfg.gini_max,
         "thresholdSource": "VALIDATION §2 · T2「叙事注意力公平：基尼 ≤0.35」",
         "worldsCounted": counted,
         "worldsSingleMember": single_member,
         "worldsOverThreshold": over,
-        "overThresholdRate": rate(over, counted),
+        "overThresholdRate": rate_or_null(over, counted),
         "meanGini": mean,
         "medianGini": percentile(&sorted, 0.5),
         "p90Gini": percentile(&sorted, 0.9),
@@ -689,7 +735,8 @@ async fn silent_streak_block(db: &AnyPool, cfg: &SloConfig) -> Result<Value, Api
     Ok(json!({
         "metric": METRIC,
         "title": TITLE,
-        "status": "ok",
+        // 窗口内没有任何成员进入统计 → 「没测过」，不是「0% 越线」。
+        "status": if members_counted > 0 { "ok" } else { NO_DATA_IN_WINDOW },
         "source": "world_events.actors_json（规范化解析）× world_ticks 拍域 ∩ world_members",
         "narrativeEventTypes": NARRATIVE_EVENT_TYPES,
         "threshold": cfg.silent_streak_max,
@@ -699,7 +746,7 @@ async fn silent_streak_block(db: &AnyPool, cfg: &SloConfig) -> Result<Value, Api
         "maxStreak": max_streak,
         "meanStreak": mean,
         "membersOverThreshold": over,
-        "overThresholdRate": rate(over, members_counted),
+        "overThresholdRate": rate_or_null(over, members_counted),
         "worstMembers": worst
             .iter()
             .map(|(w, c, s)| json!({ "worldId": w, "characterId": c, "streak": s }))
@@ -765,13 +812,15 @@ async fn forced_conclusion_block(db: &AnyPool) -> Result<Value, ApiError> {
     Ok(json!({
         "metric": "forcedConclusionRate",
         "title": "强制收尾率",
-        "status": "ok",
+        // 一个世界都还没结束过 → 强制收尾率无从谈起。显示 0% 会被读成「收尾都很自然」。
+        // 全生命周期口径，故是 NO_DATA_YET 而不是「本窗口内没有」。
+        "status": if ended > 0 { "ok" } else { NO_DATA_YET },
         "source": "audit_logs(action='world.ended').reason 前缀；分母 worlds.status='ended'",
         "endedWorlds": ended,
         "classifiedWorlds": classified,
         "unaccountedWorlds": unaccounted,
         "forcedWorlds": forced_total,
-        "forcedRate": rate(forced_total, ended),
+        "forcedRate": rate_or_null(forced_total, ended),
         "byKind": {
             "natural": by_kind.get("natural").copied().unwrap_or(0),
             "forced": by_kind.get("forced").copied().unwrap_or(0),
@@ -819,13 +868,16 @@ async fn repeat_entry_block(db: &AnyPool) -> Result<Value, ApiError> {
     Ok(json!({
         "metric": "repeatEntryRate",
         "title": "同角色二次入世率",
-        "status": "ok",
+        // 一张云角色卡都还没有 → 留存无从谈起。这一项显示 0% 尤其危险：
+        // 它看起来是「留存崩了」这种要立刻处理的坏消息，而真相是平台还没开张。
+        "status": if characters_total > 0 { "ok" } else { NO_DATA_YET },
         "source": "world_members COUNT(DISTINCT world_id)>=2；分母 cloud_characters.withdrawn=0",
         "charactersTotal": characters_total,
         "charactersEverJoined": ever_joined,
         "charactersTwoPlusWorlds": repeat,
-        "repeatEntryRate": rate(repeat, characters_total),
-        "repeatAmongJoinedRate": rate(repeat, ever_joined),
+        "repeatEntryRate": rate_or_null(repeat, characters_total),
+        // 分母不同，各判各的空：可能有卡但一次都没入世过。
+        "repeatAmongJoinedRate": rate_or_null(repeat, ever_joined),
         "notes": [
             "全生命周期口径、不切窗口：二次入世是留存量，切窗口会把首次入世截断而把留存算成 0。",
             "charactersEverJoined 不过滤 withdrawn（已下架卡的历史入世事实仍然成立），故它可能大于 charactersTotal。",
@@ -1191,7 +1243,9 @@ pub(crate) async fn narrative_slo(db: &AnyPool, cfg: &SloConfig) -> Result<Value
             "actors_json 走规范化 JSON 解析而非 LIKE 子串匹配（LIKE 会让 li 被 lixia 蹭到戏份）。",
             "日界为 UTC，由 dashboards::utc_day_start_ms + DAY_MS 在 Rust 侧算成毫秒区间传入；SQL 不含任何方言日期函数。",
             "门槛与扫描上限可配（MUSE_SLO_GINI_MAX / MUSE_SLO_SILENT_STREAK_TICKS / MUSE_SLO_SCAN_ROW_CAP / MUSE_SLO_OOC_APPEAL_RATE_MAX），VALIDATION §0.2 参数化。",
-            "🔴 oocAppealRate 有三态：entry_not_open（入口没开过，—）/ no_data_in_window（零样本，—）/ ok（真数，可以是 0%）。三者不可混同。",
+            "🔴 status 是一套七态（ok / no_data_in_window / no_data_yet / entry_not_open / no_data_source / skipped_too_large / skipped_by_request）：只有 ok 该显示数值，其余一律显示 —。",
+            "🔴 零样本时比率字段一律为 null 而不是 0：forcedRate=0 像好消息、repeatEntryRate=0 像事故，而它们可以来自同一个空库。",
+            "no_data_in_window 与 no_data_yet 的区别不是文字游戏：前者换个窗口可能就有数了，后者是全生命周期口径，改窗口选择器一点用都没有。",
             "扫描行数超过 scanRowCap 的指标返回 skipped_too_large 而不是残缺数——保护被轮询的后台端点。",
             "calibration 段按校准维度（身份 id / 境界档）分组，回答「这一维的配置与叙事结果的关系」；🔴 读数建成 ≠ 校准闭环已验证。",
         ],

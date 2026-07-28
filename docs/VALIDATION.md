@@ -1153,7 +1153,7 @@ rename 失败」的情形（需要跨文件系统或权限构造），如实记�
 |---|---|---:|---|
 | server | `admin_api` `runtime` `assembly` `safety` `ifline` `assets` | 30k | ✅ 查过并改过 |
 | server | `worlds` `events` `social` `subplot` `backpack` `shop` `billing` `ledger` `progression` `chapters` `arena` `livegate` `clips` `reports` `memorial` `onboarding` `invitations` `interventions` `annotations` `consents` `flags` `idempotency` | — | ✅ 查过（红线扫描面覆盖：读取面过滤 / 资产单一写入 / 事实不可删 / 确定性 / 幂等 / 无提现 / AI 标识 / feature 门控），**多数结论为无缺陷** |
-| server | `slo` | 3258 | ⬜ **未专门扫过**（只在「文档与读数是否对得上」那次核过 `calibration`） |
+| server | `slo` | 3258 | ✅ 查过（§3.36）：空平台把「没测过」报成 `0%`，四个块已修；纯函数面复核无缺陷 |
 | 引擎 | `lib`（新增红线）· 全 crate 的 `unwrap`/`expect` 面 · 依赖表 | — | ✅ 查过并改过 |
 | 引擎 | `narrative` 的**状态写入面**（`reducer` / `parse_path` / `build_patch` / patch 产地） | — | ✅ 查过（§3.34），**无缺陷**；顺带把两句注释变成强制 |
 | 引擎 | `narrative` 其余（回合编排 · `arbiter` · `constraints` · `relation_dynamics` · `continuity`）· `character` 3811 · `world` 2370 · `knowledge` 1593 · `replay` 1454 | 17k | ⬜ **未逐条扫过** |
@@ -1170,9 +1170,11 @@ rename 失败」的情形（需要跨文件系统或权限构造），如实记�
 2. ~~前端 `stores`（持久化面）~~ —— 已查（§3.35）。**猜对了地方，猜错了一侧**：
    数据丢失缺陷确实在这条缝上，但住在 Rust 的 `fs::write`（落盘不原子），
    前端 `diskStorage` 那 36 行本身是干净的。各 store 自身的状态迁移 / 合并语义仍未扫。
-3. **server `slo`（3258 行）** —— 只读聚合，风险低于前两者，但它是运营看板的唯一数据源，
-   算错比缺失更糟。**现在是第一顺位。**
-4. **前端 `components`（13259 行）** —— 体量最大，但多为渲染，判定密度最低。
+3. ~~server `slo`~~ —— 已查（§3.36）。**「算错比缺失更糟」这句话是对的**：
+   六个可算指标里四个在空平台上报 `0%` 而不是 `—`，且被两道用例各钉了一遍。已修。
+4. **前端 `components`（13259 行）** —— 体量最大，但多为渲染，判定密度最低。**现在是第一顺位。**
+5. 引擎 `narrative` 的其余面（回合编排 / `arbiter` / `constraints` / `relation_dynamics`）·
+   各前端 store 自身的状态迁移与合并语义 · 桌面轨 `book_travel`（1538 行）。
 
 ⚠️ **这张图不是「剩下的都有问题」**，也不是「打勾的都没问题」——
 它只说明**哪些面被这一轮的方法过过一遍**。已扫面里相当一部分结论是「无缺陷」（见各节），

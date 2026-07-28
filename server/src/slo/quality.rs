@@ -437,16 +437,20 @@ pub(crate) struct EndingDistribution {
 }
 
 impl EndingDistribution {
-    /// 最大单一结局占比（分母 = 落到真实结局的世界数）。结局池形同虚设时这个数会贴近 1.0。
-    pub fn top_share(&self) -> f64 {
-        let top = self
+    /// 最大单一结局的世界数（`top_share` 的分子；渲染层判空要单独拿它）。
+    pub fn top_count(&self) -> i64 {
+        self
             .by_ending
             .iter()
             .filter(|(k, _)| k.as_str() != ENDING_NONE && k.as_str() != ENDING_UNFINISHED)
             .map(|(_, v)| *v)
             .max()
-            .unwrap_or(0);
-        rate(top, self.with_ending)
+            .unwrap_or(0)
+    }
+
+    /// 最大单一结局占比（分母 = 落到真实结局的世界数）。结局池形同虚设时这个数会贴近 1.0。
+    pub fn top_share(&self) -> f64 {
+        rate(self.top_count(), self.with_ending)
     }
 
     /// 结局集中度（基尼，**复用 `slo::gini_coefficient`**，与叙事注意力基尼同一个实现）。
@@ -584,9 +588,15 @@ impl WorldQualityReport {
                 "collapsed": c.collapsed,
                 "unknownEnded": c.unknown_ended,
                 "unfinished": c.unfinished,
-                "completionRate": c.completion_rate(),
+                // 🔴 分母为 0 → null 而不是 0.0。空批次上的 `completionRate: 0` 会被读成
+                // 「一个都没读完」，而真相是「这一批一个世界都没有」。同 `slo::rate_or_null`
+                // 的理由（见那里的注释）；这里不带 status 字段，判空全靠紧邻的计数 + null。
+                "completionRate": crate::slo::rate_or_null(c.natural, c.worlds),
                 "endedWorlds": c.ended(),
-                "forcedRateAmongEnded": c.forced_rate(),
+                "forcedRateAmongEnded": crate::slo::rate_or_null(
+                    c.forced + c.collapsed + c.unknown_ended,
+                    c.ended(),
+                ),
                 "note": "forcedRateAmongEnded 与 VALIDATION §4.2 强制收尾率同口径同分母（只含已收尾世界）；\
                          completionRate 分母另含未收尾世界，两者不可互相换算。",
             },
@@ -596,7 +606,7 @@ impl WorldQualityReport {
                 "definition": "引擎跑完整回合但拒绝提交的拍 / 真正跑完整回合的拍（提交 + 阻断）",
                 "blockedTicks": b.blocked_ticks,
                 "engineTicks": b.engine_ticks,
-                "blockedRate": b.blocked_rate(),
+                "blockedRate": crate::slo::rate_or_null(b.blocked_ticks, b.engine_ticks),
                 "worldsWithBlock": b.worlds_with_block,
                 "safetyWithheld": {
                     "metric": "safetyWithheldEventRate",
@@ -604,7 +614,7 @@ impl WorldQualityReport {
                     "definition": "moderation <> 'approved' 的事件 / 落库事件总数（扣留 = 打码转人审，不是删除）",
                     "eventsWithheld": b.events_withheld,
                     "eventsTotal": b.events_total,
-                    "withheldRate": b.withheld_rate(),
+                    "withheldRate": crate::slo::rate_or_null(b.events_withheld, b.events_total),
                 },
                 "excludedFromDenominator": {
                     "note": "以下拍**没有跑回合**，一律不进阻断率分母——放进去只会稀释阻断率。",
@@ -624,7 +634,11 @@ impl WorldQualityReport {
                 "byReason": e.by_reason,
                 "worldsWithEnding": e.with_ending,
                 "distinctEndings": e.distinct_endings,
-                "topEndingShare": e.top_share(),
+                "topEndingShare": crate::slo::rate_or_null(e.top_count(), e.with_ending),
+                // ⚠️ `concentrationGini` 沿用 `gini_coefficient` 的既定契约（空集/全零集 → 0.0，
+                // 「没开演不是不公平」），不在这里改判空——那条契约有多个调用点共享，
+                // 单独在渲染层改一处会让同一个函数在不同出口给出不同语义。
+                // 判空线索由紧邻的 `worldsWithEnding` / `distinctEndings` 给出。
                 "concentrationGini": e.concentration_gini(),
             },
         })

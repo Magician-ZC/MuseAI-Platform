@@ -240,6 +240,11 @@ npx tsc --noEmit                                                   # 0 错误
 
 ### 7.1 Postgres 那遍(生产库形态)
 
+> 🔵 **2026-07-28 实跑记录**：本机 PG 上把 CI 的三遍都真跑过（不是静态核对 SQL）——
+> `testkit::` schema 层 2 passed、default 1110 passed、`billing,arena` 1193 passed，
+> 与 SQLite 那两遍**逐条一致**。这一轮往 `server` 加了新 SQL（`ifline::sweep` 的对账查询等），
+> 那些查询因此是**在真 PG 上验过**的，不只是符合 `$N` + `CAST` 的书面规则。
+
 上面的 server 测试全部跑 `sqlite::memory:`,而**生产跑 Postgres**(`MUSE_DATABASE_URL=postgres://...`)。
 建池统一走 `server/src/testkit.rs`,`MUSE_TEST_DATABASE_URL` 决定连哪个库,**不设 = SQLite**,
 故上面的命令行为与耗时不变。PG 下每个测试池独占一个 schema(原子计数器取号)实现隔离。

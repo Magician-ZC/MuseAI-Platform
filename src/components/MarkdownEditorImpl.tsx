@@ -16,12 +16,28 @@ interface EditorFileState {
   loading: boolean;
   saveStatus: SaveStatus;
   readError: boolean;
+  /**
+   * 🔴 `content` 是**从哪个文件读出来的**。null = 当前 content 不属于任何文件
+   * （正在加载 / 读失败 / 图片 / 空选择），此时**一个字节都不许落盘**。
+   *
+   * 由来：`text-load-start` 刻意保留上一个文件的 `content`（换文件时编辑区不闪空白），
+   * 于是「filePath 已经是新文件、content 还是旧文件的」这个状态是**真实存在**的一帧——
+   * 自动保存那条 effect 在那一帧里看到的正是 `pathToSave = 新文件` + `contentToSave = 旧内容`。
+   *
+   * ⚠️ **诚实说明：这一条今天是纵深防御，不是在补一个测得出来的洞。**
+   * 那一帧之后立刻会有一次重渲染（`text-load-start` 把 `loading` 置真）把计时器清掉，
+   * 而重渲染在任何现实情形下都远快于 800ms。故故障注入把这一条单独删掉时**用例是绿的**
+   * （`loading` / `readError` 各自也拦得住），删掉两条才红。留着它的理由不是「它今天在挡什么」，
+   * 而是把「不许写」从**几个否定条件恰好都成立**换成**一句肯定的来源断言**：
+   * 内容来自哪个文件，被写进了状态里，而不是靠重渲染比计时器快。
+   */
+  loadedPath: string | null;
 }
 
 type EditorFileAction =
   | { type: 'clear' }
   | { type: 'text-load-start' }
-  | { type: 'text-load-success'; content: string }
+  | { type: 'text-load-success'; content: string; path: string }
   | { type: 'text-load-error'; error: unknown }
   | { type: 'image-load-start' }
   | { type: 'image-load-success'; src: string }
@@ -38,6 +54,22 @@ const initialEditorFileState: EditorFileState = {
   loading: false,
   saveStatus: 'saved',
   readError: false,
+  loadedPath: null,
+};
+
+/**
+ * 🔴 **「这份内容此刻该不该写进这个文件」的唯一判据。**
+ *
+ * 防抖保存与**离开时的补写**都必须走它。两处各写一遍的话，将来只会改动其中一处——
+ * 而这两处一个管「正常节奏下的保存」、一个管「最后 800 毫秒」，判据不一致的后果
+ * 恰恰是最难复现的那一类（只在切文件的瞬间发作）。
+ */
+const shouldPersist = (state: EditorFileState, filePath: string | null, readOnly: boolean): boolean => {
+  if (readOnly || !filePath || isImageFile(filePath)) return false;
+  if (state.loading || state.readError) return false;
+  // 🔴 内容必须确实来自这个文件，否则就是在把 A 的正文写进 B。
+  if (state.loadedPath !== filePath) return false;
+  return state.content !== state.savedContent;
 };
 
 const editorFileReducer = (state: EditorFileState, action: EditorFileAction): EditorFileState => {
@@ -50,6 +82,8 @@ const editorFileReducer = (state: EditorFileState, action: EditorFileAction): Ed
         imagePreviewSrc: '',
         loading: true,
         readError: false,
+        // content 仍是上一个文件的（刻意的，避免闪空白），故它此刻**不属于**任何文件。
+        loadedPath: null,
       };
     case 'text-load-success':
       return {
@@ -59,15 +93,19 @@ const editorFileReducer = (state: EditorFileState, action: EditorFileAction): Ed
         loading: false,
         saveStatus: 'saved',
         readError: false,
+        loadedPath: action.path,
       };
     case 'text-load-error':
       return {
         ...state,
+        // 🔴 content 变成了一句错误提示。loadedPath = null 是第二道锁：
+        // 万一 readError 那道判断将来被谁改松了，这句提示也绝不会被当成正文写回文件。
         content: `**读取文件失败**: ${action.error}`,
         savedContent: '',
         loading: false,
         saveStatus: 'error',
         readError: true,
+        loadedPath: null,
       };
     case 'image-load-start':
       return {
@@ -77,6 +115,7 @@ const editorFileReducer = (state: EditorFileState, action: EditorFileAction): Ed
         loading: true,
         saveStatus: 'saved',
         readError: false,
+        loadedPath: null,
       };
     case 'image-load-success':
       return {
@@ -434,6 +473,9 @@ const useMarkdownEditorView = ({ filePath, readOnly = false }: MarkdownEditorPro
   const lastKnownModifiedAtRef = useRef<number | null>(null);
   const fullSelectionIntentUntilRef = useRef(0);
   const loadRequestIdRef = useRef(0);
+  // 补写发生在清理函数里，那时拿不到当帧的 state/props，只能从 ref 取最新的一份。
+  const fileStateRef = useSyncedRef(fileState);
+  const readOnlyRef = useSyncedRef(readOnly);
 
   const extensions = useMemo(() => (
     codeMirrorRuntime?.createExtensions(filePath || '', readOnly) ?? []
@@ -481,7 +523,7 @@ const useMarkdownEditorView = ({ filePath, readOnly = false }: MarkdownEditorPro
     ])
       .then(([text, modifiedAt]) => {
         if (acceptsResponse()) {
-          dispatchFileState({ type: 'text-load-success', content: text });
+          dispatchFileState({ type: 'text-load-success', content: text, path: filePath });
           lastKnownModifiedAtRef.current = modifiedAt;
         }
       })
@@ -539,7 +581,7 @@ const useMarkdownEditorView = ({ filePath, readOnly = false }: MarkdownEditorPro
   }, [filePath, latestContentRef, loadingRef, readErrorRef, savedContentRef]);
 
   useEffect(() => {
-    if (readOnly || !filePath || isImageFile(filePath) || loading || readError || content === savedContent) {
+    if (!shouldPersist(fileState, filePath, readOnly)) {
       return;
     }
 
@@ -565,7 +607,33 @@ const useMarkdownEditorView = ({ filePath, readOnly = false }: MarkdownEditorPro
     return () => {
       window.clearTimeout(saveTimer);
     };
-  }, [content, filePath, latestContentRef, loading, readError, readOnly, savedContent]);
+  }, [content, fileState, filePath, latestContentRef, loading, readError, readOnly, savedContent]);
+
+  /**
+   * 🔴 **离开时把最后那 800 毫秒补上。**
+   *
+   * 防抖保存的清理函数是 `clearTimeout`，而它的依赖里有 `content`——也就是**每敲一个键**
+   * 都会重建计时器。于是「打完最后一句、立刻点开下一章」这个再普通不过的动作，
+   * 会在计时器到点前触发清理：**这一轮打的字一个都没落盘，界面上也没有任何提示**。
+   * 卸载（离开作品页、关窗）同理。丢的是用户刚写的正文，而且他不会知道。
+   *
+   * 本 effect 的依赖里**没有 `content`**，所以它的清理只在**换文件或卸载**时跑一次，
+   * 正好是那两个丢数据的窗口；内容从 ref 取，永远是最新的一份。
+   * 判据与防抖那条共用 `shouldPersist`（含「内容确实来自这个文件」那一条）。
+   */
+  useEffect(() => {
+    const pathAtEntry = filePath;
+    return () => {
+      const state = fileStateRef.current;
+      if (!shouldPersist(state, pathAtEntry, readOnlyRef.current)) {
+        return;
+      }
+      // 这里没有 800ms 可等——组件下一刻就没了，直接落盘。
+      invoke('write_file', { path: pathAtEntry, content: state.content }).catch((err) => {
+        console.error('Error flushing pending edits:', err);
+      });
+    };
+  }, [filePath, fileStateRef, readOnlyRef]);
 
   const getSelectedSource = useCallback(() => {
     const view = editorViewRef.current;

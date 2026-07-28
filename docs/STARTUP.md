@@ -229,7 +229,7 @@ cargo test --manifest-path crates/muse-engine/Cargo.toml          # 295 passed
 (cd server && cargo test golden)                                   # 14 passed(12 项 runtime::golden::* + 2 项录放 round-trip)
 cargo test --manifest-path src-tauri/Cargo.toml                    # 243 passed
 # 前端 + 后台
-npm run test                                                       # 506 passed / 82 files
+npm run test                                                       # 510 passed / 82 files
 npx tsc --noEmit                                                   # 0 错误
 (cd admin && npx tsc --noEmit && npm run build)                    # 0 错误 + 产出 dist
 ```

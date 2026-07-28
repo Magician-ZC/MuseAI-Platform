@@ -77,6 +77,101 @@ describe('MarkdownEditor', () => {
     expect(invokeMock).not.toHaveBeenCalledWith('write_file', expect.anything());
   });
 
+  /**
+   * 🔴 **打完最后一句、立刻点开下一章 —— 那一段字不许丢。**
+   *
+   * 防抖保存的清理函数是 `clearTimeout`，而它的依赖里有 `content`，也就是每敲一个键都
+   * 重建一次计时器。所以只要在停止输入后 800ms 内换文件，这一轮打的字**一次都没落盘**，
+   * 界面上还什么提示都没有。改动前这里实测 `write_file` 调用数为 **0**。
+   */
+  it('flushes pending edits when switching files inside the debounce window', async () => {
+    const { rerender } = render(<MarkdownEditor filePath="/Users/test/Documents/MuseAI/articles/ch1.md" />);
+    const editor = await screen.findByRole('textbox', { name: 'Markdown源码编辑区' });
+    fireEvent.change(editor, { target: { value: '刚敲下的最后一段' } });
+
+    // 远小于 800ms 的防抖窗口：此刻计时器还没到点。
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 100));
+    });
+    rerender(<MarkdownEditor filePath="/Users/test/Documents/MuseAI/articles/ch2.md" />);
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 1200));
+    });
+
+    expect(invokeMock).toHaveBeenCalledWith('write_file', {
+      path: '/Users/test/Documents/MuseAI/articles/ch1.md',
+      content: '刚敲下的最后一段',
+    });
+    // 🔴 补写必须落到**原来那个文件**上，不能被写进刚打开的 ch2。
+    expect(invokeMock).not.toHaveBeenCalledWith('write_file', {
+      path: '/Users/test/Documents/MuseAI/articles/ch2.md',
+      content: '刚敲下的最后一段',
+    });
+  });
+
+  /** 卸载（离开作品页 / 关窗）是同一个丢数据的窗口。 */
+  it('flushes pending edits on unmount', async () => {
+    const { unmount } = render(<MarkdownEditor filePath="/Users/test/Documents/MuseAI/articles/ch3.md" />);
+    const editor = await screen.findByRole('textbox', { name: 'Markdown源码编辑区' });
+    fireEvent.change(editor, { target: { value: '离开前的最后一句' } });
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 100));
+    });
+
+    unmount();
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 200));
+    });
+
+    expect(invokeMock).toHaveBeenCalledWith('write_file', {
+      path: '/Users/test/Documents/MuseAI/articles/ch3.md',
+      content: '离开前的最后一句',
+    });
+  });
+
+  /**
+   * 反向配对：**没有未保存改动时，离开不许写盘**。
+   *
+   * 只测「离开要补写」的话，把补写写成无条件 `write_file` 也能全绿——那会在每次切文件时
+   * 重写一遍文件（刷新 mtime、无谓地触发 workspace-changed、还会和别处的写抢）。
+   */
+  it('does not write on leave when there is nothing unsaved', async () => {
+    const { rerender } = render(<MarkdownEditor filePath="/Users/test/Documents/MuseAI/articles/clean1.md" />);
+    await screen.findByRole('textbox', { name: 'Markdown源码编辑区' });
+    invokeMock.mockClear();
+
+    rerender(<MarkdownEditor filePath="/Users/test/Documents/MuseAI/articles/clean2.md" />);
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 200));
+    });
+
+    expect(invokeMock).not.toHaveBeenCalledWith('write_file', expect.anything());
+  });
+
+  /**
+   * 🔴 读取失败时那句「**读取文件失败**: …」是**提示文案，不是正文**，绝不许被写回文件。
+   *
+   * 它同时压住两道锁：`readError` 与 `loadedPath === null`。
+   */
+  it('never writes the read-error placeholder back into the file', async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === 'read_file') throw new Error('磁盘炸了');
+      if (command === 'file_modified_at') return 1;
+      return undefined;
+    });
+
+    const { rerender } = render(<MarkdownEditor filePath="/Users/test/Documents/MuseAI/articles/broken.md" />);
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 200));
+    });
+    rerender(<MarkdownEditor filePath="/Users/test/Documents/MuseAI/articles/other.md" />);
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 1200));
+    });
+
+    expect(invokeMock).not.toHaveBeenCalledWith('write_file', expect.anything());
+  });
+
   it('refreshes from disk when the file changes without unsaved edits', async () => {
     let modifiedAt = 1;
     let fileContent = '# 初始内容';

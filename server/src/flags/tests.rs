@@ -33,8 +33,30 @@ use super::*;
 use crate::onboarding::OnboardingSwitch;
 
 /// 置 `MUSE_ONBOARDING` 为原始值（None = 移除），可附带其它 env。
+///
+/// 🔴 **默认把 `MUSE_FLAGS_CACHE_TTL_MS` 钉成 `0`（即关掉缓存）**，除非调用方自己指定。
+///
+/// # 为什么必须默认关掉
+///
+/// 开关缓存是**整表快照 + 进程级**的。`env_guard` 只还原 env，**还原不了缓存**——
+/// 而本文件里测缓存行为的用例会把 TTL 设成 60 秒并往缓存里灌一份快照。
+/// 于是任何一条「`raw_insert` 写库 → `is_enabled` 读」的用例，
+/// 只要排在它后面且时间窗口没过，读到的就是**上一条用例留下的旧快照**，
+/// 断言随机失败，信息是「开关值对不上」——**指向被测逻辑，而根因是缓存**。
+///
+/// ⚠️ 这个坑在 SQLite 上几乎不发：那一遍跑得快，交错窗口窄。
+/// 它是在**真 Postgres** 上跑全量时炸出来的（同一批用例，两次跑挂的还不是同一条）。
+/// 本文件头那段「两个模块各拿各的锁 = 等于没有锁」说的是同一类问题的另一半：
+/// **进程级共享的东西，谁都得管到底**——env 要还原，缓存也要。
+///
+/// 测缓存本身的用例照常在 `extra` 里显式给 TTL，会覆盖这里的默认值。
 fn env_guard(onboarding: Option<&str>, extra: &[(&'static str, &str)]) -> OnboardingSwitch {
-    OnboardingSwitch::raw(onboarding, extra)
+    if extra.iter().any(|(k, _)| *k == ENV_CACHE_TTL_MS) {
+        return OnboardingSwitch::raw(onboarding, extra);
+    }
+    let mut all: Vec<(&'static str, &str)> = vec![(ENV_CACHE_TTL_MS, "0")];
+    all.extend_from_slice(extra);
+    OnboardingSwitch::raw(onboarding, &all)
 }
 
 fn test_config() -> ServerConfig {

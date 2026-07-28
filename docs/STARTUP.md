@@ -244,6 +244,11 @@ npx tsc --noEmit                                                   # 0 错误
 
 ### 7.1 Postgres 那遍(生产库形态)
 
+> 🔵 **2026-07-28 第二次实跑记录**：本轮新加的 SQL（健康档三维度 + `UNION` 去重、
+> if 线对账）在一次性 PG 16 上跑全量，**新 SQL 一条没挂**；但挂出了**两条只在 PG 上才现形
+> 的既有缺陷**（判据写在本地化错误文案上 / `env_guard` 不还原进程级缓存导致全量下 flaky），
+> 均已修，PG 全量连跑两遍 1128 passed。详见 `docs/VALIDATION.md` §3.57。
+>
 > 🔵 **2026-07-28 实跑记录**：本机 PG 上把 CI 的三遍都真跑过（不是静态核对 SQL）——
 > `testkit::` schema 层 2 passed、default 1110 passed、`billing,arena` 1193 passed（当时值），
 > 与 SQLite 那两遍**逐条一致**。这一轮往 `server` 加了新 SQL（`ifline::sweep` 的对账查询等），

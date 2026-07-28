@@ -300,9 +300,29 @@ mod tests {
             let err = question.expect_err(
                 "若这条开始通过，说明 sqlx 已支持 ? → $N 改写，本注释与 CI 的非阻塞标记应一并撤掉",
             );
-            assert!(
-                err.to_string().contains("syntax error"),
-                "PG 上 `?` 应报语法错，实际：{err}"
+            // 🔴 **按 SQLSTATE `42601` 判，不按错误文案判。**
+            //
+            // 这里原先写的是 `err.to_string().contains("syntax error")`——
+            // 而 PostgreSQL 的错误消息是**跟随服务器 locale 本地化**的：
+            // 在中文 locale 的实例上它返回「语法错误 在 "," 或附近的」，
+            // 于是这条断言失败，而失败信息长成
+            // 「**PG 上 `?` 应报语法错，实际：语法错误**」——
+            // 最大程度地误导：读的人会以为判据本身出了问题，
+            // 而上一行 `expect_err` 的文案还写着「若这条开始通过，说明 sqlx 已支持 ? → $N 改写」，
+            // 更容易把人引向「sqlx 行为变了」这个完全错误的方向。
+            //
+            // ⚠️ 它**在英文 locale 的 PG 上照常绿**（CI 多半就是），
+            // 所以这个坑只会在别人拿自己机器上的 PG 复现时炸——
+            // 那正是最需要它可信的时刻。本模块头注释里写的判据本来就是 `42601`，
+            // 这次只是让实现跟上文档。
+            let code = err
+                .as_database_error()
+                .and_then(|e| e.code())
+                .map(|c| c.to_string())
+                .unwrap_or_default();
+            assert_eq!(
+                code, "42601",
+                "PG 上 `?` 应报 SQLSTATE 42601（语法错误），实际 code={code:?} err={err}"
             );
         } else {
             question.expect("SQLite 上 `?` 是正常写法");

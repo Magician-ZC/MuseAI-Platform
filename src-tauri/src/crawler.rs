@@ -163,7 +163,20 @@ fn sanitize_filename(filename: &str) -> String {
     for (i, c) in illegal_chars.iter().enumerate() {
         safe = safe.replace(*c, illegal_chars_rep[i]);
     }
-    safe.trim().to_string()
+    let safe = safe.trim().to_string();
+
+    // 🔴 上面换掉的是**分隔符**，`.` 与 `..` 它管不着——而书名/章节名来自**远端页面**，
+    // 也就是外部内容。`novel_name == ".."` 时 `target_path.join("..")` 会落到上一级目录
+    // （`crawl_*_book` 的 `book_folder` 那一处没有拼扩展名，正好踩上）；
+    // 以 `.` 开头则写出隐藏目录/文件。空串会让 `join("")` 退化成目标目录本身。
+    // 这三种都不该由远端标题决定，故在此收口。
+    if safe.is_empty() || safe.chars().all(|c| c == '.') {
+        return "未命名".to_string();
+    }
+    if let Some(stripped) = safe.strip_prefix('.') {
+        return format!("_{stripped}");
+    }
+    safe
 }
 
 pub fn crawl_fanqie_article(
@@ -464,4 +477,43 @@ fn fetch_chapter_content(client: &Client, chapter_id: &str) -> Result<(String, S
     }
 
     Err("无法提取章节内容".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_filename;
+
+    /// 🔴 书名/章节名来自**远端页面**，它会被当成文件名/目录名用。
+    ///
+    /// 原实现只把分隔符换成全角（穿越确实被挡住了），但 `.` 与 `..` 它管不着：
+    /// `crawl_*_book` 的 `book_folder = target_path.join(&safe_novel_name)` 那一处**没有拼扩展名**，
+    /// 于是书名恰好是 `..` 时整本书会写到用户所选目录的**上一级**去。
+    #[test]
+    fn dot_names_from_remote_titles_cannot_escape_the_target_dir() {
+        for bad in ["..", ".", "...", "   ..   ", ""] {
+            let safe = sanitize_filename(bad);
+            assert_ne!(safe, "..", "🔴 `..` 会让 join 落到上一级目录：{bad:?}");
+            assert_ne!(safe, ".", "🔴 `.` 会让 join 退化成目录本身：{bad:?}");
+            assert!(!safe.is_empty(), "🔴 空名会让 join 退化成目录本身：{bad:?}");
+            assert!(!safe.starts_with('.'), "🔴 以 . 开头会写出隐藏项：{bad:?}");
+        }
+    }
+
+    /// 分隔符仍然被换掉（原有行为，不得因为上面的收口而回退）。
+    #[test]
+    fn separators_are_still_neutralised() {
+        let safe = sanitize_filename("../../etc/passwd");
+        assert!(!safe.contains('/'), "斜杠必须被换掉：{safe}");
+        assert!(!safe.contains('\\'), "反斜杠必须被换掉：{safe}");
+    }
+
+    /// 🔴 反方向：正常书名不得被改坏——用户看到的文件名就是书名。
+    #[test]
+    fn ordinary_titles_are_left_alone() {
+        for ok in ["斗破苍穹", "The Martian", "第1卷 少年", "book_2024"] {
+            assert_eq!(sanitize_filename(ok), ok, "🔴 正常书名被改动了：{ok}");
+        }
+        // 前后空白裁掉是原有行为。
+        assert_eq!(sanitize_filename("  斗破苍穹  "), "斗破苍穹");
+    }
 }

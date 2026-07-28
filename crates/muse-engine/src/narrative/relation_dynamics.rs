@@ -110,16 +110,46 @@ impl RelationRules {
     }
 
     fn classify(&self, text: &str) -> Category {
-        if self.rupture.is_match(text) {
+        if affirmative_match(&self.rupture, text) {
             Category::Rupture
-        } else if self.hostile.is_match(text) {
+        } else if affirmative_match(&self.hostile, text) {
             Category::Hostile
-        } else if self.friendly.is_match(text) {
+        } else if affirmative_match(&self.friendly, text) {
             Category::Friendly
         } else {
             Category::Neutral
         }
     }
+}
+
+/// 🔴 **命中且未被否定**才算数——否则「我不会伤他」会被判成敌对。
+///
+/// # 这道闸为什么必须有
+///
+/// 上面几条规则里全是**单字**关键词（`杀` `伤` `挡` `逼` `骗` `救` `帮` `送`…），
+/// 而 `action` / `intent` 是自由文本，否定式在里面**极其常见**
+/// （「我不能伤他」「绝不背叛」「拒绝攻击」）。没有这道闸的话：
+///
+/// | 模型写的 | 判成 | 后果 |
+/// |---|---|---|
+/// | 「我**永不**背叛你」 | Rupture（最强档） | trust/affinity **各 −0.50 双向** + fear +0.15 |
+/// | 「我**不会**伤你」 | Hostile | 双向减分 + fear |
+/// | 「**别**杀他」 | Hostile | 同上 |
+///
+/// **意思被读反了**，而关系数值是跨拍累积的：一次误判的 Rupture 要许多次友善行为才抵得回来，
+/// 且它下游连着羁绊解锁门（`server::social`）、传世印记、社交可见性。
+///
+/// # 判据**复用** `arbiter::negated_before`，不另写一份
+///
+/// `arbiter` 早就有这道闸（**误伤控制闸③**，「命中片段之前 N 个字内若出现否定字，
+/// 视为角色正在**拒绝**做这件事」）。这里 `pub(crate)` 复用它而不是抄一份否定字表——
+/// 抄一份的话，两处的字表与窗口长度迟早漂开，**而漂开的那一刻没有任何症状**
+/// （`docs/VALIDATION.md` §3.8.1 形态 (a)）。
+///
+/// 逐个命中位置检查：只要**有一处**未被否定就算命中（「他背叛了我，我不会背叛他」
+/// 仍然是破裂——前半句是真的）。全部被否定才算未命中。
+fn affirmative_match(re: &Regex, text: &str) -> bool {
+    re.find_iter(text).any(|m| !crate::narrative::arbiter::negated_before(text, m.start()))
 }
 
 // ---------- 推导主流程 ----------
@@ -331,6 +361,64 @@ mod tests {
         assert!(approx(set_value(&ops, "relations[wang->li].affinity").unwrap(), -0.08));
         assert!(approx(set_value(&ops, "relations[li->wang].affinity").unwrap(), -0.05));
         assert_eq!(ops.len(), 4, "敌对应恰产 4 笔：{ops:?}");
+    }
+
+    // ---- 🔴 否定不许被读成肯定 ----
+
+    /// 🔴 **「我永不背叛你」不许被判成关系破裂。**
+    ///
+    /// 规则里全是**单字**关键词（`杀` `伤` `挡` `骗` `救`…），而 `action`/`intent` 是自由文本，
+    /// 否定式在里面极其常见。改动前「永不背叛」直接命中 `背叛` → Rupture（最强档）→
+    /// trust/affinity **各 −0.50 双向** + fear +0.15。**意思被读反了**，
+    /// 而关系数值跨拍累积、下游连着羁绊解锁门 / 传世印记 / 社交可见性——
+    /// 一次误判要许多次友善行为才抵得回来。
+    #[test]
+    fn a_negated_action_is_not_read_as_its_opposite() {
+        let s = state_with_chars(&["li", "wang"]);
+        for (action, intent) in [
+            ("我永不背叛你", "立誓"),
+            ("我不会伤你", "安抚"),
+            ("拒绝攻击王五", "克制"),
+            ("别杀他", "阻止"),
+        ] {
+            let d = vec![decision("d1", "li", action, intent, &["wang"], false)];
+            let o = vec![outcome("d1", "li", ArbiterResult::Success)];
+            let ops = derive_relation_ops(&d, &o, &s);
+            let trust = set_value(&ops, "relations[li->wang].trust").unwrap_or(0.0);
+            assert!(
+                trust >= 0.0,
+                "🔴 「{action}」被读成了敌对/破裂：trust={trust}。\n\
+                 否定式在模型自由文本里极其常见，读反一次的代价是跨拍累积的关系分。ops={ops:?}"
+            );
+        }
+    }
+
+    /// 反向配对：**真的敌对仍然必须被判出来**。
+    ///
+    /// 只测「否定不许误判」的话，把整个 `classify` 恒返回 Neutral 也能全绿——
+    /// 那等于把关系演化整个关掉。
+    #[test]
+    fn a_genuinely_hostile_action_is_still_classified_as_hostile() {
+        let s = state_with_chars(&["li", "wang"]);
+        let d = vec![decision("d1", "li", "出手攻击王五", "取他性命", &["wang"], false)];
+        let o = vec![outcome("d1", "li", ArbiterResult::Success)];
+        let ops = derive_relation_ops(&d, &o, &s);
+        let trust = set_value(&ops, "relations[wang->li].trust").expect("敌对应产生 trust 变化");
+        assert!(trust < 0.0, "🔴 真敌对必须仍被判出来，否则这道闸就是把功能关了：{ops:?}");
+    }
+
+    /// 一句话里既有肯定又有否定 → **仍算命中**（前半句是真的）。
+    ///
+    /// 这一条防的是过度收紧：只要文本里出现任何否定字就整句放过的话，
+    /// 「他背叛了我，我不会背叛他」会被当成什么都没发生。
+    #[test]
+    fn one_affirmative_hit_is_enough_even_if_another_is_negated() {
+        let s = state_with_chars(&["li", "wang"]);
+        let d = vec![decision("d1", "li", "他背叛了我，我不会背叛他", "陈述", &["wang"], false)];
+        let o = vec![outcome("d1", "li", ArbiterResult::Success)];
+        let ops = derive_relation_ops(&d, &o, &s);
+        let trust = set_value(&ops, "relations[li->wang].trust").expect("应仍判为破裂");
+        assert!(trust <= -0.4, "🔴 有一处未被否定就该算命中（前半句是真的）：{ops:?}");
     }
 
     // ---- 友善：双向 + 救类 debt ----

@@ -451,7 +451,12 @@ fn forbidden_needles(line: &str) -> Vec<String> {
 }
 
 /// 命中片段之前 `NEGATION_WINDOW_CHARS` 个字内是否出现否定字（闸③）。
-fn negated_before(action: &str, pos: usize) -> bool {
+///
+/// 🔴 `pub(crate)` 是**刻意的**：`relation_dynamics` 的关键词分类需要同一个判据
+/// （「我不会伤他」不该被分成敌对）。**同一个判断不许在第二处再写一遍**——
+/// 否则两处的否定字表、窗口长度迟早会漂开，而漂开的那一刻没有任何症状。
+/// 判据理由见 `NEGATION_WINDOW_CHARS` / `NEGATION_CHARS` 的注释。
+pub(crate) fn negated_before(action: &str, pos: usize) -> bool {
     action[..pos].chars().rev().take(NEGATION_WINDOW_CHARS).any(|c| NEGATION_CHARS.contains(&c))
 }
 

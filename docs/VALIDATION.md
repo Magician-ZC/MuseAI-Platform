@@ -1049,6 +1049,46 @@ camelCase 与 snake_case 同形。`known_to` 才受影响，而那一处是类�
 ⚠️ 另一条边界：**存量模板不会被回头校验**，闸只在写入路径上。存量的发现面是运营台的
 `shape.unknownTopLevelKeys` / `shape.unknownNestedKeys` 两栏——**看得见，但不会自动修**。
 
+### 3.18 🔴 手机服务的免鉴权状态端点把访问令牌吐给了局域网（**修于 2026-07-28**）
+
+本 session 最严重的一处。
+
+`src-tauri/src/mobile_server.rs` 的 token 鉴权是**中间件 + 公开路径排除表**（设计是对的）：
+`/`、`/assets/*`、`/api/mobile/status` 免鉴权，其余全查 token
+（`X-Mobile-Token` 头 / `?token=` / cookie 三选一）。
+
+问题出在那个免鉴权的 `status` 上：
+
+```rust
+async fn get_mobile_status() -> impl IntoResponse {
+    let status = get_status();
+    axum::Json(status)          // ← MobileServiceStatus 里装着 token
+}
+```
+
+`MobileServiceStatus { is_running, url, token, error }` 是 `Serialize` 的，
+`token` 就是访问令牌，而 `url` 是 `http://<lan_ip>:<port>/?token=<token>`。
+于是**局域网上任何人 `GET /api/mobile/status` 就能拿到令牌**，
+再用它调用其余全部端点：会话列表、会话正文、起停对话、应用状态……
+**整套 token 鉴权被这一个端点旁路掉。**
+
+🔴 形状还是那个老形状：**同一个结构体服务两类信任级别不同的读者**。
+桌面侧 `Settings.tsx` 用 Tauri `invoke` 拿完整结构渲染二维码/URL——那一路只在本机进程内，
+是正当的、**未改动**；HTTP 这一路必须裁剪。
+
+修：公开端点只回 `{ isRunning, error }`。
+⚠️ **裁掉的不只是 `token`，还有 `url`**——它把 token 写在 query 里，只删 token 是没用的。
+前端类型也按「两者的交集」收窄（需要 token/url 的桌面页直接 `invoke`）。
+
+🔵 故障注入两处全红：
+- 还原成改动前的 `Json(status)` → 红（用例断言响应体里**一个字节都找不到**那个令牌，
+  而不是逐字段断言——逐字段的写法在将来加字段时会漏）；
+- **只删 `token`、保留 `url` 的半吊子修法** → **照样红**。这一条是本次注入里最该有的一条。
+
+⚠️ 手机端在应用内**没有任何代码调用**这个端点（`appInvoke('get_mobile_service_status')`
+全仓只有类型定义、switch 分支与用例引用它），也就是说这个泄露一直存在、却没有任何功能依赖它
+——「没人用」不等于「不可达」，它是公开路由。
+
 ### 3.17 桌面轨：`appInvoke` 三处手工同步里，类型表多出一个 `read_file`（**修于 2026-07-28**）
 
 本 session 首次扫**桌面轨**。CLAUDE.md 明写着一个三处手工同步的形状：

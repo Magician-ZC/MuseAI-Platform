@@ -279,9 +279,25 @@ async fn serve_static_assets<R: Runtime>(
     serve_asset_by_path(&app, &full_path)
 }
 
+/// 🔴 **免鉴权端点，只回存活状态——绝不回令牌**。
+///
+/// `/api/mobile/status` 在 `is_public_path` 的白名单里（免 token），它的用途是「服务起来了吗」。
+/// 而 `MobileServiceStatus` 里装着 `token`，`url` 又是 `http://<ip>:<port>/?token=<token>`
+/// ——把整个结构体 `Json` 出去，等于**在局域网上无鉴权地公开访问令牌**：
+/// 任何人 GET 一下就能拿到 token，然后用它调用其余全部端点（会话列表、会话正文、
+/// 起停对话、应用状态……）。那会让这套 token 鉴权**整体失效**。
+///
+/// 这就是本仓反复出现的那个形状：**同一个结构体服务两类信任级别不同的读者**。
+/// 桌面侧的 Tauri 命令 `get_mobile_service_status`（`Settings.tsx` 用它渲染二维码/URL）
+/// 需要完整信息且只在本机进程内传递，那一路**不变**；HTTP 这一路必须裁剪。
+///
+/// ⚠️ 裁剪掉的不只是 `token`，还有 `url` —— 它把 token 写在 query 里，只删 token 是没用的。
 async fn get_mobile_status() -> impl IntoResponse {
     let status = get_status();
-    axum::Json(status)
+    axum::Json(serde_json::json!({
+        "isRunning": status.is_running,
+        "error": status.error,
+    }))
 }
 
 fn sanitize_settings_state(val: &mut Value) {
@@ -1679,6 +1695,55 @@ mod tests {
 
         // Protected endpoint without a token must be rejected with UNAUTHORIZED.
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// 🔴 **免鉴权的 `/api/mobile/status` 绝不能回令牌**（否则 token 鉴权整体失效）。
+    ///
+    /// 它在 `is_public_path` 白名单里，用途只是「服务起来了吗」。而 `MobileServiceStatus`
+    /// 里装着 `token`，且 `url` 是 `http://<ip>:<port>/?token=<token>`——
+    /// 此前这个 handler 把整个结构体 `Json` 出去，于是**局域网上任何人 GET 一下就拿到令牌**，
+    /// 再用它调用其余全部端点。
+    ///
+    /// 本用例把一个可辨识的令牌塞进状态，然后断言响应体里**一个字节都找不到它**
+    /// （不逐字段断言：将来加字段时，逐字段的写法会漏掉新字段）。
+    #[tokio::test]
+    async fn public_status_endpoint_never_leaks_the_access_token() {
+        const SECRET: &str = "tok-DO-NOT-LEAK-9f3a1c";
+        set_status(MobileServiceStatus {
+            is_running: true,
+            url: Some(format!("http://192.168.1.9:1421/?token={SECRET}")),
+            token: Some(SECRET.to_string()),
+            error: None,
+        });
+
+        let app = create_mock_app();
+        let router = create_mobile_router(app);
+        let response = router
+            .oneshot(
+                // 刻意**不带**任何令牌：这正是攻击者的处境。
+                Request::builder().uri("/api/mobile/status").body(Body::empty()).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "存活探测本身仍应免鉴权可用");
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            !body.contains(SECRET),
+            "🔴 免鉴权端点泄露了访问令牌，token 鉴权整体失效。响应体：{body}"
+        );
+        // 存活状态本身要照常可读（别为了堵漏把这个端点变成没用的）。
+        let v: serde_json::Value = serde_json::from_str(&body).expect("状态应是 JSON");
+        assert_eq!(v["isRunning"], serde_json::json!(true));
+
+        // 收尾：把全局状态复位，避免影响同进程内其它用例。
+        set_status(MobileServiceStatus {
+            is_running: false,
+            url: None,
+            token: None,
+            error: None,
+        });
     }
 
     #[tokio::test]

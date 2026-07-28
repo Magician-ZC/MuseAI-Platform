@@ -36,7 +36,12 @@ type AgentSessionRecordResponse = AgentSessionRecord & {
 export interface AppInvokeCommands {
   get_mobile_service_status: {
     args: void;
-    result: { isRunning: boolean; url: string | null; token: string | null; error: string | null };
+    // ⚠️ 桌面（Tauri `invoke`）与手机（HTTP `/api/mobile/status`）拿到的**不是同一份**：
+    // 后者是免鉴权端点，**刻意不回** `token` 与 `url`（`url` 形如 `.../?token=xxx`，
+    // 回它等于回 token）——否则局域网上任何人 GET 一下就拿到令牌、鉴权整体失效。
+    // 故此处按**两者的交集**声明；需要 token/url 的桌面页（Settings）直接用 `invoke`，
+    // 那一路返回完整结构。
+    result: { isRunning: boolean; error: string | null };
   };
   list_agent_sessions: {
     args: { prefix?: string; sessionKind?: string };

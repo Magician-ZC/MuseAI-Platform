@@ -225,7 +225,7 @@ cd server && MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo ru
 # 引擎 + 后端 + 桌面壳
 cargo test --manifest-path crates/muse-engine/Cargo.toml          # 295 passed
 (cd server && cargo test)                                          # 1113 passed(default,含黄金世界回归)
-(cd server && cargo test --features billing,arena)                 # 1195 passed
+(cd server && cargo test --features billing,arena)                 # 1196 passed
 (cd server && cargo test golden)                                   # 14 passed(12 项 runtime::golden::* + 2 项录放 round-trip)
 cargo test --manifest-path src-tauri/Cargo.toml                    # 243 passed
 # 前端 + 后台
@@ -241,7 +241,7 @@ npx tsc --noEmit                                                   # 0 错误
 ### 7.1 Postgres 那遍(生产库形态)
 
 > 🔵 **2026-07-28 实跑记录**：本机 PG 上把 CI 的三遍都真跑过（不是静态核对 SQL）——
-> `testkit::` schema 层 2 passed、default 1110 passed、`billing,arena` 1193 passed，
+> `testkit::` schema 层 2 passed、default 1110 passed、`billing,arena` 1193 passed（当时值），
 > 与 SQLite 那两遍**逐条一致**。这一轮往 `server` 加了新 SQL（`ifline::sweep` 的对账查询等），
 > 那些查询因此是**在真 PG 上验过**的，不只是符合 `$N` + `CAST` 的书面规则。
 

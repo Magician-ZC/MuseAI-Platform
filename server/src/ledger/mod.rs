@@ -410,3 +410,84 @@ async fn record_suspicious(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod debug_assert_red_line {
+    //! 🔴 **`debug_assert` 在 release 里整条消失——它不能是唯一的守卫。**
+    //!
+    //! # 由来
+    //!
+    //! 本 session 反复遇到「门失效时没有症状」。`debug_assert` 是这类里最隐蔽的一种：
+    //! 它在**开发和测试里一直生效**（`cargo test` 默认 debug），
+    //! 而**生产构建里一个字节都不剩**。于是「测试全绿」与「上线后有守卫」之间
+    //! 隔着一个没人会注意到的编译开关。
+    //!
+    //! # 判据：排除表 + 逐条写清「always-on 的那道在哪」
+    //!
+    //! 不是禁用 `debug_assert`——它作为**早期定位**很有用（panic 在出错的那一行，
+    //! 而不是在下游几层之外报一个笼统的错）。要求是：
+    //! **每一处都必须有一道 always-on 的判据兜在后面**，并在这张表里写出它是哪一道。
+    //!
+    //! 新增一处而不登记就红，作者必须回答「release 下谁来守」。
+    //! 判据方向见 `docs/VALIDATION.md` §3.8.1 第二节。
+
+    #[test]
+    fn every_debug_assert_has_an_always_on_backstop() {
+        // (相对 src/ 的路径, 该文件允许的处数, release 下**真正**守着它的是什么)
+        const REGISTERED: &[(&str, usize, &str)] = &[
+            (
+                "ledger/mod.rs",
+                1,
+                "分账守恒。always-on 兜底 = `post_journal` 的复式记账校验\
+                 （`sum != 0 → LedgerError::Unbalanced`，fail-closed 整笔报错）——\
+                 creator_cut 越界会让某条 posting 被 `> 0` 守卫跳过，于是求和不为零，必被它抓住",
+            ),
+            (
+                "safety/semantic/mod.rs",
+                1,
+                "第 3 层只收紧绝不写 approved。always-on 兜底 = 源码级红线\
+                 `red_line_tightening_never_writes_approved` + SQL 自身的\
+                 `WHERE moderation = 'approved'` 单向棘轮",
+            ),
+            (
+                "assembly/mod.rs",
+                1,
+                "掷点前切片必须按 id 升序（确定性契约「不依赖 map 迭代序」）。\
+                 always-on 兜底 = 黄金世界回归（`cargo test golden`）——顺序错了产出就变，\
+                 录放比对立刻红",
+            ),
+        ];
+
+        let mut offenders = Vec::new();
+        for (rel, src) in crate::testkit::production_sources() {
+            // 只看**代码行**：注释里提到这个词（解释它守着什么）是正常的。
+            // 把注释也数进去会逼人删掉说明——而说明正是这道门想保住的东西。
+            // （同 §3.49 的 `appliedPatchIds` 扫描，同一个坑踩第二次了。）
+            let found = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .filter(|l| l.contains("debug_assert"))
+                .count();
+            let allowed =
+                REGISTERED.iter().find(|(p, _, _)| *p == rel).map(|(_, n, _)| *n).unwrap_or(0);
+            if found != allowed {
+                offenders.push(format!("{rel}：找到 {found} 处 debug_assert，表里登记 {allowed} 处"));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "🔴 `debug_assert` 与登记表对不上：\n  {}\n\n\
+             它在 release 构建里**整条消失**，而 `cargo test` 是 debug——\
+             于是「测试全绿」与「上线后有守卫」之间隔着一个没人会注意到的编译开关。\n\
+             不是禁用它（作为早期定位很有用），而是**每一处都要有一道 always-on 的判据兜在后面**，\n\
+             并在本用例的 REGISTERED 表里写清那道是什么。",
+            offenders.join("\n  ")
+        );
+
+        let present: std::collections::BTreeSet<String> =
+            crate::testkit::production_sources().into_iter().map(|(rel, _)| rel).collect();
+        for (rel, _, _) in REGISTERED {
+            assert!(present.contains(*rel), "🔴 REGISTERED 里登记的 {rel} 已不在源码树里，请删掉这一行");
+        }
+    }
+}

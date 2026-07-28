@@ -229,7 +229,7 @@ cargo test --manifest-path crates/muse-engine/Cargo.toml          # 314 passed
 # MUSE_SMOKE_API_KEY=sk-... MUSE_SMOKE_BASE_URL=https://api.deepseek.com/v1 MUSE_SMOKE_MODEL=deepseek-chat \
 #   cargo test --manifest-path crates/muse-engine/Cargo.toml real_provider -- --ignored --nocapture
 (cd server && cargo test)                                          # 1128 passed(default,含黄金世界回归)
-(cd server && cargo test --features billing,arena)                 # 1211 passed
+(cd server && cargo test --features billing,arena)                 # 1212 passed
 (cd server && cargo test golden)                                   # 14 passed(12 项 runtime::golden::* + 2 项录放 round-trip)
 cargo test --manifest-path src-tauri/Cargo.toml                    # 245 passed
 # 前端 + 后台

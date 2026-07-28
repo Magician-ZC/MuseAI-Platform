@@ -23,8 +23,13 @@ pub struct DecidePrompts {
     pub prompt_version: String,
 }
 
-/// world 层内部保留键（幂等账），绝不进入任何角色可见上下文。
-const RESERVED_WORLD_KEY: &str = "appliedPatchIds";
+/// world 层内部保留键，绝不进入任何角色可见上下文。
+///
+/// 🔴 **不再在这里另写字面量**：它与 `reducer` 的「不可经 patch 写」用**同一个数组**
+/// （`reducer::RESERVED_WORLD_KEYS`）。此前两处各写一份 `"appliedPatchIds"`，
+/// 而漂开的后果是**内部账静默出现在每个角色的 prompt 里**——不报错、不告警。
+/// 加第二个内部键时只需改那一处，两边一起生效。
+use super::reducer::RESERVED_WORLD_KEYS;
 
 /// 从 DNA 卡中裁出「行为层」视图（角色自己的卡，全部对自己可见）；
 /// 剔除存储/版本元数据，仅保留决策相关层，供角色本人推理。
@@ -88,7 +93,7 @@ pub fn assemble_visible_context(
 
     // 3) 公共 world 层（剔除引擎内部保留键）。
     let world: BTreeMap<&String, &Value> =
-        state.world.iter().filter(|(k, _)| k.as_str() != RESERVED_WORLD_KEY).collect();
+        state.world.iter().filter(|(k, _)| !RESERVED_WORLD_KEYS.contains(&k.as_str())).collect();
     let world_v = serde_json::to_value(&world)?;
 
     // 4) 他人仅以第三人称一句话摘要出现（不含自己；防卡片/原文 DNA 注入）。
@@ -347,7 +352,7 @@ mod tests {
         });
         s.world.insert("phase".into(), serde_json::json!("夜晚"));
         // 内部保留键不得泄漏。
-        s.world.insert(RESERVED_WORLD_KEY.into(), serde_json::json!(["patch-x"]));
+        s.world.insert(RESERVED_WORLD_KEYS[0].into(), serde_json::json!(["patch-x"]));
         s
     }
 
@@ -371,7 +376,7 @@ mod tests {
         // A→B 关系仅 A 知情，B 不得看到其 notes。
         assert!(!ctx.contains("秘密同盟标记"), "泄漏了 B 未知情的关系：{ctx}");
         // 引擎内部保留键不得泄漏。
-        assert!(!ctx.contains(RESERVED_WORLD_KEY), "泄漏了内部保留键：{ctx}");
+        assert!(!ctx.contains(RESERVED_WORLD_KEYS[0]), "泄漏了内部保留键：{ctx}");
 
         // B 应能看到：他人第三人称摘要、公共 world、场景。
         assert!(ctx.contains("侍卫"), "缺少他人第三人称摘要");
@@ -511,6 +516,57 @@ mod tests {
     }
 
     /// 🔴 红线：身份只挂上下文顶层，**绝不写进 DNA 卡视图**（`active_cards` 是不可变快照）。
+    /// 🔴 **每一个引擎内部保留键都必须被挡在所有角色的上下文之外——一个都不许漏。**
+    ///
+    /// # 这条门守的是一个「排除表」，而排除表的失败方向是泄露
+    ///
+    /// `world` 是**开放键空间**（叙事可以往里写任意键），所以内部键只能靠排除表挡。
+    /// 而排除表漏一条的后果是：那个键**静默出现在每个角色的 prompt 里**——
+    /// 不报错、不告警，只是每份上下文里多了一段谁也没打算给模型看的东西。
+    ///
+    /// 此前 `reducer`（不可写）与 `decide`（不可见）**各写了一份 `"appliedPatchIds"` 字面量**，
+    /// 任一处改名或加键而另一处没跟上就会漂开。现在两处共用 `RESERVED_WORLD_KEYS`，
+    /// 本用例**遍历那个数组**逐个验——加第二个内部键时它自动进入判据，
+    /// 想漏都漏不掉（`docs/VALIDATION.md` §3.8.1 形态 (a)）。
+    #[test]
+    fn reserved_world_keys_are_filtered_from_every_visible_context() {
+        assert!(!RESERVED_WORLD_KEYS.is_empty(), "保留键表不该是空的");
+        let card_b = minimal_card("B");
+        for key in RESERVED_WORLD_KEYS {
+            let mut s = state_with_secrets();
+            // 内部键的值取一个**一眼能认出来**的探针串。
+            s.world.insert((*key).to_string(), serde_json::json!(["INTERNAL-PROBE-VALUE"]));
+            // 同时放一个普通叙事键，确认过滤没有把正常的 world 层一起吃掉。
+            s.world.insert("weather".into(), serde_json::json!("大雪"));
+
+            let ctx = assemble_visible_context(
+                &s, "B", &card_b, &BTreeMap::new(), "场景", &[], None, None, &[],
+            )
+            .unwrap();
+            assert!(
+                !ctx.contains(key) && !ctx.contains("INTERNAL-PROBE-VALUE"),
+                "🔴 内部保留键 `{key}` 泄漏进了角色可见上下文：{ctx}"
+            );
+            assert!(
+                ctx.contains("大雪"),
+                "🔴 过滤把正常的 world 层也吃掉了 —— 那比泄露更容易被当成「模型变笨了」：{ctx}"
+            );
+        }
+    }
+
+    /// 反向配对：保留键**同时**必须挡住 patch 写入（两件事共用同一张表）。
+    #[test]
+    fn reserved_world_keys_are_also_rejected_by_the_reducer() {
+        for key in RESERVED_WORLD_KEYS {
+            let err = crate::narrative::reducer::parse_path(&format!("world.{key}"))
+                .expect_err("保留键必须不可经 patch 写");
+            assert!(
+                format!("{err}").contains("保留键"),
+                "报错要说清它是保留键，否则作者只会以为路径写错了：{err}"
+            );
+        }
+    }
+
     /// 🔴 **礼物只改上下文的那一格，别的一个字节都不动。**
     ///
     /// 源码扫描（`lib.rs::ambient_events_never_leave_the_presentation_layer`）证明的是

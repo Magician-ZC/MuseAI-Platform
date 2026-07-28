@@ -28,6 +28,24 @@ pub const PATH_WHITELIST_DOC: &str = "见模块注释；实现为 parse_path() �
 
 /// 幂等账在 world 中的保留键；禁止经 patch 直接写，只由 reducer 维护。
 const APPLIED_KEY: &str = "appliedPatchIds";
+
+/// 🔴 **`world` 层的全部引擎内部键。两件事必须同时成立，而它们此前各写了一份字面量。**
+///
+/// 1. **不可经 patch 写**（本文件 `parse_path`）——否则模型能改幂等账；
+/// 2. **不进任何角色的可见上下文**（`decide::assemble_visible_context`）——
+///    否则引擎内部结构会出现在每个角色的 prompt 里。
+///
+/// 此前第 2 条在 `decide.rs` 里另写了一个 `RESERVED_WORLD_KEY = "appliedPatchIds"` 字面量。
+/// 两处同名不同源，**漂开的后果不对称且严重**：任一处改名或加键而另一处没跟上，
+/// 结果都是**内部账静默出现在所有角色的上下文里**——没有报错、没有告警，
+/// 只是每个 prompt 里多了一段谁也没打算给模型看的东西。
+///
+/// ⚠️ 更要紧的是**方向**：这是一张**排除表**，而 `world` 是开放键空间
+/// （叙事可以往里写任意键）。所以它没法反过来写成白名单，
+/// 于是「将来加了第二个内部键却忘了登记」这条路必须被结构性堵死——
+/// 办法就是让两处**共用这一个数组**，加键时一次就都生效。
+/// 由 `reserved_world_keys_are_filtered_from_every_visible_context` 钉住。
+pub(crate) const RESERVED_WORLD_KEYS: &[&str] = &[APPLIED_KEY];
 /// 幂等账保留上限。
 const APPLIED_MAX: usize = 200;
 
@@ -52,7 +70,7 @@ pub fn parse_path(path: &str) -> Result<ParsedPath, EngineError> {
         if key.is_empty() || key.contains('.') || key.contains('[') {
             return Err(deny(path, "world 键非法"));
         }
-        if key == APPLIED_KEY {
+        if RESERVED_WORLD_KEYS.contains(&key) {
             return Err(deny(path, "world 保留键不可写"));
         }
         return Ok(ParsedPath::World(key.to_string()));

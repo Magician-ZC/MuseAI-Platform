@@ -1049,6 +1049,35 @@ camelCase 与 snake_case 同形。`known_to` 才受影响，而那一处是类�
 ⚠️ 另一条边界：**存量模板不会被回头校验**，闸只在写入路径上。存量的发现面是运营台的
 `shape.unknownTopLevelKeys` / `shape.unknownNestedKeys` 两栏——**看得见，但不会自动修**。
 
+### 3.17 桌面轨：`appInvoke` 三处手工同步里，类型表多出一个 `read_file`（**修于 2026-07-28**）
+
+本 session 首次扫**桌面轨**。CLAUDE.md 明写着一个三处手工同步的形状：
+「给手机端加命令需要改三处：Tauri command 注册（`lib.rs`）+ `mobile_server.rs` 的 axum 路由 +
+`appInvoke` 的 switch 分支」——手工维护的 N 处判定，正是本文件反复登记的那个形状。
+
+**先核对，两处是干净的**：`appInvoke` 映射出去的 7 条 `/api/mobile/*` 路径，服务端全都提供
+（我第一次提取路由只拿到 8 条、以为对不上，是**我的正则漏了跨行 `.route(`**——
+半份清单不能下结论）；switch 的 `default` 分支是 `throw`（不是静默返回），也对。
+
+**第三处有问题**：TypeScript 的 `AppInvokeCommands` 类型表声明 15 个命令，switch 只有 14 个分支
+——**`read_file` 在表里、没有分支**。`switch (cmd)` 不是穷尽检查，少一个 `case` 照样编译过，
+手机端调它会「类型检查通过、运行时抛异常」。
+
+🔴 **而它不该被补上分支，该从表里删掉**：`read_file` 读的是**任意路径**。进 `appInvoke` 的类型表
+等于宣告「手机端也支持」，而支持就要在 `mobile_server.rs` 上开对应路由——
+那是**在局域网上开任意文件读取**（`~/.ssh/id_rsa` 之类）。CLAUDE.md 的约定本来就是
+「只在桌面用的命令直接 `invoke`，不必进 `appInvoke` 的类型表」。
+
+**当前不可达**（唯一调用方 `bookTravelMaterials.ts` 只被桌面页 `BookTravelMaterials.tsx` 用，
+手机端只渲染 MobileHome/Chat/Story/Bond），所以这是**潜在**缺陷而非活跃 bug。
+但那条声明是一张邀请函：下一个人看到「表里有、switch 没有」，最自然的动作就是补分支。
+
+已改为直接 `invoke` + 从类型表删除，并加 `src/__tests__/runtime-appinvoke-contract.test.ts`
+钉四条：声明⊆分支、分支⊆声明、解析器没坏、**`read_file` 永不回到表里**。
+
+🔵 故障注入两处全红：把 `read_file` 放回类型表（即今天之前的真实状态）→ 两条红；
+删掉一个 switch 分支 → 红。
+
 ### 3.16 「无提现」红线：核过没有出口，但守它的只有一句注释和五个猜出来的 URI（**2026-07-28**）
 
 **核的结论：没有提现出口。** `ledger_accounts.withdrawable` 全仓只有一处写入

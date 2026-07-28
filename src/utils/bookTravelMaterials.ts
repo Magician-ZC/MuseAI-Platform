@@ -1,4 +1,4 @@
-import { appInvoke } from './runtime';
+import { invoke } from '@tauri-apps/api/core';
 import { BookTravelMaterial } from '../stores/useBookTravelStore';
 import { usePartnerStore, compileItemToMarkdown } from '../stores/usePartnerStore';
 
@@ -8,7 +8,13 @@ const fileNameFromPath = (path: string) => {
 };
 
 export const resolveOutlineMaterial = async (path: string): Promise<BookTravelMaterial> => {
-  const content = await appInvoke('read_file', { path });
+  // 🔴 **直接 `invoke`，不走 `appInvoke`**（约定见 CLAUDE.md：只在桌面用的命令不进 appInvoke 的类型表）。
+  //
+  // `read_file` 读的是**任意路径**。把它放进 `appInvoke` 的类型表，等于宣告「手机端也支持」，
+  // 而手机端要支持就得在 `mobile_server.rs` 上开一个对应路由——那是在局域网上开任意文件读取。
+  // 本页（BookTravelMaterials）只在桌面渲染（`App.tsx` 的手机分支只有 MobileHome/Chat/Story/Bond），
+  // 所以正确形态就是直接 `invoke`。
+  const content = await invoke<string>('read_file', { path });
   return {
     id: path,
     title: fileNameFromPath(path),

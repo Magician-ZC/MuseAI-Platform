@@ -2,8 +2,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { resolveOutlineMaterial, resolvePartnerMaterials } from '../utils/bookTravelMaterials';
 import { usePartnerStore } from '../stores/usePartnerStore';
 
-vi.mock('../utils/runtime', () => ({
-  appInvoke: vi.fn(async (command: string, args?: { path?: string }) => {
+// `read_file` 是**桌面专用**命令，直接走 `invoke`（不进 appInvoke 的类型表——
+// 它读任意路径，进了表就等于宣告手机端也支持，见 bookTravelMaterials.ts 的注释）。
+vi.mock('@tauri-apps/api/core', () => ({
+  invoke: vi.fn(async (command: string, args?: { path?: string }) => {
     if (command === 'read_file' && args?.path === '/outline/第一卷.md') {
       return '# 第一卷\n\n主角醒来。';
     }

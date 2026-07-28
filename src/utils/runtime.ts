@@ -86,10 +86,6 @@ export interface AppInvokeCommands {
     args: { name: string; content: string };
     result: void;
   };
-  read_file: {
-    args: { path: string };
-    result: string;
-  };
   convert_character_card_to_silly_tavern: {
     args: {
       request: {

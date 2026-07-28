@@ -120,7 +120,28 @@ pub fn effective_history_with_compaction(
     let Some(compaction) = compaction.filter(|value| !value.summary.trim().is_empty()) else {
         return history.to_vec();
     };
-    let suffix_start = compaction_boundary_suffix_start(history, compaction);
+    let mut suffix_start = compaction_boundary_suffix_start(history, compaction);
+    // 🔴 保留段不得以孤儿 `tool` 开头。
+    //
+    // 它的 `assistant`（带 `tool_calls`）已经被摘要掉了，而 OpenAI / Anthropic 都要求
+    // `tool` 消息必须紧跟在声明了对应 `tool_calls` 的 assistant 之后——否则整个请求 400，
+    // 玩家看到的是「生成失败」。
+    //
+    // ⚠️ **这道跳过在边界选择器里有、在这里没有**，是本函数此前的缺口：
+    // `select_compaction_boundary` 里有 `while start > 0 && history[start].role == "tool"`，
+    // 但那只保证**新算出来的**边界安全；本函数用的是**存下来的** id / index
+    // （历史被编辑过、或记录由更早版本写下时，它可能落到别处）。
+    // 选择器与应用器各自成立才算成立——这正是本仓反复登记的「接缝」形状。
+    //
+    // 向前跳（丢掉孤儿）而不是向后退（把 assistant 拉回来）：那个 assistant 已经在摘要里了，
+    // 拉回来等于同一段内容出现两次。
+    while history
+        .get(suffix_start)
+        .map(|message| message.role.as_str() == "tool")
+        .unwrap_or(false)
+    {
+        suffix_start += 1;
+    }
     let mut compacted = vec![ChatMessage {
         id: None,
         role: "user".to_string(),
@@ -1021,6 +1042,95 @@ mod tests {
         let estimate = chat_message_token_estimate(&msg);
         // role (9->3) + content (2->1) + tool_call_id(0) + tool_calls(call_1(6->2) + read(4->1) + args(24->6)) + 8 = 3+1+0+2+1+6+8 = 21
         assert_eq!(estimate, 21);
+    }
+
+    /// 🔴 **压缩后的保留段不得以孤儿 `tool` 开头。**
+    ///
+    /// 它的 `assistant`（带 `tool_calls`）已被摘要掉，而 OpenAI / Anthropic 都要求
+    /// `tool` 必须紧跟在声明了对应 `tool_calls` 的 assistant 之后——否则整个请求 400，
+    /// 玩家看到「生成失败」。
+    ///
+    /// ⚠️ 这道跳过**在边界选择器里有、在应用器里此前没有**：
+    /// `select_compaction_boundary` 保证的是「新算出来的边界」安全，而应用器用的是
+    /// **存下来的** id / index（历史被编辑过、或记录由更早版本写下时可能落到别处）。
+    /// 两者各自成立才算成立。
+    ///
+    /// ⚠️ `trim_history_to_context_budget` 救不了这一支：它只剥**索引 0** 的 `tool`，
+    /// 而索引 0 此时是压缩摘要那条 `user` 消息。
+    #[test]
+    fn compacted_suffix_never_starts_with_an_orphan_tool() {
+        let msg = |id: &str, role: &str, tc: bool| ChatMessage {
+            id: Some(id.to_string()),
+            role: role.to_string(),
+            content: "x".to_string(),
+            tool_call_id: None,
+            tool_calls: if tc { Some(vec![]) } else { None },
+            thinking_blocks: None,
+        };
+        let history = vec![
+            msg("m1", "user", false),
+            msg("m2", "assistant", true), // 带 tool_calls
+            msg("m3", "tool", false),     // 它的结果
+            msg("m4", "tool", false),     // 同一次调用的第二个结果
+            msg("m5", "assistant", false),
+        ];
+        let compaction = SessionContextCompaction {
+            summary: "早期摘要".to_string(),
+            compacted_through_message_id: Some("m2".to_string()), // 边界落在 assistant 上
+            compacted_through_index: 1,
+            source_message_count: 5,
+            updated_at: 0,
+        };
+
+        let out = effective_history_with_compaction(&history, Some(&compaction));
+        let roles: Vec<&str> = out.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(
+            roles,
+            vec!["user", "assistant"],
+            "🔴 保留段以孤儿 tool 开头，整个请求会被 API 拒掉（400）：{roles:?}"
+        );
+
+        // 也验按 index 的那条回退路径（id 找不到时用）。
+        let by_index = SessionContextCompaction {
+            compacted_through_message_id: None,
+            ..compaction
+        };
+        let out2 = effective_history_with_compaction(&history, Some(&by_index));
+        let roles2: Vec<&str> = out2.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles2, vec!["user", "assistant"], "index 回退路径同样不得留下孤儿");
+    }
+
+    /// 🔴 反方向：边界正常时**不得多丢消息**——跳过只能吃掉孤儿，不能顺手吃掉正常内容。
+    #[test]
+    fn a_healthy_boundary_keeps_every_following_message() {
+        let msg = |id: &str, role: &str| ChatMessage {
+            id: Some(id.to_string()),
+            role: role.to_string(),
+            content: "x".to_string(),
+            tool_call_id: None,
+            tool_calls: None,
+            thinking_blocks: None,
+        };
+        let history = vec![
+            msg("m1", "user"),
+            msg("m2", "assistant"),
+            msg("m3", "user"),
+            msg("m4", "assistant"),
+        ];
+        let compaction = SessionContextCompaction {
+            summary: "早期摘要".to_string(),
+            compacted_through_message_id: Some("m2".to_string()),
+            compacted_through_index: 1,
+            source_message_count: 4,
+            updated_at: 0,
+        };
+        let out = effective_history_with_compaction(&history, Some(&compaction));
+        let roles: Vec<&str> = out.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(
+            roles,
+            vec!["user", "user", "assistant"],
+            "🔴 正常边界后的消息一条都不能少（第一条 user 是摘要）：{roles:?}"
+        );
     }
 
     #[test]

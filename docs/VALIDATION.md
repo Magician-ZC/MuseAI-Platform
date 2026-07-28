@@ -1049,6 +1049,34 @@ camelCase 与 snake_case 同形。`known_to` 才受影响，而那一处是类�
 ⚠️ 另一条边界：**存量模板不会被回头校验**，闸只在写入路径上。存量的发现面是运营台的
 `shape.unknownTopLevelKeys` / `shape.unknownNestedKeys` 两栏——**看得见，但不会自动修**。
 
+### 3.28 上下文压缩：保护在**选择器**里、不在**应用器**里（**修于 2026-07-28**）
+
+按上一节末尾那个观察（「缺陷都在两层之间」）继续找接缝。这一处正是同一形状。
+
+`tool` 消息必须紧跟在声明了对应 `tool_calls` 的 assistant 之后，否则 OpenAI / Anthropic
+**整个请求 400**，玩家看到「生成失败」。
+
+**边界选择器是安全的**（两条路都查过）：
+- `select_turn_based_compaction_boundary` 取第 5 个 `user` 的前一条 → 保留段从 `user` 开始；
+- `select_compaction_boundary` 里有 `while start > 0 && history[start].role == "tool" { start -= 1 }`。
+
+**但应用器 `effective_history_with_compaction` 没有这道跳过。** 它用的不是「刚算出来的边界」，
+而是**存下来的** `compacted_through_message_id` / `compacted_through_index`
+（历史被编辑过、或记录由更早版本写下时，可能落到别处），直接 `index + 1` 取后缀。
+
+已用探针实测：边界落在带 `tool_calls` 的 assistant 上时，应用器吐出
+`["user"(摘要), "tool"(孤儿), "assistant"]`。
+
+⚠️ **`trim_history_to_context_budget` 救不了这一支**：它只剥**索引 0** 的 `tool`，
+而索引 0 此时是压缩摘要那条 `user` 消息。两道保护各自看着都对，接缝处没人管。
+
+修：应用器补上同样的跳过。**向前跳（丢掉孤儿）而不是向后退（把 assistant 拉回来）**
+——那个 assistant 已经在摘要里了，拉回来等于同一段内容出现两次。
+
+🔵 故障注入三处全红：退回不跳过（改动前形态）→ 红；
+跳过写成无条件 `+1` → **正常消息被吃掉**，红；写成只跳一次（`if` 而非 `while`）→
+第二个孤儿残留，红。
+
 ### 3.27 🔴 子代理不继承父级的工具白名单——一次 `subagent` 调用绕过整套限制（**修于 2026-07-28**）
 
 查 agent 文件工具的工作区限制时顺出来的，比原目标严重。

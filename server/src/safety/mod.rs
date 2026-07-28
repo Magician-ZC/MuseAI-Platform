@@ -704,6 +704,18 @@ mod tests {
         const EXEMPT: [&str; 1] = ["admin_api/audit.rs"];
 
         let mut checked: Vec<String> = Vec::new();
+        // 🔴 **未过滤的查询要计数**（恰好一条：`clips` 按 id 单取那条）。
+        //
+        // ⚠️ 这里我先推错了一步，把过程记下来：一开始以为「把豁免条件放宽成 `true`」
+        // 能把红线整个关掉。实测**单独放宽并不红，也确实无害**——本计数数的是
+        // 「SQL 里没有 `moderation` 过滤」的查询数，那是 **SQL 的性质**，与豁免条件无关：
+        // 放宽了却没有东西可豁免，等于什么都没发生。
+        //
+        // 真正危险的是**组合**：放宽豁免 **且** 新增一条未过滤的查询。
+        // 那时本计数从 1 变 2 → 当场红（组合注入实测）。
+        // 也就是说这道计数守的是「未过滤的查询只许有那一条」，
+        // 而不是「豁免条件长什么样」——后者不需要守。
+        let mut exempted: Vec<String> = Vec::new();
         for (path, src) in crate::testkit::production_sources() {
             if EXEMPT.iter().any(|e| path.ends_with(e)) {
                 continue;
@@ -721,14 +733,36 @@ mod tests {
                 if !CONTENT_COLUMNS.iter().any(|c| sql.contains(c)) {
                     continue; // 不取内容（计数 / 坐标 / actors）→ 不在本红线管辖内
                 }
+                // 🔴 **必须出现在过滤位置**，不是「这条 SQL 里有这个词」。
+                //
+                // 第一版只查 `sql.contains("moderation")`——太松：`clips` 有一条
+                // `SELECT ..., moderation FROM world_events WHERE id = $1` 把它放在**列表里**，
+                // 于是断言被满足，而 SQL 层其实一条过滤都没有。那条查询本身是安全的
+                // （按 id 单取、Rust 侧复核，见下方豁免），但红线分不出这两种机制，
+                // 就等于对它没有覆盖——Rust 侧那道检查被删掉也不会红。
+                //
+                // 这是本 session 第二次撞见同一类弱断言（第一次是手机端会话前缀那条）：
+                // **`contains` 型红线要问「这个词出现在哪」，而不是「出现没有」。**
+                let where_clause = sql.find(" WHERE ").map(|i| &sql[i..]).unwrap_or("");
+                let filtered = where_clause.contains("moderation");
+                // 豁免：按 id 单取的那一条无法随列表一起在 SQL 里过滤，改在 Rust 侧复核。
+                // 🔴 豁免的前提是**那道复核有用例钉着**：
+                // `clips::tests` 的「按 id 渲染：即便被指名也拒绝」（`expect_err(Forbidden)`）。
+                // 删掉 Rust 那道检查，那条用例会红——豁免不是免检，是换了个地方检。
+                let rust_side_recheck =
+                    path.ends_with("clips/mod.rs") && sql.contains("WHERE id = $1 AND world_id = $2");
                 assert!(
-                    sql.contains("moderation"),
-                    "🔴 {path} 有一条查询把叙事投影取出了 `world_events`，却没有按 `moderation` 过滤：\n  {sql}\n\
+                    filtered || rust_side_recheck,
+                    "🔴 {path} 有一条查询把叙事投影取出了 `world_events`，而 `moderation` \
+                     **不在过滤位置**（只出现在 SELECT 列表里也不算）：\n  {sql}\n\
                      未过审内容会直接出现在这个读取面上，且不会报任何错。\n\
                      若这个读取面**确实**需要看未过审内容（如人审工作台），请加进本红线的 EXEMPT 并写清理由，\n\
                      不要只把断言改绿。"
                 );
                 checked.push(format!("{path}"));
+                if !filtered {
+                    exempted.push(format!("{path}: {sql}"));
+                }
             }
         }
         // 🔵 **精确棘轮，不是宽松下限**（同 `flags::KNOWN_FLAGS.len()` 那条）。
@@ -749,6 +783,14 @@ mod tests {
         // 补全扫描器之后才是 7。也就是说这条红线曾经把一条测试查询算作「读取面」——
         // 不影响结论（那条查询本来就带 `moderation`），但它说明**棘轮的数字本身也会因为
         // 扫描口径变化而变**，改动时要先弄清是口径变了还是代码变了。
+        assert_eq!(
+            exempted.len(),
+            1,
+            "🔴 SQL 层未过滤、靠 Rust 侧复核的查询应当**恰好一条**（`clips` 按 id 单取那条），\n\
+             当前 {} 条：{exempted:?}\n\
+             变多 = 豁免被扩大（那等于把这条红线关掉一部分），每一条都需要指出钉住它的行为用例。",
+            exempted.len()
+        );
         assert_eq!(
             checked.len(),
             7,

@@ -224,6 +224,10 @@ cd server && MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo ru
 ```bash
 # 引擎 + 后端 + 桌面壳
 cargo test --manifest-path crates/muse-engine/Cargo.toml          # 297 passed
+# 🔵 真实 provider 冒烟（**恒 #[ignore]，绝不进 CI**）：本仓 2026-07-28 之前一次真实模型调用都没发生过
+#    key 只从 env 读，不落盘、不进仓库、不进日志
+# MUSE_SMOKE_API_KEY=sk-... MUSE_SMOKE_BASE_URL=https://api.deepseek.com/v1 MUSE_SMOKE_MODEL=deepseek-chat \
+#   cargo test --manifest-path crates/muse-engine/Cargo.toml real_provider -- --ignored --nocapture
 (cd server && cargo test)                                          # 1121 passed(default,含黄金世界回归)
 (cd server && cargo test --features billing,arena)                 # 1204 passed
 (cd server && cargo test golden)                                   # 14 passed(12 项 runtime::golden::* + 2 项录放 round-trip)

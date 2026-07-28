@@ -451,3 +451,66 @@ pub mod testing {
         assert_eq!(model_call_logs(&events).len(), 2);
     }
 }
+
+#[cfg(all(test, feature = "http"))]
+mod real_provider_smoke {
+    //! 🔵 **一次性冒烟：`HttpModelClient` 到底能不能打通一个真实 provider。**
+    //!
+    //! 本仓库在 2026-07-28 之前**一次真实模型调用都没发生过**——8 个 `ModelClient` 实现里
+    //! 只有 `HttpModelClient` 是真的，其余全是测试替身或包装器，而它从未对着真端点跑过。
+    //! 于是「OpenAI 兼容分支组装得对不对、鉴权头对不对、响应解析对不对」全靠读代码。
+    //!
+    //! 🔴 **恒 `#[ignore]`**：它要网络、要钱、要凭据，绝不能进 CI 的默认那一遍。
+    //! key 只从 `MUSE_SMOKE_API_KEY` 读——**不落盘、不进仓库、不进任何日志**。
+    //!
+    //! 跑法：
+    //! ```bash
+    //! MUSE_SMOKE_API_KEY=sk-... MUSE_SMOKE_BASE_URL=https://api.deepseek.com/v1 \
+    //!   MUSE_SMOKE_MODEL=deepseek-chat \
+    //!   cargo test --manifest-path crates/muse-engine/Cargo.toml real_provider -- --ignored --nocapture
+    //! ```
+    use super::*;
+    use crate::host::CancelFlag;
+
+    #[tokio::test]
+    #[ignore = "需要真实 API Key 与网络；恒不进 CI"]
+    async fn http_model_client_can_actually_talk_to_a_real_provider() {
+        let Ok(key) = std::env::var("MUSE_SMOKE_API_KEY") else {
+            eprintln!("未设 MUSE_SMOKE_API_KEY，跳过");
+            return;
+        };
+        let base = std::env::var("MUSE_SMOKE_BASE_URL")
+            .unwrap_or_else(|_| "https://api.deepseek.com/v1".to_string());
+        let model = std::env::var("MUSE_SMOKE_MODEL").unwrap_or_else(|_| "deepseek-chat".to_string());
+
+        let client = HttpModelClient::new().expect("建客户端");
+        let spec = ModelCallSpec {
+            profile: ModelProfile {
+                interface: ModelInterface::OpenAiCompatible,
+                base_url: base.clone(),
+                api_key: key,
+                model: model.clone(),
+            },
+            // 用一个**引擎里真的会用到的形状**：本仓所有环节都要求模型输出严格 JSON，
+            // 冒烟若只问「你好」，就验不到 `extract_json_payload` 这条必经之路。
+            system: "只输出一个 JSON 对象，形如 {\"ok\":true}。不要解释，不要代码块围栏。".into(),
+            user: "确认连通".into(),
+            temperature: 0.0,
+            max_output_tokens: 64,
+            agent: "smoke".into(),
+            prompt_version: "v0".into(),
+            run_id: "smoke".into(),
+            max_retries: Some(1),
+        };
+
+        let out = client.complete(&spec, &CancelFlag::new()).await.expect("真实调用应成功");
+        println!(
+            "SMOKE base={base} model={model} in={:?} out={:?} content={:?}",
+            out.input_tokens, out.output_tokens, out.content
+        );
+        assert!(!out.content.trim().is_empty(), "真实 provider 回了空 content");
+        // 🔴 走一遍引擎真正用的那条解析路径，而不是只看「有没有回字」。
+        let v = extract_json_payload(&out.content).expect("引擎的 JSON 提取应能吃下真实输出");
+        assert!(v.is_object(), "应是一个 JSON 对象，实得 {v}");
+    }
+}

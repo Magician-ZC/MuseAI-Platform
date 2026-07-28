@@ -677,4 +677,77 @@ mod tests {
         assert!(runtime_audit_admits(Severity::High));
         assert!(!runtime_audit_admits(Severity::Low));
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // 🔴 读取面红线：叙事投影出库必须带审核过滤
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// §15 第 2 层的「读取面过滤」是**在每个读取面手工写一遍 `moderation` 条件**维护的
+    /// （`events` / `reports` / `clips` / `arena` / `livestage` / `safety::semantic`）。
+    /// 手工维护 N 处同一判定，就是本仓反复栽的那个跟头——2026-07-28 逐条核过一遍是干净的，
+    /// 但「核过一次」不等于「以后也对」：**下一个读取面漏写这一条，违规内容就直接可见，且没有任何征兆**。
+    ///
+    /// 判据：任何从 `world_events` 取**叙事投影**（`public_projection_json` /
+    /// `private_projections_json` / `arbiter_note`）的查询，SQL 文本里必须出现 `moderation`。
+    /// 计数 / 取坐标 / 取 `actors_json` 的查询不在此列——它们不把内容交给任何人。
+    ///
+    /// 豁免只有一处，且必须说得出理由：
+    /// - `admin_api/audit.rs`（人审工作台）—— 它的**职责就是看未过审内容**，过滤掉就没得审了。
+    ///
+    /// ⚠️ 扫描走 `testkit::production_sources()`（花括号配平剥测试模块）：本仓的内联测试模块
+    /// 不止叫 `tests`，按名字截断会把测试夹具当生产码扫（那个坑已经踩过一次）。
+    #[test]
+    fn red_line_narrative_projections_never_leave_the_db_unfiltered() {
+        const CONTENT_COLUMNS: [&str; 3] =
+            ["public_projection_json", "private_projections_json", "arbiter_note"];
+        /// 人审工作台：职责就是看未过审内容。
+        const EXEMPT: [&str; 1] = ["admin_api/audit.rs"];
+
+        let mut checked: Vec<String> = Vec::new();
+        for (path, src) in crate::testkit::production_sources() {
+            if EXEMPT.iter().any(|e| path.ends_with(e)) {
+                continue;
+            }
+            // 逐个字符串字面量看：跨行 SQL 用 `\` 续行，先把续行折平再判。
+            for lit in src.split('"').skip(1).step_by(2) {
+                let sql: String = lit.split('\\').collect::<Vec<_>>().join(" ");
+                let sql = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+                if !sql.contains("FROM world_events")
+                    || sql.contains("INSERT")
+                    || sql.contains("UPDATE")
+                {
+                    continue;
+                }
+                if !CONTENT_COLUMNS.iter().any(|c| sql.contains(c)) {
+                    continue; // 不取内容（计数 / 坐标 / actors）→ 不在本红线管辖内
+                }
+                assert!(
+                    sql.contains("moderation"),
+                    "🔴 {path} 有一条查询把叙事投影取出了 `world_events`，却没有按 `moderation` 过滤：\n  {sql}\n\
+                     未过审内容会直接出现在这个读取面上，且不会报任何错。\n\
+                     若这个读取面**确实**需要看未过审内容（如人审工作台），请加进本红线的 EXEMPT 并写清理由，\n\
+                     不要只把断言改绿。"
+                );
+                checked.push(format!("{path}"));
+            }
+        }
+        // 🔵 **精确棘轮，不是宽松下限**（同 `flags::KNOWN_FLAGS.len()` 那条）。
+        //
+        // 一开始写成 `>= 5`。实测下限盖不住「扫描器坏了」这一支：让 `production_sources`
+        // 漏掉一个目录，条数 8 → 6，宽松下限照样绿，精确值当场红。
+        //
+        // ⚠️ 但它**不是万能的**，这一点必须写清楚而不是含糊过去：同样是扫描器退化，
+        // 把 `production_sources` 退回「按 `\nmod tests {` 截断」，实测**仍然是 8 条、仍然绿**
+        // ——因为这 8 条恰好都不在内联测试模块之后，那种截断刚好没削到它们。
+        // 也就是说本棘轮挡的是「条数变了」，不是「扫描器一定还健康」；
+        // 扫描器本身的正确性由 `testkit` 那一侧的注释与用例负责。
+        assert_eq!(
+            checked.len(),
+            8,
+            "取叙事投影的查询数变了（当前扫到 {} 条：{checked:?}）。\n\
+             变多 = 新增了读取面，请确认它写了 `moderation` 过滤（若已写，本数字加一即可）；\n\
+             变少 = 要么读取面被删了，要么**扫描器坏了**（后者更危险：红线会静默失效）。",
+            checked.len()
+        );
+    }
 }

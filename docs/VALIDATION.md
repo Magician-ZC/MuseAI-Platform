@@ -1049,6 +1049,29 @@ camelCase 与 snake_case 同形。`known_to` 才受影响，而那一处是类�
 ⚠️ 另一条边界：**存量模板不会被回头校验**，闸只在写入路径上。存量的发现面是运营台的
 `shape.unknownTopLevelKeys` / `shape.unknownNestedKeys` 两栏——**看得见，但不会自动修**。
 
+### 3.10 §15 第 2 层「读取面过滤」是手工维护的 N 处判定（**钉住于 2026-07-28**）
+
+台账里「`events`/`reports`/`clips`/`arena` 全部读取面过滤」这句，2026-07-28 逐条核过
+——**是准确的**，没有发现漏网的读取面（把 `world_events` 的每一条 SELECT 都过了一遍：
+返回叙事投影的六处全部带 `moderation` 条件；其余是计数 / 取坐标 / 取 `actors_json`，不交付内容）。
+
+但「核过一次」不等于「以后也对」：这道过滤是**在每个读取面手工写一遍 SQL 条件**维护的，
+而下一个读取面漏写这一条，违规内容就直接可见、且没有任何征兆。这正是本文件反复登记的形状
+（同一判定的 N 份手工拷贝），所以核完之后把它钉住：
+
+`safety::tests::red_line_narrative_projections_never_leave_the_db_unfiltered` —— 扫全部生产源码，
+任何从 `world_events` 取 `public_projection_json` / `private_projections_json` / `arbiter_note`
+的查询，SQL 文本必须含 `moderation`。豁免只有 `admin_api/audit.rs`（人审工作台的职责就是看未过审内容）。
+
+🔵 故障注入：clips 高光选取去掉过滤 → 红；把 clips 加进豁免名单（给红线开后门）→ 红。
+扫描走 `testkit::production_sources()`（花括号配平剥测试模块），读的是**源码文件**，
+故 feature 门控的 `arena` / `clips` 在 default 那遍也照样被扫到（注入实测确认）。
+
+⚠️ 条数用**精确棘轮**（8）而不是宽松下限，理由与 `flags::KNOWN_FLAGS.len()` 同：
+实测让扫描器漏掉一个目录，条数 8 → 6，宽松下限照样绿、精确值当场红。
+**但它不是万能的**：同样是扫描器退化，退回「按 `\nmod tests {` 截断」实测**仍是 8 条、仍绿**
+——那 8 条恰好都不在内联测试模块之后。本棘轮挡的是「条数变了」，不是「扫描器一定还健康」。
+
 ### 3.9 创作者模板的机审覆盖面：包含表 → 排除表（**修于 2026-07-27**）
 
 §3.8 查骨架手读键时顺出来的，但性质不同、也更重：这不是「功能静默退化」，是**内容绕过机审**。

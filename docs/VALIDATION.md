@@ -1049,6 +1049,45 @@ camelCase 与 snake_case 同形。`known_to` 才受影响，而那一处是类�
 ⚠️ 另一条边界：**存量模板不会被回头校验**，闸只在写入路径上。存量的发现面是运营台的
 `shape.unknownTopLevelKeys` / `shape.unknownNestedKeys` 两栏——**看得见，但不会自动修**。
 
+### 3.11 资产单一写入（§0.2 平台红线）此前只有注释和行为用例（**钉住于 2026-07-28**）
+
+全仓有十来处注释写着「铸卡的唯一入口是 `subplot::grant_card_tx`」「道具唯一写入路径是
+`backpack::grant_item_tx`」，`ifline` 那边也有行为用例钉「if 线不得铸卡」。
+**但那些用例证明的是「某一个模块没违反」，不是「没有别的模块违反」**——
+下一个模块直接 `INSERT INTO subplot_cards` 就凭空造出了资产，一条用例都不会红。
+
+`assets::tests::red_line_each_asset_table_has_exactly_one_minter`：每张资产表，生产码里
+只有登记的模块可以 INSERT。登记如下（**逐条核过，本身没有发现违规**）：
+
+| 表 | 合法铸造点 |
+|---|---|
+| `subplot_cards` | `subplot/mod.rs`（if 线只改状态 owned→consumed，不铸） |
+| `items` / `backpacks` | `backpack/mod.rs`（付费售卖 `shop` 复用 `grant_item_tx`） |
+| `ledger_postings` / `ledger_journals` | `ledger/mod.rs` |
+| `world_contributions` | `progression/mod.rs` |
+| `cloud_characters` | **两个，都是有意的**：`assets/mod.rs`（玩家发布）+ `onboarding/mod.rs`（新手礼包预制卡） |
+
+只管 INSERT 不管 UPDATE 是刻意的：铸造是「无中生有」，状态流转（if 线消耗卡、memorial 归还携带道具）
+各自带 CAS 与用例，塞进同一条断言只会让红线失去焦点。
+
+🔵 故障注入：在 `livegate` 里加一句 `INSERT INTO subplot_cards` → 红；把表名写错 → 红
+（「一个铸造点都没扫到」那一支，防的是扫描器失效）。
+
+#### 🔴 上线时当场撞出 `testkit::production_sources` 的一个真缺陷
+
+它只剥**文件内**的 `#[cfg(test)] mod X { .. }` 块，**不认**「声明在父模块、实现在另一个文件」的
+`#[cfg(test)] mod NAME;`。于是 `runtime/golden.rs` / `runtime/simulation.rs` 这类**整文件测试夹具**
+一直被当生产码扫——它们里面全是 `INSERT INTO cloud_characters` 之类的播种语句。
+
+这不是只影响新红线：**先前四条红线都在用这个扫描器**。补全之后有一条读数当场变了——
+§3.10 那个精确棘轮从 8 降到 7，掉的是 `runtime/golden.rs` 的一条回归快照查询。
+不影响那条红线的结论（那条查询本来就带 `moderation`），但它说明**棘轮的数字也会因为扫描口径
+变化而变**，改动时要先弄清是口径变了还是代码变了。这一段已写进那条红线的注释里。
+
+⚠️ 顺带记一次我自己的错法：第一次查这件事我用的是 `grep -v tests`（按**路径**过滤），
+`assembly/mod.rs` 里一个叫 `seed_subplot_card` 的测试播种函数当场被误报成第二个铸卡点
+——本仓的内联测试模块不止叫 `tests`。这个坑本 session 已经踩过两次，两次都是同一个原因。
+
 ### 3.10 §15 第 2 层「读取面过滤」是手工维护的 N 处判定（**钉住于 2026-07-28**）
 
 台账里「`events`/`reports`/`clips`/`arena` 全部读取面过滤」这句，2026-07-28 逐条核过

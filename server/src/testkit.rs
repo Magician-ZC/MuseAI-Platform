@@ -406,9 +406,85 @@ pub fn production_sources() -> Vec<(String, String)> {
             out.push((rel, strip_test_mods(&src)));
         }
     }
+    /// 收集**整文件测试专用**的模块：父模块里写成 `#[cfg(test)] mod NAME;` 的那些。
+    ///
+    /// 🔴 上面的 `strip_test_mods` 只认**文件内**的 `#[cfg(test)] mod X { .. }` 块，
+    /// 不认这种「声明在父模块、实现在另一个文件」的形态。漏掉它的后果是把
+    /// `runtime/golden.rs` / `runtime/simulation.rs` 这类**测试夹具文件当生产码扫**——
+    /// 它们里面有大量 `INSERT INTO cloud_characters` 之类的播种语句，
+    /// 于是任何「生产码里只许有一个写入点」的红线都会被它们误报。
+    /// （`assets::tests::red_line_each_asset_table_has_exactly_one_minter` 上线时当场撞上，
+    /// 那次误报正是本函数被补全的原因。）
+    ///
+    /// 返回相对 `src/` 的路径前缀集合：`runtime/golden` 会同时挡掉
+    /// `runtime/golden.rs` 与 `runtime/golden/` 整个目录。
+    fn test_only_module_paths(root: &std::path::Path) -> std::collections::BTreeSet<String> {
+        fn scan(dir: &std::path::Path, root: &std::path::Path, out: &mut std::collections::BTreeSet<String>) {
+            let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+                .unwrap_or_else(|e| panic!("读目录 {dir:?}：{e}"))
+                .map(|e| e.expect("目录项").path())
+                .collect();
+            entries.sort();
+            for path in entries {
+                if path.is_dir() {
+                    scan(&path, root, out);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let src = std::fs::read_to_string(&path).unwrap_or_default();
+                // 该文件所在的模块目录（`a/b/mod.rs` → `a/b`；`a/b.rs` → `a`）。
+                let parent = path.parent().unwrap_or(root);
+                let base = if path.file_name().and_then(|n| n.to_str()) == Some("mod.rs") {
+                    parent.to_path_buf()
+                } else {
+                    parent.to_path_buf()
+                };
+                let mut i = 0usize;
+                while let Some(rel) = src[i..].find("#[cfg(test)]") {
+                    let m = i + rel;
+                    let after = m + "#[cfg(test)]".len();
+                    let head = src[after..].trim_start();
+                    i = after;
+                    // 只认 `mod NAME;`（外置声明）；`mod NAME {` 由 strip_test_mods 处理。
+                    let Some(rest) = head.strip_prefix("mod ") else { continue };
+                    let Some(semi) = rest.find(';') else { continue };
+                    if rest[..semi].contains('{') {
+                        continue;
+                    }
+                    let name = rest[..semi].trim();
+                    if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                        continue;
+                    }
+                    let rel_prefix = base
+                        .join(name)
+                        .strip_prefix(root)
+                        .expect("相对路径")
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    out.insert(rel_prefix);
+                }
+            }
+        }
+        let mut out = std::collections::BTreeSet::new();
+        scan(root, root, &mut out);
+        out
+    }
+
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let test_only = test_only_module_paths(&root);
     let mut out = Vec::new();
     walk(&root, &root, &mut out);
+    out.retain(|(rel, _)| {
+        let stem = rel.strip_suffix(".rs").unwrap_or(rel);
+        !test_only.iter().any(|t| stem == t || rel.starts_with(&format!("{t}/")))
+    });
     assert!(out.len() > 50, "🔴 源码遍历只收到 {} 个文件，扫描口径坏了", out.len());
+    assert!(
+        !test_only.is_empty(),
+        "🔴 一个整文件测试模块都没识别出来（`#[cfg(test)] mod NAME;`）——本仓至少有 \
+         `runtime::golden` / `runtime::simulation`。识别失效会让测试夹具被当生产码扫。"
+    );
     out
 }

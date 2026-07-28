@@ -783,3 +783,71 @@ async fn approved_card_writes_no_audit_no_risk() {
     assert_eq!(aq, 0, "approved 卡不入审核队列");
     assert_eq!(risk, 0, "approved 卡不记风控事件");
 }
+
+// ============================================================================
+// 🔴 平台红线：资产单一写入路径（§0.2）
+// ============================================================================
+
+/// **「不凭空造资产」目前是靠散落的注释 + 几条行为用例维护的。**
+///
+/// 全仓有十来处注释写着「铸卡的唯一入口是 `subplot::grant_card_tx`」「道具唯一写入路径是
+/// `backpack::grant_item_tx`」之类，`ifline` 那边也有行为用例钉「if 线不得铸卡」。
+/// 但那些用例证明的是**某一个模块没违反**，不是**没有别的模块违反**——
+/// 下一个模块直接 `INSERT INTO subplot_cards` 就凭空造出了资产，一条用例都不会红。
+///
+/// 这一条把它变成全局不变式：**每张资产表，生产码里只有登记的那个模块可以 INSERT**。
+///
+/// 只管 INSERT，不管 UPDATE——刻意的。铸造是「无中生有」，是红线本身；
+/// 状态流转（`ifline` 把卡 `owned → consumed`、`memorial` 归还携带道具）是既有的、
+/// 各自带 CAS 与用例的合法路径，把它们塞进同一条断言只会让这条红线失去焦点。
+///
+/// ⚠️ 扫描走 `testkit::production_sources()`（花括号配平剥测试模块）。
+/// 这不是讲究：我第一次用 `grep -v tests` 查这件事时，`assembly` 里一个叫
+/// `seed_subplot_card` 的**测试播种函数**当场被误报成第二个铸卡点——本仓的内联测试模块
+/// 不止叫 `tests`（`sampling_tests` / `container_tests` / `cors_tests` …）。
+#[test]
+fn red_line_each_asset_table_has_exactly_one_minter() {
+    /// 表 → 允许 INSERT 的生产文件。多于一个即需在此显式列出并说明理由。
+    const MINTERS: &[(&str, &[&str])] = &[
+        // 副本卡：结算铸卡 + 同星合成，都在 subplot 内。if 线只改状态（owned → consumed）。
+        ("subplot_cards", &["subplot/mod.rs"]),
+        // 道具与背包：`backpack::grant_item_tx` 是唯一发放口，付费售卖（shop）复用它。
+        ("items", &["backpack/mod.rs"]),
+        ("backpacks", &["backpack/mod.rs"]),
+        // 复式账本：分录与流水只由 ledger 写；billing 的充值/退款走 ledger 的入口。
+        ("ledger_postings", &["ledger/mod.rs"]),
+        ("ledger_journals", &["ledger/mod.rs"]),
+        // 世界线贡献（戏份账本）：只有结算写。
+        ("world_contributions", &["progression/mod.rs"]),
+        // 🔴 角色卡有**两个**合法铸造口，两个都是有意的，故显式列全：
+        //   · `assets/mod.rs`  —— 玩家发布自己的卡（主路径）
+        //   · `onboarding/mod.rs` —— 新手礼包发预制卡（默认关闭的 `MUSE_ONBOARDING`；
+        //     那处 INSERT 的注释里已写明 `source_fingerprint=NULL` + `pristine=0` 两道保险）
+        // 出现第三个就是红线破了。
+        ("cloud_characters", &["assets/mod.rs", "onboarding/mod.rs"]),
+    ];
+
+    for (table, allowed) in MINTERS {
+        let needle = format!("INSERT INTO {table}");
+        let mut found: Vec<String> = Vec::new();
+        for (path, src) in crate::testkit::production_sources() {
+            if src.contains(&needle) {
+                found.push(path);
+            }
+        }
+        let unexpected: Vec<&String> =
+            found.iter().filter(|p| !allowed.iter().any(|a| p.ends_with(a))).collect();
+        assert!(
+            unexpected.is_empty(),
+            "🔴 资产表 `{table}` 出现了未登记的铸造点：{unexpected:?}\n\
+             §0.2「资产单一写入路径」：凭空 INSERT 就是凭空造资产。\n\
+             若这个新入口**确实**合法，请加进本红线的 MINTERS 并写清它为什么该存在，\n\
+             不要只把断言改绿。已登记的入口：{allowed:?}"
+        );
+        assert!(
+            !found.is_empty(),
+            "🔴 资产表 `{table}` 一个铸造点都没扫到——要么表被改名了，要么**扫描器坏了**\n\
+             （后者更危险：这条红线会静默失效）。已登记的入口：{allowed:?}"
+        );
+    }
+}

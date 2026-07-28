@@ -14,6 +14,34 @@ use super::types::{DomainEvent, NarrativeState, PatchOp, RoleDecision, StatePatc
 /// critic 模型层默认输出上限。
 const CRITIC_MAX_TOKENS: u32 = 1500;
 
+/// I1 逐字泄露检查的**最短私密片段**（Unicode 字符数）。**误伤控制闸**，
+/// **参数化集中点**（`docs/VALIDATION.md` §0.2）。
+///
+/// # 为什么必须有这个下限
+///
+/// I1 是 `prose.contains(secret)` ——**字面子串匹配**。一条 1-2 个字的 secret
+/// （模型抽卡时完全可能产出「钱」「他」「毒」这种）会命中几乎任何一段正文。
+///
+/// 而 I1 的失败后果是**整回合阻断、不提交任何状态**。secrets 又持久存在于
+/// `NarrativeState` 里——于是下一拍再算一次、再阻断一次。
+/// 🔴 **那个世界会永远卡死**，症状是「每一拍都 blocked」，而原因是一个字。
+///
+/// # 这不是新判断，是把已经学过的一课补到第二处
+///
+/// `arbiter::MIN_FORBIDDEN_CHARS`（同为 3）早就写着同一件事：
+/// 「低于此长度的底线（「不逃」→「逃」）字面匹配会大面积误伤」。
+/// 同一个判断此前只有一处做对了——而**做错的这一处失败后果更重**
+/// （那边是误伤一个动作，这边是整个世界停摆）。
+///
+/// # ⚠️ 代价说清楚：短于此长度的 secret **不再被 I1 检查**
+///
+/// 这是有意的取舍，不是遗漏。一个 1-2 字的字符串出现在正文里**本来也不构成
+/// 「逐字泄露」**——它不携带关于那条私密的任何信息（「钱」出现在任何一段江湖叙事里
+/// 都毫不意外）。也就是说这段区间里，检查的保护价值≈0 而误伤率≈100%。
+/// 真正该管的是**卡录入时**就不该产出这种 secret，那属于另一道门（见 §3.43 同款思路：
+/// 在有人的时候拒绝）。
+const MIN_SECRET_CHARS: usize = 3;
+
 /// 确定性不变量（失败即整回合阻断，§2.4：100% 通过是发布阻断门）：
 /// I1 未授权私密字段不得进入其他角色可见产物（prose 中不得出现未揭露 secrets 原文）
 /// I2 StatePatch 只能由本回合 outcomes 派生（source_decision_ids ⊆ 本回合 decision id 集）
@@ -36,7 +64,12 @@ pub fn deterministic_invariants(
     for (cid, cs) in &state.characters {
         for secret in &cs.secrets {
             let s = secret.trim();
-            if !s.is_empty() && prose.contains(s) {
+            // 🔴 长度闸在 `contains` **之前**：见 `MIN_SECRET_CHARS`。
+            // 少了它，一条一个字的 secret 会把整个世界永久卡在「每拍 blocked」上。
+            if s.chars().count() < MIN_SECRET_CHARS {
+                continue;
+            }
+            if prose.contains(s) {
                 violations.push(format!("I1: 正文逐字泄露角色 {cid} 的私密内容「{s}」"));
             }
         }
@@ -221,6 +254,47 @@ mod tests {
         let prose = "众人震惊：原来我下毒害死了国王！";
         let v = deterministic_invariants(&s, &[], &p, &[], prose, &active());
         assert!(v.iter().any(|x| x.starts_with("I1")), "应检出 I1：{v:?}");
+    }
+
+    /// 🔴 **一个字的 secret 不许把整个世界永久卡死。**
+    ///
+    /// I1 是 `prose.contains(secret)` 字面子串匹配，而它的失败后果是**整回合阻断、
+    /// 不提交任何状态**；secrets 又持久存在于 `NarrativeState` 里——
+    /// 于是下一拍再算一次、再阻断一次，**那个世界永远出不来**。
+    /// 症状是「每一拍都 blocked」，而原因是一个字。
+    ///
+    /// 这不是新判断：`arbiter::MIN_FORBIDDEN_CHARS`（同为 3）早就写着同一件事
+    /// （「不逃」→「逃」字面匹配会大面积误伤）。同一个判断此前**只有一处做对了**，
+    /// 而做错的这一处失败后果更重——那边误伤一个动作，这边是整个世界停摆。
+    #[test]
+    fn i1_does_not_deadlock_a_world_over_a_one_character_secret() {
+        let mut s = state_with_secret();
+        // 模型抽卡完全可能产出这种「私密」。
+        s.characters.get_mut("A").unwrap().secrets.push("他".into());
+        s.characters.get_mut("A").unwrap().secrets.push("毒".into());
+        let p = patch("p1", vec![], vec![]);
+        // 一段与那条真 secret 无关、但必然含「他」「毒」的普通正文。
+        let prose = "他在桌上放下一包毒药，转身离去。";
+        let v = deterministic_invariants(&s, &[], &p, &[], prose, &active());
+        assert!(
+            v.is_empty(),
+            "🔴 一两个字的 secret 命中普通正文 → 整回合阻断 → 世界永久卡死。实得：{v:?}"
+        );
+    }
+
+    /// 反向配对：**达到长度门槛的 secret 仍然必须被抓住**。
+    ///
+    /// 只测「短的不许误伤」的话，把 I1 整个删掉也能全绿——那就把私密泄露的门拆了。
+    #[test]
+    fn i1_still_catches_a_secret_at_the_length_threshold() {
+        let mut s = state_with_secret();
+        s.characters.get_mut("A").unwrap().secrets.push("私生子".into()); // 恰好 3 字
+        let p = patch("p1", vec![], vec![]);
+        let v = deterministic_invariants(&s, &[], &p, &[], "众人才知他是私生子。", &active());
+        assert!(
+            v.iter().any(|x| x.contains("私生子")),
+            "🔴 恰好达到门槛的 secret 必须仍被 I1 抓住，否则这道门就是拆了：{v:?}"
+        );
     }
 
     #[test]

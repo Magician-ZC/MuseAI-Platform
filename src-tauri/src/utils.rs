@@ -563,6 +563,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 🔴 **rename 失败时不许留下临时文件**（`docs/VALIDATION.md` §3.47 欠账 A2）。
+    ///
+    /// 登记这条欠账时我写的是「测试里造不出『文件写成了但 rename 失败』的情形
+    /// （需要跨文件系统或权限构造）」。**那句话没走一遍就写了**——
+    /// 其实有一个再简单不过的构造：**让目标路径是一个非空目录**。
+    /// 临时文件会正常写成，`fs::rename` 到目录上必然失败（EISDIR/ENOTEMPTY）。
+    ///
+    /// 这条路径若不清理，`config/` 与 `agent-sessions/` 会随每次失败攒下垃圾文件，
+    /// 而失败本身是静默的（`write_atomic` 只把错误往上抛，调用方多半只 log）。
+    ///
+    /// ⚠️ `#[cfg(unix)]`：Windows 上 `MoveFileEx` 对「目标是目录」的行为与 Unix 不同，
+    /// 那是**构造手法**的平台差异，不是被测行为的差异。
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_cleans_up_its_temp_file_when_the_rename_fails() {
+        let dir = temp_dir("atomic-rename-fail");
+        // 目标路径是一个**非空目录** → rename 必然失败。
+        let target = dir.join("target.json");
+        std::fs::create_dir_all(&target).expect("把目标建成目录");
+        std::fs::write(target.join("occupant"), "x").expect("让它非空");
+
+        let err = super::write_atomic(&target, "新内容").expect_err("rename 到非空目录必须失败");
+        assert!(!err.is_empty(), "错误信息不该是空的：{err:?}");
+
+        // 🔴 关键断言：目录里除了那个目标目录，不许多出任何 `.tmp-*` 残留。
+        let left: Vec<String> = std::fs::read_dir(&dir)
+            .expect("列目录")
+            .map(|e| e.expect("目录项").file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            left,
+            vec!["target.json".to_string()],
+            "🔴 rename 失败后临时文件没被清掉，`config/` 会随每次失败攒垃圾：{left:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 🔴 **本函数存在的全部理由**：目标文件从头到尾没有被原地改过。
     ///
     /// `fs::write` 是「先把目标截成 0 再写」——进程在这中间死掉（崩溃 / Cmd-Q / kill / OOM），

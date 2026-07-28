@@ -9,7 +9,7 @@ interface MarkdownEditorProps {
 
 type SaveStatus = 'saved' | 'saving' | 'error';
 
-interface EditorFileState {
+export interface EditorFileState {
   content: string;
   savedContent: string;
   imagePreviewSrc: string;
@@ -64,7 +64,7 @@ const initialEditorFileState: EditorFileState = {
  * 而这两处一个管「正常节奏下的保存」、一个管「最后 800 毫秒」，判据不一致的后果
  * 恰恰是最难复现的那一类（只在切文件的瞬间发作）。
  */
-const shouldPersist = (state: EditorFileState, filePath: string | null, readOnly: boolean): boolean => {
+export const shouldPersist = (state: EditorFileState, filePath: string | null, readOnly: boolean): boolean => {
   if (readOnly || !filePath || isImageFile(filePath)) return false;
   if (state.loading || state.readError) return false;
   // 🔴 内容必须确实来自这个文件，否则就是在把 A 的正文写进 B。

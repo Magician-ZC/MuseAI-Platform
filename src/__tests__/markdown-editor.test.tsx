@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import { invoke } from '@tauri-apps/api/core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import MarkdownEditor from '../components/MarkdownEditor';
+import { shouldPersist } from '../components/MarkdownEditorImpl';
 
 const invokeMock = vi.mocked(invoke);
 
@@ -306,5 +307,50 @@ describe('MarkdownEditor', () => {
     });
 
     expect(invokeMock).not.toHaveBeenCalledWith('write_file', expect.anything());
+  });
+});
+
+/**
+ * 🔴 **「A 的正文绝不许被写进 B」——直接测判据本身。**
+ *
+ * `docs/VALIDATION.md` §3.47 欠账 A4：登记时我写的是「这条只能算纵深防御，
+ * 故障注入证明不了它今天在挡什么（那一帧之后的重渲染远快于 800ms）」。
+ * **那句话没走一遍就写了**——判据早就被抽成了纯函数 `shouldPersist`，
+ * 直接调它就能把那一帧钉死，根本不需要构造「让重渲染慢过 800ms」。
+ *
+ * 那一帧是真实存在的：`text-load-start` 刻意保留上一个文件的 `content`
+ * （换文件时编辑区不闪空白），于是「filePath 已是新文件、content 还是旧文件的」
+ * 会真的出现一次。此前只有「重渲染比计时器快」在拦它。
+ */
+describe('shouldPersist（落盘判据本身）', () => {
+  const base = {
+    content: '新打的字',
+    savedContent: '旧内容',
+    imagePreviewSrc: '',
+    loading: false,
+    saveStatus: 'saving' as const,
+    readError: false,
+    loadedPath: '/w/a.md',
+  };
+
+  it('内容来自 a.md 时，绝不写进 b.md', () => {
+    expect(shouldPersist(base, '/w/a.md', false)).toBe(true);
+    expect(shouldPersist(base, '/w/b.md', false)).toBe(false);
+  });
+
+  it('内容不属于任何文件（加载中 / 读失败）时一个字节都不写', () => {
+    expect(shouldPersist({ ...base, loadedPath: null }, '/w/a.md', false)).toBe(false);
+    expect(shouldPersist({ ...base, loading: true }, '/w/a.md', false)).toBe(false);
+    // 读失败时 content 是一句「**读取文件失败**: …」的提示文案，绝不是正文。
+    expect(
+      shouldPersist({ ...base, readError: true, content: '**读取文件失败**: boom', loadedPath: null }, '/w/a.md', false),
+    ).toBe(false);
+  });
+
+  it('只读、无文件、图片一律不写；没有未保存改动也不写', () => {
+    expect(shouldPersist(base, '/w/a.md', true)).toBe(false);
+    expect(shouldPersist(base, null, false)).toBe(false);
+    expect(shouldPersist({ ...base, loadedPath: '/w/a.png' }, '/w/a.png', false)).toBe(false);
+    expect(shouldPersist({ ...base, content: base.savedContent }, '/w/a.md', false)).toBe(false);
   });
 });

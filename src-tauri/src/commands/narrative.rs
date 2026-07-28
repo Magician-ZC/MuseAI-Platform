@@ -121,6 +121,9 @@ pub async fn start_narrative_round(app: AppHandle, request: RoundRequestDto) -> 
             prompt_version: request.prompts.prompt_version.unwrap_or_else(|| "v1".into()),
         };
         let input = RoundInput {
+            // 观众礼物（平台 open-decisions §5）：**桌面轨没有观众**——本地单机跑，
+            // 没有直播间、没有打赏入口。恒空不是「暂未接线」，是这条链上不存在这个概念。
+            ambient_events: Vec::new(),
             run_id: request.run_id.clone(),
             mode: request.mode,
             active_cards: request.active_cards,

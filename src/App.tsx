@@ -31,6 +31,10 @@ import Wallet from './pages/platform/Wallet';
 import ArenaHost from './pages/platform/ArenaHost';
 import ArenaSpectate from './pages/platform/ArenaSpectate';
 import ArenaReplay from './pages/platform/ArenaReplay';
+import JourneyHome from './pages/platform/journey/JourneyHome';
+import { JourneyInvitations, JourneyOnboarding, JourneyOoc } from './pages/platform/journey/JourneyBeginnings';
+import { JourneyIfline, JourneyMemorial, JourneySubplot } from './pages/platform/journey/JourneyStories';
+import { JourneyChapters, JourneyLive, JourneySocial } from './pages/platform/journey/JourneyConnections';
 
 // Mobile components
 import MobileShell from './components/MobileShell';
@@ -50,6 +54,8 @@ import './App.css';
 function App() {
   const setWorksDirectory = useSettingsStore((s) => s.setWorksDirectory);
   const mobileEnv = isMobile();
+  // 平台世界有自己的响应式外壳；不能因为窄屏就把 /platform/* 静默替换成旧移动端首页。
+  const platformRoute = typeof window !== 'undefined' && window.location.pathname.startsWith('/platform');
   const tauriHost = isTauriHost();
 
   useEffect(() => {
@@ -84,7 +90,7 @@ function App() {
   return (
     <Router>
       <Routes>
-        {mobileEnv ? (
+        {mobileEnv && !platformRoute ? (
           <Route path="/" element={<MobileShell />}>
             <Route index element={<MobileHome />} />
             <Route path="chat" element={<MobileChat />} />
@@ -120,6 +126,16 @@ function App() {
               <Route path="characters/:cid" element={<RequireAuth><CharacterArchive /></RequireAuth>} />
               <Route path="backpack" element={<RequireAuth><Backpack /></RequireAuth>} />
               <Route path="bonds" element={<RequireAuth><Bonds /></RequireAuth>} />
+              <Route path="journey" element={<RequireAuth><JourneyHome /></RequireAuth>} />
+              <Route path="journey/onboarding" element={<RequireAuth><JourneyOnboarding /></RequireAuth>} />
+              <Route path="journey/invitations" element={<RequireAuth><JourneyInvitations /></RequireAuth>} />
+              <Route path="journey/ooc" element={<RequireAuth><JourneyOoc /></RequireAuth>} />
+              <Route path="journey/iflines" element={<RequireAuth><JourneyIfline /></RequireAuth>} />
+              <Route path="journey/subplot" element={<RequireAuth><JourneySubplot /></RequireAuth>} />
+              <Route path="journey/memorial" element={<RequireAuth><JourneyMemorial /></RequireAuth>} />
+              <Route path="journey/social" element={<RequireAuth><JourneySocial /></RequireAuth>} />
+              <Route path="journey/chapters" element={<RequireAuth><JourneyChapters /></RequireAuth>} />
+              <Route path="journey/live" element={<RequireAuth><JourneyLive /></RequireAuth>} />
               <Route path="worlds/:id" element={<RequireAuth><WorldRoom /></RequireAuth>} />
               <Route path="worlds/:id/spectate" element={<RequireAuth><WorldSpectate /></RequireAuth>} />
               <Route path="reports" element={<RequireAuth><DailyReport /></RequireAuth>} />

@@ -4,6 +4,7 @@ import {
   Avatar,
   Button,
   ConfigProvider,
+  Drawer,
   Dropdown,
   Input,
   Layout,
@@ -14,11 +15,13 @@ import {
   AppstoreOutlined,
   BellOutlined,
   BookOutlined,
+  CompassOutlined,
   DownOutlined,
   GlobalOutlined,
   HeartOutlined,
   HomeOutlined,
   LogoutOutlined,
+  MenuOutlined,
   ReadOutlined,
   SearchOutlined,
   SettingOutlined,
@@ -39,6 +42,7 @@ const PRIMARY_NAV_ITEMS = [
   { key: '/platform', icon: <GlobalOutlined />, label: '世界大厅' },
   { key: '/platform/my', icon: <BookOutlined />, label: '我的房间' },
   { key: '/platform/worlds/publish', icon: <AppstoreOutlined />, label: '我的发布' },
+  { key: '/platform/journey', icon: <CompassOutlined />, label: '我的旅程' },
   { key: '/platform/backpack', icon: <ShoppingOutlined />, label: '背包' },
   { key: '/platform/bonds', icon: <HeartOutlined />, label: '羁绊' },
   {
@@ -75,9 +79,14 @@ export const PlatformShell: React.FC = () => {
   const worldsQuery = usePlatformStore((state) => state.worldsQuery);
   const setWorldsQuery = usePlatformStore((state) => state.setWorldsQuery);
   const [searchText, setSearchText] = useState(worldsQuery);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const isLogin = location.pathname === '/platform/login';
   const designPreview = import.meta.env.DEV && new URLSearchParams(location.search).get('design') === 'preview';
   const showProfile = isAuthed || designPreview;
+  const navigatePlatform = (path: string) => {
+    setMobileNavOpen(false);
+    navigate(designPreview ? `${path}?design=preview` : path);
+  };
 
   useEffect(() => setSearchText(worldsQuery), [worldsQuery]);
 
@@ -100,6 +109,15 @@ export const PlatformShell: React.FC = () => {
     <ConfigProvider theme={warmMinimalistTheme}>
       <Layout className="platform-shell">
         <Header className="platform-shell__header">
+          {!isLogin && (
+            <Button
+              className="platform-mobile-menu"
+              type="text"
+              aria-label="打开平台导航"
+              icon={<MenuOutlined />}
+              onClick={() => setMobileNavOpen(true)}
+            />
+          )}
           <button className="platform-brand" type="button" onClick={() => navigate('/platform')} aria-label="MuseAI 平台世界首页">
             <img src="/icon.png" alt="" />
             <span>MuseAI</span>
@@ -167,10 +185,10 @@ export const PlatformShell: React.FC = () => {
                   </button>
                 </div>
               </div>
-              <Menu
+            <Menu
                 mode="inline"
                 selectedKeys={[activeNavKey(location.pathname)]}
-                onClick={({ key }) => key.startsWith('/') && navigate(key)}
+                onClick={({ key }) => key.startsWith('/') && navigatePlatform(key)}
                 items={PRIMARY_NAV_ITEMS}
                 className="platform-shell__menu"
               />
@@ -178,7 +196,7 @@ export const PlatformShell: React.FC = () => {
                 <Menu
                   mode="inline"
                   selectedKeys={[activeNavKey(location.pathname)]}
-                  onClick={({ key }) => navigate(key)}
+                  onClick={({ key }) => navigatePlatform(key)}
                   items={SECONDARY_NAV_ITEMS}
                   className="platform-shell__menu"
                 />
@@ -193,6 +211,33 @@ export const PlatformShell: React.FC = () => {
             </Content>
           </Layout>
         )}
+        <Drawer
+          className="platform-mobile-drawer"
+          title="MuseAI 平台世界"
+          placement="left"
+          size={286}
+          open={mobileNavOpen}
+          onClose={() => setMobileNavOpen(false)}
+        >
+          <div className="platform-mobile-drawer__spaces">
+            <Button icon={<HomeOutlined />} onClick={() => navigate('/')}>我的工作室</Button>
+            <Button type="primary" icon={<GlobalOutlined />} onClick={() => navigatePlatform('/platform')}>平台世界</Button>
+          </div>
+          <Menu
+            mode="inline"
+            selectedKeys={[activeNavKey(location.pathname)]}
+            onClick={({ key }) => key.startsWith('/') && navigatePlatform(key)}
+            items={PRIMARY_NAV_ITEMS}
+            className="platform-shell__menu"
+          />
+          <Menu
+            mode="inline"
+            selectedKeys={[activeNavKey(location.pathname)]}
+            onClick={({ key }) => navigatePlatform(key)}
+            items={SECONDARY_NAV_ITEMS}
+            className="platform-shell__menu platform-mobile-drawer__secondary"
+          />
+        </Drawer>
       </Layout>
     </ConfigProvider>
   );

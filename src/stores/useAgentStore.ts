@@ -117,6 +117,7 @@ interface AgentStoreState {
 import { persist, createJSONStorage } from 'zustand/middleware';
 import { createDiskStorage } from './diskStorage';
 
+import { deepMergePersisted } from './persistMerge';
 export const useAgentStore = create<AgentStoreState>()(
   persist(
     (set) => ({
@@ -175,6 +176,9 @@ export const useAgentStore = create<AgentStoreState>()(
     }),
     {
       name: 'museai-agent-storage',
+      // 🔴 深合并：默认的浅合并会让**嵌套对象里新加的字段**在老用户盘上变成 undefined
+      // （migrate 挡不住——它只在 version 不匹配时才跑）。见 stores/persistMerge.ts。
+      merge: (persisted, current) => deepMergePersisted(persisted, current),
       storage: createJSONStorage(() => createDiskStorage('agent-store', 'museai-agent-storage')),
       partialize: (state) => ({
         selectedReferenceFiles: state.selectedReferenceFiles,

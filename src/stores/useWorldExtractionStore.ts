@@ -7,6 +7,7 @@ import { persist, createJSONStorage } from 'zustand/middleware';
 import { listen } from '@tauri-apps/api/event';
 import { appInvoke } from '../utils/runtime';
 import { createDiskStorage } from './diskStorage';
+import { deepMergePersisted } from './persistMerge';
 // 与 character 提取共享的基础 DTO（凭据、章节、角色 roster、任务事件）type-only 复用，避免重复定义。
 import type {
   ModelProfile,
@@ -392,6 +393,9 @@ export const useWorldExtractionStore = create<WorldExtractionStoreState>()(
         }
         return persisted as WorldExtractionStoreState;
       },
+      // 🔴 深合并：默认的浅合并会让**嵌套对象里新加的字段**在老用户盘上变成 undefined
+      // （migrate 挡不住——它只在 version 不匹配时才跑）。见 stores/persistMerge.ts。
+      merge: (persisted, current) => deepMergePersisted(persisted, current),
       storage: createJSONStorage(() => createDiskStorage('world-extraction-store')),
       partialize: (state) => ({ activeTaskIds: state.activeTaskIds }) as WorldExtractionStoreState,
     },

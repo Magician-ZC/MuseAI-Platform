@@ -7,6 +7,7 @@ import { listen } from '@tauri-apps/api/event';
 import { appInvoke } from '../utils/runtime';
 import { createDiskStorage } from './diskStorage';
 
+import { deepMergePersisted } from './persistMerge';
 // ---------- 引擎 DTO 镜像（camelCase，与 muse-engine serde 形态一致） ----------
 
 export type ModelInterface = 'OpenAI-compatible' | 'Anthropic-compatible';
@@ -311,6 +312,9 @@ export const useExtractionStore = create<ExtractionStoreState>()(
         }
         return persisted as ExtractionStoreState;
       },
+      // 🔴 深合并：默认的浅合并会让**嵌套对象里新加的字段**在老用户盘上变成 undefined
+      // （migrate 挡不住——它只在 version 不匹配时才跑）。见 stores/persistMerge.ts。
+      merge: (persisted, current) => deepMergePersisted(persisted, current),
       storage: createJSONStorage(() => createDiskStorage('extraction-store')),
       partialize: (state) => ({ activeTaskIds: state.activeTaskIds }) as ExtractionStoreState,
     },

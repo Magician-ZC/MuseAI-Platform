@@ -7,6 +7,7 @@ import { persist, createJSONStorage } from 'zustand/middleware';
 import { listen } from '@tauri-apps/api/event';
 import { appInvoke } from '../utils/runtime';
 import { createDiskStorage } from './diskStorage';
+import { deepMergePersisted } from './persistMerge';
 import { usePartnerStore } from './usePartnerStore';
 import type { CharacterCardV2 } from '../utils/characterCardV2';
 import type { ModelProfile } from './useExtractionStore';
@@ -490,6 +491,9 @@ export const useCharacterRuntimeStore = create<RuntimeStoreState>()(
         }
         return persisted as RuntimeStoreState;
       },
+      // 🔴 深合并：默认的浅合并会让**嵌套对象里新加的字段**在老用户盘上变成 undefined
+      // （migrate 挡不住——它只在 version 不匹配时才跑）。见 stores/persistMerge.ts。
+      merge: (persisted, current) => deepMergePersisted(persisted, current),
       storage: createJSONStorage(() => createDiskStorage('character-runtime-store')),
       partialize: (state) => ({ currentRunId: state.currentRunId }) as RuntimeStoreState,
     },

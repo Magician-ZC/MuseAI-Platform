@@ -82,6 +82,7 @@ interface OutlineState {
 import { persist, createJSONStorage } from 'zustand/middleware';
 import { createDiskStorage } from './diskStorage';
 
+import { deepMergePersisted } from './persistMerge';
 export const useOutlineStore = create<OutlineState>()(
   persist(
     (set) => ({
@@ -187,6 +188,9 @@ export const useOutlineStore = create<OutlineState>()(
     }),
     {
       name: 'museai-outline-storage',
+      // 🔴 深合并：默认的浅合并会让**嵌套对象里新加的字段**在老用户盘上变成 undefined
+      // （migrate 挡不住——它只在 version 不匹配时才跑）。见 stores/persistMerge.ts。
+      merge: (persisted, current) => deepMergePersisted(persisted, current),
       storage: createJSONStorage(() => createDiskStorage('outline-store', 'museai-outline-storage')),
       partialize: (state) => ({
         creationSelectedReferenceFiles: state.creationSelectedReferenceFiles,

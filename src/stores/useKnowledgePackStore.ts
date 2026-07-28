@@ -5,6 +5,7 @@ import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
 import { appInvoke } from '../utils/runtime';
 import { createDiskStorage } from './diskStorage';
+import { deepMergePersisted } from './persistMerge';
 import type { ModelProfile } from './useExtractionStore';
 
 // ---------- 引擎 DTO 镜像（camelCase，值枚举大小写与后端 serde 一致） ----------
@@ -257,6 +258,9 @@ export const useKnowledgePackStore = create<KnowledgeStoreState>()(
         }
         return persisted as KnowledgeStoreState;
       },
+      // 🔴 深合并：默认的浅合并会让**嵌套对象里新加的字段**在老用户盘上变成 undefined
+      // （migrate 挡不住——它只在 version 不匹配时才跑）。见 stores/persistMerge.ts。
+      merge: (persisted, current) => deepMergePersisted(persisted, current),
       storage: createJSONStorage(() => createDiskStorage('knowledge-store')),
       partialize: (state) =>
         ({

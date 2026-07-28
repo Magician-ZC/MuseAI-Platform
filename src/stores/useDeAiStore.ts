@@ -52,6 +52,7 @@ interface DeAiState {
 import { persist, createJSONStorage } from 'zustand/middleware';
 import { createDiskStorage } from './diskStorage';
 
+import { deepMergePersisted } from './persistMerge';
 export const useDeAiStore = create<DeAiState>()(
   persist(
     (set) => ({
@@ -108,6 +109,9 @@ export const useDeAiStore = create<DeAiState>()(
     }),
     {
       name: 'museai-deai-storage',
+      // 🔴 深合并：默认的浅合并会让**嵌套对象里新加的字段**在老用户盘上变成 undefined
+      // （migrate 挡不住——它只在 version 不匹配时才跑）。见 stores/persistMerge.ts。
+      merge: (persisted, current) => deepMergePersisted(persisted, current),
       storage: createJSONStorage(() => createDiskStorage('deai-store', 'museai-deai-storage')),
       partialize: (state) => ({
         selectedDetectorReferences: state.selectedDetectorReferences,

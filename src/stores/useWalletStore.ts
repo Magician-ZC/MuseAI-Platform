@@ -9,6 +9,7 @@ import { persist, createJSONStorage } from 'zustand/middleware';
 import { cloudFetch, CloudError } from '../utils/cloudApi';
 import { describeCloudError } from './usePlatformStore';
 
+import { deepMergePersisted } from './persistMerge';
 /** 单笔充值上限（分）——与 server MAX_RECHARGE_CENTS 对齐，仅为更友好的前置提示；最终以服务端为准。 */
 export const MAX_RECHARGE_CENTS = 10_000_000; // 10 万元
 
@@ -155,6 +156,9 @@ export const useWalletStore = create<WalletState>()(
     {
       name: 'museai-wallet',
       version: 2,
+      // 🔴 深合并：默认的浅合并会让**嵌套对象里新加的字段**在老用户盘上变成 undefined
+      // （migrate 挡不住——它只在 version 不匹配时才跑）。见 stores/persistMerge.ts。
+      merge: (persisted, current) => deepMergePersisted(persisted, current),
       storage: createJSONStorage(() => localStorage),
       // 仅持久化本地订单回执；绝不缓存余额（服务端权威）。
       partialize: (s) => ({ orders: s.orders }) as WalletState,

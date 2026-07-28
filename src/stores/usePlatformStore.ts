@@ -5,6 +5,7 @@ import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
 import { cloudFetch, CloudError } from '../utils/cloudApi';
 
+import { deepMergePersisted } from './persistMerge';
 // ---------- 云端契约镜像（camelCase，与 server 端 JSON 形态一致） ----------
 
 export type RoomType = 'idle' | 'chapter' | 'arena';
@@ -749,6 +750,9 @@ export const usePlatformStore = create<PlatformState>()(
     {
       name: 'museai-platform-ui',
       version: 1,
+      // 🔴 深合并：默认的浅合并会让**嵌套对象里新加的字段**在老用户盘上变成 undefined
+      // （migrate 挡不住——它只在 version 不匹配时才跑）。见 stores/persistMerge.ts。
+      merge: (persisted, current) => deepMergePersisted(persisted, current),
       storage: createJSONStorage(() => localStorage),
       // 仅持久化 UI 偏好，不缓存云端列表（云端为权威，每次进入重新拉取）。
       partialize: (state) => ({ roomTypeFilter: state.roomTypeFilter, roomView: state.roomView }) as PlatformState,

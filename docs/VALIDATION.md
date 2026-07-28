@@ -1081,6 +1081,30 @@ camelCase 与 snake_case 同形。`known_to` 才受影响，而那一处是类�
 🔵 故障注入两处全红：新加一处 `debug_assert` 不登记 → 红；登记表里留一个已不存在的文件 → 红。
 🔵 顺带把引擎全量在 **release** 下跑了一遍（314 passed）——`debug_assert` 消失后行为不变。
 
+#### 顺着同一条线把**配置覆盖**问完（结论：无缺陷）
+
+§3.57 问「换个数据库还绿吗」、本节问「换个编译配置还生效吗」。同一个形式还剩一问：
+**CI 只跑 `default` 与 `billing,arena` 两种组合，另外两种从没验过。**
+feature 组合是「在那个组合下压根编译不过」的经典来源（某个 `#[cfg(feature)]` 里
+引用了另一个 feature 才有的符号）。
+
+跑下来：**单开 `billing` 1173 passed、单开 `arena` 1202 passed，编译与用例全绿，无缺陷。**
+
+至此配置维度上**我能跑的都跑过了**：
+
+| 维度 | 已验 | 未验 |
+|---|---|---|
+| 数据库 | SQLite · **真 PG 16** | — |
+| 编译配置 | debug · **release**（引擎） | server release 全量（耗时，价值低：无 `debug_assert` 依赖） |
+| feature 组合 | default · billing,arena · **billing** · **arena** | — |
+| 平台 | macOS | **Linux（CI 跑）· Windows（发版目标，从未跑过任何测试）** |
+
+🔴 **平台那一格是真空缺，而且我跑不了**：`release.yml` 打三平台包，
+但 `test.yml` 只在 ubuntu 上跑——**Windows 从来没跑过一次测试**。
+本轮加的 `write_atomic`（rename 覆盖语义）与几处 `#[cfg(unix)]` 用例
+在 Windows 上的行为是**推理出来的，不是验过的**（见 §3.35 那段注释）。
+这一格要么加 CI matrix（是决定，不是实现），要么就得一直如实标着。
+
 ### 3.57 真跑一遍 Postgres：两个**只在 PG 上才炸**的缺陷（**2026-07-28**）
 
 我说过「没有再找到能靠读代码推进的线索」。但有一件**不是读代码**的事被漏了：

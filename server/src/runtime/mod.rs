@@ -1195,11 +1195,21 @@ async fn seed_narrative_layer(
                 continue;
             }
             // advanceWhen 谓词：语法非法则丢弃谓词、保留节点为纯阈值门（不 fail-closed）。
-            let advance_when = node
-                .get("advanceWhen")
-                .and_then(Value::as_str)
-                .filter(|expr| muse_engine::narrative::constraints::parse_predicate(expr).is_ok())
-                .map(|s| s.to_string());
+            // ⚠️ 丢掉推进门会让这个世界**更容易**走到终局，所以它绝不能是静默的。
+            // 正门在发布期（`assets::worlds::validate_superset` 直接 400）；这里是**存量模板**的兜底，
+            // 至少留下一行能被搜到的日志。
+            let advance_when = node.get("advanceWhen").and_then(Value::as_str).and_then(|expr| {
+                match muse_engine::narrative::constraints::parse_predicate(expr) {
+                    Ok(()) => Some(expr.to_string()),
+                    Err(e) => {
+                        tracing::warn!(
+                            node_id = id, expression = expr, error = %e,
+                            "advanceWhen 语法非法，已丢弃该推进门（节点退化为纯阈值门，世界更容易走到终局）"
+                        );
+                        None
+                    }
+                }
+            });
             s.narrative.outline_nodes.push(OutlineNode {
                 id: id.to_string(),
                 summary,
@@ -1220,7 +1230,16 @@ async fn seed_narrative_layer(
                 continue;
             };
             // 仅种入语法合法的谓词，避免 eval 阶段 Validation 失败（受限 DSL，见 constraints）。
-            if muse_engine::narrative::constraints::parse_predicate(expr).is_err() {
+            //
+            // 🔴 **丢一条禁止谓词 = 这个世界少一条不变量**，而模板作者以为它在生效。
+            // 此前这里是**静默** `continue`——没有日志、没有计数，没有任何人能看出来。
+            // 正门已挪到发布期（`assets::worlds::validate_superset` 直接 400，作者当场能改）；
+            // 这里是**存量模板**的兜底，至少留下一行能被搜到的日志。
+            if let Err(e) = muse_engine::narrative::constraints::parse_predicate(expr) {
+                tracing::warn!(
+                    predicate_id = id, expression = expr, error = %e,
+                    "禁止谓词语法非法，已丢弃 —— 这个世界少了一条模板声明过的不变量"
+                );
                 continue;
             }
             let reason = p.get("reason").and_then(Value::as_str).unwrap_or("").to_string();

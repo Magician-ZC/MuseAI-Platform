@@ -263,6 +263,43 @@ fn validate_superset(skeleton: &Value) -> Result<(), String> {
         }
     }
 
+    // 4) 🔴 受限 DSL 谓词的**语法**必须在这里就过，否则它会在没人看的时候静默消失。
+    //
+    // `forbiddenPredicates` 是**世界不变量**：reducer 在每次应用 patch 后逐条求值，
+    // 命中即整个 patch 拒绝——它是把「这个世界里不许发生的事」挡在公共事实之外的机制。
+    //
+    // 但语法非法的谓词此前会一路通过发布、人工校准、仿真试跑、安全审（世界跑起来一切正常），
+    // 到**开世界时被 `runtime` 静默 `continue` 掉**。结果是：模板作者以为「角色不得知道 X」
+    // 已经生效，而那个世界根本没有这条不变量，**没有任何人能看出来**。
+    //
+    // 判据方向：**在有人的时候拒绝，而不是在没人的时候静默**。这里 400 一次，
+    // 作者当场就能改；漏到运行时就是一个永远不会有人发现的缺口。
+    // `advanceWhen` 同理——它虽然只是里程碑推进门，但丢掉它会让世界**更容易**走到终局。
+    if let Some(preds) = skeleton.get("forbiddenPredicates").and_then(Value::as_array) {
+        for p in preds {
+            let id = p.get("id").and_then(Value::as_str).unwrap_or("(缺 id)");
+            let Some(expr) = p.get("expression").and_then(Value::as_str) else {
+                return Err(format!("forbiddenPredicates `{id}` 缺 expression"));
+            };
+            if let Err(e) = muse_engine::narrative::constraints::parse_predicate(expr) {
+                return Err(format!(
+                    "forbiddenPredicates `{id}` 的表达式语法非法：{e}\n                     ⚠️ 它不会在运行时报错——会被**静默丢弃**，于是这个世界少了一条你以为存在的不变量。"
+                ));
+            }
+        }
+    }
+    if let Some(nodes) = skeleton.get("mainlineNodes").and_then(Value::as_array) {
+        for n in nodes {
+            let Some(expr) = n.get("advanceWhen").and_then(Value::as_str) else { continue };
+            let id = n.get("id").and_then(Value::as_str).unwrap_or("(缺 id)");
+            if let Err(e) = muse_engine::narrative::constraints::parse_predicate(expr) {
+                return Err(format!(
+                    "mainlineNodes `{id}` 的 advanceWhen 语法非法：{e}\n                     ⚠️ 它同样会被静默丢弃，而丢掉推进门会让这个世界**更容易**走到终局。"
+                ));
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1518,4 +1555,78 @@ mod tests {
         assert!(!stored["mainlineNodes"].as_array().unwrap().is_empty());
         assert!(!stored["endingPool"].as_array().unwrap().is_empty());
     }
+
+    /// 🔴 **语法非法的禁止谓词必须在发布时就被打回，而不是在开世界时被静默丢掉。**
+    ///
+    /// # 这条链此前是怎么断的
+    ///
+    /// `forbiddenPredicates` 是**世界不变量**：reducer 每次应用 patch 后逐条求值，
+    /// 命中即整个 patch 拒绝——它是把「这个世界里不许发生的事」挡在公共事实之外的机制。
+    ///
+    /// 而语法非法的那条此前会：发布通过 → 人工校准通过 → 仿真试跑通过 → 安全审通过
+    /// （世界跑起来一切正常）→ **开世界时被 `runtime` 静默 `continue` 掉**。
+    ///
+    /// 结果是模板作者以为「角色不得知道 X」已经生效，而那个世界**根本没有这条不变量**，
+    /// 且没有任何人能看出来——一个永远不会被发现的缺口。
+    ///
+    /// 判据方向：**在有人的时候拒绝，而不是在没人的时候静默**。
+    #[tokio::test]
+    async fn a_malformed_forbidden_predicate_is_rejected_at_publish_time() {
+        let (app, _state) = build_app().await;
+        let (access, _r, _u) = login_new_user(&app, "13910000090").await;
+
+        let mut sk = valid_superset();
+        // 左值不在受限 DSL 里（既不是 characters./world./relations[）。
+        sk["forbiddenPredicates"] = json!([
+            { "id": "f_bad", "expression": "hp < 10", "reason": "写错了的不变量" }
+        ]);
+        let (st, v) =
+            send(&app, "POST", "/api/assets/worlds", Some(&access), Some("pg1"), Some(publish_body(sk))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "🔴 语法非法的不变量必须当场打回：{v:?}");
+        let msg = v.to_string();
+        assert!(msg.contains("f_bad"), "报错要点名是哪一条，作者才改得动：{msg}");
+        assert!(
+            msg.contains("静默丢弃"),
+            "🔴 报错必须说清后果（会被静默丢弃、世界少一条不变量），\
+             否则作者只会以为是个格式挑剔：{msg}"
+        );
+    }
+
+    /// 反向配对：**语法合法的谓词照常发布**。
+    ///
+    /// 只测「非法要拒」的话，把 `forbiddenPredicates` 一律拒掉也能全绿——
+    /// 那会让这个功能彻底不可用。
+    #[tokio::test]
+    async fn a_well_formed_forbidden_predicate_still_publishes() {
+        let (app, _state) = build_app().await;
+        let (access, _r, _u) = login_new_user(&app, "13910000091").await;
+
+        let mut sk = valid_superset();
+        sk["forbiddenPredicates"] = json!([
+            { "id": "f_ok", "expression": "characters.npc-jian.secrets contains \"身份已暴露\"",
+              "reason": "守灵人的身份不得在本篇泄露" }
+        ]);
+        let (st, v) =
+            send(&app, "POST", "/api/assets/worlds", Some(&access), Some("pg2"), Some(publish_body(sk))).await;
+        assert_eq!(st, StatusCode::OK, "🔴 合法谓词必须能发布，否则这个功能就废了：{v:?}");
+    }
+
+    /// `advanceWhen` 同理：丢掉推进门会让世界**更容易**走到终局，不是无害的降级。
+    #[tokio::test]
+    async fn a_malformed_advance_gate_is_rejected_at_publish_time() {
+        let (app, _state) = build_app().await;
+        let (access, _r, _u) = login_new_user(&app, "13910000092").await;
+
+        let mut sk = valid_superset();
+        sk["mainlineNodes"].as_array_mut().unwrap()[0]["advanceWhen"] =
+            json!("relations[a->b].trust >>> 0.5");
+        let (st, v) =
+            send(&app, "POST", "/api/assets/worlds", Some(&access), Some("pg3"), Some(publish_body(sk))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v:?}");
+        assert!(
+            v.to_string().contains("更容易"),
+            "🔴 报错要说清失效方向（丢掉推进门 = 更容易走到终局），而不是只说「语法错」：{v}"
+        );
+    }
+
 }

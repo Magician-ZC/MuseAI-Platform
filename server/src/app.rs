@@ -275,3 +275,75 @@ mod cors_tests {
         );
     }
 }
+
+// ============================================================================
+// 🔴 经济 feature 关闭时，一条付费路径都不可达
+// ============================================================================
+
+/// **只在默认构建（无 `billing` / `arena`）里编译**——它测的正是那个构建的形状。
+///
+/// 编译器已经保证了「不能调用 `ledger`」（无 feature 时那个模块根本不存在，
+/// 调用点不 gate 就编译不过）。但编译器保证不了**路由是否真的不存在**：
+/// 有人完全可以注册一个不碰账本、却暴露付费内容的端点，那样编译照过。
+///
+/// 本用例是那一半的行为面证据：默认构建下这些前缀必须 404。
+///
+/// ⚠️ `POST /worlds` 是**同一个路径上的方法差异**（`GET` 恒在、`POST` 只在有经济时注册），
+/// 故它期望的是 405 而不是 404——把两者混为一谈会让这条断言在错误的地方绿。
+///
+/// 🔵 **三处故障注入，结果不一样，如实记**：
+/// - 给默认构建注册一个不碰账本的 `/me/earnings` → **红**（这正是编译器管不到、本用例管得到的那一类）；
+/// - 把大厅列表也一并门掉（过度门控）→ **红**（下面第二条的 `assert_ne!` 就是防这个）；
+/// - 把 `POST /worlds` 错误地注册进默认构建 → **编译不过**。
+///   `create_room` 自己就要调 `ledger`，无 feature 时那个模块不存在。
+///   也就是说这一种错**编译器已经挡住了**，本用例在这一点上是纵深而不是唯一防线——
+///   写清楚比笼统说「三处注入全红」诚实。
+#[cfg(all(test, not(any(feature = "billing", feature = "arena"))))]
+mod economy_gate_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    async fn status_of(method: &str, path: &str) -> StatusCode {
+        let state = crate::safety::testkit::test_state().await;
+        let app = build_router(state);
+        let req = Request::builder().method(method).uri(path).body(Body::empty()).unwrap();
+        app.oneshot(req).await.unwrap().status()
+    }
+
+    /// 付费面在默认构建里整片不存在。
+    #[tokio::test]
+    async fn paid_routes_are_absent_without_economy_features() {
+        for (method, path) in [
+            ("POST", "/api/shop/items/sku_x/purchase"),   // 平台道具售卖
+            ("GET", "/api/me/earnings"),                  // 创作者收益
+            ("POST", "/api/billing/orders"),              // 充值下单
+            ("GET", "/api/arena/w1/clips"),               // 竞技场切片
+            ("GET", "/api/arena/gift-skus"),              // 礼物目录
+        ] {
+            assert_eq!(
+                status_of(method, path).await,
+                StatusCode::NOT_FOUND,
+                "🔴 默认构建（无 billing/arena）里 `{method} {path}` 竟然可达——\
+                 经济 feature 关闭时必须一条付费路径都没有"
+            );
+        }
+    }
+
+    /// 建房收费：同一路径上 `GET` 恒在、`POST` 只在有经济时注册 → 405 而非 404。
+    #[tokio::test]
+    async fn creating_a_room_is_unavailable_but_the_lobby_still_lists() {
+        assert_eq!(
+            status_of("POST", "/api/worlds").await,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "🔴 建房携开房费，无经济 feature 时不得注册 POST"
+        );
+        // 大厅列表恒在（它不花钱）——顺带证明上面那条 405 不是「整条路由都没了」。
+        assert_ne!(
+            status_of("GET", "/api/worlds").await,
+            StatusCode::NOT_FOUND,
+            "🔴 大厅列表与经济无关，不得被一并门掉"
+        );
+    }
+}

@@ -4146,3 +4146,80 @@ async fn once_enabled_only_the_display_label_reaches_the_engine() {
         );
     }
 }
+
+/// 🔴 **提交时只标记「本拍真的喂进上下文」的那几条礼物，绝不 blanket 标全部未落地行。**
+///
+/// # 为什么这条必须端到端
+///
+/// `arena::report` 直接读 `applied_tick` 来说「这一拍场上有观众送的东西」。
+/// blanket 标记会让战报**声称一件没发生过的事**——而战报的全部价值就是「它说的是真的」
+/// （那一栏存在的意义是回答观众「这是不是剧本」）。
+///
+/// # 怎么构造出「没喂进去的礼物」
+///
+/// 不需要在回合中途插一条（那要改夹具）：`AMBIENT_MAX` 本身就制造了这个情形——
+/// 播种超过上限的礼物，超出的那些**必然没进这一拍的上下文**。
+/// 若提交时 blanket 标记，它们会一起被标上；正确实现下它们必须原样留着 `NULL`。
+///
+/// ⚠️ 这是 `docs/VALIDATION.md` §3.47 欠账表 A1 那一条。
+#[tokio::test]
+async fn commit_marks_only_the_gifts_that_actually_entered_this_tick() {
+    let state = test_state().await;
+    let wid = running_world_with_two_members(&state).await;
+    mk_env_table(&state.db).await;
+    crate::flags::set_flag(
+        &state.db,
+        crate::flags::SetFlag {
+            flag: "MUSE_AMBIENT_GIFT_EVENTS",
+            scope: "global",
+            target_id: "",
+            enabled: true,
+            starts_at: 0,
+            ends_at: 0,
+            actor_id: "test",
+            reason: "用例",
+        },
+    )
+    .await
+    .unwrap();
+
+    let cap = super::AMBIENT_MAX;
+    let extra = 5i64;
+    for i in 0..(cap + extra) {
+        seed_gift(
+            &state.db,
+            &format!("g{i:03}"),
+            &wid,
+            &format!(r#"{{"label":"礼物{i}"}}"#),
+            1,
+            1000 + i, // created_at 递增 → 取数按它定序，超出上限的是最后 5 条
+        )
+        .await;
+    }
+
+    let model: Arc<dyn ModelClient> = Arc::new(MockModel { input_tokens: 10, output_tokens: 20 });
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 0, model).await.unwrap(), TickStatus::Done);
+
+    let marked: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM arena_env_events WHERE world_id = $1 AND applied_tick IS NOT NULL",
+    )
+    .bind(&wid)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    let unmarked: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM arena_env_events WHERE world_id = $1 AND applied_tick IS NULL",
+    )
+    .bind(&wid)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+
+    assert_eq!(marked, cap, "只有真的进了上下文的那 {cap} 条该被标记");
+    assert_eq!(
+        unmarked, extra,
+        "🔴 超出上限、压根没进这一拍上下文的 {extra} 条必须原样留着 NULL。\n\
+         被一起标掉 = 战报会声称它们影响过这一拍，而那是假的。"
+    );
+}

@@ -1162,3 +1162,65 @@ async fn admin_slo_table_reads_only_fields_the_server_actually_sends() {
         "只有 {ok_checked} 项指标处于 ok 状态，断言几乎没跑到——播种不足，这道门是空的"
     );
 }
+
+/// 🔴 **服务端能发出的每一个 `status`，后台都得认识。**
+///
+/// # 这条缝为什么单独需要一道门
+///
+/// §3.36 把状态从三态扩到七态，§3.37 才让后台第一次渲染它们。
+/// 于是形成一条典型的接缝：**服务端加一个新状态是单方面的**，
+/// 后台那张 `SLO_STATUS_LABEL` 不跟着加，界面上就会冒出一个原始英文码
+/// （`no_data_yet` 而不是「至今零样本」）。那不是崩溃，是**悄悄变难读**——
+/// 最不容易被发现的一类退化。
+///
+/// 而 `admin/` **没有任何测试基建**（只有 `tsc`，见 §3.47 欠账表 A5），
+/// tsc 更拦不住这个（那是运行期字符串查表）。所以门钉在服务端，
+/// 手法与 `admin_slo_table_reads_only_fields_the_server_actually_sends` 同源。
+///
+/// # 判据方向
+///
+/// 从**服务端源码里实际出现的状态字面量**出发（不是手列一张表），
+/// 逐个要求后台认识它。服务端新加一个状态就会红——**遗漏往红的方向失败**。
+#[test]
+fn every_status_the_server_can_emit_is_known_to_the_admin_console() {
+    const TSX: &str = include_str!("../../../admin/src/pages/Metrics.tsx");
+    let table = TSX
+        .split("const SLO_STATUS_LABEL: Record<string, string> = {")
+        .nth(1)
+        .expect("后台源码里找不到 SLO_STATUS_LABEL —— 那张表被改名或删了，本用例口径已失效")
+        .split("\n};")
+        .next()
+        .expect("SLO_STATUS_LABEL 没有结束大括号");
+    let known: std::collections::BTreeSet<&str> =
+        table.lines().filter_map(|l| l.trim().split(':').next()).map(str::trim).collect();
+    assert!(known.len() >= 4, "只从后台解析出 {} 条状态标签，解析口径坏了：{known:?}", known.len());
+
+    // 服务端源码里实际写出来的状态字面量（`"status": "xxx"` 与状态常量）。
+    let mut emitted: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (rel, src) in crate::testkit::production_sources() {
+        if !rel.starts_with("slo") {
+            continue;
+        }
+        let mut i = 0usize;
+        while let Some(rel_at) = src[i..].find("\"status\": \"") {
+            let start = i + rel_at + "\"status\": \"".len();
+            let Some(end) = src[start..].find('"') else { break };
+            emitted.insert(src[start..start + end].to_string());
+            i = start + end;
+        }
+    }
+    for c in [NO_DATA_IN_WINDOW, NO_DATA_YET] {
+        emitted.insert(c.to_string());
+    }
+    assert!(emitted.len() >= 5, "只从服务端解析出 {} 个状态，解析口径坏了：{emitted:?}", emitted.len());
+
+    let unknown: Vec<&String> =
+        emitted.iter().filter(|s| s.as_str() != "ok" && !known.contains(s.as_str())).collect();
+    assert!(
+        unknown.is_empty(),
+        "🔴 服务端会发出这些 status，而后台的 SLO_STATUS_LABEL 不认识：{unknown:?}\n\
+         后果不是崩溃，是界面上冒出原始英文码 —— **悄悄变难读**，最不容易被发现的一类退化。\n\
+         请在 admin/src/pages/Metrics.tsx 的 SLO_STATUS_LABEL 里补上中文短名。\n\
+         （`ok` 不在表里是对的：它走数值分支，不显示状态标签。）"
+    );
+}

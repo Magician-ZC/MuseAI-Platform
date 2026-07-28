@@ -224,8 +224,8 @@ cd server && MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo ru
 ```bash
 # 引擎 + 后端 + 桌面壳
 cargo test --manifest-path crates/muse-engine/Cargo.toml          # 291 passed
-(cd server && cargo test)                                          # 1109 passed(default,含黄金世界回归)
-(cd server && cargo test --features billing,arena)                 # 1192 passed
+(cd server && cargo test)                                          # 1110 passed(default,含黄金世界回归)
+(cd server && cargo test --features billing,arena)                 # 1193 passed
 (cd server && cargo test golden)                                   # 14 passed(12 项 runtime::golden::* + 2 项录放 round-trip)
 cargo test --manifest-path src-tauri/Cargo.toml                    # 240 passed
 # 前端 + 后台

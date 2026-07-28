@@ -1049,6 +1049,46 @@ camelCase 与 snake_case 同形。`known_to` 才受影响，而那一处是类�
 ⚠️ 另一条边界：**存量模板不会被回头校验**，闸只在写入路径上。存量的发现面是运营台的
 `shape.unknownTopLevelKeys` / `shape.unknownNestedKeys` 两栏——**看得见，但不会自动修**。
 
+### 3.53 覆盖图最后一项：穿书的记忆键对不上时，症状是**「AI 忘事了」**（**2026-07-28**）
+
+覆盖图最后一格：桌面轨 `book_travel`（1538 行）。机器先扫已知形态，
+`unwrap_or` 那一族里有一处值得看。
+
+#### 缺陷
+
+`writer_state_for_prompt` 逐个键从前端传来的 `state` 里取值，
+**九个键，每个都是 `.cloned().unwrap_or(Value::Null)`**：
+`stableMemory` / `volatileMemory` / `assembledWorldModel` / `currentState` /
+`summaryMemory` / `recentScenes` / `recentTurns` / `plannedScene` / `writerInstructions`。
+
+而这份 `state` 是**前端组装的**（`Story.tsx`）。也就是说这是一份**手工镜像**的契约。
+前端改了键名、或 Rust 这边打错一个字母 →
+
+> 那一项静默变成 `"stableMemory": null` 进 prompt。
+> 症状是**「AI 忘事了、场景接不上」**——看起来像**模型质量问题**，
+> 而没有人会往「键名对不上」上想。
+
+§3.8.1 形态 (c)：两侧各自都对，中间那道缝没有主人。而这一处的**症状指向完全错误的方向**，
+这是它比一般的漂移更难查的地方。
+
+#### 判据
+
+从 **Rust 侧实际读的键**出发（源码里解析 `state.get("…")`，不手列），
+`include_str!` 读 `Story.tsx` 逐个要求它在那边出现。Rust 新读一个键、或前端改了名，都会红。
+并断言**至少解析出 8 个键**——否则解析口径一变，这道门会静默变成空断言。
+
+手法与 `admin_slo_table_reads_only_fields_the_server_actually_sends` 同源：
+`admin/` 与 `src/` 都没法在 Rust 里跑，但**源码读得到**。
+
+🔵 故障注入三处全红：Rust 侧键名打错一个字母 → 红；前端把某个键改名（Rust 没跟上）→ 红；
+`state.get` 改写法使解析口径失效 → 红。
+
+#### 覆盖图走完一轮了
+
+`docs/VALIDATION.md` §3.33 那张图，本轮从「引擎 `narrative`」一路扫到这里，
+每一格都过了一遍。⚠️ **这不等于「没有缺陷了」**——它只等于
+「这些面被这一轮的方法过过一遍」，而方法本身有盲区（§3.33 开头那段话仍然成立）。
+
 ### 3.52 给任何一个 store 的嵌套对象加字段，老用户那边它就是 `undefined`（**2026-07-28**）
 
 按覆盖图扫**前端各 store 的迁移语义**。仍然机器先扫：列出每个持久化 store
@@ -2061,7 +2101,8 @@ rename 失败」的情形（需要跨文件系统或权限构造），如实记�
 | 引擎 | `arbiter` 的**模型层出口**（漏判兜底与判定依据） | — | ✅ 查过（§3.42）：兜底与真裁决共用同一条依据，已修 |
 | 引擎 | `narrative` 其余（回合编排 · `arbiter` 规则层 · `constraints` · `relation_dynamics` · `continuity`）· `character` 3811 · `world` 2370 · `knowledge` 1593 · `replay` 1454 | 17k | ⬜ **未逐条扫过** |
 | 桌面轨 | `agent` `commands` `mobile_server` `llm` `tools` `models` `utils` `crawler` | 16k | ✅ 查过并改过 |
-| 桌面轨 | `book_travel` 1538 · `lib` 392 · `fs_commands` 297 | 2.2k | ⬜ **未扫过**（`fs_commands::rename_item_cmd` 单独看过，结论见 §3.26） |
+| 桌面轨 | `book_travel` 的**状态契约面**（前后端手工镜像的 9 个记忆键） | — | ✅ 查过（§3.53）：键名漂开会静默变 null，症状指向「模型质量」，已加接缝门 |
+| 桌面轨 | `book_travel` 其余 · `lib` 392 · `fs_commands` 297 | 2k | ⬜ **未逐条扫过**（`fs_commands::rename_item_cmd` 单独看过，见 §3.26） |
 | 前端 | `utils/runtime.ts` · `pages/MobileHome` · `utils/bookTravelMaterials` | — | ✅ 查过并改过 |
 | 前端 | `stores` 的**持久化面**（`diskStorage` → `save_app_state` 这条缝） | — | ✅ 查过（§3.35），缺陷在 Rust 那一侧：落盘不原子 |
 | 前端 | `components` 的**高危面**（内联 HTML / 竞态 / 删除确认）与**编辑器持久化面** | — | ✅ 查过（§3.38）：防抖保存丢最后一段，已修 |

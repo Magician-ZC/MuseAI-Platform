@@ -1536,3 +1536,58 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod state_contract_tests {
+    //! 🔴 **穿书写作的 `state` 契约横跨 Rust 与前端，而漂开是静默的。**
+    //!
+    //! # 这条缝为什么危险
+    //!
+    //! `writer_state_for_prompt`（本文件）逐个键从前端传来的 `state` 里取值，
+    //! 每一个都是 `.cloned().unwrap_or(Value::Null)`。于是**前端改了键名、
+    //! 或这边打错一个字母**，那一项就静默变成 `"stableMemory": null` 进 prompt。
+    //!
+    //! 症状是**「AI 忘事了」**——记忆没带上、场景接不上。而那看起来像模型质量问题，
+    //! **没有人会往「键名对不上」上想**。这正是本仓反复遇到的那个形态
+    //! （`docs/VALIDATION.md` §3.8.1 形态 (c)：两侧各自都对，中间那道缝没有主人）。
+    //!
+    //! # 判据方向
+    //!
+    //! 从**Rust 侧实际读的键**出发（源码里解析出来，不手列），逐个要求它在前端组装处出现。
+    //! 这边新读一个键、或前端改了名，都会红。`admin_slo_table_reads_only_fields_...`
+    //! 同源手法：`admin/` 与 `src/` 都没法在 Rust 里跑，但源码读得到。
+
+    /// 前端组装 `state` 的地方（`Story.tsx` 的 judgeState/keeperState/writerState 等）。
+    const STORY_TSX: &str = include_str!("../../src/pages/Story.tsx");
+
+    #[test]
+    fn every_state_key_the_rust_side_reads_exists_on_the_frontend() {
+        let src = include_str!("book_travel.rs");
+        // 只看 `writer_request.state.get("...")` 这一族，避免把别处的字符串算进来。
+        let mut keys: Vec<&str> = Vec::new();
+        let mut i = 0usize;
+        while let Some(rel) = src[i..].find("state.get(\"") {
+            let start = i + rel + "state.get(\"".len();
+            let Some(end) = src[start..].find('"') else { break };
+            keys.push(&src[start..start + end]);
+            i = start + end;
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        assert!(
+            keys.len() >= 8,
+            "🔴 只解析出 {} 个 state 键（{keys:?}）—— 解析口径坏了，这道门正在静默失效",
+            keys.len()
+        );
+
+        let missing: Vec<&&str> = keys.iter().filter(|k| !STORY_TSX.contains(**k)).collect();
+        assert!(
+            missing.is_empty(),
+            "🔴 Rust 侧要读这些 state 键，而前端组装处（Story.tsx）里根本没有它们：{missing:?}\n\n\
+             后果不是报错，是那一项**静默变成 null 进 prompt**——\n\
+             症状是「AI 忘事了 / 场景接不上」，看起来像模型质量问题，\n\
+             没有人会往「键名对不上」上想。\n\
+             要么改回同名，要么在两侧同时改并更新本用例的解析口径。"
+        );
+    }
+}

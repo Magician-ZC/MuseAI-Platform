@@ -33,14 +33,56 @@ use super::reducer::RESERVED_WORLD_KEYS;
 
 /// 从 DNA 卡中裁出「行为层」视图（角色自己的卡，全部对自己可见）；
 /// 剔除存储/版本元数据，仅保留决策相关层，供角色本人推理。
+/// 🔴 **进模型可见面的卡字段，用白名单而不是黑名单。**
+///
+/// 这里此前是**排除表**：`to_value(card)` 之后 `remove` 掉几个已知的元数据键，
+/// 其余**自动**进入每个角色的 prompt。于是给 `CharacterCardV2` 加一个新字段，
+/// 它**默认就被喂给模型了**——加字段的人不需要、也不会想到要为此做任何决定。
+/// 若那个新字段是内部的、存储用的、或含未公开信息，后果是**静默泄露**。
+///
+/// ⚠️ 与 `world` 那个排除表（`reducer::RESERVED_WORLD_KEYS`）的区别要说清楚：
+/// `world` 是**开放键空间**（叙事可写任意键），只能靠排除表挡；
+/// 而 `CharacterCardV2` 是**固定 struct**，完全可以用白名单——
+/// 既然可以，就不该把「新字段默认泄露」这条路留着。
+///
+/// 由 `dna_view_covers_every_card_field_by_an_explicit_decision` 钉住：
+/// 卡的每个字段必须**要么在包含表、要么在排除表**，加字段时不做选择就红。
+const DNA_VIEW_INCLUDE: &[&str] = &[
+    "identity",
+    "dramaticCore",
+    "decisionModel",
+    "perception",
+    "emotionDynamics",
+    "relationGrammar",
+    "expressionFingerprint",
+    "agency",
+    "growthArc",
+    "worldAdaptation",
+];
+
+/// 明确**不进**角色可见上下文的卡字段：存储/版本元数据与证据索引。
+/// 与 [`DNA_VIEW_INCLUDE`] 的并集必须恰好等于卡的全部字段（用例钉住）。
+const DNA_VIEW_EXCLUDE: &[&str] =
+    &["schemaVersion", "id", "lifecycle", "evidenceIndex", "revision", "createdAt", "updatedAt"];
+
+/// 白名单过滤本体。**单独抽出来是为了能被直接喂一个「多了一个字段」的 map** ——
+/// 那正是「给卡加字段」时会发生的事，而它不该需要真去改 struct 才测得了
+///（改 struct 的注入会牵动几十个构造点，编译都过不去，什么也证明不了）。
+fn dna_view_from_map(obj: &serde_json::Map<String, Value>) -> Value {
+    Value::Object(
+        DNA_VIEW_INCLUDE
+            .iter()
+            .filter_map(|k| obj.get(*k).map(|v| ((*k).to_string(), v.clone())))
+            .collect(),
+    )
+}
+
 fn dna_view(card: &CharacterCardV2) -> Result<Value, EngineError> {
-    let mut v = serde_json::to_value(card)?;
-    if let Some(obj) = v.as_object_mut() {
-        for k in ["schemaVersion", "id", "lifecycle", "evidenceIndex", "revision", "createdAt", "updatedAt"] {
-            obj.remove(k);
-        }
-    }
-    Ok(v)
+    let v = serde_json::to_value(card)?;
+    let obj = v.as_object().ok_or_else(|| {
+        EngineError::Validation("角色卡序列化结果不是对象，无法裁出行为层视图".into())
+    })?;
+    Ok(dna_view_from_map(obj))
 }
 
 /// 组装角色可见上下文（纯函数，必测隔离性：B 的 secrets 永不出现在 A 的产物中）。
@@ -516,6 +558,62 @@ mod tests {
     }
 
     /// 🔴 红线：身份只挂上下文顶层，**绝不写进 DNA 卡视图**（`active_cards` 是不可变快照）。
+    /// 🔴 **卡的每个字段都必须被显式表态：进 prompt，还是不进。**
+    ///
+    /// `dna_view` 此前是**排除表**——序列化整张卡再 `remove` 掉几个元数据键，
+    /// 其余**自动**进入每个角色的 prompt。于是给 `CharacterCardV2` 加一个新字段，
+    /// 它**默认就被喂给模型了**，而加字段的人根本不会想到要为此做决定。
+    ///
+    /// 这条用例把「不做决定」变成红：卡的字段集必须**恰好**等于
+    /// 包含表 ∪ 排除表——多一个字段而两张表都没登记，立刻失败。
+    ///
+    /// ⚠️ 与 `world` 那个排除表的区别：`world` 是开放键空间，只能靠排除表；
+    /// `CharacterCardV2` 是固定 struct，**能用白名单就不该留「默认泄露」这条路**。
+    #[test]
+    fn dna_view_covers_every_card_field_by_an_explicit_decision() {
+        let card = minimal_card("A");
+        let full = serde_json::to_value(&card).expect("卡可序列化");
+        let all: std::collections::BTreeSet<&str> =
+            full.as_object().expect("卡是对象").keys().map(String::as_str).collect();
+        let decided: std::collections::BTreeSet<&str> =
+            DNA_VIEW_INCLUDE.iter().chain(DNA_VIEW_EXCLUDE.iter()).copied().collect();
+
+        let undecided: Vec<&&str> = all.iter().filter(|k| !decided.contains(*k)).collect();
+        assert!(
+            undecided.is_empty(),
+            "🔴 卡上这些字段既不在 DNA_VIEW_INCLUDE 也不在 DNA_VIEW_EXCLUDE：{undecided:?}\n\
+             改动前它们会**默认进入每个角色的 prompt**。请显式选一边——\
+             这道门存在的全部意义就是不让「加字段」等于「顺手喂给模型」。"
+        );
+        let stale: Vec<&&str> = decided.iter().filter(|k| !all.contains(*k)).collect();
+        assert!(stale.is_empty(), "🔴 两张表里登记了卡上已不存在的字段，请删掉：{stale:?}");
+
+        // 行为面：包含表里的进得去，排除表里的一个都进不来。
+        let view = dna_view(&card).expect("裁视图");
+        let keys: std::collections::BTreeSet<&str> =
+            view.as_object().expect("视图是对象").keys().map(String::as_str).collect();
+        for k in DNA_VIEW_INCLUDE {
+            assert!(keys.contains(k), "🔴 包含表里的 `{k}` 没进视图：{keys:?}");
+        }
+        for k in DNA_VIEW_EXCLUDE {
+            assert!(!keys.contains(k), "🔴 排除表里的 `{k}` 混进了视图：{keys:?}");
+        }
+
+        // 🔴 **白名单的价值只在「卡多了一个字段」时才兑现**——今天两张表并集恰好覆盖全部字段，
+        // 所以包含表与排除表**输出完全相同**，光看现有字段是分不出这两种实现的。
+        // 这里直接喂一个多出字段的 map，模拟「有人给 CharacterCardV2 加了一列」：
+        // 白名单实现下它进不来；排除表实现下它会**默认出现在每个角色的 prompt 里**。
+        let mut with_new_field = full.as_object().expect("卡是对象").clone();
+        with_new_field.insert("internalAuditNote".into(), serde_json::json!("内部批注，不该给模型看"));
+        let view2 = dna_view_from_map(&with_new_field);
+        let s2 = serde_json::to_string(&view2).expect("可序列化");
+        assert!(
+            !s2.contains("internalAuditNote") && !s2.contains("内部批注"),
+            "🔴 卡上新增的字段**默认进了角色 prompt**。这正是排除表的失效方式：\n\
+             加字段的人不会想到要为此做决定，而后果是静默泄露。实得：{s2}"
+        );
+    }
+
     /// 🔴 **每一个引擎内部保留键都必须被挡在所有角色的上下文之外——一个都不许漏。**
     ///
     /// # 这条门守的是一个「排除表」，而排除表的失败方向是泄露

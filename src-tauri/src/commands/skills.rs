@@ -190,6 +190,47 @@ pub fn list_skill_files(root: &Path) -> Vec<String> {
     }
     files
 }
+/// 🔴 **技能名会被当成目录名拼进路径，所以它必须先被校验。**
+///
+/// `name` 来自导入文件夹里 `SKILL.md` 的 frontmatter —— 而技能包是**支持用户导入**的
+/// （从网上拿到的技能包也算），也就是说这个字符串**完全由不受信内容决定**。
+/// 它此前未经任何检查就进了 `skills_dir.join(&skill.name)`：
+///
+/// - `name: ../../../Documents` → 导入时写到 skills 目录**之外**；
+///   删除时 `fs::remove_dir_all` 直接把那个目录树删掉。
+/// - `name: /Users/x/.ssh` → Rust 的 `Path::join` 遇到**绝对路径会整个替换基路径**，
+///   于是连 `..` 都不需要。
+///
+/// 判据取「必须是单个、普通的路径分量」：非空、不含分隔符、不是 `.`/`..`、不以 `.` 开头
+/// （避免写出隐藏目录）、不是绝对路径。**刻意不限制字符集**——技能名可以是中文，
+/// 用白名单字符集会把合法技能挡在外面，而挡住穿越并不需要那么严。
+fn validated_skill_dir_name(name: &str) -> Result<&str, String> {
+    let n = name.trim();
+    if n.is_empty() {
+        return Err("Skill 名称不能为空".to_string());
+    }
+    if n == "." || n == ".." || n.starts_with('.') {
+        return Err(format!("Skill 名称非法（不得以 . 开头或为 . / ..）：{name}"));
+    }
+    if n.contains('/') || n.contains('\\') || n.contains('\0') {
+        return Err(format!("Skill 名称非法（不得含路径分隔符）：{name}"));
+    }
+    // ⚠️ 这一条在 Unix/Windows 上**几乎是冗余的**（绝对路径必含分隔符，已被上一条拦下）——
+    // 故障注入实测：单独去掉它，用例仍然全绿。留着是因为它表达的是**意图**
+    // （「必须是单个普通分量」），而分隔符检查表达的是手段；万一将来加了别的路径形态
+    // （如 Windows 的盘符相对路径 `C:x`），意图这一条仍然拦得住。
+    // 如实记下它不承重，免得下一个人以为每一条都被验证过。
+    // ⚠️ 这一条在 Unix / Windows 上**几乎是冗余的**：绝对路径必含分隔符，已被上一条拦下。
+    // 故障注入实测：单独去掉它，用例仍然全绿；而去掉上面那条分隔符检查，用例当场红。
+    // 留着是因为它表达的是**意图**（「必须是单个普通分量」），分隔符检查表达的是**手段**；
+    // 将来若出现别的路径形态（如 Windows 盘符相对路径 `C:x`），意图这一条仍拦得住。
+    // 如实记下它不承重，免得下一个人以为每一条都被验证过。
+    if Path::new(n).is_absolute() || Path::new(n).components().count() != 1 {
+        return Err(format!("Skill 名称必须是单个目录名：{name}"));
+    }
+    Ok(n)
+}
+
 #[tauri::command]
 pub fn import_skill(app: AppHandle, path: String) -> Result<SkillDefinition, String> {
     let source = Path::new(&path);
@@ -202,13 +243,15 @@ pub fn import_skill(app: AppHandle, path: String) -> Result<SkillDefinition, Str
 
     let skill =
         parse_skill_definition(source).ok_or_else(|| "无法解析 SKILL.md 信息".to_string())?;
+    // 🔴 先校验再拼路径：`name` 来自被导入内容，未校验就 join 等于把写入位置交给对方决定。
+    let safe_name = validated_skill_dir_name(&skill.name)?;
 
     let skills_dir = app
         .path()
         .app_data_dir()
         .map_err(|e| e.to_string())?
         .join("skills");
-    let dest = skills_dir.join(&skill.name);
+    let dest = skills_dir.join(safe_name);
 
     if dest.exists() {
         return Err(format!(
@@ -223,12 +266,14 @@ pub fn import_skill(app: AppHandle, path: String) -> Result<SkillDefinition, Str
 }
 #[tauri::command]
 pub fn delete_skill(app: AppHandle, name: String) -> Result<(), String> {
+    // 🔴 同一道校验（删除比导入更危险：它 `remove_dir_all`，而技能名可能是导入时带进来的）。
+    let safe_name = validated_skill_dir_name(&name)?;
     let dest = app
         .path()
         .app_data_dir()
         .map_err(|e| e.to_string())?
         .join("skills")
-        .join(&name);
+        .join(safe_name);
     if !dest.exists() {
         return Err(format!("Skill '{}' 不存在", name));
     }
@@ -243,6 +288,55 @@ pub fn get_skills(app: AppHandle) -> Result<Vec<SkillDefinition>, String> {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// 🔴 **技能名是路径分量，穿越写法必须一条不漏地拒掉。**
+    ///
+    /// `name` 来自被导入的 `SKILL.md` frontmatter（技能包支持用户导入 = 不受信内容），
+    /// 此前**未经任何校验**就进了 `skills_dir.join(&skill.name)`：
+    /// 导入时写到 skills 目录之外，删除时 `remove_dir_all` 把那个目录树删掉。
+    /// ⚠️ 绝对路径尤其致命——Rust 的 `Path::join` 遇到绝对路径会**整个替换基路径**，连 `..` 都不需要。
+    #[test]
+    fn skill_name_must_be_a_single_plain_directory_component() {
+        for bad in [
+            "../evil",
+            "../../Documents",
+            "a/b",
+            "a\\b",
+            "/tmp/evil",
+            "/Users/x/.ssh",
+            "..",
+            ".",
+            ".hidden",
+            "",
+            "   ",
+        ] {
+            assert!(
+                validated_skill_dir_name(bad).is_err(),
+                "🔴 非法技能名被放行（会写/删到 skills 目录之外）：{bad:?}"
+            );
+        }
+    }
+
+    /// 🔴 **反方向同样要钉**：校验不得把合法技能挡在外面。
+    /// 技能名可以是中文、可以带空格与连字符——用白名单字符集会误伤，而挡住穿越并不需要那么严。
+    #[test]
+    fn skill_name_validation_does_not_reject_legitimate_names() {
+        for ok in [
+            "fanqie-long-xianxia-outline",
+            "我的写作技能",
+            "My Skill 2",
+            "skill_v2",
+            "技能-第2版",
+        ] {
+            assert!(
+                validated_skill_dir_name(ok).is_ok(),
+                "🔴 合法技能名被误拒（用户会以为自己的技能包坏了）：{ok:?} → {:?}",
+                validated_skill_dir_name(ok)
+            );
+        }
+        // 前后空白应被裁掉而不是当成非法。
+        assert_eq!(validated_skill_dir_name("  my-skill  ").unwrap(), "my-skill");
+    }
 
     const LONG_FORM_SKILLS: &[&str] = &[
         "fanqie-long-xianxia-outline",

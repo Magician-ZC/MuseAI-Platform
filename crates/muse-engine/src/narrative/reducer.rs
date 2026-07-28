@@ -44,7 +44,13 @@ const APPLIED_KEY: &str = "appliedPatchIds";
 /// （叙事可以往里写任意键）。所以它没法反过来写成白名单，
 /// 于是「将来加了第二个内部键却忘了登记」这条路必须被结构性堵死——
 /// 办法就是让两处**共用这一个数组**，加键时一次就都生效。
-/// 由 `reserved_world_keys_are_filtered_from_every_visible_context` 钉住。
+/// 由 `reserved_world_keys_are_filtered_from_every_visible_context`（角色上下文）、
+/// `public_world` 的用例（导演 prompt）与源码级红线
+/// `no_bare_reserved_world_key_literals_in_engine_sources` 共同钉住。
+///
+/// ⚠️ **实录**：把它收敛成一张表的那一次，我说的是「两处共用」——
+/// 实际是**三处**，`public_world` 里还藏着一个裸字面量，喂的是入场导演的 prompt，
+/// 下一轮才扫到。这正是「手列有几处」不可靠、必须靠遍历 + 源码扫描的实证。
 pub(crate) const RESERVED_WORLD_KEYS: &[&str] = &[APPLIED_KEY];
 /// 幂等账保留上限。
 const APPLIED_MAX: usize = 200;

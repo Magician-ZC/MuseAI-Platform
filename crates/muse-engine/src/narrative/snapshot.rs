@@ -70,8 +70,16 @@ pub fn branch_from(
     let mut next = snap.state.clone();
     next.run_id = new_run_id.to_string();
     next.revision = 0;
-    // 幂等账属旧 run，新分支重置。lockedSceneIds 随 state 自然带入。
-    next.world.remove("appliedPatchIds");
+    // 幂等账等**引擎内部账属旧 run**，新分支一律重置。lockedSceneIds 随 state 自然带入。
+    //
+    // 🔴 这里此前是裸字面量 `"appliedPatchIds"`——同一个键名在仓库里的**第四份**拷贝。
+    // 它的失效方向比另外三处更重：另外三处漏了是**泄露**（内部账进模型可见面），
+    // 这一处漏了是**正确性**——新分支继承旧 run 的幂等账，
+    // 于是旧 patch id 会被当成「已应用」而**静默跳过**，新分支少执行几个 patch 且无人知晓。
+    // 现在遍历同一张表，加新内部键时这里自动跟上。
+    for key in crate::narrative::reducer::RESERVED_WORLD_KEYS {
+        next.world.remove(*key);
+    }
     if !next.authoring.branch_snapshot_ids.contains(&snapshot_id.to_string()) {
         next.authoring.branch_snapshot_ids.push(snapshot_id.to_string());
     }

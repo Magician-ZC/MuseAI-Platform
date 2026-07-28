@@ -543,6 +543,14 @@ mod tests {
                 &s, "B", &card_b, &BTreeMap::new(), "场景", &[], None, None, &[],
             )
             .unwrap();
+            // 🔴 **导演 prompt 也是模型可见面**——它此前用的是另一个裸字面量（第三处）。
+            let director_world =
+                serde_json::to_string(&crate::narrative::public_world(&s)).unwrap();
+            assert!(
+                !director_world.contains(key) && !director_world.contains("INTERNAL-PROBE-VALUE"),
+                "🔴 内部保留键 `{key}` 泄漏进了入场导演的 prompt：{director_world}"
+            );
+            assert!(director_world.contains("大雪"), "导演也该看得见正常的 world 层");
             assert!(
                 !ctx.contains(key) && !ctx.contains("INTERNAL-PROBE-VALUE"),
                 "🔴 内部保留键 `{key}` 泄漏进了角色可见上下文：{ctx}"

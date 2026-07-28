@@ -197,6 +197,46 @@ mod determinism_red_line {
         }
     }
 
+    /// 🔴 **`world` 的内部保留键名不许再出现第四份裸字面量。**
+    ///
+    /// # 实录：为什么这道门是必要的
+    ///
+    /// 这个键名（幂等账 `appliedPatchIds`）需要在**三个**地方生效：
+    /// 不可经 patch 写（`reducer::parse_path`）· 不进角色可见上下文
+    /// （`decide::assemble_visible_context`）· 不进入场导演 prompt（`narrative::public_world`）。
+    ///
+    /// 收敛它的时候我先合并了前两处，并在注释里写「两处共用一张表」——
+    /// **那句话是错的**，第三处（`public_world`）里还躺着一个裸字面量，下一轮才扫到。
+    /// 也就是说「手数一遍有几处」这件事，我当场就数错了。
+    ///
+    /// 所以判据不能是「我记得有几处」，得是**源码扫描**：
+    /// 除了 `reducer` 里那一处定义，任何生产源码出现这个字面量都判红。
+    /// 漏一处的后果是**内部账静默进入模型可见面**——不报错、不告警。
+    #[test]
+    fn no_bare_reserved_world_key_literals_in_engine_sources() {
+        const NEEDLE: &str = "\"appliedPatchIds\"";
+        let mut offenders = Vec::new();
+        for (rel, src) in production_sources() {
+            // 唯一允许的定义处：reducer 里那个常量。
+            let allowed = if rel == "narrative/reducer.rs" { 1 } else { 0 };
+            // 只看**代码行**：注释里提到这个名字（解释为什么要收敛它）是正常的，
+            // 把注释也判红会逼人把说明删掉——那正好是这道门要保住的东西。
+            let found = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .filter(|l| l.contains(NEEDLE))
+                .count();
+            if found != allowed {
+                offenders.push(format!("{rel}：找到 {found} 处裸字面量，允许 {allowed} 处"));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "🔴 `world` 的内部保留键名出现了不该有的裸字面量：\n  {}\n\n             它需要在三个地方同时生效（不可写 / 不进角色上下文 / 不进导演 prompt），\n             各写一份的话，漂开的后果是**内部账静默进入模型可见面**——不报错、不告警。\n             请改为引用 `narrative::reducer::RESERVED_WORLD_KEYS`。\n             （这道门存在的理由是实证：收敛它时我手数成了「两处」，实际是三处。）",
+            offenders.join("\n  ")
+        );
+    }
+
     fn production_sources() -> Vec<(String, String)> {
         fn strip_test_mods(src: &str) -> String {
             let mut out = String::with_capacity(src.len());

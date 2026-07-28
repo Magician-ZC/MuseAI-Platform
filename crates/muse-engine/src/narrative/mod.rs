@@ -1104,11 +1104,15 @@ struct WriterOut {
 }
 
 /// 公共 world 层（剔除引擎内部保留幂等账键）。
-fn public_world(state: &NarrativeState) -> BTreeMap<String, Value> {
+pub(crate) fn public_world(state: &NarrativeState) -> BTreeMap<String, Value> {
     state
         .world
         .iter()
-        .filter(|(k, _)| k.as_str() != "appliedPatchIds")
+        // 🔴 与 `decide::assemble_visible_context` 用**同一张表**。
+        // 这里此前是一个**裸字面量** `"appliedPatchIds"`——同一个键名在仓库里的第三份拷贝，
+        // 而它喂的是**入场导演的 prompt**，同样是模型可见面。
+        // 见 `reducer::RESERVED_WORLD_KEYS` 的注释：排除表漏一处 = 静默泄露。
+        .filter(|(k, _)| !reducer::RESERVED_WORLD_KEYS.contains(&k.as_str()))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
 }

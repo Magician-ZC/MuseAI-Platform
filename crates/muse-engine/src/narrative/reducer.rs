@@ -240,7 +240,11 @@ fn apply_operation(next: &mut NarrativeState, op: &PatchOperation) -> Result<(),
         }
         ParsedPath::NarrativeList { field } => match field.as_str() {
             "foreshadowing" => apply_str_list(&mut next.narrative.foreshadowing, op),
-            _ => apply_str_list(&mut next.narrative.pacing_notes, op),
+            _ => {
+                apply_str_list(&mut next.narrative.pacing_notes, op)?;
+                trim_pacing_notes(&mut next.narrative.pacing_notes);
+                Ok(())
+            }
         },
         ParsedPath::AuthoringList { field } => match field.as_str() {
             "lockedSceneIds" => apply_str_list(&mut next.authoring.locked_scene_ids, op),
@@ -376,6 +380,37 @@ fn apply_str_list(list: &mut Vec<String>, op: &PatchOperation) -> Result<(), Eng
             Ok(())
         }
         PatchOp::Increment => Err(op_kind_err(op.op, "列表字段不支持 increment")),
+    }
+}
+
+/// `narrative.pacingNotes` 的滚动窗口上限。
+///
+/// # 为什么这里可以定一个数，而别处不行
+///
+/// `build_patch` 每回合对**每个 outcome** 追加一条节拍记录，**永不清理**——
+/// 一个跑 500 拍、3 个角色的世界会攒下约 1500 条。它不进 prompt（不吃 token），
+/// 但 `worlds.narrative_state_json` **每拍全量读写**，这一段就白白跟着进出。
+///
+/// 定这个数通常需要「真实体积曲线」才有依据（同 `docs/VALIDATION.md` §1 的阈值）。
+/// **但这一条不需要**，理由是查实的事实：**全仓没有任何生产代码读 `pacing_notes`**
+/// ——server 不读、前端不读、后台不读，引擎自己也只在 reducer 里写它与做路径求值。
+/// 既然没有消费者，窗口只需覆盖「人肉看状态时想回溯多少拍」，取多少都不影响任何行为。
+/// 200 ≈ 5 个角色 × 40 拍。
+///
+/// # 🔴 截断不违反「公共事实不可回滚」
+///
+/// 那条红线保护的是 `world_events`（`ActionResolved` 等落库事件），
+/// 而节拍记录与 `ActionResolved.fact.consequence` **同源**——被截掉的旧条目
+/// 在 `world_events` 里有**不可变副本**，一个字都没丢。
+/// 这里丢的只是引擎内部状态里的一份冗余拷贝。
+///
+/// 确定性：保留**末尾** N 条，纯截断、不排序、不依赖任何迭代序。
+const MAX_PACING_NOTES: usize = 200;
+
+/// 保留最近 [`MAX_PACING_NOTES`] 条节拍记录。见该常量的注释。
+fn trim_pacing_notes(notes: &mut Vec<String>) {
+    if notes.len() > MAX_PACING_NOTES {
+        notes.drain(..notes.len() - MAX_PACING_NOTES);
     }
 }
 
@@ -970,4 +1005,77 @@ mod tests {
         let p = patch("p1", 0, vec![op(PatchOp::Set, "narrative.outlineNodes[n1].status", Some(json!("finished")))]);
         assert_eq!(validate_and_apply(&s, &p).unwrap_err().code(), "validation");
     }
+    /// 🔴 **节拍记录不许无界增长**（`docs/VALIDATION.md` §3.47 欠账 A6）。
+    ///
+    /// `build_patch` 每回合对每个 outcome 追加一条，永不清理。它不进 prompt，
+    /// 但 `worlds.narrative_state_json` **每拍全量读写**——这一段会白白跟着进出。
+    ///
+    /// ⚠️ 登记这条欠账时我写的是「定保留多少条没有依据，等真实运营数据」。
+    /// **那句话没走一遍就写了**：走一遍发现**全仓没有任何生产代码读 `pacing_notes`**，
+    /// 既然没有消费者，窗口取多少都不影响任何行为——根本不需要那条曲线。
+    ///
+    /// 🔴 截断不违反「公共事实不可回滚」：被截掉的旧条目与
+    /// `ActionResolved.fact.consequence` 同源，在 `world_events` 里有不可变副本。
+    #[test]
+    fn pacing_notes_do_not_grow_without_bound() {
+        let mut st = NarrativeState { schema_version: 1, run_id: "r".into(), ..Default::default() };
+        // 连追加两倍上限那么多条，模拟一个跑很久的世界。
+        for i in 0..(MAX_PACING_NOTES * 2) {
+            let patch = StatePatch {
+                id: format!("p{i}"),
+                base_revision: st.revision,
+                source_decision_ids: vec![],
+                operations: vec![PatchOperation {
+                    op: PatchOp::Append,
+                    path: "narrative.pacingNotes".to_string(),
+                    value: Some(serde_json::json!(format!("第 {i} 拍"))),
+                    precondition: None,
+                }],
+            };
+            st = validate_and_apply(&st, &patch).expect("追加应成功");
+        }
+
+        assert_eq!(
+            st.narrative.pacing_notes.len(),
+            MAX_PACING_NOTES,
+            "🔴 节拍记录必须有滚动窗口，否则 narrative_state_json 会随拍数无界膨胀"
+        );
+        // 🔴 保留的是**最近**的：丢旧不丢新，否则「回溯最近几拍」这个唯一用途就没了。
+        assert_eq!(
+            st.narrative.pacing_notes.last().map(String::as_str),
+            Some(format!("第 {} 拍", MAX_PACING_NOTES * 2 - 1).as_str()),
+            "最后一条必须是最新的一拍：{:?}",
+            st.narrative.pacing_notes.last()
+        );
+        assert_eq!(
+            st.narrative.pacing_notes.first().map(String::as_str),
+            Some(format!("第 {} 拍", MAX_PACING_NOTES).as_str()),
+            "窗口起点应恰好是上限之外的第一条"
+        );
+    }
+
+    /// 反向配对：**没到上限时一条都不许丢**。
+    ///
+    /// 只测「超了要截」的话，把列表恒清空也能全绿——那等于把这个字段废掉。
+    #[test]
+    fn pacing_notes_below_the_cap_are_kept_intact() {
+        let mut st = NarrativeState { schema_version: 1, run_id: "r".into(), ..Default::default() };
+        for i in 0..5 {
+            let patch = StatePatch {
+                id: format!("p{i}"),
+                base_revision: st.revision,
+                source_decision_ids: vec![],
+                operations: vec![PatchOperation {
+                    op: PatchOp::Append,
+                    path: "narrative.pacingNotes".to_string(),
+                    value: Some(serde_json::json!(format!("第 {i} 拍"))),
+                    precondition: None,
+                }],
+            };
+            st = validate_and_apply(&st, &patch).expect("追加应成功");
+        }
+        assert_eq!(st.narrative.pacing_notes.len(), 5, "远未到上限时一条都不该丢");
+        assert_eq!(st.narrative.pacing_notes[0], "第 0 拍");
+    }
+
 }

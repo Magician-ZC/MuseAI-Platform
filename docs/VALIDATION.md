@@ -1049,6 +1049,40 @@ camelCase 与 snake_case 同形。`known_to` 才受影响，而那一处是类�
 ⚠️ 另一条边界：**存量模板不会被回头校验**，闸只在写入路径上。存量的发现面是运营台的
 `shape.unknownTopLevelKeys` / `shape.unknownNestedKeys` 两栏——**看得见，但不会自动修**。
 
+### 3.33 覆盖图：这轮巡检**扫过哪些面、没扫哪些面**（**2026-07-28**）
+
+我在 §3.32 末尾写过「未扫过的面我不知道有多少」。那句话本身是可以消除的空白，
+这一节把它变成一张图——**给下一个人（或下一轮的我）一个能据以决策的起点**，
+而不是继续随机抽查。
+
+⚠️ **「查过」与「改过」是两回事**，下表分开标：查过没改的那些，结论是「无缺陷」，
+本身也是结果（省下一个人重查）。
+
+| 轨 | 模块 | 行数 | 状态 |
+|---|---|---:|---|
+| server | `admin_api` `runtime` `assembly` `safety` `ifline` `assets` | 30k | ✅ 查过并改过 |
+| server | `worlds` `events` `social` `subplot` `backpack` `shop` `billing` `ledger` `progression` `chapters` `arena` `livegate` `clips` `reports` `memorial` `onboarding` `invitations` `interventions` `annotations` `consents` `flags` `idempotency` | — | ✅ 查过（红线扫描面覆盖：读取面过滤 / 资产单一写入 / 事实不可删 / 确定性 / 幂等 / 无提现 / AI 标识 / feature 门控），**多数结论为无缺陷** |
+| server | `slo` | 3258 | ⬜ **未专门扫过**（只在「文档与读数是否对得上」那次核过 `calibration`） |
+| 引擎 | `lib`（新增红线）· 全 crate 的 `unwrap`/`expect` 面 · 依赖表 | — | ✅ 查过并改过 |
+| 引擎 | **`narrative` 9699 行** · `character` 3811 · `world` 2370 · `knowledge` 1593 · `replay` 1454 | 19k | ⬜ **未逐条扫过**（只过了 `unwrap` 面与确定性面） |
+| 桌面轨 | `agent` `commands` `mobile_server` `llm` `tools` `models` `utils` `crawler` | 16k | ✅ 查过并改过 |
+| 桌面轨 | `book_travel` 1538 · `lib` 392 · `fs_commands` 297 | 2.2k | ⬜ **未扫过**（`fs_commands::rename_item_cmd` 单独看过，结论见 §3.26） |
+| 前端 | `utils/runtime.ts` · `pages/MobileHome` · `utils/bookTravelMaterials` | — | ✅ 查过并改过 |
+| 前端 | **`components` 13259** · `stores` 7098 · `pages` 其余 | 20k+ | ⬜ **未扫过** |
+
+**按「还没扫且体量大且逻辑要紧」排，下一轮的候选顺序**：
+
+1. **引擎 `narrative`（9699 行）** —— 回合循环、仲裁、结局选取。产品最核心的判定都在这里，
+   而本轮只过了它的 `unwrap` 面。
+2. **前端 `stores`（7098 行）** —— 状态持久化。数据丢失类缺陷通常住在这里
+   （本轮在 `mobile_server` 那侧撞见过一次同类：密钥抹除与回写的两份拷贝，§3.19）。
+3. **server `slo`（3258 行）** —— 只读聚合，风险低于前两者，但它是运营看板的唯一数据源，
+   算错比缺失更糟。
+
+⚠️ **这张图不是「剩下的都有问题」**，也不是「打勾的都没问题」——
+它只说明**哪些面被这一轮的方法过过一遍**。已扫面里相当一部分结论是「无缺陷」（见各节），
+未扫面里也可能一个缺陷都没有。它的用处是：**下次不必从零决定看哪里。**
+
 ### 3.32 引擎的确定性此前**一道闸都没有**——我说「已收敛」时漏了整个 crate（**2026-07-28**）
 
 ⚠️ 先纠正自己：上一轮我说「能靠查代码独立推进的部分已经收敛」。

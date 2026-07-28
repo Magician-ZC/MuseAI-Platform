@@ -1049,6 +1049,36 @@ camelCase 与 snake_case 同形。`known_to` 才受影响，而那一处是类�
 ⚠️ 另一条边界：**存量模板不会被回头校验**，闸只在写入路径上。存量的发现面是运营台的
 `shape.unknownTopLevelKeys` / `shape.unknownNestedKeys` 两栏——**看得见，但不会自动修**。
 
+### 3.25 版本历史的 `version_id` 未校验——构造过的 meta.json 可读/删任意文件（**修于 2026-07-28**）
+
+技能包那处（§3.22）之后，按同一形状把「外部来的名字被 `join` 进路径」的地方查了一遍。
+`commands/workspace.rs` 的 `load/save_app_state_path` **是校验了的**（两处都查 `/`、`\`、`..`），
+`/api/mobile/state/{name}` 那条局域网入口因此安全。
+
+但 `commands/versions.rs` 没有：
+
+```rust
+fn get_version_file_path(file_path: &Path, version_id: &str) -> PathBuf {
+    parent.join(".versions").join(file_name).join(version_id)   // version_id 未校验
+}
+```
+
+`read_file_version` 会 `read_to_string`、`delete_file_version` 会 `remove_file`。
+**写入侧生成的是 uuid（安全），问题在读回侧信任了 `.versions/<文件名>/meta.json` 里写着的 id**
+——而那个文件在**用户打开的工作区文件夹**里（比如从网上拿到的项目）。
+构造 `id: "../../../x"` 即可读到 / 删掉 `.versions` 之外的东西。
+
+修：判据提到 `utils::validated_path_component` **一处共用**，
+技能包那两个入口也改为复用它（不在仓里留第二份同判据）。三个调用点：
+技能导入、技能删除、版本文件路径。
+
+🔵 故障注入四处全红：版本路径退回不校验（改动前形态）→ 红；
+共用判据改用白名单字符集 → **版本与技能两侧同时红**（证明确实共用）；
+去掉承重的分隔符检查 → 红。
+
+⚠️ 沿用 §3.22 的取舍并写进共用判据的注释：**不限制字符集**（版本备注可以是中文、可以带空格），
+以及 `components().count()` 那一条**不承重**（已实测），免得有人以为每条都被验证过。
+
 ### 3.24 工具能力闸：执行侧**有闸**（无漏洞），但声明侧另抄了一份判据（**2026-07-28**）
 
 `allowed_tools` 是按请求限制能力的闸（冒险模式只开放部分工具）。查它有两个问题要分开回答：

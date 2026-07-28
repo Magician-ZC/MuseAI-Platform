@@ -133,6 +133,38 @@ pub fn normalize_tool_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
+/// 🔴 **全仓唯一的「这个字符串能不能当一个路径分量用」判据。**
+///
+/// 凡是把外部来的名字 `join` 进路径的地方都要先过这里。不过的后果一律是路径穿越：
+/// 写出目标目录、读到目录外的文件、或 `remove_*` 删掉不该删的东西。
+/// ⚠️ 绝对路径尤其致命——**Rust 的 `Path::join` 遇到绝对路径会整个替换基路径**，连 `..` 都不需要。
+///
+/// 判据取「必须是单个、普通的路径分量」：非空、不含分隔符与 NUL、不是 `.`/`..`、
+/// 不以 `.` 开头（避免写出隐藏目录）、必须恰好一个分量。
+///
+/// **刻意不限制字符集**：技能名可以是中文、版本备注可以带空格；用白名单字符集会把合法输入
+/// 挡在外面，而挡住穿越并不需要那么严。这一取舍由各调用点的「合法名不得被误拒」用例钉住。
+///
+/// ⚠️ 「必须恰好一个分量」这一条在 Unix/Windows 上几乎冗余（绝对路径必含分隔符，
+/// 已被上一条拦下）；留着是因为它表达的是**意图**而非手段。故障注入实测它不承重，
+/// 如实记在这里，免得有人以为每一条都被验证过。
+pub fn validated_path_component<'a>(value: &'a str, what: &str) -> Result<&'a str, String> {
+    let v = value.trim();
+    if v.is_empty() {
+        return Err(format!("{what}不能为空"));
+    }
+    if v == "." || v == ".." || v.starts_with('.') {
+        return Err(format!("{what}非法（不得以 . 开头或为 . / ..）：{value}"));
+    }
+    if v.contains('/') || v.contains('\\') || v.contains('\0') {
+        return Err(format!("{what}非法（不得含路径分隔符）：{value}"));
+    }
+    if Path::new(v).is_absolute() || Path::new(v).components().count() != 1 {
+        return Err(format!("{what}必须是单个名称：{value}"));
+    }
+    Ok(v)
+}
+
 pub fn normalize_path(path: &Path) -> PathBuf {
     let mut result = PathBuf::new();
     for comp in path.components() {
@@ -407,6 +439,25 @@ pub fn agent_session_path(app: &AppHandle, id: &str) -> Result<std::path::PathBu
 
 #[cfg(test)]
 mod tests {
+
+    /// 🔴 共用判据本身：三个调用点（技能导入 / 技能删除 / 版本文件）都靠它。
+    #[test]
+    fn validated_path_component_rejects_traversal_and_keeps_normal_names() {
+        for bad in ["../x", "a/b", "a\\b", "/abs", "..", ".", ".hidden", "", "   "] {
+            assert!(
+                super::validated_path_component(bad, "名称").is_err(),
+                "🔴 应被拒：{bad:?}"
+            );
+        }
+        for ok in ["fanqie-long-xianxia-outline", "我的技能", "draft 2", "v1_2"] {
+            assert!(
+                super::validated_path_component(ok, "名称").is_ok(),
+                "🔴 合法名不得被误拒：{ok:?}"
+            );
+        }
+        assert_eq!(super::validated_path_component("  x  ", "名称").unwrap(), "x");
+    }
+
     use super::*;
     use std::path::PathBuf;
 

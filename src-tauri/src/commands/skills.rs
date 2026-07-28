@@ -190,45 +190,11 @@ pub fn list_skill_files(root: &Path) -> Vec<String> {
     }
     files
 }
-/// 🔴 **技能名会被当成目录名拼进路径，所以它必须先被校验。**
-///
-/// `name` 来自导入文件夹里 `SKILL.md` 的 frontmatter —— 而技能包是**支持用户导入**的
-/// （从网上拿到的技能包也算），也就是说这个字符串**完全由不受信内容决定**。
-/// 它此前未经任何检查就进了 `skills_dir.join(&skill.name)`：
-///
-/// - `name: ../../../Documents` → 导入时写到 skills 目录**之外**；
-///   删除时 `fs::remove_dir_all` 直接把那个目录树删掉。
-/// - `name: /Users/x/.ssh` → Rust 的 `Path::join` 遇到**绝对路径会整个替换基路径**，
-///   于是连 `..` 都不需要。
-///
-/// 判据取「必须是单个、普通的路径分量」：非空、不含分隔符、不是 `.`/`..`、不以 `.` 开头
-/// （避免写出隐藏目录）、不是绝对路径。**刻意不限制字符集**——技能名可以是中文，
-/// 用白名单字符集会把合法技能挡在外面，而挡住穿越并不需要那么严。
+/// 技能名会被当成目录名拼进路径（导入时写、删除时 `remove_dir_all`），
+/// 而它来自被导入的 `SKILL.md` frontmatter —— 技能包**支持用户导入**，即完全由不受信内容决定。
+/// 判据复用全仓唯一那一处（`utils::validated_path_component`），不在这里另写一份。
 fn validated_skill_dir_name(name: &str) -> Result<&str, String> {
-    let n = name.trim();
-    if n.is_empty() {
-        return Err("Skill 名称不能为空".to_string());
-    }
-    if n == "." || n == ".." || n.starts_with('.') {
-        return Err(format!("Skill 名称非法（不得以 . 开头或为 . / ..）：{name}"));
-    }
-    if n.contains('/') || n.contains('\\') || n.contains('\0') {
-        return Err(format!("Skill 名称非法（不得含路径分隔符）：{name}"));
-    }
-    // ⚠️ 这一条在 Unix/Windows 上**几乎是冗余的**（绝对路径必含分隔符，已被上一条拦下）——
-    // 故障注入实测：单独去掉它，用例仍然全绿。留着是因为它表达的是**意图**
-    // （「必须是单个普通分量」），而分隔符检查表达的是手段；万一将来加了别的路径形态
-    // （如 Windows 的盘符相对路径 `C:x`），意图这一条仍然拦得住。
-    // 如实记下它不承重，免得下一个人以为每一条都被验证过。
-    // ⚠️ 这一条在 Unix / Windows 上**几乎是冗余的**：绝对路径必含分隔符，已被上一条拦下。
-    // 故障注入实测：单独去掉它，用例仍然全绿；而去掉上面那条分隔符检查，用例当场红。
-    // 留着是因为它表达的是**意图**（「必须是单个普通分量」），分隔符检查表达的是**手段**；
-    // 将来若出现别的路径形态（如 Windows 盘符相对路径 `C:x`），意图这一条仍拦得住。
-    // 如实记下它不承重，免得下一个人以为每一条都被验证过。
-    if Path::new(n).is_absolute() || Path::new(n).components().count() != 1 {
-        return Err(format!("Skill 名称必须是单个目录名：{name}"));
-    }
-    Ok(n)
+    crate::utils::validated_path_component(name, "Skill 名称")
 }
 
 #[tauri::command]

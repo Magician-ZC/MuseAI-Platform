@@ -300,10 +300,37 @@ async fn get_mobile_status() -> impl IntoResponse {
     }))
 }
 
+/// 🔴 **全仓唯一的「这是不是密钥字段」判据**。
+///
+/// 出站抹除（[`sanitize_settings_state`]）与回写保护（[`merge_settings_preserving_keys`]）
+/// **必须用同一个判据**——此前两处各写了一遍 `k == "llmApiKey" || k == "apiKey"`。
+/// 两份拷贝一旦漂开，后果很具体：
+///
+/// 1. 桌面有 `newSecretKey: "sk-真的"`；
+/// 2. 抹除认得它 → 发给手机的是 `""`；
+/// 3. 回写保护**不认得**它 → 手机一存设置，桌面那把真 key 就被空串覆盖。
+///
+/// 也就是**用户在手机上打开一次设置，桌面的 API Key 当场丢失**。
+///
+/// 判据按**模式**而不是逐个字段名列举（默认安全）：新增 `azureApiKey` / `xxxSecret`
+/// 这类字段无需有人记得来改这里。代价是可能多抹一两个无关字段，
+/// 而漏抹的代价是密钥出本机——两者不对称。
+fn is_secret_settings_key(k: &str) -> bool {
+    let lower = k.to_ascii_lowercase();
+    ["apikey", "secret", "password", "credential", "accesskey", "privatekey", "authtoken"]
+        .iter()
+        .any(|p| lower.contains(p))
+}
+
+/// 出站抹除：发给手机的设置里，密钥一律置空串。
+///
+/// ⚠️ **只抹字符串值**。判据是模式匹配，可能命中 `isSecretRealm` 这类布尔字段；
+/// 而本函数写的是 `Value::String("")`，把布尔/数字改成空串会让读它的那一侧类型崩掉。
+/// 「不该抹的别抹坏」和「该抹的别漏」都要，故加这道类型闸。
 fn sanitize_settings_state(val: &mut Value) {
     if let Some(obj) = val.as_object_mut() {
         for (k, v) in obj.iter_mut() {
-            if k == "llmApiKey" || k == "apiKey" {
+            if is_secret_settings_key(k) && v.is_string() {
                 *v = Value::String("".to_string());
             } else {
                 sanitize_settings_state(v);
@@ -320,7 +347,10 @@ fn merge_settings_preserving_keys(existing: &mut Value, incoming: &Value) {
     match (existing, incoming) {
         (Value::Object(ext_map), Value::Object(inc_map)) => {
             for (k, inc_val) in inc_map.iter() {
-                if k == "llmApiKey" || k == "apiKey" {
+                // 回写保护：手机传回来的空密钥**不覆盖**桌面已有的真密钥
+                // （手机拿到的本来就是被抹过的空串，见 `sanitize_settings_state`）。
+                // 🔴 判据与出站抹除**同一个函数**，不再各写一遍——理由见 `is_secret_settings_key`。
+                if is_secret_settings_key(k) {
                     if let Some(s) = inc_val.as_str() {
                         if s.is_empty() {
                             continue;
@@ -1706,6 +1736,82 @@ mod tests {
     ///
     /// 本用例把一个可辨识的令牌塞进状态，然后断言响应体里**一个字节都找不到它**
     /// （不逐字段断言：将来加字段时，逐字段的写法会漏掉新字段）。
+    /// 🔴 **新增的密钥字段默认就被抹掉**（判据按模式，不靠有人记得来加名字）。
+    #[test]
+    fn newly_added_secret_fields_are_sanitized_by_default() {
+        let mut v = serde_json::json!({
+            "state": {
+                "llmApiKey": "sk-old",
+                "apiKey": "sk-old2",
+                // 以下几个今天并不存在——正是「将来有人加了、却没人记得改抹除名单」的那类。
+                "azureApiKey": "sk-azure",
+                "webhookSecret": "whsec-xxx",
+                "smtpPassword": "hunter2",
+                "vendorCredential": "cred",
+                "authToken": "bearer-xxx",
+                "models": [{ "apiKey": "sk-in-array" }]
+            }
+        });
+        sanitize_settings_state(&mut v);
+        let st = &v["state"];
+        for k in [
+            "llmApiKey", "apiKey", "azureApiKey", "webhookSecret",
+            "smtpPassword", "vendorCredential", "authToken",
+        ] {
+            assert_eq!(st[k], serde_json::json!(""), "密钥字段 `{k}` 必须被抹成空串");
+        }
+        assert_eq!(st["models"][0]["apiKey"], serde_json::json!(""), "数组里的也要抹");
+    }
+
+    /// 🔴 **只抹字符串**：判据是模式匹配，会命中 `isSecretRealm` 这类布尔字段，
+    /// 而抹除写的是空串——把布尔/数字改成空串会让读它的那一侧类型崩掉。
+    #[test]
+    fn sanitizer_never_corrupts_non_string_values() {
+        let mut v = serde_json::json!({
+            "isSecretRealm": true,
+            "maxOutputTokens": 4096,
+            "nested": { "someSecretCount": 3 }
+        });
+        sanitize_settings_state(&mut v);
+        assert_eq!(v["isSecretRealm"], serde_json::json!(true), "布尔不得被抹成空串");
+        assert_eq!(v["maxOutputTokens"], serde_json::json!(4096), "数字不得被抹成空串");
+        assert_eq!(v["nested"]["someSecretCount"], serde_json::json!(3));
+    }
+
+    /// 🔴 **出站抹除与回写保护必须同源**，否则手机上打开一次设置就会把桌面的真 key 覆盖成空串。
+    ///
+    /// 端到端走一遍那条路：桌面有真 key → 抹除后发给手机 → 手机原样存回 → 桌面的 key 必须还在。
+    /// 判据一旦漂开（比如抹除认得 `azureApiKey`、回写保护不认得），这里立刻红。
+    #[test]
+    fn phone_saving_settings_never_wipes_the_desktop_keys() {
+        let mut desktop = serde_json::json!({
+            "state": { "llmApiKey": "sk-real", "azureApiKey": "sk-azure-real", "theme": "dark" }
+        });
+
+        // ① 发给手机：密钥被抹空。
+        let mut to_phone = desktop.clone();
+        sanitize_settings_state(&mut to_phone);
+        assert_eq!(to_phone["state"]["azureApiKey"], serde_json::json!(""));
+
+        // ② 手机改了个无关设置后原样存回。
+        let mut from_phone = to_phone;
+        from_phone["state"]["theme"] = serde_json::json!("light");
+
+        // ③ 合并：真 key 必须原封不动，无关设置照常生效。
+        merge_settings_preserving_keys(&mut desktop, &from_phone);
+        assert_eq!(
+            desktop["state"]["llmApiKey"],
+            serde_json::json!("sk-real"),
+            "🔴 手机存一次设置就把桌面的 key 抹了"
+        );
+        assert_eq!(
+            desktop["state"]["azureApiKey"],
+            serde_json::json!("sk-azure-real"),
+            "🔴 两处判据漂开了：抹除认得这个字段，回写保护不认得"
+        );
+        assert_eq!(desktop["state"]["theme"], serde_json::json!("light"), "无关设置应当能改");
+    }
+
     #[tokio::test]
     async fn public_status_endpoint_never_leaks_the_access_token() {
         const SECRET: &str = "tok-DO-NOT-LEAK-9f3a1c";

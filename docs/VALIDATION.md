@@ -1049,6 +1049,45 @@ camelCase 与 snake_case 同形。`known_to` 才受影响，而那一处是类�
 ⚠️ 另一条边界：**存量模板不会被回头校验**，闸只在写入路径上。存量的发现面是运营台的
 `shape.unknownTopLevelKeys` / `shape.unknownNestedKeys` 两栏——**看得见，但不会自动修**。
 
+### 3.12 红线巡检两条：未成年保护（**核过，无缺陷**）与事实不可删（**补上红线**）
+
+按「查同类模式」继续扫两条真红线。两条的结论不同，都如实记。
+
+#### ① 未成年保护 —— **核过，没有缺陷，不动**
+
+`auth::is_declared_adult` 早已收归一处，但「实现只有一份」不等于「该拦的路径都拦了」。
+逐个数了 `social` 的九个玩家端点：五个身份端点全挂了 `ensure_adult_social`，
+**四个没挂**——`list_blocks` / `create_block` / `remove_block` / `create_report`。
+
+那不是漏挂，是**有意的**，模块头写得很清楚：
+
+> ⚠️ **拉黑与举报不设年龄门**：它们是保护工具，不是社交特权。把未成年的举报/拉黑能力
+> 一并关掉，是把"保护未成年"做成了"让未成年无法自保"。
+
+而且**正反两个方向都已经有用例**：`red_line_minor_rejected_by_server_with_zero_side_effect`
+钉身份端点必须拒未成年，`minor_can_still_block_and_report` 钉保护工具必须对未成年开放。
+后者尤其重要——它挡的是「有人发现这个不一致、为了整齐给拉黑也加上成年门」这种**看起来像修 bug 的破坏**。
+
+**这一条不需要任何改动。** 记下来是为了下一个人不必再数一遍，也为了说明：
+「N 处手工调用」这个形状不必然是缺陷，得看那 N 处的差异是不是有理由。
+
+#### ② 事实不可删 —— **补上红线**
+
+`red_line_world_events_has_one_ratchet_and_one_guarded_relax` 把 `UPDATE world_events`
+逐条钉死了形状（正文零改写 / 单向棘轮 / 一条带守卫的放宽），但**删除这一支全仓没有任何红线**。
+而「回滚公共事实」最硬、最彻底的形态恰恰是删除：**改一列还留着痕迹，删一行连痕迹都没有。**
+
+扫过一遍：生产码里对事实表**一次删除都没有**（处置手段全是状态标记——`content_takedowns`
++ 收紧 `moderation`，被拦内容仍落库留痕供申诉）。所以这条不变式今天成立，
+`red_line_facts_are_never_deleted` 只是把它从「大家都这么做」变成「不这么做就红」。
+
+覆盖：`world_events` / `world_ticks` / `ifline_beats` / `world_contributions` /
+`ledger_postings` / `ledger_journals` / `audit_logs` / `risk_events`。
+不含删除本就合法的表（幂等键、通知 outbox、运行时开关等有生命周期的行）。
+
+🔵 故障注入三处全红：下架路径加一句 `DELETE FROM world_events`（最像「合理需求」的那种）→ 红；
+删账本分录 → 红；表名写错 → 红（「有事实表一次都没被扫到」那一支，防的是扫描器失效）。
+
 ### 3.11 资产单一写入（§0.2 平台红线）此前只有注释和行为用例（**钉住于 2026-07-28**）
 
 全仓有十来处注释写着「铸卡的唯一入口是 `subplot::grant_card_tx`」「道具唯一写入路径是

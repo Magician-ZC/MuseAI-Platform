@@ -877,6 +877,60 @@ fn world_event_updates(code: &str) -> Vec<String> {
     out
 }
 
+/// 🔴 **事实表只增不删**（§0.3 公共事实不可回滚）——上面那条棘轮的**另一半**。
+///
+/// 那条把 `UPDATE world_events` 逐条钉死了形状（正文零改写 / 单向棘轮 / 一条带守卫的放宽），
+/// 但**删除这一支全仓没有任何红线**。而「回滚公共事实」最硬、最彻底的形态恰恰是删除：
+/// 改一列还留着痕迹，删一行连痕迹都没有。
+///
+/// 本仓现有的处置手段全都是**状态标记**而非删除（内容处置写 `content_takedowns` +
+/// 收紧 `moderation`；被拦事件仍落库留痕供人审/申诉，见 `clips` 那条用例）。
+/// 也就是说这条不变式今天成立——本用例只是把它从「大家都这么做」变成「不这么做就红」。
+///
+/// 覆盖的是**只增不删的事实与台账**，不含那些删除本就合法的表
+/// （幂等键、通知 outbox、运行时开关等有生命周期的行）。
+#[test]
+fn red_line_facts_are_never_deleted() {
+    /// 只增不删：世界事实、拍台账、if 线拍、戏份账本、复式账本分录与流水、审计与风控留痕。
+    const FACT_TABLES: &[&str] = &[
+        "world_events",
+        "world_ticks",
+        "ifline_beats",
+        "world_contributions",
+        "ledger_postings",
+        "ledger_journals",
+        "audit_logs",
+        "risk_events",
+    ];
+
+    let sources = production_sources();
+    let mut offenders: Vec<String> = Vec::new();
+    for (file, code) in &sources {
+        for t in FACT_TABLES {
+            if code.contains(&format!("DELETE FROM {t}")) {
+                offenders.push(format!("{file} → DELETE FROM {t}"));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "🔴 事实表上出现了删除：{offenders:?}\n\
+         §0.3「公共事实不可回滚」：改一列还留着痕迹，删一行连痕迹都没有。\n\
+         本仓的处置手段一律是状态标记（`content_takedowns` + 收紧 `moderation`），被拦内容也留痕供申诉。\n\
+         若确有合法的删除需求（如法定删除权），它需要**单独评审**并在此显式登记，不要只把断言改绿。"
+    );
+    // 扫描器失效 = 红线静默失效，故同时钉住「确实扫到了这些表」。
+    let mentioned = FACT_TABLES
+        .iter()
+        .filter(|t| sources.iter().any(|(_, c)| c.contains(&format!("FROM {t}")) || c.contains(&format!("INTO {t}"))))
+        .count();
+    assert_eq!(
+        mentioned,
+        FACT_TABLES.len(),
+        "🔴 有事实表在生产码里一次都没被扫到——要么表改名了，要么扫描器坏了（后者更危险）"
+    );
+}
+
 /// 🔴 **`world_events` 上允许存在的写入路径，逐条钉死形状**（原名
 /// `red_line_only_write_to_world_events_is_the_moderation_ratchet`；migration 0047 之后
 /// 这张表有了第二个方向，故一并改名与扩写，**不是**放宽了检查）。

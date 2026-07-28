@@ -241,6 +241,29 @@ const DEFAULT_HOSTILE_FEAR: f64 = 0.5;
 const ENV_MIN_SHARED_WORLDS: &str = "MUSE_SOCIAL_MIN_SHARED_WORLDS";
 const DEFAULT_MIN_SHARED_WORLDS: i64 = 1;
 
+/// `debt`（欠人情）是否计入正向羁绊分（**默认关**，2026-07-28 产品拍板）。
+///
+/// # 为什么改成不计
+///
+/// 解锁门的语义写明是「**双向自愿**」（跨边取 min 就是为这个）。而 `debt` 是**义务**不是意愿：
+/// 「我欠你一条命」和「我愿意把真身交给你」是两件事。原口径把它并进 `max`，等于让单方面的
+/// 亏欠也能往上抬羁绊分。
+///
+/// # 🔴 它与规格「救命属正向线」冲突吗——**不冲突，且这一条有用例钉着**
+///
+/// 引擎 `relation_dynamics` 里「救」类命中时是：
+/// `affinity +0.08` **双向**、`trust +0.06` **双向**，另加 `debt +0.10` 只加在
+/// `被救者→救人者` **单边**。而羁绊分**跨边取 min**——最小值只可能来自
+/// **救人者那条边**，那条边上压根没有 debt。
+///
+/// 所以纯救命场景下，计不计 debt 算出来的分**一模一样**：救命之恩仍然是正向线，
+/// 它由双向的 trust/affinity 承载，不由单边的 debt 承载。
+/// 见用例 `rescue_bond_is_identical_whether_debt_counts_or_not`。
+///
+/// 真正被这一改动挡掉的，只有「双方互相亏欠、但彼此并不亲近」这一类——那正是该挡的。
+const ENV_BOND_COUNTS_DEBT: &str = "MUSE_SOCIAL_BOND_COUNTS_DEBT";
+const DEFAULT_BOND_COUNTS_DEBT: bool = false;
+
 /// 「我们的角色一起死过」是否单独构成一条合格的正向羁绊线（默认开）。
 ///
 /// 规格把「共历生死」列在三条正向线之首，故默认 `true`：**羁绊分不够但一起死过**也够格。
@@ -329,6 +352,9 @@ fn hostile_fear() -> f64 {
 }
 fn min_shared_worlds() -> i64 {
     parse_positive(std::env::var(ENV_MIN_SHARED_WORLDS).ok().as_deref(), DEFAULT_MIN_SHARED_WORLDS)
+}
+fn bond_counts_debt() -> bool {
+    parse_bool(std::env::var(ENV_BOND_COUNTS_DEBT).ok().as_deref(), DEFAULT_BOND_COUNTS_DEBT)
 }
 fn death_bond_counts() -> bool {
     parse_bool(std::env::var(ENV_DEATH_BOND_COUNTS).ok().as_deref(), DEFAULT_DEATH_BOND_COUNTS)
@@ -487,7 +513,8 @@ pub(crate) async fn is_blocked_pair(db: &AnyPool, a: &str, b: &str) -> Result<bo
 /// 下发分值等于把引擎的关系数值做成可被玩家优化的仪表盘，那是另一种形式的数值化。
 #[derive(Debug, Clone, Default, PartialEq)]
 struct BondView {
-    /// 正向羁绊分：`max(trust, affinity, debt)` 取非负部分，**两方向取较小者**。
+    /// 正向羁绊分：`max(trust, affinity)` 取非负部分，**两方向取较小者**
+    /// （`debt` 是否参与见 [`ENV_BOND_COUNTS_DEBT`]，默认不参与）。
     ///
     /// 取较小者（而不是较大者/平均）是「双向自愿」在数据层的前置：单方面的好感不构成羁绊线，
     /// 一头热的人不该因为自己感觉好就够格去要对方的真身。缺失的方向按 0 计。
@@ -506,10 +533,19 @@ struct BondView {
 ///
 /// 折算规则（三条，全部是"少给"的方向，宁可解锁不了不可错解锁）：
 /// - 敌对：任一方向 `trust <= -hostile_max` 或 `affinity <= -hostile_max` 或 `fear >= hostile_fear`；
-/// - 正向单边分：`max(trust, affinity, debt)` 再与 0 取大（`debt` 计入是因为 §14 明写「救命」
-///   属正向线，而救命之恩在引擎里正是 `debt`）；
+/// - 正向单边分：`max(trust, affinity)` 再与 0 取大。
+///   ⚠️ **`debt` 默认不计入**（2026-07-28 产品拍板，见 [`ENV_BOND_COUNTS_DEBT`]）：
+///   解锁门是「双向自愿」，而欠人情是义务不是意愿。规格「救命属正向线」不受影响——
+///   理由与用例见那个常量的注释。旧口径由该 env 一键取回。
 /// - 合并：**取各边的最小值**（见 `BondView::positive`）。
-fn bond_between(state_json: &str, a: &str, b: &str, hostile_max: f64, hostile_fear: f64) -> BondView {
+fn bond_between(
+    state_json: &str,
+    a: &str,
+    b: &str,
+    hostile_max: f64,
+    hostile_fear: f64,
+    counts_debt: bool,
+) -> BondView {
     // 结构损坏 / 空状态 → 中性视图（无边、非敌对、正向分 0）：解锁不了，但也不冤枉成敌对。
     let Ok(state) = serde_json::from_str::<Value>(state_json) else { return BondView::default() };
     let relations = state.get("relations").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
@@ -530,7 +566,8 @@ fn bond_between(state_json: &str, a: &str, b: &str, hostile_max: f64, hostile_fe
         if trust <= -hostile_max || affinity <= -hostile_max || fear >= hostile_fear {
             view.hostile = true;
         }
-        let edge_positive = trust.max(affinity).max(debt).max(0.0);
+        let edge_positive =
+            if counts_debt { trust.max(affinity).max(debt) } else { trust.max(affinity) }.max(0.0);
         min_positive = Some(match min_positive {
             Some(cur) => cur.min(edge_positive),
             None => edge_positive,
@@ -864,7 +901,7 @@ async fn evaluate_eligibility(
         .fetch_optional(db)
         .await?
         .unwrap_or_else(|| "{}".to_string());
-    let bond = bond_between(&state_json, mine, theirs, hostile_max(), hostile_fear());
+    let bond = bond_between(&state_json, mine, theirs, hostile_max(), hostile_fear(), bond_counts_debt());
     let credential = died_together(db, mine, theirs).await?;
 
     let shared_worlds: i64 = sqlx::query_scalar(

@@ -1390,6 +1390,10 @@ async fn sealed_character_is_still_a_valid_social_counterpart() {
 // 纯函数：羁绊折算与参数回落
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// 现行默认：`debt` 不计入正向分（`ENV_BOND_COUNTS_DEBT` 默认 false）。
+const DEBT_OFF: bool = super::DEFAULT_BOND_COUNTS_DEBT;
+const _: () = assert!(!DEBT_OFF, "本文件多处按「默认不计 debt」写断言；默认值若翻转须逐条重看");
+
 #[test]
 fn bond_requires_both_directions_and_detects_hostility() {
     let two_way = json!({ "relations": [
@@ -1397,17 +1401,19 @@ fn bond_requires_both_directions_and_detects_hostility() {
         { "from": "b", "to": "a", "trust": 0.1 },
     ]})
     .to_string();
-    let v = bond_between(&two_way, "a", "b", 0.3, 0.5);
+    let v = bond_between(&two_way, "a", "b", 0.3, 0.5, DEBT_OFF);
     assert_eq!(v.edges, 2);
     assert!(!v.hostile);
     assert!((v.positive - 0.1).abs() < 1e-9, "双向取较小者：一头热不构成羁绊线");
 
     let one_way = json!({ "relations": [{ "from": "a", "to": "b", "affinity": 0.7 }]}).to_string();
-    assert!((bond_between(&one_way, "a", "b", 0.3, 0.5).positive - 0.7).abs() < 1e-9);
+    assert!((bond_between(&one_way, "a", "b", 0.3, 0.5, DEBT_OFF).positive - 0.7).abs() < 1e-9);
 
-    // 救命之恩（debt）计入正向线（§14「救命」）。
+    // debt 默认**不**计入正向线（2026-07-28 产品拍板：解锁门是「双向自愿」，欠人情是义务）。
     let debt = json!({ "relations": [{ "from": "a", "to": "b", "debt": 0.8 }]}).to_string();
-    assert!((bond_between(&debt, "a", "b", 0.3, 0.5).positive - 0.8).abs() < 1e-9);
+    assert_eq!(bond_between(&debt, "a", "b", 0.3, 0.5, DEBT_OFF).positive, 0.0);
+    // 旧口径由 env 一键取回，语义不变。
+    assert!((bond_between(&debt, "a", "b", 0.3, 0.5, true).positive - 0.8).abs() < 1e-9);
 
     // 敌对三判据，任一命中即敌对。
     for rel in [
@@ -1416,7 +1422,7 @@ fn bond_requires_both_directions_and_detects_hostility() {
         json!({ "from": "a", "to": "b", "fear": 0.5 }),
     ] {
         let s = json!({ "relations": [rel] }).to_string();
-        assert!(bond_between(&s, "a", "b", 0.3, 0.5).hostile, "应判为敌对");
+        assert!(bond_between(&s, "a", "b", 0.3, 0.5, DEBT_OFF).hostile, "应判为敌对");
     }
 
     // 无关的边、损坏的状态、空状态 → 中性视图（解锁不了，但也不冤枉成敌对）。
@@ -1425,7 +1431,7 @@ fn bond_requires_both_directions_and_detects_hostility() {
         "{ not json".to_string(),
         "{}".to_string(),
     ] {
-        let v = bond_between(&s, "a", "b", 0.3, 0.5);
+        let v = bond_between(&s, "a", "b", 0.3, 0.5, DEBT_OFF);
         assert_eq!(v, BondView::default());
     }
 }
@@ -1638,7 +1644,7 @@ fn engine_state_with_relation(from: &str, to: &str, trust: f32, affinity: f32, f
 fn hostility_is_detected_from_what_the_engine_actually_writes() {
     // 强敌意：trust 深负（超过 hostile_max 默认阈值）。
     let json = engine_state_with_relation("cA", "cB", -0.9, 0.0, 0.0, 0.0);
-    let view = super::bond_between(&json, "cA", "cB", 0.5, 0.6);
+    let view = super::bond_between(&json, "cA", "cB", 0.5, 0.6, DEBT_OFF);
     assert!(
         view.hostile,
         "🔴 敌对没被识别到。这条红了多半是 muse-engine 的 RelationState 改了序列化\
@@ -1651,7 +1657,7 @@ fn hostility_is_detected_from_what_the_engine_actually_writes() {
     // 高恐惧同样构成敌对（另一条判据，独立于 trust/affinity）。
     let fear_json = engine_state_with_relation("cA", "cB", 0.1, 0.1, 0.9, 0.0);
     assert!(
-        super::bond_between(&fear_json, "cA", "cB", 0.5, 0.6).hostile,
+        super::bond_between(&fear_json, "cA", "cB", 0.5, 0.6, DEBT_OFF).hostile,
         "🔴 fear 维度的敌对判据也必须认得引擎写出来的形状"
     );
 }
@@ -1661,7 +1667,7 @@ fn hostility_is_detected_from_what_the_engine_actually_writes() {
 #[test]
 fn the_positive_bond_is_computed_from_what_the_engine_actually_writes() {
     let json = engine_state_with_relation("cA", "cB", 0.8, 0.4, 0.0, 0.0);
-    let view = super::bond_between(&json, "cA", "cB", 0.5, 0.6);
+    let view = super::bond_between(&json, "cA", "cB", 0.5, 0.6, DEBT_OFF);
     assert!(!view.hostile, "无敌意: {view:?}");
     assert_eq!(view.edges, 1, "{view:?}");
     // 逐边 max(trust, affinity, debt, 0) = 0.8；单边时跨边 min 就是它本身。
@@ -1671,14 +1677,16 @@ fn the_positive_bond_is_computed_from_what_the_engine_actually_writes() {
          所有人永远解锁不了，且没人知道为什么。实得 {view:?}"
     );
 
-    // 🔴 debt 计入正向、fear 不计入：这是现行公式（open-decisions §2 仍待产品确认），
-    // 但**只要它还是现行公式，就该被钉住**——悄悄改掉它会改变谁能看到谁的真身。
+    // 🔴 debt 与 fear 都不计入正向：**现行公式**（debt 那一条 2026-07-28 由产品拍定），
+    // 钉住它是因为悄悄改掉会改变谁能看到谁的真身。
     let debt_json = engine_state_with_relation("cA", "cB", 0.0, 0.0, 0.0, 0.7);
-    assert!((super::bond_between(&debt_json, "cA", "cB", 0.5, 0.6).positive - 0.7).abs() < 1e-6,
-            "debt 目前计入正向");
+    assert_eq!(
+        super::bond_between(&debt_json, "cA", "cB", 0.5, 0.6, DEBT_OFF).positive, 0.0,
+        "🔴 debt 是义务不是意愿，默认不计入正向"
+    );
     let fear_only = engine_state_with_relation("cA", "cB", 0.0, 0.0, 0.4, 0.0);
     assert_eq!(
-        super::bond_between(&fear_only, "cA", "cB", 0.5, 0.6).positive, 0.0,
+        super::bond_between(&fear_only, "cA", "cB", 0.5, 0.6, DEBT_OFF).positive, 0.0,
         "🔴 fear 绝不计入正向 —— 怕一个人不是跟他关系好"
     );
 }
@@ -1697,7 +1705,7 @@ fn a_one_sided_bond_does_not_pass_because_the_weaker_direction_gates() {
     st.relations.push(mk("cB", "cA", 0.1)); // 对方平淡
     let json = serde_json::to_string(&st).unwrap();
 
-    let view = super::bond_between(&json, "cA", "cB", 0.5, 0.6);
+    let view = super::bond_between(&json, "cA", "cB", 0.5, 0.6, DEBT_OFF);
     assert_eq!(view.edges, 2, "两条有向边都要数到: {view:?}");
     assert!(
         (view.positive - 0.1).abs() < 1e-6,
@@ -1705,4 +1713,105 @@ fn a_one_sided_bond_does_not_pass_because_the_weaker_direction_gates() {
          「双向自愿」在数据层的前置就是这一步——一头热的人不该因为自己感觉好\
          就够格去要对方的真身。实得 {view:?}"
     );
+}
+
+/// 🔴 **「救命属正向线」这条规格没有被 debt 的改动动到——由引擎实际产出的形状证明。**
+///
+/// 2026-07-28 产品拍定 `debt` 不再计入正向羁绊分。表面看它和规格 §14「救命属正向线」冲突，
+/// 因为救命之恩在引擎里正是 `debt`。**不冲突**，理由是结构性的，这条用例把它钉住：
+///
+/// 引擎 `relation_dynamics` 对「救」类命中时写的是
+/// `affinity` / `trust` **双向**增，另加 `debt` **只加在被救者→救人者那一条边**。
+/// 而羁绊分**跨边取 min**，最小值只可能来自**救人者那条边**——那条边上压根没有 debt。
+///
+/// 所以纯救命场景下，计不计 debt 算出来的分**一模一样**：
+/// 救命之恩仍是正向线，只不过它由双向的 trust/affinity 承载，不由单边的 debt 承载。
+///
+/// ⚠️ 这条用例**直接驱动引擎**（`derive_relation_ops`）而不是照抄常量：
+/// 哪天引擎改成「救类只加 debt、不加 trust/affinity」，上面那个论证就不成立了，
+/// 而这里会立刻红——那正是需要重新回到产品面的时刻。
+#[test]
+fn rescue_bond_is_identical_whether_debt_counts_or_not() {
+    use muse_engine::narrative::relation_dynamics::derive_relation_ops;
+    use muse_engine::narrative::types::{
+        ArbiterOutcome, ArbiterResult, CharacterState, NarrativeState, RoleDecision, SpeakIntent,
+    };
+
+    let mut state = NarrativeState { schema_version: 1, run_id: "r".into(), ..Default::default() };
+    for c in ["rescuer", "rescued"] {
+        state.characters.insert(c.into(), CharacterState::default());
+    }
+    let decisions = vec![RoleDecision {
+        decision_id: "d1".into(),
+        character_id: "rescuer".into(),
+        intent: "护住他".into(),
+        action: "出手救下坠崖的同伴".into(),
+        speak: SpeakIntent { will_speak: false, purpose: String::new() },
+        targets: vec!["rescued".into()],
+        acceptable_costs: Vec::new(),
+        predictions: Vec::new(),
+        duration: 0,
+    }];
+    let outcomes = vec![ArbiterOutcome {
+        decision_id: "d1".into(),
+        character_id: "rescuer".into(),
+        result: ArbiterResult::Success,
+        rule_refs: vec![],
+        consequence: "救下了".into(),
+    }];
+    let ops = derive_relation_ops(&decisions, &outcomes, &state);
+
+    // ---- 引擎侧的结构事实：debt 单边、trust/affinity 双向 ----
+    let val = |path: &str| -> Option<f64> {
+        ops.iter().find(|o| o.path == path).and_then(|o| o.value.as_ref()).and_then(|v| v.as_f64())
+    };
+    let debt_edges: Vec<&str> =
+        ops.iter().filter(|o| o.path.ends_with(".debt")).map(|o| o.path.as_str()).collect();
+    assert_eq!(
+        debt_edges.len(),
+        1,
+        "🔴 救类的 debt 必须只加在一条边上；变成双向就推翻了「debt 不影响救命线」的论证：{debt_edges:?}"
+    );
+    assert!(
+        debt_edges[0].contains("rescued->rescuer"),
+        "debt 记在被救者→救人者那一边（救命之恩记欠）：{debt_edges:?}"
+    );
+    for path in ["relations[rescuer->rescued]", "relations[rescued->rescuer]"] {
+        for field in ["trust", "affinity"] {
+            assert!(
+                val(&format!("{path}.{field}")).is_some_and(|v| v > 0.0),
+                "🔴 救类必须**双向**抬 trust/affinity，否则救命线就只剩单边 debt 撑着：缺 {path}.{field}"
+            );
+        }
+    }
+
+    // ---- 服务端侧：把引擎算出来的值搭成两条边，计不计 debt 结论一致 ----
+    let mut after = NarrativeState::default();
+    for (from, to) in [("rescuer", "rescued"), ("rescued", "rescuer")] {
+        let g = |f: &str| val(&format!("relations[{from}->{to}].{f}")).unwrap_or(0.0) as f32;
+        after.relations.push(muse_engine::narrative::types::RelationState {
+            from: from.into(),
+            to: to.into(),
+            trust: g("trust"),
+            affinity: g("affinity"),
+            fear: g("fear"),
+            debt: g("debt"),
+            known_to: Vec::new(),
+            notes: Vec::new(),
+        });
+    }
+    let json = serde_json::to_string(&after).expect("叙事态可序列化");
+
+    let off = super::bond_between(&json, "rescuer", "rescued", 0.5, 0.6, false);
+    let on = super::bond_between(&json, "rescuer", "rescued", 0.5, 0.6, true);
+    assert_eq!(off.edges, 2, "两条边都该被数到：{off:?}");
+    assert!(!off.hostile && !on.hostile, "救命不该判敌对");
+    assert!(
+        (off.positive - on.positive).abs() < 1e-9,
+        "🔴 救命场景下计不计 debt 必须同分——这正是「不冲突」的全部依据。\
+         实得 off={:?} on={:?}",
+        off.positive,
+        on.positive
+    );
+    assert!(off.positive > 0.0, "救命必须留下正向分，否则规格 §14 那条线就断了：{off:?}");
 }

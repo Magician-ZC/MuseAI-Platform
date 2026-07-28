@@ -393,6 +393,106 @@ async fn earnings_requires_auth() {
 
 // ---------- 红线：无提现出口 ----------
 
+/// 🔴 **`withdrawable` 永不被置为非 0**（§0.5 无提现，红线⑤）。
+///
+/// `ledger::ensure_account` 的注释里写着「红线：`withdrawable` 恒 0」，而在此之前
+/// **守着这条的只有那句注释**——对比 `memorial` 的 `withdrawn` 单向门，那个有源码级断言。
+/// 一旦某处把它写成 1，`GET /me/earnings` 会立刻如实回 `withdrawable: true`
+/// （`shop` 是**读库**而不是硬编码 false），于是红线在读取面上当场破掉，且没有任何用例会红。
+///
+/// 判据：生产码里凡出现 `withdrawable` 的 SQL，其取值只能是字面量 `0`；
+/// 不接受绑定参数（`$N`）——绑定值意味着「取决于运行时」，那正是这条红线不允许的。
+#[test]
+fn red_line_withdrawable_is_never_written_nonzero() {
+    let mut checked = 0usize;
+    for (path, src) in crate::testkit::production_sources() {
+        for lit in src.split('"').skip(1).step_by(2) {
+            let sql: String = lit.split('\\').collect::<Vec<_>>().join(" ");
+            let sql = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+            // 必须同时含表名：否则会误伤 JSON 键名 `"withdrawable"`（`shop` 的响应体里就有一个），
+            // 那不是 SQL，判它等于让这条红线在第一次运行时就报假警。
+            if !(sql.contains("withdrawable") && sql.contains("ledger_accounts")) {
+                continue;
+            }
+            // 只读的 SELECT 不在管辖内。
+            if sql.starts_with("SELECT") {
+                continue;
+            }
+            checked += 1;
+            assert!(
+                sql.contains("VALUES") && sql.contains(", 0, 0,"),
+                "🔴 {path} 的这条 SQL 触碰了 `withdrawable`，而它必须恒为字面量 0：\n  {sql}\n\
+                 §0.5「无提现」：`GET /me/earnings` 是**读库**回这个标志的，写成 1 就等于\n\
+                 在读取面上开了提现出口。若真要开（待牌照），那是产品与合规决定，需单独评审。"
+            );
+        }
+    }
+    assert_eq!(
+        checked, 1,
+        "🔴 触碰 `withdrawable` 的写语句应当**恰好一条**（`ledger::ensure_account` 的建户 INSERT）。\n\
+         变多 = 多了一条能改这个标志的路径；变少 = 建户语句没了或扫描器坏了。"
+    );
+}
+
+/// 🔴 **路由里不存在提现语义的路径**（§0.5）。
+///
+/// 原先那条用例试的是**五个猜出来的 URI**（`/me/earnings/withdraw` 等）——
+/// 换个名字（`/me/wallet/cashout`、`/creator/payout-request`）就照样全绿。
+/// 这一条改为扫**路由注册本身**：任何 `.route("…")` 的路径里都不得出现提现语义的词。
+///
+/// 保留原来那条按 URI 试 404 的用例：两者一个查「路由表里有没有」、
+/// 一个查「打过去到底通不通」，都要。
+#[test]
+fn red_line_no_route_path_carries_withdrawal_semantics() {
+    const BANNED: &[&str] = &["withdraw", "payout", "cashout", "cash-out", "remit", "encash"];
+
+    /// ⚠️ **`withdraw` 在本仓是一词两义**，这里必须区分，否则这条红线要么误报要么形同虚设：
+    /// - **资产义**：`cloud_characters.withdrawn` = 停止后续投放（下架一张已发布的卡 / 一个世界模板）。
+    ///   与钱无关，`memorial` 封卷也复用它。
+    /// - **金钱义**：`ledger_accounts.withdrawable` = 可提现。**这才是 §0.5 红线管的那个。**
+    ///
+    /// 下面按**完整路径**豁免资产义的那几条，不按词豁免——按词豁免等于把 `withdraw`
+    /// 整个从黑名单里拿掉，那样 `/me/earnings/withdraw` 也会被放过。
+    ///
+    /// 🔵 这个歧义本身值得知道：有人为了核「无提现」去 grep `withdraw`，会先撞见一堆资产下架，
+    /// 从而既可能误判成「有提现出口」，也可能因为「看起来都是资产的」而漏掉真的那个。
+    const ASSET_SENSE_PATHS: &[&str] = &[
+        "/assets/characters/{id}/withdraw",
+        "/assets/worlds/{id}/withdraw",
+    ];
+
+    // 🔴 只看**真正的路由注册** `.route("…")`。
+    //
+    // 第一版按「以 `/` 开头的字面量」筛，当场误报了 `/assembly/payoutTable`——那是
+    // `assembled_json` 里的 **JSON 指针**，`payout` 在那儿指「产出表」（战利品），不是付款。
+    // 这是本条红线撞见的**第二个一词两义**（第一个是 `withdraw`），说明按词扫路径必须先
+    // 确定「这个字面量真的是路由」，否则黑名单越全、误报越多，最后只会被加一堆豁免绕过去。
+    let mut routes = 0usize;
+    for (path, src) in crate::testkit::production_sources() {
+        for seg in src.split(".route(\"").skip(1) {
+            let Some(uri) = seg.split('"').next() else { continue };
+            routes += 1;
+            if ASSET_SENSE_PATHS.contains(&uri) {
+                continue; // 资产下架，与钱无关（见上方注释）。
+            }
+            let low = uri.to_ascii_lowercase();
+            for b in BANNED {
+                assert!(
+                    !low.contains(b),
+                    "🔴 {path} 注册了一条带提现语义的路由 `{uri}`（命中 `{b}`）。\n\
+                     §0.5「无提现」：creator_earnings 只作站内权益，提现默认永不开启（待牌照）。\n\
+                     若确实要开，那是产品 + 合规决定，需单独评审——不要只把断言改绿。"
+                );
+            }
+        }
+    }
+    assert!(
+        routes > 80,
+        "🔴 只扫到 {routes} 条路由注册，扫描口径疑似坏了（红线会静默失效）"
+    );
+}
+
+
 /// 提现/转账/兑付端点一律不存在（404）——creator_earnings 站内可消费，本期绝不可提现。
 #[tokio::test]
 async fn no_withdraw_or_payout_endpoints() {

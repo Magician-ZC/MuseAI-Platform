@@ -110,46 +110,16 @@ impl RelationRules {
     }
 
     fn classify(&self, text: &str) -> Category {
-        if affirmative_match(&self.rupture, text) {
+        if crate::narrative::arbiter::affirmative_match(&self.rupture, text) {
             Category::Rupture
-        } else if affirmative_match(&self.hostile, text) {
+        } else if crate::narrative::arbiter::affirmative_match(&self.hostile, text) {
             Category::Hostile
-        } else if affirmative_match(&self.friendly, text) {
+        } else if crate::narrative::arbiter::affirmative_match(&self.friendly, text) {
             Category::Friendly
         } else {
             Category::Neutral
         }
     }
-}
-
-/// 🔴 **命中且未被否定**才算数——否则「我不会伤他」会被判成敌对。
-///
-/// # 这道闸为什么必须有
-///
-/// 上面几条规则里全是**单字**关键词（`杀` `伤` `挡` `逼` `骗` `救` `帮` `送`…），
-/// 而 `action` / `intent` 是自由文本，否定式在里面**极其常见**
-/// （「我不能伤他」「绝不背叛」「拒绝攻击」）。没有这道闸的话：
-///
-/// | 模型写的 | 判成 | 后果 |
-/// |---|---|---|
-/// | 「我**永不**背叛你」 | Rupture（最强档） | trust/affinity **各 −0.50 双向** + fear +0.15 |
-/// | 「我**不会**伤你」 | Hostile | 双向减分 + fear |
-/// | 「**别**杀他」 | Hostile | 同上 |
-///
-/// **意思被读反了**，而关系数值是跨拍累积的：一次误判的 Rupture 要许多次友善行为才抵得回来，
-/// 且它下游连着羁绊解锁门（`server::social`）、传世印记、社交可见性。
-///
-/// # 判据**复用** `arbiter::negated_before`，不另写一份
-///
-/// `arbiter` 早就有这道闸（**误伤控制闸③**，「命中片段之前 N 个字内若出现否定字，
-/// 视为角色正在**拒绝**做这件事」）。这里 `pub(crate)` 复用它而不是抄一份否定字表——
-/// 抄一份的话，两处的字表与窗口长度迟早漂开，**而漂开的那一刻没有任何症状**
-/// （`docs/VALIDATION.md` §3.8.1 形态 (a)）。
-///
-/// 逐个命中位置检查：只要**有一处**未被否定就算命中（「他背叛了我，我不会背叛他」
-/// 仍然是破裂——前半句是真的）。全部被否定才算未命中。
-fn affirmative_match(re: &Regex, text: &str) -> bool {
-    re.find_iter(text).any(|m| !crate::narrative::arbiter::negated_before(text, m.start()))
 }
 
 // ---------- 推导主流程 ----------

@@ -77,6 +77,14 @@ fn violates_resource(state: &NarrativeState, d: &RoleDecision, res_re: &Regex) -
         .map(|c| c.resources.as_slice())
         .unwrap_or(&[]);
     for cap in res_re.captures_iter(&d.action) {
+        // 🔴 「我**不**动用那把刀」不是动用。没有这道闸的话，一句否定式声明会被判成
+        // 「动用了并不持有的资源」→ Invalid，角色这一拍什么都做不成，而他说的恰恰是不做。
+        // 判据与 R7 / `relation_dynamics` 共用同一份（`negated_before`），不另写。
+        if let Some(whole) = cap.get(0) {
+            if negated_before(&d.action, whole.start()) {
+                continue;
+            }
+        }
         let object = cap.get(2).map(|m| m.as_str()).unwrap_or("").trim();
         if object.is_empty() {
             continue;
@@ -94,7 +102,8 @@ fn violates_resource(state: &NarrativeState, d: &RoleDecision, res_re: &Regex) -
 
 /// R3 读心/强制他人：直接获取他人内心/秘密，或强迫他人吐露私密。保守匹配明确句式。
 fn violates_mind_control(d: &RoleDecision, coerce_re: &Regex, read_re: &Regex) -> bool {
-    coerce_re.is_match(&d.action) || read_re.is_match(&d.action)
+    // 🔴 同 R1：「我**不会**逼他说出秘密」不是读心/强制，判成 Invalid 是把意思读反了。
+    affirmative_match(coerce_re, &d.action) || affirmative_match(read_re, &d.action)
 }
 
 /// 规则层（纯函数）：
@@ -224,6 +233,9 @@ pub fn rule_arbitrate(
 
         // R4 / R5：需模型层裁决结果与意外后果。
         let conflict = d.targets.iter().any(|t| conflict_targets.contains(t.as_str()));
+        // ⚠️ R5 **刻意不加**否定闸：它的作用是把「可能威胁硬节点」的决策**交给模型层判**，
+        // 而不是自己下结论。多匹配 = 多一次模型调用（成本），少匹配 = 硬节点失去保护。
+        // 两个方向不对称，宁可多送。这与 R1/R3 不同——那两条命中即 Invalid，误判直接吃掉一个行动。
         let threatens_hard = has_pending_hard && irreversible_re.is_match(&d.action);
         if conflict || threatens_hard {
             pending.push(d.clone());
@@ -458,6 +470,22 @@ fn forbidden_needles(line: &str) -> Vec<String> {
 /// 判据理由见 `NEGATION_WINDOW_CHARS` / `NEGATION_CHARS` 的注释。
 pub(crate) fn negated_before(action: &str, pos: usize) -> bool {
     action[..pos].chars().rev().take(NEGATION_WINDOW_CHARS).any(|c| NEGATION_CHARS.contains(&c))
+}
+
+/// 🔴 **正则命中且该处未被否定**才算数——「我不会伤他」不是敌意，「我不动用那把刀」不是动用。
+///
+/// # 为什么这是全 crate 唯一一份
+///
+/// 「命中了但前面有否定字」这个判断，本仓此前在 `screen_bottom_lines`（R7）里做对过一次，
+/// 而**同一个模块的 R1（资源）/ R3（读心）与 `relation_dynamics` 的关系分类都没做**。
+/// 补的时候如果各写一份，四处的否定字表与窗口长度迟早漂开，**而漂开的那一刻没有任何症状**
+/// （`docs/VALIDATION.md` §3.8.1 形态 (a)）。所以判据只有这一份，谁要用谁调它。
+///
+/// 语义是「**只要有一处命中未被否定就算命中**」，不是「文本里出现否定就整句放过」：
+/// 「他背叛了我，我不会背叛他」仍然算命中——**前半句是真的**。
+/// 过度收紧和原缺陷一样错，只是方向相反。
+pub(crate) fn affirmative_match(re: &Regex, text: &str) -> bool {
+    re.find_iter(text).any(|m| !negated_before(text, m.start()))
 }
 
 /// `action` 是否**明白无误地重述**了某个被禁止的行为：命中片段且该处未被否定。
@@ -1097,6 +1125,61 @@ mod tests {
             !format!("{evs:?}").contains("arbiterUnjudged"),
             "🔴 一条都没兜底时不该发告警——狼来了叫多了就没人看了"
         );
+    }
+
+    // ===== 🔴 R1 / R3：否定不许被读成肯定 =====
+
+    /// 🔴 **「我不动用那把刀」不是动用，「我不会逼他说出秘密」不是读心。**
+    ///
+    /// R1（资源）与 R3（读心/强制）命中即 `Invalid` —— 误判**直接吃掉一个行动**，
+    /// 角色这一拍什么都做不成，而他说的恰恰是「不做」。
+    ///
+    /// ⚠️ 这道闸本模块**早就有**（R7 的 `negated_before`，标题就叫「误伤控制闸③」），
+    /// 却只用在 R7 上。同一个模块里，发明这道闸的人没把它用在自己的另外两条规则上——
+    /// 这正是 §3.8.1 形态 (a) 最隐蔽的一种：不是两个模块各写一份，
+    /// 而是**一个模块里做对了一处、漏了两处**。
+    #[test]
+    fn a_negated_action_does_not_trip_the_resource_or_mind_control_rules() {
+        let mut s = base_state();
+        // li 身上什么都没有：任何「动用 X」都会命中 R1。
+        s.characters.get_mut("li").unwrap().resources.clear();
+
+        for action in [
+            "我不动用那把断刃",
+            "他没有拿出令牌",
+            "我不会逼他说出秘密",
+            "绝不窥探他的内心",
+        ] {
+            let d = decision("d1", "li", action, vec![]);
+            let (resolved, pending) =
+                rule_arbitrate(&s, &[d], &["li".to_string()], &no_locations());
+            let invalid: Vec<&ArbiterOutcome> =
+                resolved.iter().filter(|o| o.result == ArbiterResult::Invalid).collect();
+            assert!(
+                invalid.is_empty(),
+                "🔴 「{action}」被规则层判成了违规：{invalid:?}\n\
+                 否定式在模型自由文本里极其常见，读反一次就吃掉角色这一拍的行动。pending={pending:?}"
+            );
+        }
+    }
+
+    /// 反向配对：**真的动用 / 真的读心仍然必须被抓住**。
+    ///
+    /// 只测「否定不许误判」的话，把 R1/R3 整个删掉也能全绿——那就把两条规则拆了。
+    #[test]
+    fn genuine_resource_and_mind_control_violations_are_still_caught() {
+        let mut s = base_state();
+        s.characters.get_mut("li").unwrap().resources.clear();
+
+        let d = decision("d1", "li", "我动用那把断刃", vec![]);
+        let (resolved, _p) = rule_arbitrate(&s, &[d], &["li".to_string()], &no_locations());
+        assert_eq!(resolved[0].result, ArbiterResult::Invalid, "真动用不持有的资源必须仍被拦");
+        assert_eq!(resolved[0].rule_refs, vec!["rule:resource".to_string()]);
+
+        let d = decision("d2", "li", "我逼他说出秘密", vec![]);
+        let (resolved, _p) = rule_arbitrate(&s, &[d], &["li".to_string()], &no_locations());
+        assert_eq!(resolved[0].result, ArbiterResult::Invalid, "真读心/强制必须仍被拦");
+        assert_eq!(resolved[0].rule_refs, vec!["rule:mind_control".to_string()]);
     }
 
     // ===== R7 底线硬约束（人设保险第 1 级·事前，总规格 §7）=====

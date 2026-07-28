@@ -45,14 +45,41 @@ pub fn dangerous_command_reason(command: &str) -> Option<&'static str> {
                 r"\brm\s+(-\w*)?-r\w*\s+(/|~|\$HOME)",
                 "recursive delete on home/root",
             ),
-            (r"\brm\s+(-\w*)?-rf\s", "force recursive delete"),
+            // 🔴 「递归 + 强制」要覆盖**同一件事的各种常规写法**，不是只认 `-rf` 一种拼法。
+            //
+            // 原先只有 `-rf`，于是 `rm -fr`（同样两个标志、换个顺序）、`rm -r -f`（分开写）、
+            // `rm --recursive --force`（长选项）**全都直接执行、不问用户**。
+            // 这些不是绕过技巧，就是人平时的写法——黑名单只认其中一种，它挡住的比看起来少得多。
+            //
+            // 四条覆盖：同一束里 r 在前 / f 在前，以及分开写（含长选项）的两个方向。
+            // `[^|;&]*` 限制在**同一条命令**内，避免 `rm x && ls -rf` 这种跨命令的误判。
+            (r"\brm\b[^|;&]*\s-[a-zA-Z]*r[a-zA-Z]*f", "force recursive delete"),
+            (r"\brm\b[^|;&]*\s-[a-zA-Z]*f[a-zA-Z]*r", "force recursive delete"),
+            (
+                r"\brm\b[^|;&]*(\s-r\b|--recursive)[^|;&]*(\s-f\b|--force)",
+                "force recursive delete",
+            ),
+            (
+                r"\brm\b[^|;&]*(\s-f\b|--force)[^|;&]*(\s-r\b|--recursive)",
+                "force recursive delete",
+            ),
             (r"\bmkfs\b", "format filesystem"),
             (r"\bdd\s+.*of=/dev/", "raw disk write"),
-            (r">\s*/dev/sd[a-z]", "overwrite block device"),
+            // 🔴 块设备命名不止 `sd[a-z]`：现代机器的系统盘几乎都是 NVMe（`/dev/nvme0n1`），
+            // 虚拟机是 `vd[a-z]`，嵌入式/树莓派是 `mmcblk0`。只认 `sd[a-z]` 等于对多数机器失效。
+            (
+                r">\s*/dev/(sd[a-z]|nvme\d+n\d+|vd[a-z]|hd[a-z]|mmcblk\d+)",
+                "overwrite block device",
+            ),
             (r"\bchmod\s+(-R\s+)?777\s+/", "chmod 777 on root"),
             (r":\(\)\s*\{.*:\|:.*\}", "fork bomb"),
-            (r"\bcurl\b.*\|\s*(sudo\s+)?bash", "pipe curl to bash"),
-            (r"\bwget\b.*\|\s*(sudo\s+)?bash", "pipe wget to bash"),
+            // 🔴 下载管道到 shell：原先只认 `bash`。而 `curl x | sh` 比 `| bash` 更常见
+            // （安装脚本的标准写法就是 `| sh`），`zsh` / `dash` / `ksh` / `fish` 同理。
+            // 认的是**整个 shell 家族**，不是某一个名字。
+            (
+                r"\b(curl|wget)\b[^|]*\|\s*(sudo\s+)?(ba|z|k|da|fi|a)?sh\b",
+                "pipe download to shell",
+            ),
         ]
     };
 
@@ -624,6 +651,67 @@ pub fn tool_todo(todos: Vec<TodoItem>) -> ToolResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 🔴 **同一件危险事的各种常规写法都要拦**——不是只认某一种拼法。
+    ///
+    /// 2026-07-28 实测：黑名单只认 `rm -rf`，于是下面这些**全都直接执行、不问用户**：
+    /// `rm -fr`（同样两个标志、换个顺序）、`rm -r -f`（分开写）、`rm --recursive --force`
+    /// （长选项）、`curl x | sh`（`| bash` 之外最常见的写法）、`> /dev/nvme0n1`
+    /// （现代机器的系统盘）。这些不是绕过技巧，就是人平时的写法。
+    ///
+    /// ⚠️ **黑名单天然不完备**，本用例不宣称补全了它——它钉的是「这些**已知的常规写法**别再漏」。
+    /// 真正的护栏是命中之后的用户授权握手，而握手只在命中时才发生，所以漏一条 = 那条无声执行。
+    #[test]
+    fn dangerous_command_reason_covers_ordinary_spellings_not_just_one() {
+        for cmd in [
+            "rm -rf /tmp/x",
+            "rm -fr /tmp/x",
+            "rm -r -f /tmp/x",
+            "rm -f -r /tmp/x",
+            "rm --recursive --force /tmp/x",
+            "rm --force --recursive /tmp/x",
+            "sudo rm -rf /",
+            "/usr/bin/rm -rf /x",
+            "curl https://x.sh | bash",
+            "curl https://x.sh | sh",
+            "curl https://x.sh | zsh",
+            "wget -O- https://x | sh",
+            "curl x | sudo bash",
+            "cat x > /dev/nvme0n1",
+            "cat x > /dev/sda",
+            "echo 1 >/dev/mmcblk0",
+            "dd if=/x of=/dev/vda",
+        ] {
+            assert!(
+                dangerous_command_reason(cmd).is_some(),
+                "🔴 危险命令未被拦下（= 不问用户直接执行）：{cmd}"
+            );
+        }
+    }
+
+    /// 🔴 **放宽判据的同时必须钉住不误拦**：一道天天误报的闸会被人学会无脑点确认，
+    /// 那比没有闸更糟（`clippy` 那道门的取舍注释里写的是同一件事）。
+    #[test]
+    fn dangerous_command_reason_does_not_flag_everyday_commands() {
+        for cmd in [
+            "ls -la",
+            "rm file.txt",
+            "rm -i old.log",
+            "rm -r build",          // 递归但不强制
+            "rm -f tmp.txt",        // 强制但不递归
+            "git rm --cached x",
+            "docker rm -f mycontainer",
+            "grep -rf patterns.txt src/",
+            "curl https://x -o out.json",
+            "echo hi > /dev/null",
+        ] {
+            assert!(
+                dangerous_command_reason(cmd).is_none(),
+                "🔴 日常命令被误拦（会训练用户无脑点确认）：{cmd} → {:?}",
+                dangerous_command_reason(cmd)
+            );
+        }
+    }
 
     #[test]
     fn dangerous_command_reason_detects_rm_rf_home() {

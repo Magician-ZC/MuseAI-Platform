@@ -441,8 +441,32 @@ fn apply_emotions(list: &mut Vec<EmotionEntry>, op: &PatchOperation) -> Result<(
     }
 }
 
+/// 里程碑进度键前缀。`build_patch` 用 `Increment` 按本回合强度累积，
+/// 达 `threshold` + `advance_when` 命中才翻 Done（放置房终局的判据之一）。
+pub(crate) const MILESTONE_PREFIX: &str = "milestoneProgress_";
+
 /// world 层灵活值：Set/Remove 通用；Append 要求数组；Increment 要求数值。
+///
+/// 🔴 **里程碑进度键只许 `Increment`**（本函数唯一的键级特例）。
+///
+/// `build_patch` 的注释写着「Increment 单调不减，进度键仅经此路径写入」——
+/// 那句话今天成立（模型只交结构化的 decisions/outcomes，全部 `PatchOperation` 由引擎构造；
+/// 全仓另两处构造 `StatePatch` 的地方一处是硬编码的 `authoring.lockedSceneIds` 追加、
+/// 一处 operations 为空）。**但它只是约定，没有东西守着。**
+///
+/// 一旦将来有人让模型直接提 operations（作为"优化"），`world.<key>` 是开放键空间——
+/// 一条 `Set world.milestoneProgress_m1 = 999` 就能跳过本该逐回合累积的节奏、直接触发终局。
+/// 把「单调不减」从注释变成强制，那条路就走不通了：**结构上只剩累加**。
+///
+/// ⚠️ 只挡这一个前缀，不挡整个 `world.*`——`world` 本就是给叙事用的开放键空间，
+/// 一律限制会把正常的世界状态写入也挡掉。
 fn apply_world(next: &mut NarrativeState, key: &str, op: &PatchOperation) -> Result<(), EngineError> {
+    if key.starts_with(MILESTONE_PREFIX) && op.op != PatchOp::Increment {
+        return Err(op_kind_err(
+            op.op,
+            "里程碑进度键只许 increment（单调不减；直接赋值会跳过逐回合累积的节奏）",
+        ));
+    }
     match op.op {
         PatchOp::Set => {
             next.world.insert(key.to_string(), require_value(op)?.clone());
@@ -556,6 +580,76 @@ fn record_applied(state: &mut NarrativeState, patch_id: &str) {
 
 #[cfg(test)]
 mod tests {
+    /// 🔴 **里程碑进度键只许 `Increment`**——「单调不减」从注释变成强制。
+    ///
+    /// 今天模型交的是结构化 decisions/outcomes，全部 `PatchOperation` 由 `build_patch` 构造，
+    /// 所以直接赋值这条路走不到。但那是**约定**，不是强制。一旦有人让模型直接提 operations，
+    /// `world.<key>` 是开放键空间：一条 `Set world.milestoneProgress_m1 = 999`
+    /// 就能跳过逐回合累积、直接把放置房推到终局。
+    #[test]
+    fn milestone_progress_accepts_only_increment() {
+        let base = NarrativeState::default();
+        let mk = |op: PatchOp, v: Option<serde_json::Value>| StatePatch {
+            id: "p1".into(),
+            base_revision: base.revision,
+            source_decision_ids: vec![],
+            operations: vec![PatchOperation {
+                op,
+                path: "world.milestoneProgress_m1".into(),
+                value: v,
+                precondition: None,
+            }],
+        };
+
+        // 引擎自己那条路：照常可用，且真的累加。
+        let after = validate_and_apply(&base, &mk(PatchOp::Increment, Some(serde_json::json!(2.5))))
+            .expect("引擎的 Increment 必须照常可用");
+        assert_eq!(after.world.get("milestoneProgress_m1").and_then(|v| v.as_f64()), Some(2.5));
+        let after2 = validate_and_apply(
+            &after,
+            &StatePatch { id: "p2".into(), base_revision: after.revision, ..mk(PatchOp::Increment, Some(serde_json::json!(1.0))) },
+        )
+        .expect("再累加一次");
+        assert_eq!(after2.world.get("milestoneProgress_m1").and_then(|v| v.as_f64()), Some(3.5));
+
+        // 其余写法一律拒。
+        for (op, v) in [
+            (PatchOp::Set, Some(serde_json::json!(999))),
+            (PatchOp::Remove, None),
+            (PatchOp::Append, Some(serde_json::json!(1))),
+        ] {
+            assert!(
+                validate_and_apply(&base, &mk(op, v)).is_err(),
+                "🔴 里程碑进度键被 {op:?} 写入了 —— 那能跳过逐回合累积直接触发终局"
+            );
+        }
+    }
+
+    /// 🔴 反方向：**只挡这一个前缀**，普通 world 键不受影响。
+    /// `world` 本就是给叙事用的开放键空间，一律限制会把正常的世界状态写入也挡掉。
+    #[test]
+    fn ordinary_world_keys_are_unaffected_by_the_milestone_rule() {
+        let base = NarrativeState::default();
+        let patch = |op: PatchOp, path: &str, v: Option<serde_json::Value>| StatePatch {
+            id: format!("p-{path}"),
+            base_revision: base.revision,
+            source_decision_ids: vec![],
+            operations: vec![PatchOperation { op, path: path.into(), value: v, precondition: None }],
+        };
+        for (op, path, v) in [
+            (PatchOp::Set, "world.warDeclared", Some(serde_json::json!(true))),
+            (PatchOp::Set, "world.season", Some(serde_json::json!("winter"))),
+            (PatchOp::Increment, "world.dayCount", Some(serde_json::json!(1))),
+            // 前缀相近但不是它：不得被误挡。
+            (PatchOp::Set, "world.milestoneSummary", Some(serde_json::json!("x"))),
+        ] {
+            assert!(
+                validate_and_apply(&base, &patch(op, path, v)).is_ok(),
+                "🔴 普通 world 键被误挡：{path}"
+            );
+        }
+    }
+
     use super::*;
     use crate::narrative::types::{ConstraintLevel, ForbiddenPredicate};
     use serde_json::json;

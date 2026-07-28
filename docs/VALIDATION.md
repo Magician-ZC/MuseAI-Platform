@@ -1049,6 +1049,38 @@ camelCase 与 snake_case 同形。`known_to` 才受影响，而那一处是类�
 ⚠️ 另一条边界：**存量模板不会被回头校验**，闸只在写入路径上。存量的发现面是运营台的
 `shape.unknownTopLevelKeys` / `shape.unknownNestedKeys` 两栏——**看得见，但不会自动修**。
 
+### 3.34 引擎 `narrative`：状态写入面**没有缺陷**，但两句注释变成了强制（**2026-07-28**）
+
+按 §3.33 覆盖图的第一项开工：引擎 `narrative`（回合循环 / 仲裁 / 结局选取）。
+先查最要紧的一处——**模型输出如何变成状态写入**（不可信输入直达状态）。
+
+#### 查下来：这一面是稳的，一处没改
+
+| 问题 | 答案 |
+|---|---|
+| 模型能写任意路径吗？ | **不能。** `parse_path` 是严格白名单，末尾 `Err("未知根段")` |
+| 能删掉禁止谓词再为所欲为吗？ | **不能。** `narrative.` 只放行 `outlineNodes[].status` / `foreshadowing` / `pacingNotes`，`forbiddenPredicates` **不在可写面里** |
+| 禁止谓词求值出错会放行吗？ | **不会。** `?` 传播 → 整个 patch 拒绝（fail-closed） |
+| 模型能直接提 operations 吗？ | **不能。** 它只交结构化的 decisions/outcomes，**全部 `PatchOperation` 由 `build_patch` 构造**。全仓另两处构造 `StatePatch` 的地方：一处是硬编码的 `authoring.lockedSceneIds` 追加，一处 operations 为空 |
+| 重复应用 / 并发写？ | 幂等（patch id）+ revision CAS + clone-on-apply |
+
+#### 但两句注释只是约定，现在变成强制
+
+`build_patch` 里写着「**Increment 单调不减，进度键仅经此路径写入**」。那句话**今天成立**
+（见上表最后一行），但没有任何东西守着它。而 `world.<key>` 是**开放键空间**——
+一旦将来有人让模型直接提 operations（作为「优化」），一条
+`Set world.milestoneProgress_m1 = 999` 就能跳过本该逐回合累积的节奏、直接把放置房推到终局。
+
+`apply_world` 加一条**键级特例**：`milestoneProgress_*` 只许 `Increment`。
+结构上只剩累加，那条路走不通。
+
+⚠️ **只挡这一个前缀**，不挡整个 `world.*`——`world` 本就是给叙事用的开放键空间，
+一律限制会把正常的世界状态写入也挡掉。这一条由「普通 world 键不得被误挡」的用例钉住。
+
+🔵 故障注入三处全红，**两处是过度收紧方向**：去掉键级特例（改动前形态）→ 红；
+把限制扩到整个 `world.*` → 误挡用例红；前缀判据写成 `contains("milestone")` →
+`world.milestoneSummary` 被误挡，红。
+
 ### 3.33 覆盖图：这轮巡检**扫过哪些面、没扫哪些面**（**2026-07-28**）
 
 我在 §3.32 末尾写过「未扫过的面我不知道有多少」。那句话本身是可以消除的空白，
@@ -1064,7 +1096,8 @@ camelCase 与 snake_case 同形。`known_to` 才受影响，而那一处是类�
 | server | `worlds` `events` `social` `subplot` `backpack` `shop` `billing` `ledger` `progression` `chapters` `arena` `livegate` `clips` `reports` `memorial` `onboarding` `invitations` `interventions` `annotations` `consents` `flags` `idempotency` | — | ✅ 查过（红线扫描面覆盖：读取面过滤 / 资产单一写入 / 事实不可删 / 确定性 / 幂等 / 无提现 / AI 标识 / feature 门控），**多数结论为无缺陷** |
 | server | `slo` | 3258 | ⬜ **未专门扫过**（只在「文档与读数是否对得上」那次核过 `calibration`） |
 | 引擎 | `lib`（新增红线）· 全 crate 的 `unwrap`/`expect` 面 · 依赖表 | — | ✅ 查过并改过 |
-| 引擎 | **`narrative` 9699 行** · `character` 3811 · `world` 2370 · `knowledge` 1593 · `replay` 1454 | 19k | ⬜ **未逐条扫过**（只过了 `unwrap` 面与确定性面） |
+| 引擎 | `narrative` 的**状态写入面**（`reducer` / `parse_path` / `build_patch` / patch 产地） | — | ✅ 查过（§3.34），**无缺陷**；顺带把两句注释变成强制 |
+| 引擎 | `narrative` 其余（回合编排 · `arbiter` · `constraints` · `relation_dynamics` · `continuity`）· `character` 3811 · `world` 2370 · `knowledge` 1593 · `replay` 1454 | 17k | ⬜ **未逐条扫过** |
 | 桌面轨 | `agent` `commands` `mobile_server` `llm` `tools` `models` `utils` `crawler` | 16k | ✅ 查过并改过 |
 | 桌面轨 | `book_travel` 1538 · `lib` 392 · `fs_commands` 297 | 2.2k | ⬜ **未扫过**（`fs_commands::rename_item_cmd` 单独看过，结论见 §3.26） |
 | 前端 | `utils/runtime.ts` · `pages/MobileHome` · `utils/bookTravelMaterials` | — | ✅ 查过并改过 |

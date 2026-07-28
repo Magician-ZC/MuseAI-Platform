@@ -2,7 +2,7 @@ use crate::agent::sessions::{
     list_agent_sessions_in_dir, load_agent_session_from_dir, save_agent_session_in_dir,
 };
 use crate::models::{ChatStreamEvent, ChatStreamRequest};
-use crate::utils::resolve_document_dir;
+use crate::utils::{resolve_document_dir, write_atomic};
 use crate::ActiveStreams;
 use axum::{
     body::Body,
@@ -654,8 +654,8 @@ async fn update_session_title<R: Runtime>(
     record.saved_at = current_timestamp_millis();
     let updated_text = serde_json::to_string_pretty(&record)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    fs::write(path, updated_text)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    write_atomic(&path, &updated_text)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     let summary = crate::models::AgentSessionSummary {
         id: record.id.clone(),
@@ -1311,8 +1311,8 @@ async fn archive_session_memory<R: Runtime>(
         .join(format!("{}.json", session.id));
     let text = serde_json::to_string_pretty(&session)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    fs::write(session_save_path, text)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    write_atomic(&session_save_path, &text)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     let _ = app.emit("partner-store-updated", ());
 

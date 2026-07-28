@@ -449,8 +449,311 @@ pub fn agent_session_path(app: &AppHandle, id: &str) -> Result<std::path::PathBu
     Ok(agent_sessions_dir(app)?.join(format!("{}.json", safe_id)))
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// 覆盖既有用户数据的落盘，必须是原子的
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 原子落盘：写同目录临时文件 → `rename` 覆盖目标。用于**覆盖已有用户数据**的每一处写。
+///
+/// # 它替掉的是什么
+///
+/// `fs::write` 是「**先把目标截成 0 字节，再往里写**」。中途进程没了（崩溃、Cmd-Q、
+/// force quit、被 kill、OOM），留下的就是一个**截断或全空**的文件。对这个仓库最要命的是
+/// `config/partner-store.json`（全部角色卡 + 世界书）和 `config/settings-store.json`
+/// （全部模型配置、API Key、每一条自定义 prompt）——它们由 zustand persist 在**每次状态变更时
+/// 落盘**，也就是正常使用中一直在写，窗口不是理论上的。
+///
+/// 🔴 而且损坏会**自我固化**：下次启动时截断的 JSON 解析失败 → persist 静默回落到初始状态 →
+/// 用户随手一改，第一次 `setItem` 就把那份空状态原样写回文件。原始内容至此彻底没有第二份。
+///
+/// `rename` 覆盖是原子的：任何时刻别的进程看到的要么是**完整的旧内容**、要么是**完整的新内容**，
+/// 没有中间态。临时文件与目标**同目录**（跨文件系统 rename 会失败），失败路径一律清掉它。
+///
+/// # 边界：不做 fsync，这是有意的
+///
+/// 本函数消掉的是**进程死亡**窗口，不是**断电 / 内核 panic** 窗口——后者需要在 rename 前
+/// `sync_all()`，而那在 macOS 上是 `F_FULLFSYNC`（整盘刷），按「每次状态变更一次」的写入频率
+/// 摊到设置页的每一次输入上，会变成肉眼可见的卡顿。用一次真实的交互退化去换一个由
+/// 文件系统本身已经大幅缓解的窗口（APFS 与 ext4 `data=ordered` 都对「写完即 rename 覆盖」
+/// 有强制落盘的启发式），不划算。
+///
+/// # 临时文件名
+///
+/// `<目标文件名>.tmp-<pid>-<序号>`：
+/// - 后缀**不是 `.json`**，因为会话目录与配置目录的枚举器都按 `extension() == "json"` 过滤
+///   （`sessions.rs` / `workspace.rs`）——残留的临时文件不会被当成一条坏会话列出来。
+/// - 带 pid + 进程内递增序号：桌面端与手机端可能同时保存同一个 store，共用一个固定临时名
+///   会让两次写交叉后 rename 出一份**混合内容**。序号用 `AtomicU64` 而非随机数/时间戳，
+///   与 `docs/VALIDATION.md` §4「禁三样」同口径。
+pub fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let dir = path
+        .parent()
+        .ok_or_else(|| format!("无法定位 {} 的父目录", path.display()))?;
+    fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let stem = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("目标文件名不可用：{}", path.display()))?;
+    let tmp = dir.join(format!(
+        "{}.tmp-{}-{}",
+        stem,
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    let written = (|| -> std::io::Result<()> {
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(content.as_bytes())
+    })();
+    if let Err(e) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.to_string());
+    }
+    fs::rename(&tmp, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        e.to_string()
+    })
+}
+
 #[cfg(test)]
 mod tests {
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("museai-utils-{}-{}", name, nanos));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    /// 覆盖写的基本契约：内容换掉了，且**不留临时文件**。
+    ///
+    /// 残留检查不是洁癖：`config/` 与 `agent-sessions/` 都会被枚举，攒一地临时文件既是
+    /// 磁盘泄漏、也可能被将来的枚举器当成真文件读出来。
+    #[test]
+    fn write_atomic_overwrites_and_leaves_no_residue() {
+        let dir = temp_dir("atomic-overwrite");
+        let path = dir.join("partner-store.json");
+
+        super::write_atomic(&path, r#"{"cards":["旧"]}"#).expect("首次写入");
+        super::write_atomic(&path, r#"{"cards":["新","新2"]}"#).expect("覆盖写入");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("读回"),
+            r#"{"cards":["新","新2"]}"#
+        );
+        let left: Vec<String> = std::fs::read_dir(&dir)
+            .expect("列目录")
+            .map(|e| e.expect("目录项").file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, vec!["partner-store.json".to_string()], "🔴 目录里多了东西：{left:?}");
+
+        // 父目录不存在时自建（`save_app_state` 首次运行就是这个情形）。
+        let nested = dir.join("config").join("settings-store.json");
+        super::write_atomic(&nested, "{}").expect("应自建父目录");
+        assert_eq!(std::fs::read_to_string(&nested).expect("读回"), "{}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🔴 **本函数存在的全部理由**：目标文件从头到尾没有被原地改过。
+    ///
+    /// `fs::write` 是「先把目标截成 0 再写」——进程在这中间死掉（崩溃 / Cmd-Q / kill / OOM），
+    /// 留下的就是一个截断文件。这里用 inode 与**改动前就打开的句柄**同时验证：
+    /// 新内容是 `rename` 换上去的，旧 inode 一个字节都没动。测试杀不掉自己来演示崩溃，
+    /// 但「旧内容从未被就地覆盖」正是崩溃窗口不存在的**结构性**理由。
+    ///
+    /// ⚠️ `#[cfg(unix)]`：Windows 上 `File::open` 不带 `FILE_SHARE_DELETE`，
+    /// 对一个已打开的文件做 rename 覆盖会失败——那是**测试手法**的平台差异，
+    /// 不是被测行为的差异（`fs::rename` 在 Windows 上走
+    /// `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`，同样是原子替换）。
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_never_overwrites_the_old_file_in_place() {
+        use std::io::Read;
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = temp_dir("atomic-inode");
+        let path = dir.join("settings-store.json");
+        super::write_atomic(&path, "旧内容").expect("首次写入");
+
+        let before = std::fs::metadata(&path).expect("元信息").ino();
+        let mut held = std::fs::File::open(&path).expect("改动前先握住旧文件");
+
+        super::write_atomic(&path, "新内容").expect("覆盖写入");
+
+        let mut old = String::new();
+        held.read_to_string(&mut old).expect("从旧句柄读");
+        assert_eq!(old, "旧内容", "🔴 旧文件被原地改了 —— 截断窗口还在");
+        assert_ne!(
+            before,
+            std::fs::metadata(&path).expect("元信息").ino(),
+            "🔴 目标仍是同一个 inode —— 说明没走 rename，是原地写"
+        );
+        assert_eq!(std::fs::read_to_string(&path).expect("读回"), "新内容");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 递归收集 `src-tauri/src` 下的生产源码（花括号配平剥掉 `#[cfg(test)] mod X { .. }`）。
+    ///
+    /// 与 `server/src/testkit.rs::production_sources` 同一套判据。本 crate 目前 16 个内联
+    /// 测试模块**全部叫 `tests`**，但仍按配平剥离而不是按名字截断——一旦将来出现
+    /// 文件中段的测试夹具（server 侧就有），按名字截断会把其后的生产码整段漏掉，
+    /// 让扫描形同虚设，而且**不会有任何报错**。
+    #[cfg(test)]
+    fn production_sources() -> Vec<(String, String)> {
+        fn strip_test_mods(src: &str) -> String {
+            let mut out = String::with_capacity(src.len());
+            let bytes = src.as_bytes();
+            let mut i = 0usize;
+            while i < src.len() {
+                let Some(rel) = src[i..].find("#[cfg(test)]") else {
+                    out.push_str(&src[i..]);
+                    break;
+                };
+                let marker = i + rel;
+                let after = marker + "#[cfg(test)]".len();
+                let rest = &src[after..];
+                let pad = rest.len() - rest.trim_start().len();
+                let head = rest.trim_start();
+                let is_mod_block = head.starts_with("mod ")
+                    && head[..head.find(['{', ';']).map(|k| k + 1).unwrap_or(head.len())]
+                        .ends_with('{');
+                if !is_mod_block {
+                    out.push_str(&src[i..after]);
+                    i = after;
+                    continue;
+                }
+                out.push_str(&src[i..marker]);
+                let brace_at = after + pad + head.find('{').expect("上面已确认有 {");
+                let mut depth = 0i32;
+                let mut j = brace_at;
+                while j < bytes.len() {
+                    match bytes[j] {
+                        b'{' => depth += 1,
+                        b'}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                j += 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                i = j;
+            }
+            out
+        }
+        fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String, String)>) {
+            let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+                .unwrap_or_else(|e| panic!("读目录 {dir:?}：{e}"))
+                .map(|e| e.expect("目录项").path())
+                .collect();
+            entries.sort();
+            for path in entries {
+                if path.is_dir() {
+                    walk(&path, root, out);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("读 {path:?}：{e}"));
+                let rel = path
+                    .strip_prefix(root)
+                    .expect("相对路径")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                out.push((rel, strip_test_mods(&src)));
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = Vec::new();
+        walk(&root, &root, &mut out);
+        assert!(out.len() > 15, "🔴 源码遍历只收到 {} 个文件，扫描口径坏了", out.len());
+        out
+    }
+
+    /// 🔴 **覆盖既有用户数据的落盘，一处都不许用 `fs::write`。**
+    ///
+    /// # 为什么是「排除表」而不是「清单」
+    ///
+    /// 这道门要防的是**将来新写的落盘点忘了走原子写**。若写成「以下这些点必须原子」，
+    /// 新增的第 N+1 处不在清单里 → 静默放行，门等于不存在。反过来，「除了这几处已知安全的，
+    /// 一律不许出现 `fs::write`」让**遗漏往红的方向失败**：新写一处就红，作者必须在
+    /// 「改成 `write_atomic`」和「在这张表里写清为什么安全」之间选一个。
+    /// 判据方向的选法见 `docs/VALIDATION.md` §3.8.1。
+    ///
+    /// # 表里为什么按「处数」而不是只按文件
+    ///
+    /// 只记文件名的话，往一个已豁免文件里新加一处 `fs::write` 会被顺带放行。
+    /// 记数字，加一处就对不上。
+    #[test]
+    fn red_line_every_write_that_overwrites_user_data_is_atomic() {
+        // (相对 src/ 的路径, 该文件允许的 `fs::write(` 处数, 为什么这几处安全)
+        const EXEMPT: &[(&str, usize, &str)] = &[
+            (
+                "crawler.rs",
+                4,
+                "抓下来的网页正文/目录：写的是新建文件，且内容随时可以重抓，不是不可再生的用户数据",
+            ),
+            (
+                "fs_commands.rs",
+                1,
+                "新建空文件（`fs::write(&item_path, \"\")`）：目标此前不存在，没有任何内容会被截断",
+            ),
+            (
+                "agent/sessions.rs",
+                1,
+                "反向大纲保存：路径来自 `unique_reverse_outline_path`，它逐个试到不存在的文件名才返回，写的一定是新文件",
+            ),
+            (
+                "commands/fs.rs",
+                3,
+                "两处导出到下载目录（路径来自 `unique_download_path`，同样只返回不存在的路径）+ 一处 `create_file`（已先 `if path.exists() { return Err }`）",
+            ),
+        ];
+
+        let mut offenders = Vec::new();
+        for (rel, src) in production_sources() {
+            let found = src.matches("fs::write(").count();
+            let allowed = EXEMPT
+                .iter()
+                .find(|(p, _, _)| *p == rel)
+                .map(|(_, n, _)| *n)
+                .unwrap_or(0);
+            if found != allowed {
+                offenders.push(format!("{rel}：找到 {found} 处 `fs::write(`，表里登记 {allowed} 处"));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "🔴 落盘点与豁免表对不上：\n  {}\n\n\
+             覆盖既有用户数据的写必须走 `utils::write_atomic`（写同目录临时文件 → rename）。\
+             `fs::write` 先把目标截成 0 再写，进程在这中间死掉就留下一个截断文件——\
+             对 `config/partner-store.json`（全部角色卡）和 `config/settings-store.json`\
+             （全部模型配置与 API Key）而言那就是数据没了，而且下次启动会被空状态覆盖固化。\n\
+             确实安全（写的是新建文件 / 空文件 / 可再生内容）就把它加进本用例的 EXEMPT 表并写清理由。",
+            offenders.join("\n  ")
+        );
+
+        // 表本身别烂掉：登记了却已经不存在的文件要及时删掉，否则它会悄悄放行一个同名新文件。
+        let present: std::collections::BTreeSet<String> =
+            production_sources().into_iter().map(|(rel, _)| rel).collect();
+        for (rel, _, _) in EXEMPT {
+            assert!(present.contains(*rel), "🔴 EXEMPT 里登记的 {rel} 已不在源码树里，请删掉这一行");
+        }
+    }
 
     /// 🔴 共用判据本身：三个调用点（技能导入 / 技能删除 / 版本文件）都靠它。
     #[test]

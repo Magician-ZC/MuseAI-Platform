@@ -216,7 +216,7 @@ pub fn tool_write(
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
 
-        fs::write(&path, &content).map_err(|e| e.to_string())?;
+        write_atomic(&path, &content)?;
         let _ = app.emit("workspace-changed", ());
         let line_count = count_lines(&content);
         Ok(format!("Wrote {} lines to {}", line_count, path.display()))
@@ -261,7 +261,7 @@ pub fn tool_edit(
         }
 
         let new_content = content.replacen(&old_string, &new_string, 1);
-        fs::write(&path, &new_content).map_err(|e| e.to_string())?;
+        write_atomic(&path, &new_content)?;
         let _ = app.emit("workspace-changed", ());
         Ok(format!(
             "Edited {}\n{}",

@@ -200,7 +200,7 @@ fn save_work_summary_result_for_root(
         score_json: parsed,
     };
     let content = serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?;
-    fs::write(result_path, content).map_err(|e| e.to_string())
+    write_atomic(&result_path, &content)
 }
 
 fn load_work_summary_result_for_root(
@@ -514,7 +514,7 @@ pub fn save_app_state_path(base: &Path, name: &str, content: &str) -> Result<(),
     let dir = base.join("MuseAI").join("config");
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join(format!("{}.json", name));
-    fs::write(path, content).map_err(|e| e.to_string())
+    write_atomic(&path, content)
 }
 
 #[tauri::command]

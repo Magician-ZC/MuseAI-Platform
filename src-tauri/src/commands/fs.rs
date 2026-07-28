@@ -128,7 +128,7 @@ pub fn read_image_data_url(path: String) -> Result<String, String> {
 
 #[tauri::command]
 pub fn write_file(app: tauri::AppHandle, path: String, content: String) -> Result<u64, String> {
-    fs::write(&path, content).map_err(|e| e.to_string())?;
+    write_atomic(Path::new(&path), &content)?;
     let _ = app.emit("workspace-changed", ());
     file_modified_at(path)
 }

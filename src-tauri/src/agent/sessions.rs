@@ -205,7 +205,7 @@ pub(crate) fn save_agent_session_in_dir(
     let safe_id = sanitize_session_id(&session.id)?;
     let path = dir.join(format!("{}.json", safe_id));
     let text = serde_json::to_string_pretty(&session).map_err(|e| e.to_string())?;
-    fs::write(path, text).map_err(|e| e.to_string())?;
+    write_atomic(&path, &text)?;
     Ok(session_summary(&session))
 }
 #[tauri::command]
@@ -340,7 +340,7 @@ pub fn update_agent_session_title(
     record.title = title;
     record.saved_at = now_millis()?;
     let updated_text = serde_json::to_string_pretty(&record).map_err(|e| e.to_string())?;
-    fs::write(path, updated_text).map_err(|e| e.to_string())?;
+    write_atomic(&path, &updated_text)?;
     Ok(AgentSessionSummary {
         id: record.id,
         title: record.title,

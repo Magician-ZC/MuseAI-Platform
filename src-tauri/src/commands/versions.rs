@@ -83,7 +83,7 @@ pub fn create_file_version(path: String) -> Result<VersionInfo, String> {
 
     meta.versions.push(version_info.clone());
 
-    fs::write(&meta_path, serde_json::to_string(&meta).unwrap()).map_err(|e| e.to_string())?;
+    crate::utils::write_atomic(&meta_path, &serde_json::to_string(&meta).unwrap())?;
 
     Ok(version_info)
 }
@@ -110,7 +110,7 @@ pub fn delete_file_version(path: String, version_id: String) -> Result<(), Strin
         let mut meta: FileVersionsMetadata =
             serde_json::from_str(&content).map_err(|e| e.to_string())?;
         meta.versions.retain(|v| v.id != version_id);
-        fs::write(&meta_path, serde_json::to_string(&meta).unwrap()).map_err(|e| e.to_string())?;
+        crate::utils::write_atomic(&meta_path, &serde_json::to_string(&meta).unwrap())?;
     }
 
     Ok(())
@@ -152,7 +152,7 @@ pub fn update_version_ai_result(
         return Err("Version not found".to_string());
     }
 
-    fs::write(&meta_path, serde_json::to_string(&meta).unwrap()).map_err(|e| e.to_string())?;
+    crate::utils::write_atomic(&meta_path, &serde_json::to_string(&meta).unwrap())?;
     Ok(())
 }
 

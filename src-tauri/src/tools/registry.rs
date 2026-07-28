@@ -232,17 +232,23 @@ pub fn agent_tool_definitions() -> Vec<AgentToolDefinition> {
         },
     ]
 }
+/// 给模型声明哪些工具可用。
+///
+/// 🔴 **判据复用 `AgentRunOptions::allows_tool`，不另写一份。**
+///
+/// 同一个「这个工具允许吗」此前有两份实现：执行侧（`execute_agent_tool_inner` 的第一句）
+/// 调 `allows_tool`，声明侧在这里内联抄了一遍。今天两份逻辑相同，但漂移的方向是**不对称**的：
+///
+/// - 声明侧变宽 → 工具被声明、执行时被拒 → 报错可见，**安全**；
+/// - **执行侧变宽而声明侧不动 → 执行允许的比声明的多**。模型平时不会调没声明的工具，
+///   但提示注入可以指名一个——那时挡它的只剩执行侧那道已经被放宽的闸。
+///
+/// 复用之后不存在「两份」，也就没有那个方向可漂。
+/// 顺带去掉了每次比较都 `tool.name.to_string()` 的分配。
 pub fn filtered_agent_tool_definitions(options: &AgentRunOptions) -> Vec<AgentToolDefinition> {
     agent_tool_definitions()
         .into_iter()
-        .filter(|tool| {
-            if let Some(allowed) = &options.allowed_tools {
-                if !allowed.contains(&tool.name.to_string()) {
-                    return false;
-                }
-            }
-            !options.excluded_tools.contains(&tool.name.to_string())
-        })
+        .filter(|tool| options.allows_tool(tool.name))
         .collect()
 }
 pub fn openai_tool_definitions(options: &AgentRunOptions) -> Vec<Value> {
@@ -379,6 +385,71 @@ impl AnthropicRoundResult {
 
 #[cfg(test)]
 mod tests {
+
+    /// 🔴 **声明侧与执行侧必须是同一个判据。**
+    ///
+    /// 执行侧（`execute_agent_tool_inner` 的第一句）调 `AgentRunOptions::allows_tool`；
+    /// 声明侧此前内联抄了一遍同样的逻辑。漂移方向不对称：声明侧变宽只是「声明了却执行不了」
+    /// （报错可见）；而**执行侧变宽、声明侧不动**，就等于执行允许的比声明的多——
+    /// 模型平时不会调没声明的工具，但提示注入可以指名一个。
+    ///
+    /// 本条逐个工具比对两侧结论，任何一侧被改宽/改窄而另一侧没跟上，立刻红。
+    #[test]
+    fn declaration_filter_and_execution_gate_agree_on_every_tool() {
+        let with = |allowed: Option<Vec<String>>, excluded: Vec<String>| AgentRunOptions {
+            allowed_tools: allowed,
+            excluded_tools: excluded,
+            ..AgentRunOptions::parent()
+        };
+        let cases = [
+            AgentRunOptions::parent(),
+            with(Some(vec!["read".into(), "write".into()]), vec![]),
+            with(Some(vec!["read".into(), "bash".into()]), vec![]),
+            with(None, vec!["subagent".into()]),
+            // 交集：既在白名单里、又在排除表里 —— 两侧都必须判「不允许」。
+            with(Some(vec!["read".into(), "subagent".into()]), vec!["subagent".into()]),
+        ];
+        for opts in &cases {
+            let declared: Vec<&str> =
+                filtered_agent_tool_definitions(opts).iter().map(|t| t.name).collect();
+            for tool in agent_tool_definitions() {
+                assert_eq!(
+                    declared.contains(&tool.name),
+                    opts.allows_tool(tool.name),
+                    "🔴 工具 `{}` 上，声明侧与执行侧结论不一致（allowed={:?} excluded={:?}）",
+                    tool.name,
+                    opts.allowed_tools,
+                    opts.excluded_tools
+                );
+            }
+        }
+    }
+
+    /// 🔴 **执行侧的闸必须在分发之前**（源码级）。
+    ///
+    /// 声明侧过滤只决定「告诉模型有哪些工具」；真正挡住「模型指名一个没声明的工具」的
+    /// 是执行侧那一句。它一旦被挪到 `match tool_name` 之后（或被删掉），
+    /// 受限模式就形同虚设，而所有既有用例都不会红。
+    #[test]
+    fn red_line_execution_gate_runs_before_tool_dispatch() {
+        let src = include_str!("../agent/mod.rs");
+        let f = src
+            .find("async fn execute_agent_tool_inner")
+            .expect("找不到工具执行入口 —— 本断言的前提变了");
+        let gate = src[f..]
+            .find("options.allows_tool(tool_name)")
+            .map(|i| f + i)
+            .expect("🔴 执行侧没有能力闸：受限模式（如冒险模式）将形同虚设");
+        let dispatch = src[f..]
+            .find("match tool_name")
+            .map(|i| f + i)
+            .expect("找不到工具分发 —— 本断言的前提变了");
+        assert!(
+            gate < dispatch,
+            "🔴 能力闸必须在 `match tool_name` **之前**：晚一步，未声明的工具就已经被执行了"
+        );
+    }
+
     use super::*;
     use crate::models::AgentRunOptions;
 

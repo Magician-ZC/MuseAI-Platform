@@ -933,3 +933,49 @@ async fn contradiction_rate_distinguishes_untested_from_zero() {
     assert_eq!(x["status"], "no_data_in_window");
     assert!(x["value"].is_null(), "没测过必须是 null，显示 0% 会被读成「一次矛盾都没有」：{x}");
 }
+
+// ============================================================================
+// 文档同步闸：`slo::calibration` 的维度读数 vs `docs/VALIDATION.md`
+// ============================================================================
+
+/// 🔴 **「还差什么」清单过期，代价是一份重复实现。**
+///
+/// 2026-07-28 实测：`identityShareBalance` 与 `realmTierWorldQuality` 早已上线，
+/// 而 `VALIDATION.md` 三处仍写着「把身份维/境界维接进 `slo/` ……未做」，且**全文一次都没提过
+/// 这两个读数的名字**。照着那份清单去补，就会造出同一读数的第二份实现——
+/// 那正是本仓反复在修的缺陷形态（同一判定的多份拷贝）。
+///
+/// 这道闸的形状与 CLAUDE.md 去掉硬编码计数是同一个道理，但方向相反：
+/// 那边是**删掉**会过期的数字（描述现状的数字，过期即误导）；
+/// 这边是**钉住**一个必须同步的事实（约束变更的闸门，过期即报警，正是它要的）。
+///
+/// 判据刻意只要求「名字在文档里出现过」，不校验措辞：
+/// 措辞会变，而「新加了一个维度却没在验证台账里露过面」是确定性的疏漏。
+#[test]
+fn validation_doc_mentions_every_calibration_dimension() {
+    let src = include_str!("calibration.rs");
+    let doc = include_str!("../../../docs/VALIDATION.md");
+
+    let mut metrics: Vec<&str> = Vec::new();
+    for line in src.lines() {
+        let t = line.trim();
+        let Some(rest) = t.strip_prefix("const METRIC: &str = \"") else { continue };
+        let Some(name) = rest.split('"').next() else { continue };
+        metrics.push(name);
+    }
+    assert!(
+        metrics.len() >= 2,
+        "维度读数解析疑似失效，只解出 {}：{metrics:?}",
+        metrics.len()
+    );
+
+    for m in &metrics {
+        assert!(
+            doc.contains(m),
+            "校准维度 `{m}` 已在 `slo::calibration` 上线，但 `docs/VALIDATION.md` 全文没提过它。\n\
+             台账漏记一个已上线的读数，下一个人就会照着「还差什么」清单再实现一遍——\n\
+             2026-07-28 就差点发生（`identityShareBalance` 已存在，文档三处仍写「未做」）。\n\
+             请在 VALIDATION 相应小节写清它测什么、出口在哪，而不是只把这里的断言改绿。"
+        );
+    }
+}

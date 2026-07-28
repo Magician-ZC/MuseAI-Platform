@@ -713,6 +713,13 @@ pub(crate) async fn schedule_tick_marked(
     mark: TickMark,
 ) -> Result<Option<i64>, ApiError> {
     let world = load_world(&state.db, world_id).await?;
+    // 🔴 读-改-写分配，与 `world_events.sequence` 当初同形态——但**这里是安全的**，
+    // 靠的是 `UNIQUE INDEX idx_world_tick_unique(world_id, tick_no)`：撞号是写入报错，不是静默并列。
+    //
+    // ⚠️ §3.3 ① 明确拒绝用唯一约束兜底 `world_events.sequence`，理由是「输的一方是一整个
+    // tick 的 commit 事务回滚（模型已跑完、token 已烧掉）」。**这里输的一方只是一次排期尝试**
+    // ——模型还没被调用，重排即可。代价不对称，所以工具选择不同。
+    // **两处不该被「统一写法」改成一致**（见 docs/VALIDATION.md §3.56）。
     let max: i64 = sqlx::query("SELECT COALESCE(MAX(tick_no), -1) AS m FROM world_ticks WHERE world_id = $1")
         .bind(world_id)
         .fetch_one(&state.db)

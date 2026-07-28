@@ -4244,6 +4244,71 @@ mod sampling_tests {
         assert!(s.identity_assignments.is_empty());
     }
 
+    // ---------- 🔴 确定性契约：全仓「禁三样」----------
+
+    /// 「禁三样」（系统随机 / 浮点 RNG / map 迭代序驱动 RNG）此前只有 **`ifline` 一个模块**
+    /// 有源码级红线（`red_line_module_is_rng_free`），而这句话本身住在**本文件**——
+    /// 装配与采样才是确定性最要紧的地方，却没有任何闸。
+    ///
+    /// 本条按「排除表而非包含表」扫**全仓生产码**：新模块默认被覆盖，不必有人记得加。
+    /// 这个方向是刻意的，理由与 `world_scan_text` 那次相同——漏扫一个模块，
+    /// 那个模块的不可复现随机不会报错，只会让黄金世界回归**偶发**变红，
+    /// 而偶发红的第一反应通常是「重跑一下」。
+    ///
+    /// 禁的是**不可复现**的 API，不是「随机」本身：确定性随机走
+    /// `assembly::fnv1a_64` + `Rng`（SplitMix64）并登记域常量。
+    ///
+    /// ⚠️ 也不禁 `HashMap`：契约禁的是「用 map 迭代序驱动 RNG」，而不是拿 map 做查表。
+    /// 源码级扫描分不出这两者，一律禁会逼出一堆无意义的改写并让这道门被无视。
+    /// 迭代序那一支由「同种子同结果」的行为用例负责（`same_seed_same_sampling` 等）。
+    #[test]
+    fn red_line_no_irreproducible_randomness_outside_the_exempt_list() {
+        /// 不可复现的随机 / 时钟 API。
+        const BANNED: &[&str] =
+            &["thread_rng", "rand::random", "gen_range", "shuffle(", "SystemTime::now", "Instant::now"];
+
+        /// 豁免，每条都必须说得出理由：
+        /// - `auth/mod.rs`：会话 token 与短信验证码**必须**是密码学随机——
+        ///   确定性 token 是安全漏洞，这里的「不可复现」正是要的性质。
+        /// - `db.rs`：全仓**唯一的时间源**（`now_ms`）。别处要时间一律调它，
+        ///   于是「现在几点」也只有一处定义（测试可据此整体控制时间）。
+        const EXEMPT: &[&str] = &["auth/mod.rs", "db.rs"];
+
+        let mut offenders: Vec<String> = Vec::new();
+        for (path, src) in crate::testkit::production_sources() {
+            if EXEMPT.iter().any(|e| path.ends_with(e)) {
+                continue;
+            }
+            // 剥注释：本仓多处注释里逐字写着 `thread_rng` 来说明「禁的是它」。
+            let code: String = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            for b in BANNED {
+                if code.contains(b) {
+                    offenders.push(format!("{path} → {b}"));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "🔴 生产码出现不可复现的随机/时钟 API：{offenders:?}\n\
+             确定性产出是合规红线（同一种子同一结果，黄金世界回归与录制回放都以此为前提）。\n\
+             · 需要随机 → 走 `assembly::fnv1a_64` + `Rng`（SplitMix64）并登记域常量；\n\
+             · 需要时间 → 走 `db::now_ms`（全仓唯一时间源）。\n\
+             若确有必须不可复现的理由（如密码学随机），加进 EXEMPT 并写清楚，不要只把断言改绿。"
+        );
+        // 扫描器失效 = 红线静默失效：确认豁免名单里的文件**确实**含被禁 API，
+        // 否则说明扫描根本没读到东西。
+        for e in EXEMPT {
+            let hit = crate::testkit::production_sources()
+                .iter()
+                .any(|(p, src)| p.ends_with(e) && BANNED.iter().any(|b| src.contains(b)));
+            assert!(hit, "🔴 豁免项 `{e}` 里一个被禁 API 都没扫到——要么它不再需要豁免（请删掉），要么扫描器坏了");
+        }
+    }
+
     // ---------- 建模板期校验：未知顶层键 ----------
     //
     // 这一组防的是本文件里最不像 bug 的那类 bug：**拼错一个键，全程零报错**。

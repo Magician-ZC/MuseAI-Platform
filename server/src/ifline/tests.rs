@@ -890,12 +890,51 @@ fn code_only(src: &str) -> String {
 
 /// 🔴 **红线的扫描面 = 本功能的全部源码**。
 ///
-/// 0039 只有 `mod.rs`，源码级用例直接 `include_str!("mod.rs")`；0041 加了 `runner.rs`（推进）。
-/// 若扫描面不跟着扩，新增文件就是红线的盲区——「不写世界线 / 不铸资产 / 不用系统随机」
-/// 这三条会在最需要它们的那个文件上失效，而所有用例仍然全绿。
-/// 将来再拆文件时**必须同步加进这里**。
+/// 0039 只有 `mod.rs`，源码级用例直接 `include_str!("mod.rs")`；0041 加了 `runner.rs`（推进）；
+/// 0052 加了 `sweep.rs`（对账补投）。若扫描面不跟着扩，新增文件就是红线的盲区——
+/// 「不写世界线 / 不铸资产 / 不用系统随机」这三条会在最需要它们的那个文件上失效，
+/// 而所有用例仍然全绿。
+///
+/// ⚠️ **这里原本写着「将来再拆文件时必须同步加进这里」——而它当场就没被做到**：
+/// 0052 新增 `sweep.rs` 时我漏了这一步，三条红线对新文件静默失效了一整批提交
+/// （所幸那个文件确实没有违反，但那是运气不是保证）。
+/// 所以现在不靠人记得：`ifline_source_files_are_all_scanned` 从**目录**核对扫描面，
+/// 少一个文件就红。`include_str!` 必须是字面量（编译期读取），故清单仍写在这里，
+/// 但「清单是否完整」由那条用例负责。
 fn ifline_sources() -> String {
-    [code_only(include_str!("mod.rs")), code_only(include_str!("runner.rs"))].join("\n")
+    [
+        code_only(include_str!("mod.rs")),
+        code_only(include_str!("runner.rs")),
+        code_only(include_str!("sweep.rs")),
+    ]
+    .join("\n")
+}
+
+/// 🔴 扫描面完整性：`ifline/` 下每一个生产源码文件都必须在 `ifline_sources()` 里。
+///
+/// 这条防的是上面那段注释**已经预言过、而且真的发生了**的事：加了新文件、忘了加扫描面，
+/// 于是三条红线在新文件上静默失效，全绿。
+#[test]
+fn ifline_source_files_are_all_scanned() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ifline");
+    let mut files: Vec<String> = std::fs::read_dir(&dir)
+        .expect("读 ifline 目录")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.ends_with(".rs") && n != "tests.rs")
+        .collect();
+    files.sort();
+    assert!(files.len() >= 3, "ifline 目录只解出 {} 个文件，读目录疑似失效：{files:?}", files.len());
+
+    let listed = include_str!("tests.rs");
+    for f in &files {
+        assert!(
+            listed.contains(&format!("include_str!(\"{f}\")")),
+            "🔴 `ifline/{f}` 没有进 `ifline_sources()` 的扫描面——\n\
+             「不写世界线 / 不铸资产 / 不用系统随机」三条红线对这个文件是失效的，而用例会全绿。\n\
+             把 `code_only(include_str!(\"{f}\"))` 加进 `ifline_sources()`。"
+        );
+    }
 }
 
 /// 🔴 **本模块对世界线表只有 SELECT**（§0.3 公共事实不可回滚的源码级证据）。

@@ -2284,9 +2284,9 @@ async fn worldline_settlement_pays_by_public_payout_table() {
     );
 }
 
-/// 世界线崩塌（关键角色退场）：③ 归零 · ① 减半 · ② 已锁定产出原样保留。
+/// 世界线崩塌（关键角色退场）：③ 归零 · ① 通关奖励归零 · ② 已锁定的节点收益原样保留。
 #[tokio::test]
-async fn worldline_collapse_zeroes_tier3_halves_baseline_and_keeps_locked_items() {
+async fn worldline_collapse_zeroes_both_tiers_and_keeps_locked_node_rewards() {
     let state = test_state().await;
     seed_template_worldline(
         &state.db,
@@ -2334,11 +2334,12 @@ async fn worldline_collapse_zeroes_tier3_halves_baseline_and_keeps_locked_items(
     );
     assert_eq!(world_status(&state.db, &wid).await, "ended");
 
-    // ① 减半：出席产出 60 → 30（不是 0，也不是 60，更不含任何 ③ 层加成）。
+    // ① 归零：崩塌 = 世界线没走完 ⇒ 无通关奖励。🔴 而 ② 已锁定的节点收益**必须原样保留**——
+    // 那正是「完成即锁定」这个语义存在的理由，也是新模型下玩家在一局崩塌世界里唯一的所得。
     assert_eq!(
         i64_one(&state.db, "SELECT mileage FROM cloud_characters WHERE id=$1", "ccolB").await,
-        30,
-        "崩塌 → ① 保底层减半（60×0.5），且 ③ 归零（否则会是 30+20 或 60+20）"
+        0,
+        "崩塌 → ① 通关奖励归零（世界线没走完）且 ③ 归零（旧规则是减半 30，见 COLLAPSE_BASELINE_FACTOR）"
     );
     // ③ 归零：不发任何世界线产出，但结算占位已落（不留重复结算空子）。
     assert_eq!(

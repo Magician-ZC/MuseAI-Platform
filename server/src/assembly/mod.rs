@@ -183,7 +183,9 @@ pub struct PayoutTier {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CollapsePolicy {
-    /// ① 保底层折算系数（默认 0.5 = 减半）。
+    /// **通关奖励**折算系数（默认 0.0 = 崩塌不发；⚠️ 2026-07-29 由 0.5 改为 0.0，
+    /// 因为 §12 重定后这一层不是「保底」而是「通关奖励」，而崩塌恰恰意味着世界线没走完。
+    /// JSON 键名 `baselineFactor` 是历史名，不改是为了不让存量模板的键变成「无人读取的键」）。
     #[serde(default = "default_collapse_baseline_factor")]
     pub baseline_factor: f64,
     /// ③ 世界线层折算系数（默认 0.0 = 归零；≤ 0 即整层不发放）。
@@ -917,7 +919,23 @@ fn container_instance_seed(
     )
 }
 
-/// 种子分派：**容器形态才四段，其余一律三段**。
+/// 实例种子（**第五段：世界线烙印**）：在三/四段式之上追加**烙印指纹**。
+///
+/// 提案见 `docs/build/spec-worldline-imprint.md` §2.2「共鸣 · 结构层」。它要兑现的那半句是：
+/// **即使别人一字不差复刻了内核，抽到的剧情线 / 隐藏钩子 / 地点组合也不同**——
+/// 因为这张卡带着一段别人没有的经历，而经历进了种子。
+///
+/// 🔴 **烙印指纹为空时，本函数一定不被调用**（见 [`resolve_instance_seed`] 的分派）。
+/// 那条分派是黄金世界回归能继续绿的全部依据：全新库、全新卡没有烙印 ⇒ 走原路径 ⇒
+/// 种子一个 bit 都不变。**这一层是纯增量，不是改写。**
+///
+/// 🔵 顺带它加强了防刷：种子里又多了一个玩家**不可控、不可预测、不可复现**的分量
+/// （烙印由服务端按 world_events 派生，客户端写不进来）。
+fn imprinted_instance_seed(base: u64, imprint_fingerprint: &str) -> u64 {
+    fnv1a_64(format!("{base}\u{1}{imprint_fingerprint}").as_bytes())
+}
+
+/// 种子分派：**容器形态才四段，其余一律三段**；两者之上再按烙印指纹追加第五段。
 ///
 /// 这是「四段式只在容器形态生效」的唯一落点——`Skeleton.container` 只可能由
 /// `compose_container_skeleton` 置上，而它只在「开关已开 + 模板声明了 subplotCardRefs +
@@ -927,13 +945,19 @@ fn resolve_instance_seed(
     world_id: &str,
     fingerprint: &str,
     template_version: i64,
+    imprint_fingerprint: &str,
 ) -> u64 {
-    match &skeleton.container {
+    let base = match &skeleton.container {
         Some(plan) => {
             container_instance_seed(world_id, fingerprint, template_version, &plan.fingerprint)
         }
         None => instance_seed(world_id, fingerprint, template_version),
+    };
+    // 🔴 空指纹 → 原样返回。这一句就是「零烙印时逐字节不变」的落点。
+    if imprint_fingerprint.is_empty() {
+        return base;
     }
+    imprinted_instance_seed(base, imprint_fingerprint)
 }
 
 /// storyline 阵容加权 boost（复用 weight_endings_scored 的阵容画像口径）。
@@ -1148,6 +1172,8 @@ fn plan_sampling(
     cards: &[(String, CharacterCardV2)],
     ending_threshold: f32,
     star_rating: i64,
+    // 世界线烙印指纹（空 = 无烙印 ⇒ 种子与接线前逐字节相同）。
+    imprint_fingerprint: &str,
 ) -> Selection {
     let superset_mode =
         skeleton.is_superset && !skeleton.storylines.is_empty() && !skeleton.sampling.is_empty();
@@ -1156,7 +1182,8 @@ fn plan_sampling(
         // 身份池是**独立维度**（不搭超集判据的车）：模板声明了 identityPool 才分配；未声明 → 空 Vec
         // → 老模板零行为变化（assemble 侧 skip_serializing_if 保证 assembled_json 也逐字节不变）。
         // 退化路径无采样，故"在演内容" = 全部 storyline / 隐藏 / 支线钩子。
-        let degraded_seed = resolve_instance_seed(skeleton, world_id, fingerprint, template_version);
+        let degraded_seed =
+            resolve_instance_seed(skeleton, world_id, fingerprint, template_version, imprint_fingerprint);
         let identity_assignments = if skeleton.identity_pool.is_empty() {
             Vec::new()
         } else {
@@ -1183,7 +1210,7 @@ fn plan_sampling(
         };
     }
 
-    let seed = resolve_instance_seed(skeleton, world_id, fingerprint, template_version);
+    let seed = resolve_instance_seed(skeleton, world_id, fingerprint, template_version, imprint_fingerprint);
 
     // 1) Storyline 脊柱（阵容依赖 + 种子扰动）。
     //    容器形态额外乘上**卡权重**（`subplotCardRefs[].weight`，按 id 前缀归属查表）——
@@ -2230,6 +2257,22 @@ pub(crate) async fn save_wrapper(db: &AnyPool, world_id: &str, wrapper: &Value) 
     Ok(())
 }
 
+/// 仅测试可见的种子入口：让 `imprint` 模块能钉住「零烙印逐字节不变」这条接缝，
+/// 而不必把 `instance_seed` / `resolve_instance_seed` 改成 `pub`
+/// （它们的字节口径被黄金世界回归锁死，暴露出去等于给了改它的方便）。
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::{instance_seed, resolve_instance_seed, Skeleton};
+
+    pub(crate) fn instance_seed_for_test(world_id: &str, fp: &str, ver: i64) -> u64 {
+        instance_seed(world_id, fp, ver)
+    }
+
+    pub(crate) fn resolve_seed_for_test(world_id: &str, fp: &str, ver: i64, imprint_fp: &str) -> u64 {
+        resolve_instance_seed(&Skeleton::default(), world_id, fp, ver, imprint_fp)
+    }
+}
+
 // ---------- 核心：开局装配 ----------
 
 /// 读取骨架 + 全体入场角色卡 → per-character 钩子 / 结局加权 / 阵容参数 / 主场标注。
@@ -2270,6 +2313,25 @@ pub async fn assemble_instance(state: &AppState, world_id: &str) -> Result<Assem
     // 装配采样（防刷第二环）：固定实例种子 → 从超集各池采子集（退化路径 audit=None，全量装配）。
     // 种子由已钉住输入（world_id + 阵容指纹 + template_version）算出，纯函数、可 replay。
     let fingerprint = roster_fingerprint(&cards);
+
+    // 世界线烙印指纹（提案 `spec-worldline-imprint.md` §2.2「共鸣 · 结构层」）：
+    // 把这批卡各自带来的经历哈希进实例种子 ⇒ **内核相同但经历不同的两张卡，抽到的剧情不同**。
+    //
+    // 🔴 **零烙印 → 空串 → 种子逐字节不变**（`resolve_instance_seed` 里那一句早退）。
+    // 全新库、全新卡没有烙印，黄金世界回归因此一个 bit 都不受影响——这一层是纯增量。
+    //
+    // ⚠️ 读失败一律降级为空串（按无烙印装配），不阻断建房：烙印是**叙事差异化**，
+    // 不是资格判定；让一次读库抖动把整个房开不起来，代价与收益完全不成比例。
+    let imprint_fp = {
+        let cids: Vec<String> = cards.iter().map(|(c, _)| c.clone()).collect();
+        match crate::imprint::load_imprints_for_cards(&state.db, &cids).await {
+            Ok(rows) => crate::imprint::imprint_fingerprint(&rows),
+            Err(e) => {
+                tracing::warn!(world_id, error = %e, "烙印读取失败，本次按无烙印装配");
+                String::new()
+            }
+        }
+    };
     let agg_terms = aggregate_obsession_terms(&cards);
     let selection = plan_sampling(
         &skeleton,
@@ -2281,6 +2343,7 @@ pub async fn assemble_instance(state: &AppState, world_id: &str) -> Result<Assem
         &cards,
         rules.ending_weight_threshold,
         star_rating,
+        &imprint_fp,
     );
     let sampled = selection.audit.is_some();
 
@@ -3565,13 +3628,13 @@ mod sampling_tests {
     }
 
     fn plan_star(sk: &Skeleton, world_id: &str, fp: &str, star: i64) -> Selection {
-        plan_sampling(sk, fp, world_id, 1, &PROFILE, &[], &[], 0.5, star)
+        plan_sampling(sk, fp, world_id, 1, &PROFILE, &[], &[], 0.5, star, "")
     }
 
     /// 带阵容的规划（身份池分配需要卡本体做内核匹配）。
     fn plan_with_roster(sk: &Skeleton, world_id: &str, cards: &[(String, CharacterCardV2)]) -> Selection {
         let fp = roster_fingerprint(cards);
-        plan_sampling(sk, &fp, world_id, 1, &PROFILE, &[], cards, 0.5, 5)
+        plan_sampling(sk, &fp, world_id, 1, &PROFILE, &[], cards, 0.5, 5, "")
     }
 
     // #10 PRNG 测试向量：锁死跨版本一致性（FNV-1a / SplitMix64 均为规范实现）。
@@ -3747,7 +3810,7 @@ mod sampling_tests {
 
     /// 按给定阈值规划（`plan` 把阈值写死成 0.5，零权/未启用语义需要自定阈值）。
     fn plan_with_threshold(sk: &Skeleton, world_id: &str, threshold: f32) -> Selection {
-        plan_sampling(sk, "cidA\ncidB", world_id, 1, &PROFILE, &[], &[], threshold, 5)
+        plan_sampling(sk, "cidA\ncidB", world_id, 1, &PROFILE, &[], &[], threshold, 5, "")
     }
 
     /// 同实例（同 world_id / 同阵容 / 同模板版本）反复规划 → 定盘结局逐字相同。
@@ -4962,7 +5025,7 @@ mod container_tests {
     }
 
     fn plan(sk: &Skeleton, world_id: &str, fp: &str, star: i64) -> Selection {
-        plan_sampling(sk, fp, world_id, 1, &PROFILE, &[], &[], 0.5, star)
+        plan_sampling(sk, fp, world_id, 1, &PROFILE, &[], &[], 0.5, star, "")
     }
 
     /// 一组地点 id 在给定图上是否连通（无向）。
@@ -5014,7 +5077,7 @@ mod container_tests {
         let plain = sk(container_json());
         assert!(plain.container.is_none(), "未合并的骨架不是容器形态");
         assert_eq!(
-            resolve_instance_seed(&plain, "w1", "cidA\ncidB", 3),
+            resolve_instance_seed(&plain, "w1", "cidA\ncidB", 3, ""),
             instance_seed("w1", "cidA\ncidB", 3),
             "非容器形态必须走原三段式公式（byte 级不变）"
         );
@@ -5024,12 +5087,12 @@ mod container_tests {
         let plan_ref = composed.container.as_ref().unwrap();
         assert_eq!(plan_ref.fingerprint, "c1@1\nc2@1", "卡集合指纹 = 排序去重的 cardId@version");
         assert_eq!(
-            resolve_instance_seed(&composed, "w1", "cidA\ncidB", 3),
+            resolve_instance_seed(&composed, "w1", "cidA\ncidB", 3, ""),
             container_instance_seed("w1", "cidA\ncidB", 3, "c1@1\nc2@1"),
             "容器形态必须走四段式公式"
         );
         assert_ne!(
-            resolve_instance_seed(&composed, "w1", "cidA\ncidB", 3),
+            resolve_instance_seed(&composed, "w1", "cidA\ncidB", 3, ""),
             instance_seed("w1", "cidA\ncidB", 3),
             "四段式必须与三段式不同，否则卡集合没进种子"
         );
@@ -5061,8 +5124,8 @@ mod container_tests {
             b.container.as_ref().unwrap().fingerprint
         );
         assert_ne!(
-            resolve_instance_seed(&a, "w_swap", "cidA", 1),
-            resolve_instance_seed(&b, "w_swap", "cidA", 1),
+            resolve_instance_seed(&a, "w_swap", "cidA", 1, ""),
+            resolve_instance_seed(&b, "w_swap", "cidA", 1, ""),
             "换一张卡 → 种子必变（防「换卡组合刷同一世界」）"
         );
     }

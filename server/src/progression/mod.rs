@@ -45,11 +45,15 @@ use muse_engine::narrative::types::{
 
 // ---------------- 平衡参数集中区（可调，数值即产品策划口径） ----------------
 
-/// 章节房通关：每张参与卡（结算时该世界 active 成员的云端角色）+100。
+/// 章节房**通关奖励**：世界线走完时，每张仍在场的卡 +100。
+///
+/// ⚠️ 2026-07-29 之前这一层叫「① 保底层（出席制，不看行动率）」。总规格 §12 重定后
+/// **「保底」这个说法不存在了**：收益只有两处——各节点的收益（②，钩子完成即锁定）
+/// 与**走完世界线的通关奖励**（本项）。名字与语义已正名，见 `clear_reward_factor`。
 pub(crate) const MILEAGE_CHAPTER_CLEAR: i64 = 100;
 /// 章节房隐藏任务：每完成一个隐藏钩子（与隐藏道具带出同幂等口径）+50。
 pub(crate) const MILEAGE_HIDDEN_TASK: i64 = 50;
-/// idle 放置房终局：每张在场卡（终局那一刻的 active 成员角色）+60。
+/// idle 放置房**通关奖励**：世界线走完时，每张仍在场的卡 +60。语义同 [`MILEAGE_CHAPTER_CLEAR`]。
 pub(crate) const MILEAGE_IDLE_ENDING: i64 = 60;
 /// arena 赛事结算：每张参赛卡（收敛落定时的 active 成员角色，含冠军）+40。
 #[cfg(feature = "arena")]
@@ -63,8 +67,17 @@ pub(crate) const MAX_CARD_SLOTS: i64 = 6;
 
 // ---- 三层结算 ③ 世界线层与崩塌（总规格 §9【拍板 9(修订)】；系数可被模板 payoutTable 覆盖） ----
 
-/// 世界线崩塌时 ① 保底层的折算系数：**减半**（出席分打折，不清零——有输、有痛、不冤案）。
-pub(crate) const COLLAPSE_BASELINE_FACTOR: f64 = 0.5;
+/// 世界线崩塌时**通关奖励**的折算系数：**归零**。
+///
+/// 🔴 2026-07-29 由 `0.5`（减半）改为 `0.0`。改的不是数值，是**这一层的含义**：
+/// 它此前是「① 保底层」——出席即有、崩塌打个折；总规格 §12 重定后**没有保底层**，
+/// 这一层是**通关奖励**，而崩塌恰恰意味着**世界线没走完**。没走完就没有通关奖励，
+/// 这不是惩罚力度的调整，是定义上的必然。
+///
+/// ⚠️ 它仍然是**可被模板 `payoutTable` 覆盖的参数**（§0.2 产品规则参数化）：
+/// 运营若想给某个副本的崩塌留一点安慰分，配上就是；默认不给。
+/// 📄 JSON 键名仍是 `baselineFactor`（历史名，不改是为了不让存量模板的键变成「无人读取的键」而 400）。
+pub(crate) const COLLAPSE_BASELINE_FACTOR: f64 = 0.0;
 /// 世界线崩塌时 ③ 世界线层的折算系数：**归零**（≤ 0 即整层不发放）。
 /// ② 成就层不在此列——已锁定的钩子产出**原样保留**（"完成即锁定"的锁定语义正为此设计）。
 pub(crate) const COLLAPSE_WORLDLINE_FACTOR: f64 = 0.0;
@@ -121,7 +134,8 @@ pub(crate) async fn grant_mileage_tx(
 // ---------- 三层结算 ③ 世界线层：贡献归因 + 确定性产出（总规格 §9、§10【拍板 17】） ----------
 //
 // 三层分工（本模块承载 ① 与 ③，② 在 chapters::finish 与钩子道具同幂等口径发放）：
-//   ① 保底层   在场至终局的卡（出席制，不看行动率）→ 基础历练
+//   ① 通关奖励 走完世界线时仍在场的卡 → 基础历练（崩塌 = 没走完 → 缺省归零）
+//              ⚠️ 原为「保底层（出席制，不看行动率）」，§12 重定后没有保底层这个说法
 //   ② 成就层   完成自己隐藏钩子的卡，完成即锁定    → 钩子道具 + 历练（崩塌亦保留）
 //   ③ 世界线层 引擎记录的里程碑推动者（确定性数据）→ 查公示产出表确定发放
 //
@@ -148,7 +162,7 @@ impl PayoutContext {
         self.table.as_ref().map(|t| t.contribution_weights.clone()).unwrap_or_default()
     }
 
-    /// ① 保底层折算系数：崩塌 → 产出表系数（缺省 COLLAPSE_BASELINE_FACTOR）；正常收束 → 1.0。
+    /// **通关奖励**折算系数：崩塌 → 产出表系数（缺省 [`COLLAPSE_BASELINE_FACTOR`] = 归零）；正常 → 1.0。
     fn baseline_factor(&self, collapsed: bool) -> f64 {
         if !collapsed {
             return 1.0;
@@ -524,7 +538,7 @@ async fn settle_worldline_with_ctx_tx(
     Ok(granted)
 }
 
-/// idle 放置房终局结算：① 保底层（每张在场卡 +60）+ ③ 世界线层（查产出表确定发放）。
+/// idle 放置房终局结算：① 通关奖励（走完世界线时每张在场卡 +60，崩塌缺省归零）+ ③ 世界线层。
 /// runtime 终局事务内调用；`collapsed` 由调用方传 `is_collapse_reason(reason)`。
 ///
 /// 崩塌语义（§9）：① 减半 · ③ 归零 · ②（已锁定的钩子产出）**原样保留**——② 在 chapters::finish
@@ -541,7 +555,7 @@ pub(crate) async fn settle_idle_world_ending_tx(
 ) -> Result<(), ApiError> {
     let ctx = load_payout_context_tx(tx, world_id).await?;
 
-    // ① 保底层（出席制，不看行动率）：崩塌按 baseline_factor 折算（缺省减半）。
+    // 通关奖励：走完世界线才有。崩塌 → 缺省归零（没走完就没有通关奖励，见 COLLAPSE_BASELINE_FACTOR）。
     let amount = scaled_amount(MILEAGE_IDLE_ENDING, ctx.baseline_factor(collapsed));
     if amount > 0 {
         for (cid, _) in participants {
@@ -555,6 +569,24 @@ pub(crate) async fn settle_idle_world_ending_tx(
     // 崩塌 → 封卷出一份「BE 结局传记」（§9「坏结局也是内容，封卷收藏」）。与结算同事务：
     // 结算回滚则传记同滚，绝不出现"奖罚没落地但墓志铭已刻好"。正常终局不产出（有输才有痛）。
     seal_be_biography_tx(tx, world_id, collapsed, &ctx, flags.be_biography).await?;
+
+    // 世界线烙印（提案 `spec-worldline-imprint.md` 第 2 步）：把这一局的确定性事实
+    // 派生成烙印落库。**append-only + 幂等**（唯一索引裁决重入），与结算同事务。
+    //
+    // 🔴 放在结算侧而非退场处，与副本卡铸卡同一条理由：平权红线要求 `runtime/mod.rs`
+    // 对资产模块零引用，而烙印虽然不是资产，它的写入面同样该收在一处。
+    //
+    // ⚠️ 失败**不阻断结算**：烙印是叙事差异化，不是账目。丢一条的代价是这张卡少一段经历，
+    // 而让它把整场结算回滚掉，代价与收益完全不成比例。
+    match crate::imprint::collect_world_facts_tx(tx, world_id, collapsed).await {
+        Ok(facts) => {
+            let imprints = crate::imprint::derive_imprints(&facts);
+            if let Err(e) = crate::imprint::record_imprints_tx(tx, world_id, &imprints).await {
+                tracing::warn!(world_id, error = %e, "烙印落库失败（结算照常落定）");
+            }
+        }
+        Err(e) => tracing::warn!(world_id, error = %e, "烙印事实收集失败（结算照常落定）"),
+    }
 
     // ⚠️ 此处原有一段「自动封卷」：结算时把本世界里已死的卡转为传世卡（`memorial_status='sealed'`
     // + `withdrawn=1` ⇒ 不可再入任何世界）。**2026-07-29 随整块 memorial 功能一并删除**。

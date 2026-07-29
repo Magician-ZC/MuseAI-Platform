@@ -305,7 +305,7 @@ async fn chapter_finish(
             }
         }
 
-        // ① 保底层 + ③ 世界线层（波次 2 + R1 三层结算，总规格 §9）：仅「未通关 → 通关」转变沿那一次。
+        // ① 通关奖励 + ③ 世界线层（波次 2 + R1，总规格 §9）：仅「未通关 → 通关」转变沿那一次。
         // 成员查询一并取出 user_id——③ 层的产出道具要发给**卡的主人**（grant_item_tx 按 user_id 归属），
         // 只有 cloud_character_id 是发不出去的。
         let mut worldline_payouts: Vec<Value> = Vec::new();
@@ -317,8 +317,8 @@ async fn chapter_finish(
             .bind(&world_id)
             .fetch_all(&mut *tx)
             .await?;
-            // ① 保底层（出席制，不看行动率）：每张参与卡 +100，与通关结算（CAS 写 chapterState +
-            // 道具发货）同一事务。
+            // ① 通关奖励：走完世界线（cleared）时每张仍在场的卡 +100，与通关结算（CAS 写 chapterState +
+            // 道具发货）同一事务。⚠️ 原为「保底层（出席制，不看行动率）」——§12 重定后没有保底层这个说法。
             for (member_cid, _) in &participants {
                 crate::progression::grant_mileage_tx(
                     &mut tx,

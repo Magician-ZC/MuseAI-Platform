@@ -461,7 +461,9 @@ fn payout_table_is_parameterized() {
 /// 崩塌系数是具名常量且可被模板覆盖；`is_collapse_reason` 只认关键角色退场类终局。
 #[test]
 fn collapse_policy_constants_and_reasons() {
-    assert_eq!(COLLAPSE_BASELINE_FACTOR, 0.5, "① 保底层崩塌减半");
+    // 🔴 2026-07-29：0.5 → 0.0。改的不是数值是**含义**——§12 重定后没有「保底层」，
+    // 这一层是**通关奖励**，而崩塌恰恰意味着世界线没走完。没走完就没有通关奖励。
+    assert_eq!(COLLAPSE_BASELINE_FACTOR, 0.0, "崩塌 = 世界线没走完 ⇒ 无通关奖励");
     assert_eq!(COLLAPSE_WORLDLINE_FACTOR, 0.0, "③ 世界线层崩塌归零");
 
     // 默认值来自 progression 常量（单一事实源，不散落魔数）。

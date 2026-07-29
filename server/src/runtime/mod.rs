@@ -1826,7 +1826,7 @@ fn select_ending(world: &WorldRow) -> Option<String> {
 /// + `ON CONFLICT DO NOTHING`，重复/并发不重复发放。仅当选出结局（`ending=Some`）时发奖。
 ///
 /// R1 三层结算（总规格 §9）：`participants` 传 `(cloud_character_id, user_id)`——③ 世界线层要给
-/// **卡的主人**发产出道具，只有角色 id 不够。① 保底层 + ③ 世界线层的发放逻辑整体收在
+/// **卡的主人**发产出道具，只有角色 id 不够。① 通关奖励 + ③ 世界线层的发放逻辑整体收在
 /// `progression::settle_idle_world_ending_tx`（本文件不出现任何成长数值字段，守红线 grep 断言）；
 /// 崩塌判定只把 `reason` 串交给 progression 判，系数与产出表都在那边。
 async fn finalize_ending_tx(
@@ -1849,7 +1849,7 @@ async fn finalize_ending_tx(
     .execute(&mut **tx)
     .await?;
 
-    // 三层结算（波次 2 + R1）：① 保底层（每张在场卡的出席产出）+ ③ 世界线层（里程碑推动者按贡献分
+    // 结算（波次 2 + R1）：① 通关奖励（走完世界线时每张在场卡的产出）+ ③ 世界线层（里程碑推动者按贡献分
     // 查公示产出表确定发放，无随机数），与终局停机同事务（只在真正结算那一次；participants 仅含
     // 玩家成员卡，NPC 不在列）。世界线崩塌（关键角色退场等 reason）→ ③ 归零 + ① 减半 + ② 已锁定保留，
     // 系数与判定全在 progression。发放逻辑收在 progression 模块——本文件（RoundInput 组装处）

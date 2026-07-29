@@ -928,7 +928,7 @@ async fn golden_world_reaches_natural_ending_and_settles() {
 // ============================================================================
 
 /// **剧情测试点 ②：崩塌 BE**。关键角色（崔萼）永久退场 → `key_character_exit` 强制收尾 →
-/// ③ 世界线层归零 · ① 保底层减半 · 结算幂等标记仍然落下（不留重复结算空子）。
+/// ③ 世界线层归零 · ① 通关奖励归零（崩塌 = 没走完）· 结算幂等标记仍然落下（不留重复结算空子）。
 #[tokio::test]
 async fn golden_world_collapse_is_forced_and_zeroes_worldline() {
     let state = test_state().await;
@@ -967,12 +967,12 @@ async fn golden_world_collapse_is_forced_and_zeroes_worldline() {
     assert_eq!(classify_conclusion(&reason), ConclusionKind::Collapsed);
     assert!(is_forced_conclusion(&reason), "崩塌属于强制收尾（不是自然结局）");
 
-    // ① 减半：出席 60 → 30；③ 归零：不发任何世界线产出，但幂等标记照落。
+    // ① 归零：崩塌没走完世界线 ⇒ 无通关奖励；③ 归零：不发任何世界线产出，但幂等标记照落。
     for cid in ["shenyan", "peizhao"] {
         assert_eq!(
             i64_one(&state.db, "SELECT mileage FROM cloud_characters WHERE id = $1", cid).await,
-            30,
-            "{cid} 崩塌 → ① 保底减半（60×0.5）且 ③ 归零"
+            0,
+            "{cid} 崩塌 → ① 通关奖励归零（没走完世界线）且 ③ 归零"
         );
         let settled: i64 = sqlx::query_scalar(
             "SELECT settled_at FROM world_contributions WHERE world_id = $1 AND character_id = $2",

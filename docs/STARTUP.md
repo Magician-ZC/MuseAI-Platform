@@ -115,6 +115,10 @@ cd server && MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo ru
 | `MUSE_IFLINE_ADVANCE_STALE_MS` | `600000`(10min) | if 线推进「在飞」标记的陈旧线(migration 0050)。推进已改异步:端点回 202、模型调用在后台 worker 跑,在飞期间重复点击 409。🔴 **这一列不可省**:`MemQueue` 不持久,进程重启会带走在飞任务而标记已写下——没有陈旧线,这条**付费**的 if 线就永久推不动了(玩家已烧掉副本卡)。⚠️ 陈旧线只是**让玩家能再点一次**,不是自动补上丢掉的那次——补上那次的是下一行的对账补投。同组 `MUSE_IFLINE_WORKERS`(默认 1,**池大小即成本闸**) |
 | `MUSE_IFLINE_ADVANCE_SWEEP` | **关闭** | if 线推进的**对账式补偿**(migration 0052)。开着它才会把「在飞标记还在、且已过补投窗口」的行补投回推进队列——即**玩家没再点也补上**丢掉的那一拍。🔴 **它不是调度器**:判据恒为 `advance_requested_at > 0`,而那一列只由玩家点击写下,故它永远只补投「玩家已经点过」的那一次。🔴 **补投是真的调模型、真烧 token**(if 线是付费内容),故有封顶 `MUSE_IFLINE_SWEEP_MAX_REDELIVERIES`(默认 3)——worker 若每次都在清标记前就死掉,无封顶的补投是个无限烧钱的循环;到顶时清标记 + 写 `last_error`,**不静默放弃**。🔴 补投窗口 `MUSE_IFLINE_SWEEP_AFTER_MS`(默认 30min)恒被钳在 `MUSE_IFLINE_ADVANCE_STALE_MS + 1min` 之上(代码保证),配小了会对仍在跑的任务补投、白烧一次调用。🔴 **单实例**:多实例同开会重复补投(同 L3 sweep)。同组 `MUSE_IFLINE_SWEEP_INTERVAL_MS`(默认 5min)/ `MUSE_IFLINE_SWEEP_BATCH`(默认 50) |
 | `MUSE_SAFETY_RECHECK_SWEEP` | **关闭** | 第 3 层复核的**补偿轮询**(扫尾未复核拍)。内存队列不持久,进程重启会把在飞的复核任务带走;另有一类拍(tick 走 blocked / cas_conflict 收尾)压根没经过入队那一行。开着它才会按 `world_ticks ⋈ safety_recheck_runs` 对账补投。🔴 **有真实覆盖上限**:只回看 `MUSE_SAFETY_L3_SWEEP_LOOKBACK_MS`(默认 24h),挂机超过这段的拍**永远补不回来**——`GET /api/admin/safety/recheck` 的 `durability.justOutsideWindow` 就是量它的。🔴 **单实例**:多实例同开会重复补投(重复的 provider 调用是真烧的),同 `world_events.sequence` 那条,属发布纪律。调参前缀 `MUSE_SAFETY_L3_SWEEP_*`(间隔 / 宽限 / 回看 / 批量) |
+| `MUSE_IMPRINT_CAPACITY` | `12` | 世界线烙印的**恒定容量**(§3.62)。满了之后最旧的一条褪色而非删除。🔴 **它是平权机制的一部分,不是性能参数**:不设容量,老卡就是"烙印更多"而非"烙印更旧",直接滑向养成优势。同时它也是上下文成本的上限,而 12 这个值是拍脑袋的——真实 token 账单出来之前不必当真 |
+| `MUSE_FATED_TICK_SPACING` | `600` | 主线节点映射到 DES 时间轴的**宿命时刻间距**(秒)。`chapterOrder × 本值 → due_at`。宿命时刻优先于角色行动被拉到时钟上——原著主线该发生时就会发生,不因所有人都在忙而错过 |
+| `MUSE_LIFE_MARKED_AT` / `MUSE_LIFE_STORIED_AT` | `3` / `8` | 生命层两档跃迁的世界记忆条数门槛。这一层是「用户不能编辑的部分」,即一张卡真正有生命、也**唯一无法被复刻**的地方(别人可以抄走内核,抄不走你的卡活过什么) |
+| `MUSE_OPPORTUNITY_SWING_BP` / `MUSE_FORTUNE_SWING_BP` | `2000` / `5000` | **机缘 / 气运**的摆幅上限(万分比,即 ±20% / ±50%),总规格 §12.5。机缘调间隙内容的**密度**,气运调其**幅度**(两极化,温和与凶险等量抬起)。🔴 **两者作用于世界不作用于角色**,全员共享——不存在"我气运高我拿得多";且**产出封顶与稀有预算不受其影响**(`RARE_TIER`/`RARE_BUDGET`/星级封顶在采样之后执行,气运只决定抽到哪些)。空烙印集合 → 恒中性 → 采样产物与本层落地前逐字节相同 |
 | `MUSE_CORS_ORIGINS` | 本地开发六项(见下) | 跨源白名单(逗号分隔)。**三个前端都与 server 不同源**:玩家端 Vite `:1420`、运营后台 Vite `:1430`、Tauri webview(`tauri://localhost` / `https://tauri.localhost`),而 server 在 `:8787`。🔴 **生产必配**——不配则只放行本地开发来源,线上域名会被拦。非法条目跳过并告警,全部非法则退化为「不放行任何跨源」(fail-closed:配错了宁可前端连不上、立刻可见,也不静默放宽成通配)。**刻意不提供通配选项**:这些接口虽有 JWT 鉴权,放开任意源仍是无谓攻击面 |
 
 > 🔴 **配上 `MUSE_MODERATION_HTTP_ENDPOINT` 的那一刻,一件事当场生效、另一件不会——两者极易混淆。**
@@ -214,7 +218,7 @@ cd server && MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo ru
 
 ## 7. 冒烟验证
 
-全绿基线(**校验于 2026-07-29**,数字随开发增长——对不上先确认是新增测试还是漏跑):
+全绿基线(**校验于 2026-07-29（第二轮：世界记忆层 / 主线上时间轴 / 生命层 / 气运与机缘）**,数字随开发增长——对不上先确认是新增测试还是漏跑):
 
 > ⚠️ **2026-07-29 有两次反向变动,记在这里免得被误判成「测试跑挂了」**:
 > ① 服务端从 1137 降到 1100 —— **`memorial` 整块删除**带走了它自己的 1475 行测试
@@ -229,16 +233,16 @@ cd server && MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo ru
 
 ```bash
 # 引擎 + 后端 + 桌面壳
-cargo test --manifest-path crates/muse-engine/Cargo.toml          # 314 passed
+cargo test --manifest-path crates/muse-engine/Cargo.toml          # 325 passed
 # 🔵 真实 provider 冒烟（**恒 #[ignore]，绝不进 CI**）：本仓 2026-07-28 之前一次真实模型调用都没发生过
 #    key 只从 env 读，不落盘、不进仓库、不进日志
 # MUSE_SMOKE_API_KEY=sk-... MUSE_SMOKE_BASE_URL=https://api.deepseek.com/v1 MUSE_SMOKE_MODEL=deepseek-chat \
 #   cargo test --manifest-path crates/muse-engine/Cargo.toml real_provider -- --ignored --nocapture
-(cd server && cargo test)                                          # 1116 passed(default,含黄金世界回归)
-(cd server && cargo test --features billing,arena)                 # 1200 passed
-(cd server && cargo test --features billing)                       # 1173 passed（CI 不跑，2026-07-28 手验）
-(cd server && cargo test --features arena)                         # 1202 passed（同上）
-(cd server && cargo test golden)                                   # 14 passed(12 项 runtime::golden::* + 2 项录放 round-trip)
+(cd server && cargo test)                                          # 1138 passed(default,含黄金世界回归)
+(cd server && cargo test --features billing,arena)                 # 1222 passed
+(cd server && cargo test --features billing)                       # 1183 passed（CI 不跑，2026-07-29 手验）
+(cd server && cargo test --features arena)                         # 1212 passed（同上）
+(cd server && cargo test golden)                                   # 15 passed(13 项 runtime::golden::* + 2 项录放 round-trip)
 cargo test --manifest-path src-tauri/Cargo.toml                    # 245 passed
 # 前端 + 后台
 npm run test                                                       # 567 passed / 87 files（含后台组件用例，见 VALIDATION §3.47 A5）

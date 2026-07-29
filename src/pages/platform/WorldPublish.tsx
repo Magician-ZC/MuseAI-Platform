@@ -6,6 +6,9 @@
 // 云发布交互复用 CharacterPublish 的骨架（权利声明/发布/mine 列表/status/withdraw）。
 // ⚠️ WorldSkeletonDraft 是**只读产物**：一切编辑收敛到 Review 阶段的三条 roster，引擎合成时统一收口，
 //    避免深编辑击穿 server 超集校验（悬空引用 / redundancyRatio<3.0 → 400）。
+//    发布步的「装入副本卡」是这条规则的**唯一例外，且只增不改**：它往骨架顶层**附加**
+//    `subplotCardRefs` / `anchors` / `nexus` 三个容器声明键，一个既有键都不碰
+//    （见 `ContainerAssembly.tsx` 的 `buildContainerSkeleton`——不装卡时返回的是同一个引用）。
 import React from 'react';
 import {
   Steps,
@@ -49,6 +52,11 @@ import {
 import { useSettingsStore } from '../../stores/useSettingsStore';
 import { cloudFetch } from '../../utils/cloudApi';
 import { describeCloudError, moderationMeta } from '../../stores/usePlatformStore';
+import ContainerAssemblyPanel, {
+  buildContainerSkeleton,
+  EMPTY_SELECTION,
+  type ContainerSelection,
+} from './ContainerAssembly';
 
 const { Title, Text, Paragraph } = Typography;
 
@@ -140,6 +148,8 @@ const WorldPublish: React.FC = () => {
   const [roomType, setRoomType] = React.useState<RoomType>('idle');
   const [rights, setRights] = React.useState<Rights>('original');
   const [agreed, setAgreed] = React.useState(false);
+  // 自定义房装配的声明（总规格 §10）。空 = 不装卡 = 提交体与接线前逐字节相同，见 buildContainerSkeleton。
+  const [container, setContainer] = React.useState<ContainerSelection>(EMPTY_SELECTION);
   const [publishing, setPublishing] = React.useState(false);
   const [feedback, setFeedback] = React.useState<{ type: 'success' | 'error'; text: string } | null>(
     null,
@@ -330,7 +340,7 @@ const WorldPublish: React.FC = () => {
         body: {
           workTitle: workTitle.trim() || task?.workTitle || '未命名世界',
           roomType,
-          skeletonJson: lastAssembledDraft,
+          skeletonJson: buildContainerSkeleton(lastAssembledDraft, container),
           rightsDeclaration: rights,
         },
       });
@@ -340,6 +350,7 @@ const WorldPublish: React.FC = () => {
         text: `已提交发布：${view.title}（第 ${view.version} 版），当前审核态：${m.label}`,
       });
       setAgreed(false);
+      setContainer(EMPTY_SELECTION);
       await loadMine();
     } catch (e) {
       setFeedback({ type: 'error', text: describeCloudError(e) });
@@ -896,6 +907,12 @@ const WorldPublish: React.FC = () => {
                 </Radio.Group>
               </div>
             </div>
+
+            <ContainerAssemblyPanel
+              draft={lastAssembledDraft}
+              value={container}
+              onChange={setContainer}
+            />
 
             <Alert
               type="info"

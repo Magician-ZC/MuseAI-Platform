@@ -129,15 +129,108 @@ fn parse(expression: &str) -> Result<Predicate, EngineError> {
     Err(err(format!("无法识别的谓词左值，token: `{lhs}`")))
 }
 
+/// 析取分隔符：`A || B` = 「A 或 B，任一条成立即成立」。
+const OR: &str = "||";
+
+/// 按**顶层** `||` 切分——字符串字面量内部的 `||` 不算分隔符。
+///
+/// ⚠️ 不做这一步的后果很具体：`characters.a.goals contains "打通北门||南门"` 会被从中间劈开，
+/// 两半都不是合法谓词 ⇒ 建模板期报一个跟作者写的东西对不上的错。
+fn split_disjuncts(expr: &str) -> Vec<&str> {
+    let b = expr.as_bytes();
+    let (mut out, mut start, mut i, mut in_str, mut escaped) = (Vec::new(), 0usize, 0usize, false, false);
+    while i < b.len() {
+        let c = b[i];
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'"' {
+            in_str = true;
+            i += 1;
+            continue;
+        }
+        // ⚠️ 从 `OR` 派生，**不写死** `b'|'`：写死的话这个常量就成了摆设——
+        // 改它不会改变任何行为，而下一个人会以为改了。
+        // （做故障注入时当场撞见：把 OR 换成 `&&` 竟然什么都没变。）
+        if b[i..].starts_with(OR.as_bytes()) {
+            out.push(&expr[start..i]);
+            i += OR.len();
+            start = i;
+            continue;
+        }
+        i += 1;
+    }
+    out.push(&expr[start..]);
+    out
+}
+
+/// 解析一个推进门表达式：一条或多条以 `||` 相连的谓词。
+///
+/// ══════════════════════════════════════════════════════════════════════════
+/// 🔴 **只支持析取（或），刻意不支持合取（与）**
+/// ══════════════════════════════════════════════════════════════════════════
+/// 这不是「还没做」，是一个设计决定，有两个理由：
+///
+/// 1. **产品上：没有 DM 兜底。** 剧场有导演在现场调节奏；这里只有 endgame 策略和仲裁，
+///    两者都不会看着场上说「这组人卡住了，我放点水」。合取门（全都要）会让「差一条」
+///    变成「卡死」，而那条差的可能**根本没人分到**——钩子是私有的、按执念分配的，
+///    没人执念对得上的那条支线就没人会去做。
+/// 2. **工程上：失败方向不对称。** 合取门的失败是**静默**的——世界照常跑、照常结算，
+///    只是那扇门永远不开，没有任何报错；而析取门只会「更容易开」，
+///    失败方向是安全的（顶多是主线推得比预期快，那看得见）。
+///
+/// 🔵 真需要「全都要」时，正确的表达是**拆成多个连续的主线节点**——
+/// 那本来就是大纲的表达方式，而且每一步都看得见推没推动。把它压进一个谓词只是把
+/// 「三件事」写成一行，代价是失去了中间的可观测性。
+///
+/// 单条谓词（无 `||`）⇒ 恰好一个析取项 ⇒ 与本层落地前**逐字节等价**。
+fn parse_gate(expression: &str) -> Result<Vec<Predicate>, EngineError> {
+    let parts = split_disjuncts(expression);
+    let mut out = Vec::with_capacity(parts.len());
+    for (i, raw) in parts.iter().enumerate() {
+        let t = raw.trim();
+        if t.is_empty() {
+            return Err(err(format!(
+                "推进门第 {} 个析取项为空（`{OR}` 两侧都要有谓词）：`{expression}`",
+                i + 1
+            )));
+        }
+        out.push(parse(t)?);
+    }
+    Ok(out)
+}
+
 /// 创建时校验谓词表达式语法；解析失败 → Validation（运行时不应再失败）。
+///
+/// 支持 `A || B || C`（任一成立即成立）。理由与「为何不支持合取」见 [`parse_gate`]。
 pub fn parse_predicate(expression: &str) -> Result<(), EngineError> {
-    parse(expression).map(|_| ())
+    parse_gate(expression).map(|_| ())
 }
 
 /// 求值：状态命中谓词返回 true。表达式非法 → Validation；引用的实体缺失视为「未命中」（false）。
+///
+/// 多个析取项时**任一命中即 true**，且**短路**：前一条成立就不再算后面的。
+/// 🔵 短路在这里不只是性能——它让「把最可能的那条路写在前面」成为一种可用的表达。
 pub fn eval_predicate(state: &NarrativeState, predicate: &ForbiddenPredicate) -> Result<bool, EngineError> {
-    let pred = parse(&predicate.expression)?;
-    Ok(match pred {
+    for pred in parse_gate(&predicate.expression)? {
+        if eval_one(state, pred) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// 单个谓词求值。引用的实体缺失视为「未命中」（false）。
+fn eval_one(state: &NarrativeState, pred: Predicate) -> bool {
+    match pred {
         Predicate::CharListContains { id, field, literal } => match state.characters.get(&id) {
             None => false,
             Some(c) => {
@@ -175,7 +268,7 @@ pub fn eval_predicate(state: &NarrativeState, predicate: &ForbiddenPredicate) ->
                 }
             }
         }
-    })
+    }
 }
 
 /// JSON 值相等：数值按 f64 容差比较，其余精确比较。
@@ -346,6 +439,83 @@ mod tests {
         assert!(!eval_predicate(&s, &pred("relations[li->wang].trust > 0.5")).unwrap());
         // 关系缺失 → 未命中
         assert!(!eval_predicate(&s, &pred("relations[wang->li].trust < 0.9")).unwrap());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // 析取门（第 3 步）：多条路任一条通
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// 🔴 **任一析取项成立即成立。**
+    ///
+    /// 这是「没有 DM」这条约束在语法上的落点：主线门必须能写「多条路任一条通」，
+    /// 否则难度会两极分化——没做支线的人觉得主线不可能，做了的人觉得太简单。
+    #[test]
+    fn any_one_branch_opens_the_gate() {
+        let s = state_with(); // trust = 0.5，world.flag 见 state_with
+        // 第一条不成立、第二条成立 → 开。
+        assert!(eval_predicate(&s, &pred("relations[li->wang].trust > 0.9 || relations[li->wang].trust == 0.5")).unwrap());
+        // 第一条成立、第二条不成立 → 开（且短路，不会因为后一条非法而失败——见下一条用例）。
+        assert!(eval_predicate(&s, &pred("relations[li->wang].trust == 0.5 || relations[li->wang].trust > 0.9")).unwrap());
+        // 全不成立 → 不开。
+        assert!(!eval_predicate(&s, &pred("relations[li->wang].trust > 0.9 || relations[li->wang].trust < 0.1")).unwrap());
+    }
+
+    /// 🔴 **单条谓词（无 `||`）的行为逐字节不变。**
+    ///
+    /// 这是这一层能作为纯增量上线的全部依据：全部存量模板写的都是单条谓词。
+    #[test]
+    fn a_single_predicate_behaves_exactly_as_before() {
+        let s = state_with();
+        for (expr, want) in [
+            ("relations[li->wang].trust == 0.5", true),
+            ("relations[li->wang].trust > 0.9", false),
+            ("characters.li.secrets contains \"身世\"", true),
+            ("characters.li.secrets contains \"不存在的秘密\"", false),
+            ("characters.li.arcStage == \"觉醒\"", true),
+            ("world.phase == \"night\"", true),
+        ] {
+            assert_eq!(eval_predicate(&s, &pred(expr)).unwrap(), want, "表达式 `{expr}`");
+            assert!(parse_predicate(expr).is_ok(), "表达式 `{expr}` 应可通过建模板期校验");
+        }
+    }
+
+    /// 🔴 **字符串字面量里的 `||` 不是分隔符。**
+    ///
+    /// 不做这一步的后果很具体：`contains "打通北门||南门"` 会被从中间劈开，
+    /// 两半都不是合法谓词 ⇒ 建模板期报一个跟作者写的东西对不上的错。
+    #[test]
+    fn a_pipe_inside_a_string_literal_is_not_a_separator() {
+        assert!(parse_predicate("characters.li.secrets contains \"打通北门||南门\"").is_ok());
+        let parts = super::split_disjuncts("characters.li.secrets contains \"a||b\"");
+        assert_eq!(parts.len(), 1, "引号内的 || 不得切分：{parts:?}");
+        // 引号外的照切。
+        assert_eq!(super::split_disjuncts("a == 1 || b == 2").len(), 2);
+        // 混合：引号内不切、引号外切。
+        assert_eq!(
+            super::split_disjuncts("characters.li.secrets contains \"a||b\" || world.x == true").len(),
+            2
+        );
+    }
+
+    /// 空析取项直接拒（`A || ` / ` || B` / `A |||| B`）——建模板期就该看见。
+    #[test]
+    fn an_empty_branch_is_rejected_at_authoring_time() {
+        for bad in ["world.x == true || ", " || world.x == true", "world.x == true |||| world.y == true"] {
+            let e = parse_predicate(bad).unwrap_err();
+            assert_eq!(e.code(), "validation", "`{bad}` 应在建模板期被拒");
+            assert!(format!("{e}").contains("析取项为空"), "报错要说清是哪种问题：{e}");
+        }
+    }
+
+    /// 🔴 **刻意不支持合取（`&&`）**——它不是被漏掉的，是被排除的。
+    ///
+    /// 理由见 `parse_gate` 的注释：没有 DM 兜底时，合取门的失败是**静默**的
+    /// （世界照常跑，只是那扇门永远不开）。真需要「全都要」时应当拆成多个连续的主线节点。
+    /// 这条用例把那个决定钉死——将来有人顺手加上 `&&` 会当场红，逼一次显式评审。
+    #[test]
+    fn conjunction_is_deliberately_unsupported() {
+        let e = parse_predicate("world.x == true && world.y == true").unwrap_err();
+        assert_eq!(e.code(), "validation", "`&&` 必须被拒，而不是被当成某种意思悄悄接受");
     }
 
     #[test]

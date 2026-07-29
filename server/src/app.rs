@@ -83,6 +83,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::chapters::router())
         .merge(crate::progression::router())
         .merge(crate::subplot::router())
+        .merge(crate::imprint::router())
         .merge(crate::onboarding::router())
         .merge(crate::annotations::router())
         .merge(crate::ifline::router())

@@ -244,3 +244,111 @@ fn two_cards_with_identical_cores_but_different_pasts_get_different_seeds() {
     let s_new = crate::assembly::testing::resolve_seed_for_test("w1", "cidA", 1, &rookie);
     assert_ne!(s_vet, s_new, "经历不同 ⇒ 种子不同 ⇒ 抽到的剧情线/钩子/地点不同");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 世界记忆层（迁移 0055）
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// 🔴 这一组守的是**服务端与引擎的口径一致**：
+// 引擎运行期间喂给角色的 `yourMemory`（`decide.rs`）与结算时定格进库的记忆（本模块）
+// 用的是同一份 `pacingNotes` 和同一条过滤规则。两边漂开会产生最难查的一类偏差——
+// **角色运行期间记得的事，结算之后没留下**（或反过来），而两边各自的用例都会是绿的。
+
+#[test]
+fn memories_are_filtered_by_the_same_prefix_rule_as_the_engine() {
+    let notes: Vec<String> = [
+        "A｜Success｜甲推开了门",
+        "B｜Failure｜乙没拦住",
+        "A｜PartialSuccess｜甲拿到一半",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+
+    let a = memories_of(&notes, "A");
+    assert_eq!(a.len(), 2, "只该拿到自己的两条：{a:?}");
+    assert!(a.iter().all(|n| n.starts_with("A｜")));
+    assert!(!a.iter().any(|n| n.contains("乙没拦住")), "🔴 别人的记忆不得混进来");
+}
+
+/// 🔴 分隔符必须进前缀：id `A` 不得把 `AB` 的记忆算走。
+///
+/// 与引擎侧 `a_character_id_that_prefixes_another_does_not_steal_its_memory` 是**同一条判据**，
+/// 两边都要有——因为它们是两份独立实现，而这正是本仓反复吃亏的「同一判定的 N 份拷贝」。
+/// ⚠️ 真要收口，得把过滤规则抽成引擎的 pub 函数让 server 调；本轮不做，先用双边用例钉住。
+#[test]
+fn a_prefixing_id_does_not_steal_memories_on_the_server_side_either() {
+    let notes: Vec<String> =
+        ["A｜Success｜甲的事", "AB｜Success｜乙的事"].iter().map(|s| s.to_string()).collect();
+    let a = memories_of(&notes, "A");
+    assert_eq!(a, vec!["A｜Success｜甲的事".to_string()]);
+}
+
+#[test]
+fn a_character_with_no_history_freezes_nothing() {
+    let notes: Vec<String> = ["B｜Success｜与我无关".to_string()].to_vec();
+    assert!(memories_of(&notes, "A").is_empty());
+}
+
+/// 记忆**原样保留**，不做二次加工。
+///
+/// 加工过的记忆不可对账：`world_events` 是不可回滚的公共事实，而记忆必须能被同一份
+/// `pacingNotes` 复算出来——一旦在落库时改写措辞，这条对账链就断了。
+#[test]
+fn memories_are_stored_verbatim() {
+    let raw = "A｜Success｜他在断桥前退了一步，那一步之后同伴死了";
+    let got = memories_of(&[raw.to_string()], "A");
+    assert_eq!(got, vec![raw.to_string()], "落库前不得改写一个字");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 生命层：记忆累积够多之后，卡身上开始有用户改不了的东西
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 🔴 平权红线的可执行检验：**两张卡的生命阶位互换，谁会变强？**
+///
+/// 答案必须是「谁都不会」。这里能检验的是**结构性**的那一半：
+/// 阶位是记忆条数的纯函数，不含任何优待语义，也不进任何判定
+/// （`life_snapshot` 的产物没有任何调用方把它喂进 `RoundInput` / 仲裁 / 结算）。
+#[test]
+fn life_stage_is_a_pure_function_of_how_long_a_card_has_lived() {
+    assert_eq!(life_stage(0), LifeStage::Blank);
+    assert_eq!(life_stage(29), LifeStage::Blank);
+    assert_eq!(life_stage(30), LifeStage::Marked, "到阈值即进阶");
+    assert_eq!(life_stage(119), LifeStage::Marked);
+    assert_eq!(life_stage(120), LifeStage::Storied);
+}
+
+/// 🔴 **阶位封顶**：`Storied` 之上没有了。
+///
+/// 没有封顶，生命层就会变成一条无限增长的刻度——而任何无限刻度迟早会被人当成战力表。
+/// 一张跑过 10 个世界的卡与一张跑过 1000 个世界的卡，**阶位相同**。
+#[test]
+fn the_ladder_has_a_top_so_it_never_becomes_a_power_scale() {
+    assert_eq!(life_stage(120), LifeStage::Storied);
+    assert_eq!(life_stage(100_000), LifeStage::Storied, "🔴 跑一万个世界也不会比 Storied 更高");
+}
+
+/// 阈值参数化（§0.2），且**调它不改变任何判定**——只改变展示。
+#[test]
+fn thresholds_are_parameterized_and_ordered() {
+    // 默认值单一事实源。
+    assert_eq!(env_i64(ENV_LIFE_MARKED_AT, DEFAULT_LIFE_MARKED_AT), DEFAULT_LIFE_MARKED_AT);
+    // 🔴 storied 恒 > marked：即使有人把两个 env 配反，阶梯也不能反转
+    //（`life_stage` 里 `.max(marked + 1)` 保证）。配错的代价该是「阶梯变窄」而不是「阶梯倒挂」。
+    assert!(DEFAULT_LIFE_STORIED_AT > DEFAULT_LIFE_MARKED_AT);
+}
+
+/// 生命层**没有存储**：它是记忆的函数，不是另一份状态。
+///
+/// 这一条用「同一个记忆数恒得同一个阶位」来钉：只要它是纯函数，
+/// 就不可能出现「记忆和阶位对不上」的第三种事实——而那种不一致没有任何办法自愈。
+#[test]
+fn life_stage_never_drifts_from_the_memories_it_is_derived_from() {
+    for n in [0, 1, 29, 30, 31, 119, 120, 500] {
+        let first = life_stage(n);
+        for _ in 0..5 {
+            assert_eq!(life_stage(n), first, "同一记忆数必须恒得同一阶位（n={n}）");
+        }
+    }
+}

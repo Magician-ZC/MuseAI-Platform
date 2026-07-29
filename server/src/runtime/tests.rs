@@ -4224,3 +4224,115 @@ async fn commit_marks_only_the_gifts_that_actually_entered_this_tick() {
          被一起标掉 = 战报会声称它们影响过这一拍，而那是假的。"
     );
 }
+
+// ==================== 宿命时刻：原著顺序 → 游戏时间轴（2026-07-29） ====================
+
+/// 🔴 骨架的 `chapterOrder` 必须真的变成引擎的 `due_at`，否则「主线遵循原著」就是一句空话。
+///
+/// 这是**接缝**用例：引擎那边有 `a_fated_moment_pulls_the_clock_to_itself_even_when_everyone_is_busy`
+/// 守着「有 due_at 就会拉动时钟」，server 这边有本条守着「chapterOrder 会变成 due_at」——
+/// 两边各自都绿、而中间那次映射漏了，是最典型的漂法。
+#[tokio::test]
+async fn chapter_order_becomes_a_fated_moment_on_the_timeline() {
+    let state = test_state().await;
+    let skeleton = json!({
+        "mainlineNodes": [
+            // 带章序 → 宿命：到点自己发生。
+            { "id": "n1", "summary": "血洗黑角城", "fated": true, "chapterOrder": 3, "atLocation": "黑角城" },
+            // 无章序 → 老式节点：等人来推，due_at 必须是 None。
+            { "id": "n2", "summary": "等人来推的软节点", "constraint": "soft" }
+        ]
+    });
+    seed_template_custom(&state.db, "tpl-fated", "idle", skeleton).await;
+    seed_model_routes(&state.db, "routes-fated").await;
+    seed_user(&state.db, "uF").await;
+    seed_char(&state.db, "chF", "uF", "沈砚").await;
+    seed_user(&state.db, "uF2").await;
+    seed_char(&state.db, "chF2", "uF2", "裴昭").await;
+
+    // 与 `seed_narrative_layer_filters_outline_to_selected_mainline` 同款：显式钉住 assembled_json，
+    // 让本用例只测「章序 → 宿命时刻」这一段，不受装配路径的其它变化牵动。
+    let assembled = json!({
+        "assembly": { "sampling": { "seed": "deadbeefdeadbeef" } },
+        "chapterState": {},
+        "templateVersion": 1
+    });
+    let mut p = CreateWorldParams::official("tpl-fated", 1, "宿命世界");
+    p.status = Some("running".into());
+    p.model_route_version = Some("routes-fated".into());
+    p.prompt_set_version = Some("test-prompts".into());
+    p.member_limit = 10;
+    p.daily_token_budget = 1_000_000;
+    p.daily_cny_budget_cents = 0;
+    p.assembled_json = Some(assembled.to_string());
+    let wid = create_world(&state.db, p).await.unwrap();
+    seed_member(&state.db, &wid, "uF", "chF").await;
+    seed_member(&state.db, &wid, "uF2", "chF2").await;
+
+    let model: Arc<dyn ModelClient> = Arc::new(MockModel { input_tokens: 10, output_tokens: 20 });
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 0, model).await.unwrap(), TickStatus::Done);
+
+    let w = load_world(&state.db, &wid).await.unwrap();
+    let st: NarrativeState = serde_json::from_str(&w.narrative_state_json).unwrap();
+    let n1 = st.narrative.outline_nodes.iter().find(|n| n.id == "n1").expect("n1 应在大纲里");
+    let n2 = st.narrative.outline_nodes.iter().find(|n| n.id == "n2").expect("n2 应在大纲里");
+
+    // 章序 3 × 默认间距 600 = 1800。
+    assert_eq!(n1.due_at, Some(1800), "chapterOrder 必须映射成 due_at");
+    assert_eq!(n1.at_location.as_deref(), Some("黑角城"), "地点是碰撞的另一半坐标");
+
+    // 🔵 反向配对：没有章序的节点**逐字节不变**——它仍然等人来推。
+    // 这一条是这一层能作为纯增量上线的依据：老模板一个刻度都不该变。
+    assert_eq!(n2.due_at, None, "无 chapterOrder → 不上时间轴");
+    assert_eq!(n2.at_location, None);
+}
+
+/// 间距参数化（§0.2）：章序不是直接当时刻用的。
+///
+/// 🔴 不放大的后果是**整部原著在开局那一瞬间演完**——章序是 1,2,3…，
+/// 而一个角色单次行动的 `DEFAULT_DURATION` 就是 60，
+/// 直接拿章号当时刻等于把所有宿命节点挤进角色第一次行动之前。
+#[tokio::test]
+async fn the_spacing_between_fated_moments_is_a_parameter_not_a_hardcoded_one() {
+    let state = test_state().await;
+    let skeleton = json!({
+        "mainlineNodes": [{ "id": "n1", "summary": "大事", "fated": true, "chapterOrder": 2 }]
+    });
+    seed_template_custom(&state.db, "tpl-spacing", "idle", skeleton).await;
+    seed_model_routes(&state.db, "routes-spacing").await;
+    seed_user(&state.db, "uS").await;
+    seed_char(&state.db, "chS", "uS", "阿箬").await;
+    seed_user(&state.db, "uS2").await;
+    seed_char(&state.db, "chS2", "uS2", "宋衡").await;
+
+    // 与 `seed_narrative_layer_filters_outline_to_selected_mainline` 同款：显式钉住 assembled_json，
+    // 让本用例只测「章序 → 宿命时刻」这一段，不受装配路径的其它变化牵动。
+    let assembled = json!({
+        "assembly": { "sampling": { "seed": "deadbeefdeadbeef" } },
+        "chapterState": {},
+        "templateVersion": 1
+    });
+    let mut p = CreateWorldParams::official("tpl-spacing", 1, "间距世界");
+    p.status = Some("running".into());
+    p.model_route_version = Some("routes-spacing".into());
+    p.prompt_set_version = Some("test-prompts".into());
+    p.member_limit = 10;
+    p.daily_token_budget = 1_000_000;
+    p.daily_cny_budget_cents = 0;
+    p.assembled_json = Some(assembled.to_string());
+    let wid = create_world(&state.db, p).await.unwrap();
+    seed_member(&state.db, &wid, "uS", "chS").await;
+    seed_member(&state.db, &wid, "uS2", "chS2").await;
+
+    let model: Arc<dyn ModelClient> = Arc::new(MockModel { input_tokens: 10, output_tokens: 20 });
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    process_tick_with_model(&state, &wid, 0, model).await.unwrap();
+
+    let w = load_world(&state.db, &wid).await.unwrap();
+    let st: NarrativeState = serde_json::from_str(&w.narrative_state_json).unwrap();
+    let n1 = st.narrative.outline_nodes.iter().find(|n| n.id == "n1").unwrap();
+    // 默认间距 600：章序 2 → 1200，而**不是** 2。
+    assert_eq!(n1.due_at, Some(1200));
+    assert!(n1.due_at.unwrap() > 60, "🔴 必须远大于单次行动时长，否则原著会在开局瞬间演完");
+}

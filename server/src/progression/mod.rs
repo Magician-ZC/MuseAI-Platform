@@ -538,6 +538,27 @@ async fn settle_worldline_with_ctx_tx(
     Ok(granted)
 }
 
+/// 从 `worlds.narrative_state_json` 里取出这个世界的节拍记录（`narrative.pacingNotes`）。
+///
+/// ⚠️ 解析失败 / 字段缺失一律回空——记忆是叙事层，读不到就少留一段，
+/// 绝不因此让整场结算回滚（口径同上方烙印那一段）。
+async fn load_pacing_notes_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    world_id: &str,
+) -> Result<Vec<String>, ApiError> {
+    let raw: Option<String> =
+        sqlx::query_scalar("SELECT narrative_state_json FROM worlds WHERE id = $1")
+            .bind(world_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let Some(raw) = raw else { return Ok(Vec::new()) };
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+    Ok(v.pointer("/narrative/pacingNotes")
+        .and_then(|n| n.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .unwrap_or_default())
+}
+
 /// idle 放置房终局结算：① 通关奖励（走完世界线时每张在场卡 +60，崩塌缺省归零）+ ③ 世界线层。
 /// runtime 终局事务内调用；`collapsed` 由调用方传 `is_collapse_reason(reason)`。
 ///
@@ -583,6 +604,25 @@ pub(crate) async fn settle_idle_world_ending_tx(
             let imprints = crate::imprint::derive_imprints(&facts);
             if let Err(e) = crate::imprint::record_imprints_tx(tx, world_id, &imprints).await {
                 tracing::warn!(world_id, error = %e, "烙印落库失败（结算照常落定）");
+            }
+
+            // 世界记忆定格（迁移 0055）：把这张卡在**这个世界**里做过的事留在它身上。
+            //
+            // 🔴 产品定性：**单个世界的经历不改变角色卡的内核**，只是多加一层关于那个世界的记忆；
+            // 记忆累积够多才影响「用户不能编辑的部分」（生命层）。所以这里只写记忆表，
+            // **一个字节都不碰 `cloud_characters.card_json`**。
+            //
+            // 数据源与引擎运行期间喂给角色的 `yourMemory` 是**同一份**（`narrative.pacingNotes`）：
+            // 一个让它记得，一个让它带走。两处的过滤口径必须一致，见 `imprint::memories_of`。
+            let notes = load_pacing_notes_tx(tx, world_id).await.unwrap_or_default();
+            if !notes.is_empty() {
+                let cids: Vec<String> =
+                    facts.characters.iter().map(|c| c.character_id.clone()).collect();
+                if let Err(e) =
+                    crate::imprint::record_world_memories_tx(tx, world_id, &notes, &cids).await
+                {
+                    tracing::warn!(world_id, error = %e, "世界记忆定格失败（结算照常落定）");
+                }
             }
         }
         Err(e) => tracing::warn!(world_id, error = %e, "烙印事实收集失败（结算照常落定）"),

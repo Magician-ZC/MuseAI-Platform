@@ -1217,6 +1217,30 @@ async fn seed_narrative_layer(
                     }
                 }
             });
+            // 宿命时刻（2026-07-29）：把**原著顺序**映射成游戏时间轴上的一个时刻。
+            //
+            // ══════════════════════════════════════════════════════════════════
+            // 🔴 它划开「遵循原著」与「自然推演」
+            // ══════════════════════════════════════════════════════════════════
+            // 骨架里的 `chapterOrder` 是这件事在原著里的先后（提取管线产出）。
+            // 有它 ⇒ 这个节点**到点就发生**，不需要任何角色去推——
+            // 「血洗黑角城」不会因为在场的人都躲着走而不发生。
+            // 没有它 ⇒ 走原来的路（threshold 累积 + advanceWhen 谓词，等人来推），**逐字节不变**。
+            //
+            // 映射：`due_at = chapterOrder × MUSE_FATED_TICK_SPACING`（§0.2 参数化）。
+            // 用「章序 × 间距」而不是直接拿章号当时刻：章序是 1,2,3…，而游戏时间单位是抽象量
+            // （角色一个行动的 `DEFAULT_DURATION` 就是 60）——不放大的话，全部宿命节点会挤在
+            // 前几个时间单位里同时炸掉，整部原著在世界开局那一瞬间演完。
+            //
+            // ⚠️ `atLocation` 缺省时全员视作在场（退化为老世界的单场语义），
+            // 而不是「没人在场」——后者会让一件原著大事对所有人都只是「听说」。
+            let due_at = node
+                .get("chapterOrder")
+                .and_then(Value::as_i64)
+                .filter(|n| *n > 0)
+                .map(|n| n.saturating_mul(fated_tick_spacing()));
+            let at_location =
+                node.get("atLocation").and_then(Value::as_str).map(str::to_string).filter(|s| !s.is_empty());
             s.narrative.outline_nodes.push(OutlineNode {
                 id: id.to_string(),
                 summary,
@@ -1225,6 +1249,8 @@ async fn seed_narrative_layer(
                 threshold,
                 advance_when,
                 weights: None,
+                due_at,
+                at_location,
             });
         }
     }
@@ -1829,6 +1855,24 @@ fn select_ending(world: &WorldRow) -> Option<String> {
 /// **卡的主人**发产出道具，只有角色 id 不够。① 通关奖励 + ③ 世界线层的发放逻辑整体收在
 /// `progression::settle_idle_world_ending_tx`（本文件不出现任何成长数值字段，守红线 grep 断言）；
 /// 崩塌判定只把 `reason` 串交给 progression 判，系数与产出表都在那边。
+/// 宿命节点的**章序 → 游戏时刻**间距（§0.2 参数化）。
+///
+/// 默认 600 = 十个 `DEFAULT_DURATION`（60）。取这个量级的理由：两件原著大事之间，
+/// 要留得下角色**若干次自主行动**——否则世界就成了一串背靠背的过场动画，
+/// 「其余自然推演」那一半没有发生的余地。
+///
+/// ⚠️ 真实值要等有了真实模型下的行动时长分布再调（本仓至今一次真实模型调用都没发生过）。
+const DEFAULT_FATED_TICK_SPACING: i64 = 600;
+const ENV_FATED_TICK_SPACING: &str = "MUSE_FATED_TICK_SPACING";
+
+fn fated_tick_spacing() -> i64 {
+    std::env::var(ENV_FATED_TICK_SPACING)
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_FATED_TICK_SPACING)
+}
+
 async fn finalize_ending_tx(
     tx: &mut Transaction<'_, Any>,
     world_id: &str,

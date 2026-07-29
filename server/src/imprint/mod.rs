@@ -31,7 +31,12 @@
 
 use serde::Serialize;
 use serde_json::json;
+use axum::extract::{Path, State};
+use axum::routing::get;
+use axum::{Json, Router};
 use sqlx::{Any, Row, Transaction};
+
+use crate::app::AppState;
 
 use crate::db::{new_id, now_ms};
 use crate::error::ApiError;
@@ -415,4 +420,239 @@ pub(crate) async fn load_imprints_for_cards(
         }
     }
     Ok(out)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 世界记忆层（迁移 0055）：一张卡在**某一个世界**里的经历，世界结束时定格
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// 🔴 与烙印的分工（产品 2026-07-29 拍板）：
+// - **单个世界的经历不改变角色卡的内核**，只是多加一层关于那个世界的记忆（本段）；
+// - 记忆累积够多，才影响「用户不能编辑的部分」（生命层，见 `life_stage`）。
+//
+// 数据源是引擎的 `narrative.pacingNotes`——它每拍记录每一条仲裁结果
+// （格式 `{角色id}｜{结果}｜{后果}`），而在 2026-07-29 之前**全仓没有任何生产代码读它**。
+// 这一段与引擎侧 `assemble_visible_context` 的 `yourMemory` 是同一份数据的两个出口：
+// 一个在世界**运行期间**喂给角色（让它记得），一个在世界**结束时**定格（让它带走）。
+
+/// 从引擎状态里切出某张卡的记忆条目。
+///
+/// 🔴 与引擎 `decide.rs` 的 `yourMemory` **同一条过滤口径**（`{cid}｜` 前缀）：
+/// 分隔符必须进前缀，否则 id `A` 会把 `AB` 的条目也算走。
+/// 两处口径必须一致——不一致时会出现「角色运行期间记得的事，结算后没留下」这种最难查的偏差。
+pub(crate) fn memories_of(pacing_notes: &[String], character_id: &str) -> Vec<String> {
+    let prefix = format!("{character_id}｜");
+    pacing_notes.iter().filter(|n| n.starts_with(&prefix)).cloned().collect()
+}
+
+/// 定格这个世界里各张卡的记忆。**append-only + 幂等**（唯一索引裁决重入）。
+///
+/// ⚠️ `seq` 按**数组下标**给：记忆天然按发生先后排列，不需要发号器，也不该重排。
+pub(crate) async fn record_world_memories_tx(
+    tx: &mut Transaction<'_, Any>,
+    world_id: &str,
+    pacing_notes: &[String],
+    character_ids: &[String],
+) -> Result<u64, ApiError> {
+    let now = now_ms();
+    let mut written = 0u64;
+    for cid in character_ids {
+        for (i, note) in memories_of(pacing_notes, cid).into_iter().enumerate() {
+            let res = sqlx::query(
+                "INSERT INTO character_world_memories \
+                 (id, character_id, world_id, seq, note, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
+            )
+            .bind(new_id("mem"))
+            .bind(cid)
+            .bind(world_id)
+            .bind(i as i64 + 1)
+            .bind(&note)
+            .bind(now)
+            .execute(&mut **tx)
+            .await;
+            match res {
+                Ok(_) => written += 1,
+                // 唯一冲突 = 这条记忆已经定格过（结算重入）。正常路径。
+                Err(e) if is_unique_violation(&e) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+    Ok(written)
+}
+
+/// 这张卡一共积累了多少条世界记忆（生命层的阈值判据，见 `life_stage`）。
+pub(crate) async fn memory_count(db: &sqlx::AnyPool, character_id: &str) -> Result<i64, ApiError> {
+    Ok(sqlx::query_scalar(
+        "SELECT COUNT(*) FROM character_world_memories WHERE character_id = $1",
+    )
+    .bind(character_id)
+    .fetch_one(db)
+    .await
+    .unwrap_or(0))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 生命层：记忆累积到一定程度之后，这张卡身上开始有一些**用户改不了**的东西
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// 🔴 产品定性（2026-07-29 拍板）：
+//   「单个世界的经历不会影响角色卡的内核，只是给角色卡多加了一层关于这个世界的记忆而已。
+//     当积累够多后，才会影响用户不能编辑的部分内容，这部分内容需要独立于内核可编辑的内容，
+//     而且是一张角色卡真正有生命的地方。」
+//
+// 于是一张卡分三层，各有各的写入方与可见性：
+//
+// | 层 | 谁写 | 用户可编辑 | 随卡导出 | 能被复刻吗 |
+// |---|---|---|---|---|
+// | 内核（`card_json`） | 用户 | ✅ | ✅ | ✅ **可以** |
+// | 世界记忆（0055） | 系统（该世界确定性事实） | ❌ | ❌ | ❌ |
+// | **生命层**（本段） | 系统（记忆累积派生） | ❌ | ❌ | ❌ |
+//
+// 🔵 「用户不能编辑」不只是防作弊：它让生命层成为**唯一无法被复刻的东西**。
+// 别人可以抄走你的内核，抄不走你的卡活过什么——这就是那句「真正有生命的地方」的工程含义。
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// 🔴 它凭什么不违平权红线
+// ═══════════════════════════════════════════════════════════════════════════
+// 与烙印同一条论证，且更强，因为生命层**连上下文都不进**（本轮）：
+// 1. 它是**派生只读量**，不写回卡、不进 `RoundInput`、不进任何仲裁判据；
+// 2. 阶位只表示「这张卡活过多久」，**不表示它更强**——高阶位不带任何优待；
+// 3. 阶位有**封顶**（`LifeStage::Storied` 之上没有了），老卡不会无限拉开。
+//
+// 🔵 检验：**两张卡的生命阶位互换，谁会变强？** 答案必须是「谁都不会」。
+// 本轮它唯一的出口是玩家自己的展示面（「这张卡活过 N 个世界」），
+// 任何「据阶位改判定 / 改产出 / 开权限 / 调难度」的下游都是红线违规。
+
+/// 生命阶位。**只表示活过多久，不表示更强。**
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum LifeStage {
+    /// 崭新：还没有足够的经历。
+    Blank,
+    /// 有痕：开始有说得出来的经历。
+    Marked,
+    /// 有史：经历成型，这张卡有自己的过去了。
+    Storied,
+}
+
+/// 进入「有痕」需要的记忆条数（§0.2 参数化）。
+const DEFAULT_LIFE_MARKED_AT: i64 = 30;
+/// 进入「有史」需要的记忆条数。
+const DEFAULT_LIFE_STORIED_AT: i64 = 120;
+const ENV_LIFE_MARKED_AT: &str = "MUSE_LIFE_MARKED_AT";
+const ENV_LIFE_STORIED_AT: &str = "MUSE_LIFE_STORIED_AT";
+
+fn env_i64(name: &str, default: i64) -> i64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default)
+}
+
+/// 由记忆条数派生生命阶位。**纯函数**。
+///
+/// ⚠️ 两个阈值都是拍脑袋的（30 / 120），不是算出来的——它们该取多少取决于
+/// 「一局世界平均留下多少条记忆」，而那个数要等真实模型跑过才有。
+/// 参数化（§0.2）以便有数据后就能调，且**调它不改变任何判定**，只改变展示。
+///
+/// 🔴 阶位**封顶**：`Storied` 之上没有了。这不是偷懒——没有封顶，
+/// 生命层就会变成一条无限增长的刻度，而任何无限刻度迟早会被人当成战力表。
+pub(crate) fn life_stage(memory_count: i64) -> LifeStage {
+    let marked = env_i64(ENV_LIFE_MARKED_AT, DEFAULT_LIFE_MARKED_AT);
+    let storied = env_i64(ENV_LIFE_STORIED_AT, DEFAULT_LIFE_STORIED_AT).max(marked + 1);
+    if memory_count >= storied {
+        LifeStage::Storied
+    } else if memory_count >= marked {
+        LifeStage::Marked
+    } else {
+        LifeStage::Blank
+    }
+}
+
+/// 一张卡的生命层快照（只读派生，无存储）。
+///
+/// 🔴 **没有存储**是刻意的：生命层是记忆的**函数**，不是另一份状态。
+/// 存下来就会出现「记忆和阶位对不上」的第三种事实，而那种不一致没有任何办法自愈。
+pub(crate) async fn life_snapshot(
+    db: &sqlx::AnyPool,
+    character_id: &str,
+) -> Result<serde_json::Value, ApiError> {
+    let memories = memory_count(db, character_id).await?;
+    let worlds: i64 = sqlx::query_scalar(
+        "SELECT COUNT(DISTINCT world_id) FROM character_world_memories WHERE character_id = $1",
+    )
+    .bind(character_id)
+    .fetch_one(db)
+    .await
+    .unwrap_or(0);
+    let imprints: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM character_imprints WHERE character_id = $1")
+            .bind(character_id)
+            .fetch_one(db)
+            .await
+            .unwrap_or(0);
+    Ok(json!({
+        "stage": life_stage(memories),
+        "memories": memories,
+        "worlds": worlds,
+        "imprints": imprints,
+        // 🔴 这句话是给下游看的，不是给玩家看的：它是这一层的红线，写在数据里比写在文档里更难被绕过。
+        "note": "生命层只表示这张卡活过多久，不表示它更强。它由经历派生、用户不可编辑、不随卡导出，\
+也不进入任何引擎判定——据它改判定、改产出、开权限或调难度都是平权红线违规。",
+    }))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 玩家读取面：我的这张卡活过什么
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// GET /me/characters/{id}/life：这张卡的生命层 + 世界记忆。
+///
+/// 🔴 **只读，无任何写入端点**——生命层与记忆都由系统按确定性事实派生，
+/// 客户端一个字节都写不进来（同「资产单一写入路径」红线的取向）。
+/// 这也是它不可伪造、因而不可复刻的全部依据。
+///
+/// 归属校验：只能看自己的卡。**404 而不是 403**——不向外泄露「这张卡存在但不是你的」
+/// （口径同 `subplot::load_container_cards` 与 `assets` 的既有做法）。
+async fn my_character_life(
+    State(state): State<AppState>,
+    user: crate::auth::AuthUser,
+    Path(character_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let owner: Option<String> =
+        sqlx::query_scalar("SELECT owner_id FROM cloud_characters WHERE id = $1")
+            .bind(&character_id)
+            .fetch_optional(&state.db)
+            .await?;
+    match owner {
+        Some(o) if o == user.user_id => {}
+        _ => return Err(ApiError::NotFound),
+    }
+
+    let life = life_snapshot(&state.db, &character_id).await?;
+    // 世界记忆按 (world, seq) 定序取回；分世界成组——一段经历属于一个世界，
+    // 摊平成一条流水会让「它在哪个世界里做的这件事」丢掉。
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT world_id, note FROM character_world_memories \
+         WHERE character_id = $1 ORDER BY world_id ASC, seq ASC",
+    )
+    .bind(&character_id)
+    .fetch_all(&state.db)
+    .await?;
+    let mut by_world: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for (w, n) in rows {
+        by_world.entry(w).or_default().push(n);
+    }
+    let worlds: Vec<serde_json::Value> = by_world
+        .into_iter()
+        .map(|(w, notes)| json!({ "worldId": w, "notes": notes }))
+        .collect();
+
+    Ok(Json(json!({ "characterId": character_id, "life": life, "memories": worlds })))
+}
+
+pub fn router() -> Router<AppState> {
+    Router::new().route("/me/characters/{id}/life", get(my_character_life))
 }

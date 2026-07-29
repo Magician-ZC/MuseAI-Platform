@@ -1,5 +1,6 @@
 import React from 'react';
 import { Outlet, useNavigate, useLocation } from 'react-router-dom';
+import RouteFallback from './RouteFallback';
 import { HomeOutlined, MessageOutlined, FireOutlined, HeartOutlined } from '@ant-design/icons';
 
 const MOBILE_NAV_ITEMS = [
@@ -41,7 +42,9 @@ const MobileShell: React.FC = () => {
 
       {/* Main Content Area */}
       <div className="mobile-shell__content">
-        <Outlet />
+        <RouteFallback>
+              <Outlet />
+            </RouteFallback>
       </div>
 
       {/* Bottom Navigation */}

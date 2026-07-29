@@ -19,6 +19,7 @@ import {
   SettingOutlined,
 } from '@ant-design/icons';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
+import RouteFallback from './RouteFallback';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import { warmMinimalistTheme } from '../theme';
@@ -156,7 +157,9 @@ const AppShell: React.FC = () => {
             </div>
           </Sider>
           <Content className="local-client-shell__content">
-            <Outlet />
+            <RouteFallback>
+              <Outlet />
+            </RouteFallback>
           </Content>
         </Layout>
       </Layout>

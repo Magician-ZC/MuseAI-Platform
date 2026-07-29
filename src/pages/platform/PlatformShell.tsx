@@ -30,6 +30,7 @@ import {
   WalletOutlined,
 } from '@ant-design/icons';
 import { Navigate, Outlet, useLocation, useNavigate } from 'react-router-dom';
+import RouteFallback from '../../components/RouteFallback';
 import { warmMinimalistTheme } from '../../theme';
 import { useAuthStore } from '../../stores/useAuthStore';
 import { usePlatformStore } from '../../stores/usePlatformStore';
@@ -167,7 +168,9 @@ export const PlatformShell: React.FC = () => {
 
         {isLogin ? (
           <Content className="platform-shell__login-content">
-            <Outlet />
+            <RouteFallback>
+              <Outlet />
+            </RouteFallback>
           </Content>
         ) : (
           <Layout className="platform-shell__body">
@@ -207,7 +210,9 @@ export const PlatformShell: React.FC = () => {
               </div>
             </Sider>
             <Content className="platform-shell__content">
+              <RouteFallback>
               <Outlet />
+            </RouteFallback>
             </Content>
           </Layout>
         )}

@@ -58,14 +58,16 @@ pub async fn synthesize_mainline(
         "作品：{title}\n以下是从原文提取的剧情节拍（按章序）：\n{list}\n\
 可引用的道具 id：{items:?}\n\n\
 把它们组织为多条互斥/并行剧情线的内容超集（供下游副本采样，须足量冗余），严格输出 JSON：\n\
-{{\"mainlineNodes\":[{{\"id\":\"mn-1\",\"fated\":true,\"variantGroup\":null,\"arcTags\":[\"arc-1\"]}}],\
+{{\"mainlineNodes\":[{{\"id\":\"mn-1\",\"fated\":true,\"chapterOrder\":1,\"variantGroup\":null,\"arcTags\":[\"arc-1\"]}}],\
 \"hiddenContentPool\":[{{\"id\":\"hc-1\",\"themes\":[\"复仇\"],\"template\":\"{{name}}发现{{seed}}\",\
 \"rewardItemRef\":\"itm-xxx\",\"variantGroup\":\"vg-1\",\"arcTags\":[\"arc-1\"]}}],\
 \"sideHookPool\":[{{\"id\":\"sh-1\",\"themes\":[],\"template\":\"...\",\"arcTags\":[\"arc-1\"]}}],\
 \"storylines\":[{{\"id\":\"arc-1\",\"summary\":\"...\",\"mainlineNodeIds\":[\"mn-1\"],\"hiddenPoolIds\":[\"hc-1\"],\
 \"endingIds\":[\"end-1\"],\"affinity\":\"combat\"}}]}}\n\
 要求：所有 id 全局唯一且非空；同一 variantGroup 内的条目互斥（采样每组至多取一），高价值奖励分散在不同 variantGroup；\
-rewardItemRef 只引用已存在的道具 id。",
+rewardItemRef 只引用已存在的道具 id。\n\
+chapterOrder：**只给 fated=true 的节点**，表示这件事在原著里排第几，从 1 开始连续编号（不是章号），\
+同时发生的给同一个号；顺序照上面节拍列表的章序。fated=false 的节点不要给它。",
         title = source_title,
         list = list,
         items = item_ids,

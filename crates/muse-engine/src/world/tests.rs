@@ -73,8 +73,8 @@ fn char_synth() -> String {
 fn plot_synth() -> String {
     r#"{
         "mainlineNodes":[
-            {"id":"mn-1","fated":true,"variantGroup":"vg-trial","arcTags":["arc-revenge"]},
-            {"id":"mn-2","fated":false,"variantGroup":"vg-trial","arcTags":["arc-revenge"]},
+            {"id":"mn-1","fated":true,"chapterOrder":12,"variantGroup":"vg-trial","arcTags":["arc-revenge"]},
+            {"id":"mn-2","fated":false,"chapterOrder":40,"variantGroup":"vg-trial","arcTags":["arc-revenge"]},
             {"id":"mn-3","fated":false,"arcTags":["arc-revenge"]}
         ],
         "hiddenContentPool":[
@@ -183,6 +183,13 @@ async fn full_pipeline_produces_world_superset() {
     assert_eq!(draft.mainline_nodes[1].variant_group, Some("vg-trial".to_string()));
     assert_eq!(draft.mainline_nodes[2].variant_group, None); // 未分组
     assert_eq!(draft.hidden_content_pool[0].variant_group, Some("vg-secret".to_string()));
+    // chapterOrder：模型给的是章号（12/40），产出必须是归一后的宿命序号，且只落在宿命节点上。
+    // 🔴 这条守着「主线遵循原著」这一整条链的**上游**——runtime 那头
+    // （`chapter_order_becomes_a_fated_moment_on_the_timeline`）一直在测「有 chapterOrder 就变 due_at」，
+    // 但在这之前，提取管线从来就没产出过它，那条链的第一环是空的。
+    assert_eq!(draft.mainline_nodes[0].chapter_order, Some(1), "章号 12 须压成序号 1");
+    assert_eq!(draft.mainline_nodes[1].chapter_order, None, "非宿命节点不得带宿命时刻");
+    assert_eq!(draft.mainline_nodes[2].chapter_order, None);
     assert!(group_members_ge2(&draft));
     // hidden pool 合法 rewardItemRef 保留。
     assert_eq!(draft.hidden_content_pool[0].reward_item_ref, Some("itm-fenji".to_string()));

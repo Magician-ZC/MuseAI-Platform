@@ -75,6 +75,9 @@ pub fn assemble(input: SupersetInput) -> WorldSkeletonDraft {
     // ---- variantGroup 可采样性：每组须 ≥2 成员，否则清空该成员的 variantGroup ----
     enforce_variant_groups(&mut mainline_nodes, &mut hidden_content_pool, &mut side_hook_pool, &mut ending_pool);
 
+    // ---- chapterOrder 归一：模型给什么都收成 1..K 的宿命序号 ----
+    normalize_chapter_order(&mut mainline_nodes);
+
     // ---- storyline 引用自洽：只保留指向存在元素的 id ----
     let mn_ids: BTreeSet<String> = mainline_nodes.iter().map(|n| n.id.clone()).collect();
     let pool_ids: BTreeSet<String> = hidden_content_pool
@@ -109,6 +112,39 @@ pub fn assemble(input: SupersetInput) -> WorldSkeletonDraft {
         storylines,
         sampling,
         is_superset: true,
+    }
+}
+
+/// 把模型给的 `chapterOrder` 收成一个**能当游戏时刻用**的序号：只留宿命节点 + 稠密重排 1..K。
+///
+/// ══════════════════════════════════════════════════════════════════════════
+/// 🔴 为什么必须归一：这个值会变成**游戏时间坐标**，而模型多半会回填**章号**
+/// ══════════════════════════════════════════════════════════════════════════
+/// 下游是 `due_at = chapterOrder × MUSE_FATED_TICK_SPACING`（默认 600），而一个角色
+/// 一次行动只推进 60。合成 prompt 里的节拍列表逐条带着「第N章」，模型即使被要求
+/// 「从 1 开始连续编号」，也极容易照抄章号——一部 400 章的书写出 `chapterOrder: 380`，
+/// 这件事的宿命时刻就落在 228000 拍，等于**它永远不会发生**，而模板看起来完全正常。
+/// 稠密重排让它无论模型写什么都落在 1..K。
+///
+/// ⚠️ 代价说清楚：**丢掉原著的节奏**——第 10 章到第 50 章、第 400 章到第 480 章，
+/// 归一后都是同样的一格。这是有意的取舍：「顺序对」才是「主线遵循原著」的实质，
+/// 而「间隔按比例」在一个 tick 预算有限的世界里会把后半本书整个挤出时间轴。
+///
+/// 🔴 **只有 `fated` 节点保留 chapterOrder**。`due_at` 在引擎里叫「宿命时刻」，
+/// 语义是「到点就发生，不需要任何人推」；给一个 `fated: false`（采样可裁、本就可有可无）
+/// 的节点安上宿命时刻是自相矛盾的——那会把「可选支线」变成「必然事件」。
+///
+/// 纯函数、无随机；并列（同号）保留为并列。
+fn normalize_chapter_order(nodes: &mut [MainlineNodeDraft]) {
+    for n in nodes.iter_mut() {
+        n.chapter_order = if n.fated { n.chapter_order.filter(|c| *c > 0) } else { None };
+    }
+    let mut distinct: Vec<i64> = nodes.iter().filter_map(|n| n.chapter_order).collect();
+    distinct.sort_unstable();
+    distinct.dedup();
+    for n in nodes.iter_mut() {
+        // `distinct` 已排序去重 ⇒ 二分下标 + 1 就是稠密秩。
+        n.chapter_order = n.chapter_order.and_then(|c| distinct.binary_search(&c).ok()).map(|i| i as i64 + 1);
     }
 }
 
@@ -195,6 +231,17 @@ mod tests {
             fated: false,
             variant_group: vg.map(String::from),
             arc_tags: vec![],
+            chapter_order: None,
+        }
+    }
+    /// 宿命节点 + 模型给的原始 `chapterOrder`（**故意用章号量级**，见归一函数的注释）。
+    fn fated_mn(id: &str, raw_order: Option<i64>) -> MainlineNodeDraft {
+        MainlineNodeDraft {
+            id: id.into(),
+            fated: true,
+            variant_group: None,
+            arc_tags: vec![],
+            chapter_order: raw_order,
         }
     }
     fn pool(id: &str, reward: Option<&str>, vg: Option<&str>) -> PoolItemDraft {
@@ -243,6 +290,81 @@ mod tests {
         assert_eq!(draft.mainline_nodes[2].variant_group, None);
         // storyline 悬空 mainline id 被剔除。
         assert_eq!(draft.storylines[0].mainline_node_ids, vec!["mn-1".to_string()]);
+    }
+
+    /// 造一份只关心主线的入参。
+    fn only_mainline(nodes: Vec<MainlineNodeDraft>) -> SupersetInput {
+        SupersetInput {
+            source_work: SkeletonSourceDraft::default(),
+            world_characters: vec![],
+            locations: vec![],
+            world_items: vec![],
+            mainline_nodes: nodes,
+            hidden_content_pool: vec![],
+            side_hook_pool: vec![],
+            ending_pool: vec![],
+            storylines: vec![],
+        }
+    }
+
+    /// 🔴 模型回填章号是**最可能**的失败形态，而它的症状是「宿命时刻落在天文数字上 ⇒
+    /// 那件事永远不发生」，模板看起来却完全正常。归一必须把量级压回来。
+    #[test]
+    fn raw_chapter_numbers_are_compressed_into_usable_ticks() {
+        let draft = assemble(only_mainline(vec![
+            fated_mn("mn-a", Some(10)),
+            fated_mn("mn-b", Some(120)),
+            fated_mn("mn-c", Some(380)),
+        ]));
+        let orders: Vec<Option<i64>> = draft.mainline_nodes.iter().map(|n| n.chapter_order).collect();
+        assert_eq!(orders, vec![Some(1), Some(2), Some(3)], "章号须稠密重排成 1..K");
+    }
+
+    /// 顺序是实质，节奏不是：乱序输入也要按原著先后排定，且**并列保持并列**。
+    #[test]
+    fn order_survives_and_ties_stay_tied() {
+        let draft = assemble(only_mainline(vec![
+            fated_mn("mn-late", Some(300)),
+            fated_mn("mn-early", Some(7)),
+            fated_mn("mn-also-late", Some(300)),
+            fated_mn("mn-mid", Some(88)),
+        ]));
+        let by_id: std::collections::BTreeMap<&str, Option<i64>> =
+            draft.mainline_nodes.iter().map(|n| (n.id.as_str(), n.chapter_order)).collect();
+        assert_eq!(by_id["mn-early"], Some(1));
+        assert_eq!(by_id["mn-mid"], Some(2));
+        // 同一章发生的两件事必须落在同一个时刻，不能被拆成先后。
+        assert_eq!(by_id["mn-late"], Some(3));
+        assert_eq!(by_id["mn-also-late"], Some(3));
+    }
+
+    /// 🔴 `due_at` 叫「宿命时刻」：给一个采样可裁的节点安上它，等于把可选支线变成必然事件。
+    #[test]
+    fn a_node_that_sampling_may_cut_never_gets_a_fated_moment() {
+        let mut optional = mn("mn-optional", None);
+        optional.chapter_order = Some(5); // 模型给了，但它 fated=false
+        let draft = assemble(only_mainline(vec![fated_mn("mn-fixed", Some(9)), optional]));
+        let by_id: std::collections::BTreeMap<&str, Option<i64>> =
+            draft.mainline_nodes.iter().map(|n| (n.id.as_str(), n.chapter_order)).collect();
+        // 🔵 这里**只断言这一件事**。归一后的具体值是上面那条的主张——两件事写进一条断言，
+        // 红了就分不清是哪件坏了（VALIDATION §3.8.1）。
+        assert_eq!(by_id["mn-optional"], None, "非宿命节点不得带宿命时刻");
+        assert!(by_id["mn-fixed"].is_some(), "宿命节点须留在时间轴上");
+    }
+
+    /// 非正数（模型写 0 / 负数）与缺省一样处理：不上时间轴，走老路径。
+    /// 🔵 这条同时钉住「没有任何节点带 chapterOrder 时，整批产物与本层落地前一致」。
+    #[test]
+    fn absent_or_nonpositive_orders_stay_off_the_timeline() {
+        let draft = assemble(only_mainline(vec![
+            fated_mn("mn-none", None),
+            fated_mn("mn-zero", Some(0)),
+            fated_mn("mn-neg", Some(-3)),
+        ]));
+        assert!(
+            draft.mainline_nodes.iter().all(|n| n.chapter_order.is_none()),
+            "无合法章序 → 一个都不上时间轴"
+        );
     }
 
     #[test]

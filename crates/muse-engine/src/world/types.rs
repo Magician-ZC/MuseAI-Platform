@@ -232,6 +232,16 @@ pub struct MainlineNodeDraft {
     /// 所属剧情线。
     #[serde(default)]
     pub arc_tags: Vec<String>,
+    /// **这件事在原著里排第几**（1 起，同时发生的给同一个号）。
+    ///
+    /// 下游把它映射成引擎时间轴上的宿命时刻：`due_at = chapterOrder × MUSE_FATED_TICK_SPACING`
+    /// （`server/src/runtime/mod.rs`）。有它 ⇒ 到点就发生，不需要任何角色去推；
+    /// `None` ⇒ 走原来的路（阈值累积 + 推进门，等人来推），**产物逐字节不变**。
+    ///
+    /// ⚠️ 这里存的是**归一后的序号，不是章号**——`superset::assemble` 会把模型给的任何
+    /// 数值稠密重排成 1..K（见 `normalize_chapter_order`）。原因见那个函数的注释。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chapter_order: Option<i64>,
 }
 
 /// 内容池条目（对齐 server `assembly::PoolItem` + 超集采样元数据）。

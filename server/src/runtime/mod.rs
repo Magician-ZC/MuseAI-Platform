@@ -37,7 +37,9 @@ use muse_engine::narrative::types::{
     CharacterState, ConstraintLevel, DomainEvent, DomainEventType, ForbiddenPredicate, LocationDef,
     NarrativeState, NodeStatus, OutlineNode, RealmCostume, RoundBudget, RunMode,
 };
-use muse_engine::narrative::{ModelRoutes, NarrativeEngine, NarrativePrompts, RoundInput, Terminal};
+use muse_engine::narrative::{
+    ModelRoutes, NarrativeEngine, NarrativePrompts, PersonalThread, RoundInput, Terminal,
+};
 
 const TOPIC: &str = "world_tick";
 
@@ -1409,8 +1411,8 @@ async fn load_carried_item_facts(
 /// 单个条目损坏只跳过该条。
 fn parse_personal_threads(
     assembled_json: Option<&str>,
-) -> std::collections::BTreeMap<String, Vec<(String, String)>> {
-    let mut out: std::collections::BTreeMap<String, Vec<(String, String)>> = Default::default();
+) -> std::collections::BTreeMap<String, Vec<PersonalThread>> {
+    let mut out: std::collections::BTreeMap<String, Vec<PersonalThread>> = Default::default();
     let Some(raw) = assembled_json else {
         return out;
     };
@@ -1431,7 +1433,28 @@ fn parse_personal_threads(
         if cid.is_empty() || text.is_empty() || key.is_empty() {
             continue;
         }
-        out.entry(cid.to_string()).or_default().push((text.to_string(), key.to_string()));
+        // 了结后留下的世界事实（`producesWorldFacts`）。缺省/结构不符 → 空 = 这条线索不改变世界。
+        let leaves: Vec<(String, Value)> = hook
+            .get("producesWorldFacts")
+            .and_then(Value::as_array)
+            .map(|facts| {
+                facts
+                    .iter()
+                    .filter_map(|f| {
+                        let k = f.get("key").and_then(Value::as_str).map(str::trim)?;
+                        if k.is_empty() {
+                            return None;
+                        }
+                        Some((k.to_string(), f.get("value").cloned().unwrap_or(Value::Bool(true))))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.entry(cid.to_string()).or_default().push(PersonalThread {
+            what: text.to_string(),
+            done_key: key.to_string(),
+            leaves,
+        });
     }
     out
 }

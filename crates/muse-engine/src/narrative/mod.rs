@@ -243,7 +243,7 @@ pub struct RoundInput {
     /// DomainEvent / 同意门控。它是「你心里还惦记着一件事」，不是「你手上有一张牌」。
     ///
     /// 空表（默认，桌面壳恒空）⇒ 追加函数根本不会被调到 ⇒ 上下文与接线前逐字节一致。
-    pub personal_threads: BTreeMap<String, Vec<(String, String)>>,
+    pub personal_threads: BTreeMap<String, Vec<PersonalThread>>,
 }
 
 impl Default for RoundInput {
@@ -278,6 +278,26 @@ impl Default for RoundInput {
             personal_threads: BTreeMap::new(),
         }
     }
+}
+
+/// 一条私有线索的投放形态（per-character 钩子，见 [`RoundInput::personal_threads`]）。
+///
+/// 🔴 **这个结构里永远不该出现数值字段**（成功率、加成、优先级、强度……）。
+/// 它只有「这件事是什么」「怎么算了结」「了结之后世界上会多出什么」——
+/// 三样都是叙事事实，没有一样是可比较的量。
+/// 一旦出现一个数，仲裁就会有理由去读它，那一刻私有线索就变成了私有数值。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PersonalThread {
+    /// 线索本身（平台侧按这张卡的执念参数化好的一句话）。
+    pub what: String,
+    /// 完成标记的世界键（`hookDone_<卡id>_<钩子id>`）；了结时由模型写 `true`。
+    pub done_key: String,
+    /// 了结之后世界上会多出的事实：`world.<key> = <value>`。
+    ///
+    /// 🔵 **这是「支线通向主线」的那半条链**：主线节点的 `advanceWhen` 谓词
+    /// （`world.<key> == <literal>`）读的正是这里留下的东西。空 = 这条线索不改变世界，
+    /// 只是这个角色自己的一段戏。
+    pub leaves: Vec<(String, serde_json::Value)>,
 }
 
 /// 一条**观众礼物等环境事件**的展示形态。见 [`RoundInput::ambient_events`] 的边界声明。
@@ -3911,11 +3931,18 @@ mod tests {
 
     // ===== 私有线索 · per-character 钩子的投放（2026-07-29） =====
 
-    fn threads(cid: &str, items: &[(&str, &str)]) -> BTreeMap<String, Vec<(String, String)>> {
+    fn threads(cid: &str, items: &[(&str, &str)]) -> BTreeMap<String, Vec<PersonalThread>> {
         let mut m = BTreeMap::new();
         m.insert(
             cid.to_string(),
-            items.iter().map(|(w, k)| (w.to_string(), k.to_string())).collect(),
+            items
+                .iter()
+                .map(|(w, k)| PersonalThread {
+                    what: w.to_string(),
+                    done_key: k.to_string(),
+                    leaves: vec![],
+                })
+                .collect(),
         );
         m
     }
@@ -4000,7 +4027,11 @@ mod tests {
     fn the_thread_note_denies_advantage_and_denies_obligation() {
         let ctx = decide::append_personal_threads(
             "{}",
-            &[("一件未了的事".to_string(), "hookDone_a_b".to_string())],
+            &[PersonalThread {
+                what: "一件未了的事".into(),
+                done_key: "hookDone_a_b".into(),
+                leaves: vec![("密道位置已知".into(), serde_json::json!(true))],
+            }],
         )
         .unwrap();
         for must in ["不给你任何优势", "不提高成功率", "不保证你做得成", "不是非做不可"] {
@@ -4009,6 +4040,28 @@ mod tests {
         // 完成标记必须随线索一起给出，否则模型不知道该写哪个键。
         assert!(ctx.contains("hookDone_a_b"), "doneKey 必须出现在上下文里");
         assert!(ctx.contains("没了结就不要写"), "必须写明「没完成不要写」——否则会被无脑标完成");
+        // 🔵 `leaves` 是「支线通向主线」的那半条链：主线的推进门读的正是这里留下的世界事实。
+        assert!(ctx.contains("密道位置已知"), "了结后要留下的世界事实必须一起投放");
+        assert!(ctx.contains("worldKey") && ctx.contains("becomes"), "留痕的写法必须说清楚");
+    }
+
+    /// 不留痕的线索：`leaves` 那一格**完全不出现**（不是空数组）。
+    ///
+    /// 空数组会让模型以为「这里本该有东西而我没拿到」，进而去猜一个键写进去——
+    /// 而它猜的那个键没有任何主线门在读，于是那条支线看起来做完了、实际什么都没通。
+    #[test]
+    fn a_thread_that_changes_nothing_carries_no_leaves_field() {
+        let ctx = decide::append_personal_threads(
+            "{}",
+            &[PersonalThread {
+                what: "只是他自己的一段心事".into(),
+                done_key: "hookDone_a_b".into(),
+                leaves: vec![],
+            }],
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&ctx).unwrap();
+        assert!(v["yourThreads"]["unfinished"][0].get("leaves").is_none(), "不留痕就不该出现这一格：{ctx}");
     }
 
     /// 不传戏服（默认档）→ 导演 prompt 里**一个字节都不多**。

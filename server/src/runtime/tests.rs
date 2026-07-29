@@ -2590,7 +2590,8 @@ async fn a_hook_reaches_its_owners_prompt_and_nobody_elses() {
         .bind(
             json!({ "assembly": { "perCharacterHooks": [
                 { "characterId": "chA", "poolItemId": "hc-1", "parameterizedText": "甲惦记着断桥下的旧物",
-                  "difficultyScore": 0.5, "doneKey": "hookDone_chA_hc-1" },
+                  "difficultyScore": 0.5, "doneKey": "hookDone_chA_hc-1",
+                  "producesWorldFacts": [{ "key": "断桥旧物已现世", "value": true }] },
                 { "characterId": "chB", "poolItemId": "hc-9", "parameterizedText": "乙惦记着剑冢里的断剑",
                   "difficultyScore": 0.6, "doneKey": "hookDone_chB_hc-9" }
             ] } })
@@ -2615,6 +2616,12 @@ async fn a_hook_reaches_its_owners_prompt_and_nobody_elses() {
     assert!(
         a["yourThreads"]["unfinished"].to_string().contains("hookDone_chA_hc-1"),
         "完成键必须随线索一起投放，否则模型不知道该写哪个键"
+    );
+    // 🔵 「支线通向主线」的那半条链：了结后要留下的世界事实必须一起投放，
+    // 否则模型不知道该往世界里写什么，主线的推进门就永远等不到它。
+    assert!(
+        a["yourThreads"]["unfinished"][0]["leaves"].to_string().contains("断桥旧物已现世"),
+        "留痕没有被投放：{a}"
     );
     // 🔴 信息隔离：甲的上下文里不得有乙的任何字节。
     let a_all = a.to_string();

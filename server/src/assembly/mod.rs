@@ -333,6 +333,10 @@ pub struct CharacterHook {
     /// 永远拿不到奖励，而且没有任何症状。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub done_key: String,
+    /// 这条线索了结后留下的世界事实（原样透自 `PoolItem::produces_world_facts`）。
+    /// 空 = 不改变世界；`skip_serializing_if` 保证既有实例的 `assembled_json` 逐字节不变。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub produces_world_facts: Vec<WorldFactSpec>,
     /// 从预审核池挑出的隐藏道具：通关结算（chapters::finish）经 grant_item 兑现。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reward_item: Option<ItemDefinition>,
@@ -676,6 +680,55 @@ struct PoolItem {
     /// 归属的 storyline id 集（arcTags）：命中被选 storyline 即入采样候选。
     #[serde(default)]
     arc_tags: Vec<String>,
+    /// **这条支线了结之后，世界上会多出的事实**（`world.<key> = <value>`）。
+    ///
+    /// 🔵 这是「支线通向主线」的那半条链：主线节点的 `advanceWhen` 谓词
+    /// （`world.<key> == <字面量>`）读的正是这里留下的东西。
+    /// 在它之前，钩子是**孤立**的——做完加分，然后就没事了，与主线没有任何关系。
+    ///
+    /// 空 = 这条支线不改变世界，只是这个角色自己的一段戏（完全合法，也是绝大多数支线的形态）。
+    #[serde(default)]
+    produces_world_facts: Vec<WorldFactSpec>,
+}
+
+/// 一条支线了结后留下的世界事实。
+///
+/// 🔴 `key` 必须是**合法的世界键**（引擎 `reducer::parse_path` 要求：非空、不含 `.` 与 `[`、
+/// 不是保留键）。非法键写进模板会让这条痕迹**永远落不了地**，而支线看起来做完了——
+/// 由 `validate_world_fact_key` 在建模板期直接拒。
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorldFactSpec {
+    pub key: String,
+    /// 变成什么。缺省 `true`——绝大多数事实是「发生过 / 知道了 / 拿到了」这类布尔。
+    /// ⚠️ **值参与匹配**：主线门写 `world.x == "opened"` 时，一条产出 `world.x = true`
+    /// 的支线**不满足**它。第 5 步的交叉校验按 `(key, value)` 成对比，不只比 key。
+    #[serde(default = "fact_true")]
+    pub value: Value,
+}
+
+fn fact_true() -> Value {
+    Value::Bool(true)
+}
+
+/// 世界事实键的合法性（与引擎 `reducer::parse_path` 的 `world.<key>` 口径**同一条**）。
+///
+/// ⚠️ 两边各写一份是这个仓库反复吃亏的形状（「同一判定的 N 份拷贝」）。
+/// 这里没法直接调引擎那个函数——它是 `pub` 但吃的是完整路径且返回引擎错误类型，
+/// 在建模板期报错时给不出人读得懂的话。**所以这里复述判据的同时，
+/// 用 `world_fact_key_matches_engine_path_rules` 把两边钉在一起**：
+/// 那条用例真的去调引擎的 `parse_path`，对同一批样本比对结论。
+pub(crate) fn validate_world_fact_key(key: &str) -> Result<(), String> {
+    if key.is_empty() {
+        return Err("producesWorldFacts[].key 不可为空".into());
+    }
+    if key.contains('.') || key.contains('[') {
+        return Err(format!(
+            "producesWorldFacts[].key `{key}` 含 `.` 或 `[`：引擎的世界键是**单段**的，\
+这样的键永远写不进世界，支线会看起来做完了而什么都没留下"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1843,6 +1896,16 @@ fn merge_fragment(target: &mut Skeleton, card: &ContainerCard, item_tier_cap: u8
         reward_item: p.reward_item.as_ref().map(|it| cap_item(it, cid, item_tier_cap)),
         variant_group: p.variant_group.as_deref().map(|g| ns(cid, g)).filter(|s| !s.is_empty()),
         arc_tags: ns_all(cid, &p.arc_tags),
+        // 🔴 **产出的世界事实键同样要命名空间化。**
+        // 不改的话，两张副本卡各自产出 `world.密道位置已知` 会串台；更糟的是一张卡的支线
+        // 能满足**本体主线**的推进门——那是跨卡越界，与 id/variantGroup 必须命名空间化
+        // 是同一个理由，而这一维是新加的、最容易被漏掉的那一维。
+        produces_world_facts: p
+            .produces_world_facts
+            .iter()
+            .map(|f| WorldFactSpec { key: ns(cid, &f.key), value: f.value.clone() })
+            .filter(|f| !f.key.is_empty())
+            .collect(),
     };
     target.hidden_content_pool.extend(f.hidden_content_pool.iter().map(&rewrite_pool));
     target.side_hook_pool.extend(f.side_hook_pool.iter().map(&rewrite_pool));
@@ -2550,6 +2613,7 @@ pub async fn assemble_instance(state: &AppState, world_id: &str) -> Result<Assem
                 character_id: cid.clone(),
                 pool_item_id: pool_item.id.clone(),
                 done_key: hook_done_key(cid, &pool_item.id).unwrap_or_default(),
+                produces_world_facts: pool_item.produces_world_facts.clone(),
                 parameterized_text: text,
                 difficulty_score: difficulty,
                 reward_item: resolve_reward_item(pool_item, &skeleton.world_items),
@@ -2890,6 +2954,8 @@ pub(crate) const SKELETON_KEY_SETS: &[(&str, &str, &[&str])] = &[
     ("endgame", "", ENDGAME_KEYS),                              // 无结构体，全靠 runtime 手读
     ("endingPool[]", "EndingCandidate", &["id", "affinity", "baseWeight", "variantGroup", "arcTags"]), // EndingCandidate
     ("hiddenContentPool[]", "PoolItem", POOL_ITEM_KEYS),                // PoolItem
+    ("hiddenContentPool[].producesWorldFacts[]", "WorldFactSpec", WORLD_FACT_KEYS),
+    ("sideHookPool[].producesWorldFacts[]", "WorldFactSpec", WORLD_FACT_KEYS),
     ("hiddenContentPool[].rewardItem", "ItemDefinition", ITEM_DEFINITION_KEYS),
     ("hiddenContentPool[].rewardItem.origin", "ItemOrigin", ITEM_ORIGIN_KEYS),
     ("sideHookPool[]", "PoolItem", POOL_ITEM_KEYS),                     // PoolItem（与上面同型）
@@ -2951,7 +3017,11 @@ pub(crate) const POOL_ITEM_KEYS: &[&str] = &[
     "rewardItem",
     "variantGroup",
     "arcTags",
+    "producesWorldFacts",
 ];
+
+/// `WorldFactSpec`（支线了结后留下的世界事实）。
+pub(crate) const WORLD_FACT_KEYS: &[&str] = &["key", "value"];
 
 /// `admission::ItemDefinition` / `ItemOrigin`：道具目录与内联奖励共用同一形状
 /// （目录里那份与内联那份是同一类型，这也是它们的送审必须一视同仁的原因，见 VALIDATION §3.9）。
@@ -5294,7 +5364,8 @@ mod container_tests {
             ],
             "mainlineNodes": [ { "id": "mn", "fated": true, "arcTags": ["arc"] } ],
             "hiddenContentPool": [
-                { "id": "hc", "arcTags": ["arc"], "themes": [theme], "rewardItemRef": "wi", "variantGroup": "vg" }
+                { "id": "hc", "arcTags": ["arc"], "themes": [theme], "rewardItemRef": "wi", "variantGroup": "vg",
+                  "producesWorldFacts": [{ "key": "密道位置已知" }] }
             ],
             "endingPool": [ { "id": "end", "arcTags": ["arc"] } ],
             "worldItems": [ {
@@ -6123,6 +6194,100 @@ mod container_tests {
         for n in ["n1", "n2", "n3", "n4"] {
             assert_eq!(crowd[n], (0, 0), "新卡应是零档");
         }
+    }
+
+    // ---------- 支线产出：世界事实（第 2 步） ----------
+
+    /// 🔴 **两边的世界键口径必须是同一条**——这条用例真的去调引擎的 `parse_path` 对答案。
+    ///
+    /// `validate_world_fact_key` 是在**建模板期**给作者看的（要给人读得懂的话），
+    /// 引擎的 `reducer::parse_path` 是在**运行期**判定能不能写的。两份实现，一条判据。
+    /// ⚠️ 这正是本仓反复吃亏的「同一判定的 N 份拷贝」——不钉在一起，
+    /// 漂开的表现是「模板发布成功，但那条痕迹永远落不了地」，而支线看起来做完了。
+    #[test]
+    fn world_fact_key_matches_engine_path_rules() {
+        for key in ["密道位置已知", "hookDone_a_b", "x", "卡1:门开了"] {
+            let mine = validate_world_fact_key(key).is_ok();
+            let engine = muse_engine::narrative::reducer::parse_path(&format!("world.{key}")).is_ok();
+            assert_eq!(mine, engine, "键 `{key}`：建模板期判 {mine}，引擎判 {engine}——两边漂开了");
+        }
+        for bad in ["", "a.b", "a[0]"] {
+            assert!(validate_world_fact_key(bad).is_err(), "非法键 `{bad}` 应被拒");
+            assert!(
+                muse_engine::narrative::reducer::parse_path(&format!("world.{bad}")).is_err(),
+                "非法键 `{bad}` 引擎也该拒"
+            );
+        }
+    }
+
+    /// 🔴 **容器模式下产出键必须命名空间化。**
+    ///
+    /// 不改的话，两张副本卡各自产出 `world.密道位置已知` 会串台；更糟的是**一张卡的支线
+    /// 能满足本体主线的推进门**——那是跨卡越界。与 id / variantGroup / arcTags 必须
+    /// 命名空间化是同一个理由，而这一维是新加的、最容易被漏掉的那一维。
+    ///
+    /// ⚠️ **这条测试的第一版是假的，记在这里防止有人改回去**：它自己调 `ns()` 算一遍再断言，
+    /// 于是把 `merge_fragment` 里的命名空间化整个去掉之后**它照样绿**——
+    /// 断言的是「`ns` 函数会加前缀」，不是「合并路径用了它」。
+    /// 正确的做法是走真实的 `compose`，断言**产物**里的键。
+    #[test]
+    fn a_cards_world_facts_are_namespaced_so_they_cannot_open_the_bodys_gates() {
+        let _sw = ContainerSwitch::set(true);
+        let (container, cards) = two_card_container(refs_json(&["c1", "c2"]));
+        let m = compose(container, &cards, 5).unwrap();
+
+        let key_of = |id: &str| -> String {
+            m.hidden_content_pool
+                .iter()
+                .find(|p| p.id == id)
+                .unwrap_or_else(|| panic!("{id} 应在合并产物里"))
+                .produces_world_facts
+                .first()
+                .unwrap_or_else(|| panic!("{id} 应带产出"))
+                .key
+                .clone()
+        };
+        assert_eq!(key_of("c1:hc"), "c1:密道位置已知");
+        assert_eq!(key_of("c2:hc"), "c2:密道位置已知");
+        assert_ne!(key_of("c1:hc"), key_of("c2:hc"), "🔴 两张卡的同名事实串台了");
+        // 命名空间化之后仍须是合法世界键（否则那条痕迹永远落不了地）。
+        assert!(validate_world_fact_key(&key_of("c1:hc")).is_ok());
+        // 🔴 而且都不等于本体会写的那个裸键——卡的支线开不了本体的门。
+        assert!(!key_of("c1:hc").starts_with("密道"), "🔴 卡内事实退化成了裸键");
+    }
+
+    /// `value` 缺省即 `true`；显式值原样保留（第 5 步的交叉校验按 `(key, value)` 成对比）。
+    #[test]
+    fn a_world_fact_defaults_to_true_but_keeps_an_explicit_value() {
+        let item: PoolItem = serde_json::from_value(json!({
+            "id": "hc-1",
+            "producesWorldFacts": [{ "key": "a" }, { "key": "b", "value": "opened" }]
+        }))
+        .unwrap();
+        assert_eq!(item.produces_world_facts[0].value, json!(true), "缺省应是 true");
+        assert_eq!(item.produces_world_facts[1].value, json!("opened"));
+    }
+
+    /// 未声明产出的支线：`producesWorldFacts` 为空，且**不写进** `assembled_json`。
+    ///
+    /// 空数组若被序列化出来，既有实例的装配产物就不再逐字节可比——
+    /// 那条红线（`realm_tier_absent_keeps_assembled_json_byte_identical`）在第 1 步
+    /// 已经因为同一个原因红过一次（`hookCompletionRequired: false` 被写了出来）。
+    #[test]
+    fn a_side_quest_that_leaves_no_trace_adds_no_bytes() {
+        let item: PoolItem = serde_json::from_value(json!({ "id": "hc-1" })).unwrap();
+        assert!(item.produces_world_facts.is_empty());
+        let hook = CharacterHook {
+            character_id: "chA".into(),
+            pool_item_id: "hc-1".into(),
+            parameterized_text: "t".into(),
+            difficulty_score: 0.5,
+            done_key: "hookDone_chA_hc-1".into(),
+            produces_world_facts: vec![],
+            reward_item: None,
+        };
+        let j = serde_json::to_string(&hook).unwrap();
+        assert!(!j.contains("producesWorldFacts"), "不留痕的支线不该多出这个键：{j}");
     }
 
     // ---------- 🔮 道具加值：预留接口的两条红线 ----------

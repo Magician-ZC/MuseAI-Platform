@@ -413,12 +413,24 @@ pub fn append_worldline_imprints(
 /// 空表 → 原样返回（连解析都不做，逐字节恒等）。纯函数，无随机、不依赖任何迭代序。
 pub fn append_personal_threads(
     visible_context: &str,
-    threads: &[(String, String)],
+    threads: &[crate::narrative::PersonalThread],
 ) -> Result<String, EngineError> {
     let items: Vec<Value> = threads
         .iter()
-        .filter(|(what, key)| !what.trim().is_empty() && !key.trim().is_empty())
-        .map(|(what, key)| json!({ "what": what.trim(), "doneKey": key.trim() }))
+        .filter(|t| !t.what.trim().is_empty() && !t.done_key.trim().is_empty())
+        .map(|t| {
+            let mut item = json!({ "what": t.what.trim(), "doneKey": t.done_key.trim() });
+            if !t.leaves.is_empty() {
+                // 了结之后世界上会多出的事实——主线的推进门读的正是这里。
+                item["leaves"] = Value::Array(
+                    t.leaves
+                        .iter()
+                        .map(|(k, v)| json!({ "worldKey": k, "becomes": v }))
+                        .collect(),
+                );
+            }
+            item
+        })
         .collect();
     if items.is_empty() {
         return Ok(visible_context.to_string());
@@ -433,7 +445,9 @@ pub fn append_personal_threads(
 它们不给你任何优势、不提高成功率、不保证你做得成，也不是非做不可：\
 它只说明这个世界上有几件事和你有关，去不去、怎么去，由你的性格决定。",
                 "howToClose": "其中一条真的有了了结（做成了，或者彻底断了念想）时，\
-在本回合的状态更新里把它的 doneKey 记为 true；没了结就不要写。",
+在本回合的状态更新里把它的 doneKey 记为 true；没了结就不要写。\
+若它带着 leaves，同时把那几条世界事实按 becomes 写进去——那是这件事在世界上留下的痕迹，\
+别人未必知道是你留下的，但世界从此不一样了。",
             }),
         );
     }

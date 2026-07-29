@@ -351,8 +351,31 @@ pub fn parse_outline(text: &str) -> Result<Vec<OutlineNode>, EngineError> {
 
 /// 当前待推进节点（首个 Pending）；硬节点 Blocked 判定辅助。
 pub fn next_pending(nodes: &[OutlineNode]) -> Option<&OutlineNode> {
-    nodes.iter().find(|n| matches!(n.status, super::types::NodeStatus::Pending))
+    nodes
+        .iter()
+        .find(|n| matches!(n.status, super::types::NodeStatus::Pending) && n.due_at.is_none())
 }
+
+/// 🔴 **带宿命时刻的节点不参与「等人来推」这条路**（`due_at.is_none()` 那半句）。
+///
+/// ══════════════════════════════════════════════════════════════════════════
+/// 不加这一句会让宿命时刻整个失效，而且**看起来一切正常**
+/// ══════════════════════════════════════════════════════════════════════════
+/// `build_patch` 拿 `next_pending` 取「本回合要推的那个节点」。一个 `fated: true` 的节点
+/// 在 runtime 那头会被种成 `constraint: Hard`，而模板通常**不给它 threshold**
+/// （提取管线就不产 threshold）——于是它落进 `threshold: None` 那条**老式兼容路径**：
+/// 只要本回合「有进展」就直接翻 Done。
+///
+/// 结果：**宿命节点在它到点之前，就被随便哪一拍的普通回合推掉了**。
+/// 那个 `due_at` 一次都不会被用上，「原著大事到点就发生」退回成「谁先动谁推」，
+/// 而世界照常跑、节点照常 Done、没有任何报错——现象与正常世界一模一样。
+///
+/// 🔵 引擎在宿命分支里早就写着「不看阈值、不看谓词——那两样是『等人来推』的判据，
+/// 与宿命互斥」，但那句话**只在一个方向上被执行了**（宿命落定时不看阈值），
+/// 反方向（等人来推时不碰宿命节点）一直是空的。互斥要两边都写才成立。
+///
+/// 由 `a_fated_node_is_not_advanced_by_ordinary_rounds` 钉住。
+fn _next_pending_doc() {}
 
 #[cfg(test)]
 mod tests {
@@ -564,6 +587,27 @@ mod tests {
         assert_eq!(gate_branches("world.x == true").unwrap(), vec![Some(("x".to_string(), json!(true)))]);
         // 纯关系门 → 一项 None（完全合法：这扇门不依赖任何支线）。
         assert_eq!(gate_branches("relations[a->b].trust > 0.5").unwrap(), vec![None]);
+    }
+
+    /// 🔴 **带宿命时刻的节点不参与「等人来推」**——否则它会在到点之前被普通回合推掉。
+    #[test]
+    fn a_fated_node_is_not_advanced_by_ordinary_rounds() {
+        let node = |id: &str, due: Option<i64>| OutlineNode {
+            id: id.into(),
+            summary: id.into(),
+            constraint: ConstraintLevel::Hard,
+            status: super::super::types::NodeStatus::Pending,
+            threshold: None,
+            advance_when: None,
+            weights: None,
+            due_at: due,
+            at_location: None,
+        };
+        // 宿命节点排在前面，但「等人来推」的那条路必须跳过它，取到后面那个普通节点。
+        let nodes = vec![node("mn-fated", Some(600)), node("n-normal", None)];
+        assert_eq!(next_pending(&nodes).map(|n| n.id.as_str()), Some("n-normal"));
+        // 只有宿命节点时：这一路取不到任何东西（它只由时间轴推）。
+        assert!(next_pending(&nodes[..1]).is_none(), "🔴 宿命节点被普通回合推掉了");
     }
 
     #[test]

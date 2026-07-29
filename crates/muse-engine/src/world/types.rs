@@ -290,6 +290,18 @@ pub struct PoolItemDraft {
     /// 通关兑现的隐藏道具对 worldItems 目录的引用。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reward_item_ref: Option<String>,
+    /// **这条支线发生在哪个地点**（`locations[].id`）。
+    ///
+    /// 🔴 「支线通向主线」这套设计最硬的那个副作用就在这一维：把 100 个角色散到支线上之后，
+    /// 主线**到点照样发生**（宿命时刻不等人），但很可能一个人都不在场——
+    /// 那件事对所有人就只是「听说」，比没有这件事更糟。
+    /// 对策必须是**空间**的：支线要**通向**主线地点，而不是远离
+    /// （那正是《新世界》一万平米实景里那些楼梯的作用）。
+    /// 由发布期 `validate_gate_reachability` 的姊妹校验核对连通性。
+    ///
+    /// 空 = 这条支线不绑地点（到处都能发生），不参与连通核对。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub at_location: String,
     /// **这条支线了结之后，世界上会多出的事实**（`world.<key> = <value>`）。
     /// 主线节点的 [`MainlineNodeDraft::advance_when`] 读的正是这里留下的东西。
     /// 空 = 这条支线不改变世界，只是一段各自的戏（绝大多数支线的形态）。

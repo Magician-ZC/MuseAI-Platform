@@ -4493,3 +4493,131 @@ fn a_world_without_hooks_delivers_nothing() {
     assert!(super::parse_personal_threads(Some(r#"{"assembly":{}}"#)).is_empty());
     assert!(super::parse_personal_threads(Some(r#"{"assembly":{"perCharacterHooks":[]}}"#)).is_empty());
 }
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 宿命步：它不是终局短路（2026-07-30，接缝缺陷）
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 🔴 **宿命时刻落定之后，新状态必须回灌 DB；而且世界绝不能因此收尾。**
+///
+/// ══════════════════════════════════════════════════════════════════════════
+/// 这条守的是一个**接缝**缺陷：`outcome: None` 多了一个新的产生方
+/// ══════════════════════════════════════════════════════════════════════════
+/// 宿命时刻（`run_event_step` 2a 段）跑完了一整段世界变更（节点翻 Done、写
+/// `world.fated_<id>`、给每个角色记下亲历/听说），但它走的是 `outcome: None` 出口——
+/// 而宿主那头对这个信号的既有理解是「终局短路，无状态可提交」。两个后果：
+///
+/// 1. 新状态不回灌 ⇒ 下一拍从库里回灌旧状态 ⇒ 同一件原著大事**每拍重演一次**；
+/// 2. 那条分支**不看 `terminal` 是不是 Some** ⇒ 过了终局地板之后，
+///    **任何一个宿命时刻都会把世界直接收尾**——「宴会开席」= 剧终。
+///
+/// 两条都不报错、不告警。🔵 而 `run_event_step` 的文档注释里那句
+/// 「`outcome: None` 只有两个出口」，在宿命时刻落地那一刻就已经过期了——
+/// **接缝缺陷的第一现场往往就是一句没人会去读的注释。**
+#[tokio::test]
+async fn a_fated_moment_persists_its_state_and_does_not_end_the_world() {
+    let _sp = FatedSpacing::set("1"); // chapterOrder 1 → due_at 1，第 2 拍就到点
+    let state = test_state().await;
+    let tpl = "tpl-fated-step";
+    // 走真实路径：模板骨架带 chapterOrder → 冷启动时种成 due_at。
+    let skeleton = json!({
+        "mainlineNodes": [
+            { "id": "mn-banquet", "summary": "宴会开席", "fated": true, "constraint": "hard",
+              "chapterOrder": 1, "atLocation": "宴会厅" },
+            { "id": "n2", "summary": "后面还有", "fated": false, "constraint": "soft" }
+        ],
+        "forbiddenPredicates": [],
+        "identityPool": standard_identity_pool(),
+    });
+    sqlx::query(
+        "INSERT INTO world_templates (id, title, room_type, skeleton_json, admission_json, official, version, moderation, created_at) \
+         VALUES ($1, '宿命步模板', 'idle', $2, '{\"mode\":\"open\"}', 1, 1, 'approved', $3)",
+    )
+    .bind(tpl)
+    .bind(skeleton.to_string())
+    .bind(now_ms())
+    .execute(&state.db)
+    .await
+    .unwrap();
+    seed_model_routes(&state.db, "test-routes").await;
+    seed_user(&state.db, "uA").await;
+    seed_user(&state.db, "uB").await;
+    seed_char(&state.db, "chA", "uA", "李").await;
+    seed_char(&state.db, "chB", "uB", "王").await;
+    let mut p = CreateWorldParams::official(tpl, 1, "宿命步世界");
+    p.status = Some("running".into());
+    p.model_route_version = Some("test-routes".into());
+    p.prompt_set_version = Some("test-prompts".into());
+    p.member_limit = 10;
+    p.daily_token_budget = 1_000_000;
+    p.daily_cny_budget_cents = 0;
+    let wid = create_world(&state.db, p).await.unwrap();
+    seed_member(&state.db, &wid, "uA", "chA").await;
+    seed_member(&state.db, &wid, "uB", "chB").await;
+    sqlx::query("UPDATE worlds SET timeline_mode='event' WHERE id=$1")
+        .bind(&wid)
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    let mock = || -> Arc<dyn ModelClient> {
+        Arc::new(CapturingMock { decide_prompts: Arc::new(std::sync::Mutex::new(Vec::new())) })
+    };
+    // 连跑几拍，直到宿命时刻到点。⚠️ 不断言「第几拍」——那取决于 DES 的选时，
+    // 钉死拍号会让这条用例变成对调度实现的断言，而它要守的是**落定之后发生了什么**。
+    let mut fated_tick: Option<i64> = None;
+    for tick in 0..6i64 {
+        insert_tick(&state.db, &wid, tick, tick).await.unwrap();
+        let st = process_tick_with_model(&state, &wid, tick, mock()).await.unwrap();
+        if st == TickStatus::Skipped("fated") {
+            fated_tick = Some(tick);
+            break;
+        }
+    }
+    assert!(fated_tick.is_some(), "🔴 六拍之内宿命时刻没有到点——这条用例失去了守护对象");
+
+    // 🔴 世界还活着——宿命时刻不是终局。
+    let status = text_one(&state.db, "SELECT status FROM worlds WHERE id=$1", &wid).await;
+    assert_eq!(status, "running", "🔴 一个宿命时刻把世界收尾了");
+
+    // 🔴 新状态回灌了：那个节点已经 done，且世界层留了痕。
+    let raw = text_one(&state.db, "SELECT narrative_state_json FROM worlds WHERE id=$1", &wid).await;
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let node = v["narrative"]["outlineNodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["id"] == "mn-banquet")
+        .unwrap_or_else(|| panic!("宿命节点应还在，实际状态：{raw}"));
+    assert_eq!(node["status"], json!("done"), "🔴 宿命节点没有落定回库——下一拍它会重演：{raw}");
+    assert!(
+        v["world"].get("fated_mn-banquet").is_some(),
+        "🔴 世界层的痕迹没回灌——「即使没人在场这件事也发生过」就落空了：{raw}"
+    );
+}
+
+/// `MUSE_FATED_TICK_SPACING` 的进程级 RAII 夹具（同 `DeathmatchSwitch` 范式）。
+struct FatedSpacing {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    prev: Option<String>,
+}
+
+impl FatedSpacing {
+    fn set(v: &str) -> Self {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("MUSE_FATED_TICK_SPACING").ok();
+        std::env::set_var("MUSE_FATED_TICK_SPACING", v);
+        Self { _guard: guard, prev }
+    }
+}
+
+impl Drop for FatedSpacing {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(v) => std::env::set_var("MUSE_FATED_TICK_SPACING", v),
+            None => std::env::remove_var("MUSE_FATED_TICK_SPACING"),
+        }
+    }
+}

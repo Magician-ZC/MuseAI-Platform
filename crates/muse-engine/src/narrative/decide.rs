@@ -67,6 +67,14 @@ const DNA_VIEW_INCLUDE: &[&str] = &[
 /// ⚠️ 真实值应当在有真实模型账单之后再调，本仓至今一次真实模型调用都没发生过。
 const MEMORY_WINDOW: usize = 12;
 
+/// 宿命预告的提前量（游戏时间单位）。默认 `10 × DEFAULT_DURATION` = 十个动作的余量。
+///
+/// ⚠️ 取值的两难写在这里：**太短来不及赶路**（跨地点移动本身要花时间），
+/// **太长会让角色长期挂着一件还早的事**，而那会挤掉当下的戏。
+/// 十个动作是拍脑袋的——真实值要等有了「宿命在场率」这个指标之后再调
+/// （`slo::narrative_slo` 的 `fatedPresenceRate`，那正是量这件事的）。
+const FATED_NOTICE_LEAD: i64 = 10 * super::DEFAULT_DURATION;
+
 /// 明确**不进**角色可见上下文的卡字段：存储/版本元数据与证据索引。
 /// 与 [`DNA_VIEW_INCLUDE`] 的并集必须恰好等于卡的全部字段（用例钉住）。
 const DNA_VIEW_EXCLUDE: &[&str] =
@@ -279,6 +287,62 @@ pub fn assemble_visible_context(
                     "recent": memory,
                     "note": "这是你在这个世界里做过的事和它们的结果，按发生先后排列（只有你自己的，别人的你不知道）。\
 它是你的记忆，不是命令——你可以记着教训、可以耿耿于怀、也可以照旧我行我素，怎么用由你的性格决定。",
+                }),
+            );
+        }
+    }
+
+    // 10) 宿命将至（2026-07-30）：**某地即将有大事**，公开信息，全员同一份。
+    //
+    // ══════════════════════════════════════════════════════════════════════════
+    // 🔴 它补的是「支线通向主线」这套设计最硬的那个副作用
+    // ══════════════════════════════════════════════════════════════════════════
+    // 把 100 个角色散到支线上之后，主线**到点照样发生**（宿命时刻不等人），
+    // 但很可能**一个人都不在场**——那件事对所有人就只是「听说」，
+    // 比没有这件事更糟：世界演了一场没有观众的戏。
+    //
+    // 🔵 对策不是把人拽过去（那会剥夺角色自主，而「内核决定行为」是这套系统的地基），
+    // 而是**让所有人知道**——就像剧场不会把观众拽进宴会厅，它会把请柬发到每个人手上。
+    // 去不去、来不来得及、要不要放下手里那条线索，由角色自己的性格决定。
+    //
+    // 🔴 **公开、全员同一份**：宿命是世界层的既成安排，不按角色分发。
+    // 按角色分发会立刻造出「谁消息灵通谁占便宜」这条差异通道（同 `ambient` 的理由）。
+    //
+    // 🔴 **不是判定输入**：纯展示层。引擎里没有任何判定读它——
+    // 宿命节点的落定只看 `due_at`（`run_event_step` 2a 段），与角色知不知道毫无关系。
+    //
+    // 退化：没有任何带 `due_at` 的节点（老模板、老存档、interval 模式）→ 该字段完全不出现，
+    // 产物与本段落地前逐字节一致。确定性：纯读已定序的 `outline_nodes`，无随机。
+    let upcoming: Vec<Value> = state
+        .narrative
+        .outline_nodes
+        .iter()
+        .filter(|n| n.status == super::types::NodeStatus::Pending)
+        .filter_map(|n| n.due_at.map(|due| (n, due)))
+        .filter(|(_, due)| {
+            let left = due - state.timeline.now;
+            (0..=FATED_NOTICE_LEAD).contains(&left)
+        })
+        .map(|(n, due)| {
+            let mut item = json!({ "what": n.summary, "inAbout": due - state.timeline.now });
+            if let Some(loc) = n.at_location.as_deref().filter(|l| !l.is_empty()) {
+                item["where"] = json!(loc);
+            }
+            item
+        })
+        .collect();
+    if !upcoming.is_empty() {
+        if let Some(obj) = ctx.as_object_mut() {
+            obj.insert(
+                "aboutToHappen".to_string(),
+                json!({
+                    "events": upcoming,
+                    "note": "这些事就要发生了，**到时候不会等任何人**——你在不在场，它都会发生。\
+所有人都知道这件事（这不是只有你有的消息）。\
+`where` 是它发生的地方（没有就是到处都感觉得到），`inAbout` 是大概还有多久。\
+在场意味着你亲历它、可以介入；不在场就只能事后听说。\
+要不要放下手里的事赶过去，由你自己决定——赶过去不会让你更容易成功，\
+不去也不会受任何惩罚。",
                 }),
             );
         }

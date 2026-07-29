@@ -301,7 +301,111 @@ fn validate_superset(skeleton: &Value) -> Result<(), String> {
     }
 
     validate_gate_reachability(skeleton)?;
+    validate_gate_locality(skeleton)?;
 
+    Ok(())
+}
+
+/// 🔴 **给主线开门的支线，地点必须与那条主线连得上。**
+///
+/// ══════════════════════════════════════════════════════════════════════════
+/// 这一条守的是「支线通向主线」最硬的那个副作用
+/// ══════════════════════════════════════════════════════════════════════════
+/// 把 100 个角色散到支线上之后，主线**到点照样发生**（宿命时刻不等人），
+/// 但如果那些支线都在城外、而宴会在城里，开场那一刻**一个人都不在场**——
+/// 那件事对所有人就只是「听说」。**一个「宴会开场了而 100 个玩家全在别的楼里做支线」的世界，
+/// 比没有宴会更糟。**
+///
+/// 🔵 对策是空间的，不是逻辑的：支线要**通向**主线地点，而不是远离——
+/// 那正是《新世界》一万平米实景里那些楼梯的作用。
+///
+/// ⚠️ **只核对「给这扇门开路的支线」**，不核对全部支线：一条与主线无关的支线爱在哪就在哪，
+/// 那是世界的宽度，不是缺陷。判据落在「它产出的事实被某扇门读了」这个连接上。
+///
+/// ⚠️ **任一端没绑地点就跳过**：主线不绑地点 = 全员视作在场（引擎的退化语义）；
+/// 支线不绑地点 = 到处都能做。两种情况都谈不上「连不上」。
+fn validate_gate_locality(skeleton: &Value) -> Result<(), String> {
+    let nodes = match skeleton.get("mainlineNodes").and_then(Value::as_array) {
+        Some(n) => n,
+        None => return Ok(()),
+    };
+    // 地点连通图（无向：connections 单边声明即视作可通行，与装配层同口径）。
+    let mut adj: std::collections::BTreeMap<&str, std::collections::BTreeSet<&str>> = Default::default();
+    if let Some(locs) = skeleton.get("locations").and_then(Value::as_array) {
+        for l in locs {
+            let Some(id) = l.get("id").and_then(Value::as_str) else { continue };
+            adj.entry(id).or_default();
+            for c in l.get("connections").and_then(Value::as_array).into_iter().flatten() {
+                if let Some(to) = c.as_str() {
+                    adj.entry(id).or_default().insert(to);
+                    adj.entry(to).or_default().insert(id);
+                }
+            }
+        }
+    }
+    if adj.is_empty() {
+        return Ok(()); // 无地点维度的世界（退化为单一场景）：谈不上连不上。
+    }
+    let reachable = |from: &str, to: &str| -> bool {
+        if from == to {
+            return true;
+        }
+        let (mut seen, mut stack) = (std::collections::BTreeSet::new(), vec![from]);
+        while let Some(cur) = stack.pop() {
+            if !seen.insert(cur) {
+                continue;
+            }
+            if cur == to {
+                return true;
+            }
+            for nx in adj.get(cur).into_iter().flatten() {
+                stack.push(nx);
+            }
+        }
+        false
+    };
+
+    // 「产出这个事实的支线」→ (池名, id, 地点)。
+    let mut producers: Vec<(&str, &str, &str, String)> = Vec::new();
+    for pool_name in ["hiddenContentPool", "sideHookPool"] {
+        let Some(pool) = skeleton.get(pool_name).and_then(Value::as_array) else { continue };
+        for item in pool {
+            let id = item.get("id").and_then(Value::as_str).unwrap_or("(缺 id)");
+            let at = item.get("atLocation").and_then(Value::as_str).unwrap_or("").trim();
+            for f in item.get("producesWorldFacts").and_then(Value::as_array).into_iter().flatten() {
+                if let Some(k) = f.get("key").and_then(Value::as_str) {
+                    producers.push((pool_name, id, at, k.trim().to_string()));
+                }
+            }
+        }
+    }
+
+    for n in nodes {
+        let Some(expr) = n.get("advanceWhen").and_then(Value::as_str) else { continue };
+        let node_loc = n.get("atLocation").and_then(Value::as_str).unwrap_or("").trim();
+        if node_loc.is_empty() {
+            continue; // 主线不绑地点 → 全员视作在场，无所谓远近。
+        }
+        let id = n.get("id").and_then(Value::as_str).unwrap_or("(缺 id)");
+        let Ok(branches) = muse_engine::narrative::constraints::gate_branches(expr) else { continue };
+        for (key, _) in branches.into_iter().flatten() {
+            for (pool_name, hook_id, hook_loc, produced_key) in &producers {
+                if produced_key != &key || hook_loc.is_empty() {
+                    continue;
+                }
+                if reachable(hook_loc, node_loc) {
+                    continue;
+                }
+                return Err(format!(
+                    "{pool_name} `{hook_id}` 在 `{hook_loc}`，它给 mainlineNodes `{id}`（在 `{node_loc}`）开门，\n\
+                     但这两个地点**走不通**。\n\
+                     🔴 后果：主线到点照样发生（宿命时刻不等人），而做这条支线的人赶不过去——\n\
+                     那场戏会在没有观众的情况下演完，对所有人都只是「听说」。\n\
+                     修法：把支线挪到走得通的地方，或者在 locations 里补上连接。"
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1107,6 +1211,95 @@ mod tests {
             "endingPool": [ { "id": "end-1", "arcTags": ["arc-1"] } ],
             "sampling": { "instanceStorylineCount": 1, "instanceHiddenCount": 1, "redundancyRatio": 3.0 }
         });
+        assert!(super::validate_superset(&sk).is_ok());
+    }
+
+    /// 带地点的骨架：主线在 `node_loc`，支线在 `hook_loc`，地点图由 `links` 给出。
+    fn skeleton_with_locations(node_loc: &str, hook_loc: &str, links: Value) -> Value {
+        json!({
+            "sourceWork": { "sourceId": "s", "title": "t" },
+            "isSuperset": true,
+            "storylines": [ { "id": "arc-1", "mainlineNodeIds": ["mn-1"], "hiddenPoolIds": ["hc-1"], "endingIds": ["end-1"] } ],
+            "mainlineNodes": [ { "id": "mn-1", "fated": true, "arcTags": ["arc-1"],
+                                 "atLocation": node_loc, "advanceWhen": "world.密道位置已知 == true" } ],
+            "hiddenContentPool": [ { "id": "hc-1", "arcTags": ["arc-1"], "atLocation": hook_loc,
+                                     "producesWorldFacts": [{ "key": "密道位置已知" }] } ],
+            "endingPool": [ { "id": "end-1", "arcTags": ["arc-1"] } ],
+            "locations": links,
+            "sampling": { "instanceStorylineCount": 1, "instanceHiddenCount": 1, "redundancyRatio": 3.0 }
+        })
+    }
+
+    /// 🔴 **给主线开门的支线，必须与主线地点连得上。**
+    ///
+    /// 这是「支线通向主线」最硬的那个副作用：主线到点照样发生（宿命时刻不等人），
+    /// 而做支线的人赶不过去 ⇒ 那场戏在没有观众的情况下演完。
+    /// **一个「宴会开场了而 100 个玩家全在别的楼里」的世界，比没有宴会更糟。**
+    #[test]
+    fn a_side_quest_that_opens_a_gate_must_be_reachable_from_it() {
+        // 城外 ↔ 城门 ↔ 宴会厅：连得上。
+        let ok = skeleton_with_locations(
+            "宴会厅",
+            "城外",
+            json!([
+                { "id": "宴会厅", "connections": ["城门"] },
+                { "id": "城门", "connections": ["城外"] },
+                { "id": "城外", "connections": [] }
+            ]),
+        );
+        assert!(super::validate_superset(&ok).is_ok(), "走得通就该放行");
+
+        // 孤岛：走不通。
+        let bad = skeleton_with_locations(
+            "宴会厅",
+            "海外孤岛",
+            json!([
+                { "id": "宴会厅", "connections": [] },
+                { "id": "海外孤岛", "connections": [] }
+            ]),
+        );
+        let err = super::validate_superset(&bad).unwrap_err();
+        assert!(err.contains("走不通"), "要说清是连通性问题：{err}");
+        assert!(err.contains("没有观众"), "要说清后果，否则作者不知道这有多严重：{err}");
+    }
+
+    /// 任一端不绑地点 → 跳过：主线不绑 = 全员视作在场；支线不绑 = 到处都能做。
+    #[test]
+    fn an_unanchored_end_is_not_a_locality_problem() {
+        for (node_loc, hook_loc) in [("", "海外孤岛"), ("宴会厅", "")] {
+            let sk = skeleton_with_locations(
+                node_loc,
+                hook_loc,
+                json!([{ "id": "宴会厅", "connections": [] }, { "id": "海外孤岛", "connections": [] }]),
+            );
+            assert!(super::validate_superset(&sk).is_ok(), "不绑地点谈不上连不上：{node_loc}/{hook_loc}");
+        }
+    }
+
+    /// ⚠️ **只核对「给这扇门开路的支线」**——一条与主线无关的支线爱在哪就在哪。
+    ///
+    /// 那是世界的宽度，不是缺陷。判据落在「它产出的事实被某扇门读了」这个连接上。
+    #[test]
+    fn a_side_quest_unrelated_to_any_gate_may_live_anywhere() {
+        let mut sk = skeleton_with_locations(
+            "宴会厅",
+            "宴会厅",
+            json!([{ "id": "宴会厅", "connections": [] }, { "id": "海外孤岛", "connections": [] }]),
+        );
+        // 再加一条与任何门无关的支线，扔在孤岛上。
+        sk["hiddenContentPool"] = json!([
+            { "id": "hc-1", "arcTags": ["arc-1"], "atLocation": "宴会厅",
+              "producesWorldFacts": [{ "key": "密道位置已知" }] },
+            { "id": "hc-2", "arcTags": ["arc-1"], "atLocation": "海外孤岛" }
+        ]);
+        sk["storylines"][0]["hiddenPoolIds"] = json!(["hc-1", "hc-2"]);
+        assert!(super::validate_superset(&sk).is_ok(), "与主线无关的支线不该被地点校验管");
+    }
+
+    /// 无地点维度的世界（退化为单一场景）：整条校验跳过，逐字节不变。
+    #[test]
+    fn a_world_without_locations_is_untouched_by_locality() {
+        let sk = skeleton_with_locations("宴会厅", "海外孤岛", json!([]));
         assert!(super::validate_superset(&sk).is_ok());
     }
 

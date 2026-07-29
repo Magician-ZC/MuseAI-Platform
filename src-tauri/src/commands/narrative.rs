@@ -158,6 +158,10 @@ pub async fn start_narrative_round(app: AppHandle, request: RoundRequestDto) -> 
             // 🔴 这一条不是「暂时不接」：烙印之所以能兑现「复刻内核也复刻不了这张卡」，
             // 正是因为它不在本地那份可导出的卡 JSON 里。本地能读到它的那天，它就失效了。
             worldline_imprints: BTreeMap::new(),
+            // 私有线索（per-character 钩子的投放）：钩子是**平台装配器**的产物
+            // （按入场卡的执念从预审核内容池里挑、参数化、过机审），本地模式没有装配这一步，
+            // 故恒空——引擎对空表的处理是「追加函数根本不被调到」，可见上下文逐字节不变。
+            personal_threads: BTreeMap::new(),
         };
         let result = engine.run_round(&routes, &prompts, input, &flag).await;
         let payload = match &result {

@@ -62,7 +62,7 @@ pub async fn synthesize_mainline(
 \"advanceWhen\":\"world.密道位置已知 == true\"}}],\
 \"hiddenContentPool\":[{{\"id\":\"hc-1\",\"themes\":[\"复仇\"],\"template\":\"{{name}}发现{{seed}}\",\
 \"rewardItemRef\":\"itm-xxx\",\"variantGroup\":\"vg-1\",\"arcTags\":[\"arc-1\"],\
-\"producesWorldFacts\":[{{\"key\":\"密道位置已知\",\"value\":true}}]}}],\
+\"atLocation\":\"loc-xxx\",\"producesWorldFacts\":[{{\"key\":\"密道位置已知\",\"value\":true}}]}}],\
 \"sideHookPool\":[{{\"id\":\"sh-1\",\"themes\":[],\"template\":\"...\",\"arcTags\":[\"arc-1\"]}}],\
 \"storylines\":[{{\"id\":\"arc-1\",\"summary\":\"...\",\"mainlineNodeIds\":[\"mn-1\"],\"hiddenPoolIds\":[\"hc-1\"],\
 \"endingIds\":[\"end-1\"],\"affinity\":\"combat\"}}]}}\n\
@@ -80,7 +80,10 @@ chapterOrder：**只给 fated=true 的节点**，表示这件事在原著里排�
   \"world.密道位置已知 == true || world.正门令牌已到手 == true\"）。\
   **务必给关键主线节点写成多条路**——只有一条路时，没走那条支线的人会卡死在这里，而现场没有人能放水。\n\
 - 🔴 advanceWhen 引用的每一个 key，都**必须**有某条支线的 producesWorldFacts 产出它。\
-  引用一个没人产出的 key，那扇门就永远打不开，而这个世界看起来一切正常。",
+  引用一个没人产出的 key，那扇门就永远打不开，而这个世界看起来一切正常。\n\
+- atLocation：支线发生在哪个地点（用 locations 里的 id）。\
+  🔴 **给主线开门的那些支线，地点要与主线地点连得上**（同一处，或经 connections 走得到）——\
+  不然主线到点开演时，做支线的人全在别的楼里，那场戏没有观众。不绑地点的支线留空即可。",
         title = source_title,
         list = list,
         items = item_ids,

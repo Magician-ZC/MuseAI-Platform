@@ -255,6 +255,7 @@ mod tests {
             reward_item_ref: reward.map(String::from),
             variant_group: vg.map(String::from),
             arc_tags: vec![],
+            at_location: String::new(),
             produces_world_facts: vec![],
         }
     }

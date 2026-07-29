@@ -340,7 +340,7 @@ pub enum Terminal {
 /// 调度器单步返回（P2 DES，Phase 1）：让 server 知道「推进到哪个游戏时刻、哪些角色动了、是否终局」。
 #[derive(Debug)]
 pub struct EventStep {
-    /// 本步 `run_round` 结果；终局短路（未跑回合）时为 None。
+    /// 本步 `run_round` 结果；**未跑回合**时为 None（两类：终局短路 / 宿命步，见 [`Self::fated_fired`]）。
     pub outcome: Option<RoundOutcome>,
     /// 本步激活的 cohort（角色 id，字典序确定）。
     pub activated: Vec<String>,
@@ -348,6 +348,26 @@ pub struct EventStep {
     pub at_time: i64,
     /// 终局信号；非终局为 None。
     pub terminal: Option<Terminal>,
+    /// 本步**落定的宿命节点 id**（到点就发生的原著大事，2a 段）。非空即「这一步真的改了世界」。
+    ///
+    /// ══════════════════════════════════════════════════════════════════════════
+    /// 🔴 这个字段是补一个**接缝缺陷**：`outcome: None` 曾经只意味着「什么都没发生」
+    /// ══════════════════════════════════════════════════════════════════════════
+    /// 宿命时刻落地时，2a 段也走了 `outcome: None` 出口——它**跑完了一整段世界变更**
+    /// （节点翻 Done、写 `world.fated_<id>`、给每个角色记下亲历/听说），只是没跑角色回合。
+    /// 而宿主那头对 `outcome: None` 的既有理解是「终局短路，无状态可提交」，于是：
+    ///
+    /// 1. **新状态不回灌 DB** ⇒ 下一拍从库里回灌旧状态，那个节点又变回 Pending ⇒
+    ///    同一件原著大事**每拍重演一次**，而且世界层的痕迹每次都被冲掉；
+    /// 2. 更糟：宿主那条分支只看 `endgame_policy.enabled && tick >= 地板`，**不看 `terminal` 是不是 Some**
+    ///    ⇒ 过了地板之后，**任何一个宿命时刻都会把世界直接收尾**——「宴会开席」= 剧终。
+    ///
+    /// 两条都不会报错、不会告警。非空的 `fated_fired` 让宿主能把这一步与终局短路区分开。
+    ///
+    /// 🔵 这类缺陷的形状叫**接缝**：一个既有信号多了一个新的产生方，
+    /// 而消费方的假设**悄悄地**不再成立（`run_event_step` 的文档注释里那句
+    /// 「`outcome: None` 只有两个出口」当时就已经过期了，只是没人会去读注释来发现 bug）。
+    pub fated_fired: Vec<String>,
 }
 
 pub struct NarrativeEngine {
@@ -960,6 +980,7 @@ impl NarrativeEngine {
                 activated: Vec::new(),
                 at_time: state.timeline.now,
                 terminal: Some(t),
+                fated_fired: Vec::new(), // 真·终局短路：没跑任何东西
             });
         }
 
@@ -1024,6 +1045,12 @@ impl NarrativeEngine {
                 activated: Vec::new(),
                 at_time: t,
                 terminal,
+                // 🔴 非空 = 这一步**真的改了世界**（节点翻 Done + 世界层留痕 + 每个角色的记忆），
+                // 只是没跑角色回合。宿主必须据此把它与「终局短路」区分开，见字段注释。
+                fated_fired: fated_now
+                    .iter()
+                    .filter_map(|(i, ..)| new_state.narrative.outline_nodes.get(*i).map(|n| n.id.clone()))
+                    .collect(),
             });
         }
 
@@ -1037,6 +1064,7 @@ impl NarrativeEngine {
                 activated: Vec::new(),
                 at_time: t,
                 terminal: Some(Terminal::Starved),
+                fated_fired: Vec::new(), // 无角色可调度：同样没跑任何东西
             });
         }
 
@@ -1092,6 +1120,7 @@ impl NarrativeEngine {
             activated: cohort,
             at_time: t,
             terminal,
+            fated_fired: Vec::new(),
         })
     }
 }
@@ -2174,6 +2203,17 @@ mod tests {
                 advance_when: None,
                 weights: None, due_at: None, at_location: None,
             });
+        }
+        NarrativeStore::new(host.fs.clone()).init(&s).unwrap();
+    }
+
+    /// 与 `init_run` 同款，但种入若干带宿命时刻的主线节点。
+    fn init_run_with_fated(host: &EngineHost, run_id: &str, nodes: &[(&str, i64, &str, &str)]) {
+        let mut s = NarrativeState { schema_version: 1, run_id: run_id.into(), ..Default::default() };
+        s.characters.insert("li".into(), CharacterState::default());
+        s.characters.insert("wang".into(), CharacterState::default());
+        for (id, due, loc, summary) in nodes {
+            s.narrative.outline_nodes.push(fated_node(id, *due, loc, summary));
         }
         NarrativeStore::new(host.fs.clone()).init(&s).unwrap();
     }
@@ -3926,6 +3966,84 @@ mod tests {
         let ctx = decide::append_worldline_imprints("{}", &["他退过一次".to_string()]).unwrap();
         for must in ["不让你更强", "不提高任何成功率", "不给你豁免或特权", "不决定你现在该怎么做"] {
             assert!(ctx.contains(must), "🔴 说明里少了这句显式否认：「{must}」\n{ctx}");
+        }
+    }
+
+    // ===== 宿命将至：预告（2026-07-30，第 6 步） =====
+
+    /// 🔴 **主线要发生了，所有人都得知道——否则 100 个人散在支线上，那场戏就没有观众。**
+    ///
+    /// 把角色推到支线上之后，主线**到点照样发生**（宿命时刻不等人），但很可能一个人都不在场，
+    /// 那件事对所有人就只是「听说」——比没有这件事更糟。
+    /// 🔵 对策不是把人拽过去（那会剥夺角色自主），而是让所有人知道：
+    /// 剧场不会把观众拽进宴会厅，它会把请柬发到每个人手上。
+    #[tokio::test]
+    async fn everyone_gets_word_that_something_is_about_to_happen() {
+        let model = Arc::new(CapturingModel::new(two_char_script()));
+        let host = host_capturing(model.clone());
+        let engine = NarrativeEngine::new(host.clone());
+        // 现在 0，宴会在 300（提前量之内）；另有一件还早的（9000，不该预告）。
+        init_run_with_fated(
+            host.as_ref(),
+            "run-1",
+            &[("mn-banquet", 300, "宴会厅", "大浦三郎的宴会开席"), ("mn-far", 9000, "码头", "很久以后的接头")],
+        );
+        let input = round_input("run-1", big_budget());
+        engine.run_round(&routes(), &prompts(), input, &CancelFlag::new()).await.unwrap();
+
+        for cid in ["li", "wang"] {
+            let ctx = decide_ctx_json(&model.decide_prompt_of(cid));
+            let s = ctx["aboutToHappen"].to_string();
+            assert!(s.contains("宴会开席"), "🔴 {cid} 没收到请柬：{ctx}");
+            assert!(s.contains("宴会厅"), "地点必须给出——不然赶都不知道往哪赶：{s}");
+            assert!(!s.contains("很久以后"), "还早的事不该现在就挂上，那会挤掉当下的戏：{s}");
+        }
+        // 🔴 全员同一份：按角色分发会造出「谁消息灵通谁占便宜」这条差异通道。
+        let a = decide_ctx_json(&model.decide_prompt_of("li"))["aboutToHappen"].clone();
+        let b = decide_ctx_json(&model.decide_prompt_of("wang"))["aboutToHappen"].clone();
+        assert_eq!(a, b, "🔴 宿命预告必须全员同一份");
+    }
+
+    /// 🔴 **没有宿命节点的世界（老模板、老存档、interval 模式）：这一格完全不出现。**
+    #[tokio::test]
+    async fn a_world_without_fated_moments_shows_no_notice() {
+        let model = Arc::new(CapturingModel::new(two_char_script()));
+        let host = host_capturing(model.clone());
+        init_run(host.as_ref(), "run-1", true);
+        let engine = NarrativeEngine::new(host.clone());
+        engine
+            .run_round(&routes(), &prompts(), round_input("run-1", big_budget()), &CancelFlag::new())
+            .await
+            .unwrap();
+        assert!(
+            decide_ctx_json(&model.decide_prompt_of("li")).get("aboutToHappen").is_none(),
+            "无宿命节点时不得出现这一格"
+        );
+    }
+
+    /// 措辞必须说清三件事：**不等人**、**在场才亲历**、**赶过去不给优势**。
+    ///
+    /// 第三条是平权红线在这里的落点：预告是让角色**知道**，不是给赶到的人发奖励。
+    /// 少了它，模型会把「赶到现场」演成一种正确答案，而这套系统的地基是内核决定行为。
+    #[test]
+    fn the_notice_says_it_waits_for_nobody_and_grants_nothing() {
+        let mut st = NarrativeState { schema_version: 1, run_id: "run-1".into(), ..Default::default() };
+        st.characters.insert("li".into(), CharacterState::default());
+        st.narrative.outline_nodes = vec![fated_node("mn-1", 120, "宴会厅", "宴会开席")];
+        let ctx = decide::assemble_visible_context(
+            &st,
+            "li",
+            &cards()["li"],
+            &BTreeMap::new(),
+            "场景",
+            &[],
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        for must in ["不会等任何人", "所有人都知道", "不会让你更容易成功", "不会受任何惩罚"] {
+            assert!(ctx.contains(must), "🔴 预告说明里少了这句：「{must}」\n{ctx}");
         }
     }
 

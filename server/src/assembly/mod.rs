@@ -680,6 +680,12 @@ struct PoolItem {
     /// 归属的 storyline id 集（arcTags）：命中被选 storyline 即入采样候选。
     #[serde(default)]
     arc_tags: Vec<String>,
+    /// **这条支线发生在哪个地点**（`locations[].id`）。空 = 不绑地点，不参与连通核对。
+    ///
+    /// 🔴 见 `assets::worlds::validate_gate_locality`：给主线开门的支线，
+    /// 地点必须与那条主线的地点连得上——不然主线到点开演时，做支线的人全在别的楼里。
+    #[serde(default)]
+    at_location: String,
     /// **这条支线了结之后，世界上会多出的事实**（`world.<key> = <value>`）。
     ///
     /// 🔵 这是「支线通向主线」的那半条链：主线节点的 `advanceWhen` 谓词
@@ -1896,6 +1902,8 @@ fn merge_fragment(target: &mut Skeleton, card: &ContainerCard, item_tier_cap: u8
         reward_item: p.reward_item.as_ref().map(|it| cap_item(it, cid, item_tier_cap)),
         variant_group: p.variant_group.as_deref().map(|g| ns(cid, g)).filter(|s| !s.is_empty()),
         arc_tags: ns_all(cid, &p.arc_tags),
+        // 地点同样命名空间化（与 locations[].id 的重写口径一致）。
+        at_location: if p.at_location.trim().is_empty() { String::new() } else { ns(cid, &p.at_location) },
         // 🔴 **产出的世界事实键同样要命名空间化。**
         // 不改的话，两张副本卡各自产出 `world.密道位置已知` 会串台；更糟的是一张卡的支线
         // 能满足**本体主线**的推进门——那是跨卡越界，与 id/variantGroup 必须命名空间化
@@ -3017,6 +3025,7 @@ pub(crate) const POOL_ITEM_KEYS: &[&str] = &[
     "rewardItem",
     "variantGroup",
     "arcTags",
+    "atLocation",
     "producesWorldFacts",
 ];
 

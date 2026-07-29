@@ -1646,12 +1646,56 @@ fn parse_realm_costume(assembled_json: Option<&str>) -> Option<RealmCostume> {
 /// | `terminal` | `run_event_step` 返回 `outcome: None` | 见下 |
 ///
 /// `terminal` 这一条是唯一需要读引擎才能确认的：`run_event_step`（`narrative/mod.rs`）里
-/// `outcome: None` 只有两个出口——① 开头 `is_terminal(&state)` 命中；② `select_cohort` 空
-/// （`Starved`）。两者都在调用 `run_round` **之前** `return`，而 `is_terminal` / `select_cohort`
-/// 都是对 `NarrativeState` 的纯读函数，不碰 `host.model`。故这一拍确实一个 token 都没烧。
+/// `outcome: None` 有**三个**出口——① 开头 `is_terminal(&state)` 命中；② `select_cohort` 空
+/// （`Starved`）；③ **宿命步**（2a 段，`fated_fired` 非空）。三者都在调用 `run_round` **之前**
+/// `return`，不碰 `host.model`，故这一拍确实一个 token 都没烧。
+///
+/// ⚠️ **但第 ③ 类不是 noop**：它跑完了一整段世界变更（节点翻 Done + 世界层留痕 + 每人的记忆），
+/// 必须回灌状态、且**绝不能**被当成终局。调用方按 `step.fated_fired` 先行分流，
+/// 走到本函数时 note 记 `"fated"` 而不是 `"terminal"`——两者在运维上要能分得开。
+/// 🔵 这段注释此前写的是「只有两个出口」，而宿命时刻落地那一刻它就已经过期了。
+/// **接缝缺陷的第一现场往往就是一句没人会去读的注释。**
 ///
 /// **反例在下面**：`blocked` 拍走 `finish_tick_blocked`，因为引擎已经跑完整个回合。
 /// 把两者混在同一个「noop」里，正是 #42 的成因。
+/// 宿命步的状态回灌：把引擎刚落定的状态写回 `worlds`（CAS on `state_revision`）。
+///
+/// 🔴 **它刻意不走 `commit_tick`**：那一套是为「跑过角色回合」的拍准备的
+/// （事件投影 / 贡献归因 / 结算 / 日报），而宿命步没有 decisions、没有 outcomes、没有场景。
+/// 硬套过去只会喂给它一堆空集合，然后在下游产生一串「本拍 0 条事件」的噪声记录。
+/// 这里只做真正发生了的那三件事：**状态、时钟、revision**。
+///
+/// 返回 `false` = CAS 落空（这一拍已被更早的 tick 处理），调用方按 cas_conflict 收尾。
+async fn persist_fated_step(
+    db: &AnyPool,
+    world_id: &str,
+    engine: &NarrativeEngine,
+    run_id: &str,
+    base_revision: i64,
+    game_time: i64,
+) -> Result<bool, ApiError> {
+    // 引擎已把新状态写进它自己的 FS（`persist_timeline`）；这里读回那一份**唯一事实源**，
+    // 而不是在服务端凭 step 的字段重建——重建等于第二份实现，两边迟早漂开。
+    let state = muse_engine::narrative::state::NarrativeStore::new(engine.host.fs.clone())
+        .load(run_id)
+        .map_err(ApiError::internal)?;
+    let json = serde_json::to_string(&state).map_err(ApiError::internal)?;
+    let now = now_ms();
+    let cas = sqlx::query(
+        "UPDATE worlds SET narrative_state_json=$1, state_revision=$2, game_time=$3, updated_at=$4 \
+         WHERE id=$5 AND state_revision=$6",
+    )
+    .bind(&json)
+    .bind(base_revision + 1)
+    .bind(game_time)
+    .bind(now)
+    .bind(world_id)
+    .bind(base_revision)
+    .execute(db)
+    .await?;
+    Ok(cas.rows_affected() > 0)
+}
+
 async fn finish_tick_noop(
     db: &AnyPool,
     world_id: &str,
@@ -2816,6 +2860,44 @@ async fn process_tick_inner(
                     let terminal = step.terminal;
                     match step.outcome {
                         Some(outcome) => Ok((outcome, terminal)),
+                        // 🔴 **宿命步不是终局短路。** 见下。
+                        None if !step.fated_fired.is_empty() => {
+                            // ══════════════════════════════════════════════════════════
+                            // 这一段修的是一个**接缝缺陷**（2026-07-30）
+                            // ══════════════════════════════════════════════════════════
+                            // 宿命时刻（`run_event_step` 2a 段）也走 `outcome: None` 出口——
+                            // 它**跑完了一整段世界变更**（节点翻 Done、写 `world.fated_<id>`、
+                            // 给每个角色记下亲历/听说），只是没跑角色回合。
+                            // 而下面那条既有分支对 `outcome: None` 的理解是「终局短路，无状态可提交」，
+                            // 于是宿命时刻落地之后同时踩了两个坑：
+                            //
+                            // 1. **新状态不回灌 DB** ⇒ 下一拍 `build_seed_state` 从库里回灌旧状态，
+                            //    那个节点又变回 Pending ⇒ 同一件原著大事**每拍重演一次**，
+                            //    而世界层的痕迹每次都被冲掉；
+                            // 2. 更糟：那条分支**不看 `terminal` 是不是 Some**，只看
+                            //    `endgame_policy.enabled && tick >= 地板` ⇒ 过了地板之后，
+                            //    **任何一个宿命时刻都会把世界直接收尾**——「宴会开席」= 剧终。
+                            //
+                            // 两条都不报错、不告警。`fated_fired` 非空让这一步能被认出来。
+                            //
+                            // 处理：把新状态原样回灌（本步无回合 ⇒ 无 decisions/outcomes/事件投影，
+                            // 也就不走 `commit_tick` 那一整套；只需状态 + 时钟 + revision 的 CAS），
+                            // 然后按**零成本的正常拍**收尾——它确实一个 token 都没烧，但它**发生了事**。
+                            let fired = step.fated_fired.join(",");
+                            match persist_fated_step(db, world_id, &engine, &run_id, base_revision, step.at_time)
+                                .await?
+                            {
+                                true => {
+                                    tracing::info!(world_id, tick_no, fated = %fired, "宿命时刻落定，状态已回灌");
+                                    finish_tick_noop(db, world_id, tick_no, Some("fated")).await?;
+                                    return Ok(TickStatus::Skipped("fated"));
+                                }
+                                false => {
+                                    finalize_cas_conflict(&state.db, world_id, tick_no).await?;
+                                    return Ok(TickStatus::Skipped("cas_conflict"));
+                                }
+                            }
+                        }
                         None => {
                             // 终局短路：run_event_step 起始即判终局，无状态可提交（无回合）。消费终局信号（P1 Phase 0）：
                             // policy.enabled 且过终局地板 → end_world 停机（无 CAS，单独事务原子结算）；否则保持 running

@@ -300,6 +300,102 @@ fn validate_superset(skeleton: &Value) -> Result<(), String> {
         }
     }
 
+    validate_gate_reachability(skeleton)?;
+
+    Ok(())
+}
+
+/// 🔴 **「支线通向主线」这套设计唯一的静默失败点：一扇没有人能打开的门。**
+///
+/// ══════════════════════════════════════════════════════════════════════════
+/// 失败长什么样
+/// ══════════════════════════════════════════════════════════════════════════
+/// 主线节点写了 `advanceWhen: world.密道位置已知 == true`，而**没有任何一条支线**
+/// 的 `producesWorldFacts` 会产出 `密道位置已知`（拼错一个字、改了措辞、那条支线后来被删掉）。
+/// 于是那扇门**永远打不开**——而世界照常发布、照常开、照常跑、照常结算，
+/// **没有任何报错、没有任何日志**。玩家只会觉得「这条主线卡住了」，
+/// 而没有任何人能从现象反推到那个拼错的字。
+///
+/// 这与 `forbiddenPredicates` 曾经的失败形状**完全一样**（语法拼错 → 整条约束被静默丢弃，
+/// 世界照常开，只是那条不变量从来没生效过），而那一个是靠上面那段语法校验补上的。
+/// 这一个语法是对的，**只有指向是空的**——语法校验看不见它。
+///
+/// ══════════════════════════════════════════════════════════════════════════
+/// 判据方向：**在有人的时候拒绝，而不是在没人的时候静默**
+/// ══════════════════════════════════════════════════════════════════════════
+/// 这里 400 一次，作者当场就能改；漏到运行时就是一个永远不会有人发现的缺口。
+///
+/// ⚠️ **按 `(key, value)` 成对比，不只比 key**：门写 `world.x == "opened"` 时，
+/// 一条产出 `world.x = true` 的支线**不满足**它——只比 key 会放过这种「看起来接上了、
+/// 实际值对不上」的情况，而那正是最难查的一种。
+///
+/// ⚠️ **只核对世界事实那一类**：关系谓词（`relations[a->b].trust > 0.5`）与角色谓词
+/// 由叙事自然驱动，没有「谁产出它」这个概念（`referenced_world_keys` 已把它们排除）。
+/// 一扇只依赖关系的门是完全合法的。
+fn validate_gate_reachability(skeleton: &Value) -> Result<(), String> {
+    let nodes = match skeleton.get("mainlineNodes").and_then(Value::as_array) {
+        Some(n) => n,
+        None => return Ok(()),
+    };
+
+    // 全部支线能产出的 (key, value) 集合。两个池都算——支线钩子与隐藏内容都是「支线」。
+    let mut produced: Vec<(String, Value)> = Vec::new();
+    for pool_name in ["hiddenContentPool", "sideHookPool"] {
+        let Some(pool) = skeleton.get(pool_name).and_then(Value::as_array) else { continue };
+        for item in pool {
+            let Some(facts) = item.get("producesWorldFacts").and_then(Value::as_array) else {
+                continue;
+            };
+            for f in facts {
+                let Some(key) = f.get("key").and_then(Value::as_str).map(str::trim) else { continue };
+                // 非法键在这里就拒：它永远写不进世界，那条痕迹等于不存在。
+                if let Err(msg) = crate::assembly::validate_world_fact_key(key) {
+                    let id = item.get("id").and_then(Value::as_str).unwrap_or("(缺 id)");
+                    return Err(format!("{pool_name} `{id}`：{msg}"));
+                }
+                produced.push((key.to_string(), f.get("value").cloned().unwrap_or(Value::Bool(true))));
+            }
+        }
+    }
+
+    for n in nodes {
+        let Some(expr) = n.get("advanceWhen").and_then(Value::as_str) else { continue };
+        let id = n.get("id").and_then(Value::as_str).unwrap_or("(缺 id)");
+        // 语法已在上面拦过；这里解析失败按「无门」处理，不重复报同一件事。
+        let Ok(branches) = muse_engine::narrative::constraints::gate_branches(expr) else {
+            continue;
+        };
+        // 🔴 **任一条路通即可**，不是「每条路都要通」。
+        // 后者会把「多给一条备用路」变成一种负担，而多给备用路恰恰是我们希望作者做的事——
+        // 没有 DM 兜底时，单路门会让没走那条支线的人卡死（总规格 §12 与提案 §4.2）。
+        let open = branches.iter().any(|b| match b {
+            None => true, // 关系 / 角色谓词：由叙事自然驱动，永远算「有路」
+            Some((k, v)) => produced.iter().any(|(pk, pv)| pk == k && pv == v),
+        });
+        if open {
+            continue;
+        }
+        // 走到这里 = 每一条路都走不通。逐条说清是哪种错法——「拼错了」和「值对不上」
+        // 要各自能被认出来，否则作者只知道「不通」，不知道差在哪。
+        let mut why: Vec<String> = Vec::new();
+        for (key, value) in branches.into_iter().flatten() {
+            let same_key: Vec<String> =
+                produced.iter().filter(|(k, _)| k == &key).map(|(_, v)| v.to_string()).collect();
+            why.push(if same_key.is_empty() {
+                format!("`{key}`：没有任何一条支线会产出它（拼错了？那条支线被删了？）")
+            } else {
+                format!("`{key}`：有支线产出这个 key，但值对不上——门要 {value}，支线给的是 [{}]", same_key.join(", "))
+            });
+        }
+        return Err(format!(
+            "mainlineNodes `{id}` 的 advanceWhen **每一条路都走不通**：\n  {}\n\
+             🔴 这扇门永远打不开，而世界会照常发布、照常跑、照常结算，没有任何报错——\n\
+             玩家只会觉得「这条主线卡住了」，没有人能从现象反推到这里。\n\
+             修法三选一：给某条支线加上 producesWorldFacts 产出它；把这个引用从 advanceWhen 里去掉；\n\
+             或者用 `||` 再给一条别的路（推荐——单路门会让没走那条支线的人卡死）。",
+            why.join("\n  ")
+        ));
+    }
     Ok(())
 }
 
@@ -905,6 +1001,113 @@ mod tests {
             updated_at: 0,
         };
         serde_json::to_value(card).unwrap()
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // 支线通向主线：门的可达性（第 5 步，唯一的静默失败点）
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// 造一个「主线有门、支线有产出」的最小骨架。
+    fn skeleton_with_gate(gate: &str, produces: Value) -> Value {
+        json!({
+            "sourceWork": { "sourceId": "s", "title": "t" },
+            "isSuperset": true,
+            "storylines": [ { "id": "arc-1", "mainlineNodeIds": ["mn-1"], "hiddenPoolIds": ["hc-1"], "endingIds": ["end-1"] } ],
+            "mainlineNodes": [ { "id": "mn-1", "fated": true, "arcTags": ["arc-1"], "advanceWhen": gate } ],
+            "hiddenContentPool": [ { "id": "hc-1", "arcTags": ["arc-1"], "producesWorldFacts": produces } ],
+            "endingPool": [ { "id": "end-1", "arcTags": ["arc-1"] } ],
+            "sampling": { "instanceStorylineCount": 1, "instanceHiddenCount": 1, "redundancyRatio": 3.0 }
+        })
+    }
+
+    /// 🔴 **一扇没有人能打开的门必须在建模板期被拒。**
+    ///
+    /// 这是「支线通向主线」这套设计**唯一的静默失败点**：门引用了一个没有任何支线会产出的
+    /// 世界事实 ⇒ 那扇门永远打不开，而世界照常发布、照常开、照常跑、照常结算，
+    /// **没有任何报错**。玩家只会觉得「这条主线卡住了」，没有人能从现象反推到那个拼错的字。
+    ///
+    /// 与 `forbiddenPredicates` 曾经的失败形状完全一样——只是那一个是**语法**错，
+    /// 这一个**语法完全正确、只有指向是空的**，语法校验看不见它。
+    #[test]
+    fn a_gate_nobody_can_open_is_rejected_at_authoring_time() {
+        let sk = skeleton_with_gate("world.密道位置已知 == true", json!([{ "key": "别的事实" }]));
+        let err = super::validate_superset(&sk).unwrap_err();
+        assert!(err.contains("密道位置已知"), "报错要点名是哪个事实：{err}");
+        assert!(err.contains("永远打不开"), "报错要说清后果，否则作者不知道这有多严重：{err}");
+        assert!(err.contains("没有任何一条支线会产出它"), "要区分「拼错了」这一种错法：{err}");
+    }
+
+    /// 🔴 **按 `(key, value)` 成对比，不只比 key。**
+    ///
+    /// 门要 `world.x == "opened"`，而支线产出 `world.x = true` —— 只比 key 会放过这种
+    /// 「看起来接上了、实际值对不上」的情况，而那是最难查的一种（作者会以为已经接好了）。
+    #[test]
+    fn a_gate_whose_value_does_not_match_is_rejected_too() {
+        let sk = skeleton_with_gate("world.门 == \"opened\"", json!([{ "key": "门", "value": true }]));
+        let err = super::validate_superset(&sk).unwrap_err();
+        assert!(err.contains("值对不上"), "要区分「值对不上」这一种错法：{err}");
+        assert!(err.contains("opened"), "报错要给出门要的值：{err}");
+    }
+
+    /// 接上号的门放行；两个池都算（隐藏内容与支线钩子都是「支线」）。
+    #[test]
+    fn a_gate_that_some_side_quest_can_open_passes() {
+        let ok = skeleton_with_gate("world.密道位置已知 == true", json!([{ "key": "密道位置已知" }]));
+        assert!(super::validate_superset(&ok).is_ok(), "接上号的门不该被拦");
+        // 产出在 sideHookPool 里同样算。
+        let mut from_side = ok.clone();
+        from_side["hiddenContentPool"] = json!([{ "id": "hc-1", "arcTags": ["arc-1"] }]);
+        from_side["sideHookPool"] =
+            json!([{ "id": "sh-1", "arcTags": ["arc-1"], "producesWorldFacts": [{ "key": "密道位置已知" }] }]);
+        assert!(super::validate_superset(&from_side).is_ok(), "支线钩子池的产出同样算");
+    }
+
+    /// 🔴 **析取门只要有一条路通就放行**——这正是「没有 DM」那条约束要的效果。
+    ///
+    /// ⚠️ 这一条与上面那条是**成对**的：只拦「一条都不通」，不拦「有一条不通」。
+    /// 反过来（要求每条路都通）会把「多给一条备用路」变成一种负担，
+    /// 而多给备用路正是我们希望作者做的事。
+    #[test]
+    fn a_gate_with_one_open_branch_passes_even_if_another_branch_is_dead() {
+        let sk = skeleton_with_gate(
+            "world.走不通的路 == true || world.密道位置已知 == true",
+            json!([{ "key": "密道位置已知" }]),
+        );
+        assert!(
+            super::validate_superset(&sk).is_ok(),
+            "🔴 只要有一条路通就该放行——否则「多给一条备用路」会变成一种负担"
+        );
+    }
+
+    /// 只依赖关系/角色的门是完全合法的：它们由叙事自然驱动，没有「谁产出它」这个概念。
+    #[test]
+    fn a_gate_that_depends_only_on_relations_needs_no_producer() {
+        let sk = skeleton_with_gate("relations[a->b].trust > 0.5", json!([]));
+        assert!(super::validate_superset(&sk).is_ok(), "关系门不该被要求有产出方");
+    }
+
+    /// 非法的世界事实键在建模板期就拒：它永远写不进世界，那条痕迹等于不存在。
+    #[test]
+    fn an_illegal_world_fact_key_is_rejected() {
+        let sk = skeleton_with_gate("relations[a->b].trust > 0.5", json!([{ "key": "a.b" }]));
+        let err = super::validate_superset(&sk).unwrap_err();
+        assert!(err.contains("hiddenContentPool `hc-1`"), "报错要点名是哪条支线：{err}");
+        assert!(err.contains("永远写不进世界"), "要说清后果：{err}");
+    }
+
+    /// 没有门的骨架（全部存量模板）一律放行——这一层是纯增量。
+    #[test]
+    fn a_skeleton_without_any_gate_is_untouched() {
+        let sk = json!({
+            "sourceWork": { "sourceId": "s", "title": "t" },
+            "isSuperset": true,
+            "storylines": [ { "id": "arc-1", "mainlineNodeIds": ["mn-1"], "hiddenPoolIds": ["hc-1"], "endingIds": ["end-1"] } ],
+            "mainlineNodes": [ { "id": "mn-1", "fated": true, "arcTags": ["arc-1"] } ],
+            "hiddenContentPool": [ { "id": "hc-1", "arcTags": ["arc-1"] } ],
+            "endingPool": [ { "id": "end-1", "arcTags": ["arc-1"] } ],
+            "sampling": { "instanceStorylineCount": 1, "instanceHiddenCount": 1, "redundancyRatio": 3.0 }
+        });
+        assert!(super::validate_superset(&sk).is_ok());
     }
 
     /// 完整道具目录条目（对齐 server `admission::ItemDefinition`，全字段无 default，须显式给全）。

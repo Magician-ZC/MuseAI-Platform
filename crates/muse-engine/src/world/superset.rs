@@ -232,6 +232,7 @@ mod tests {
             variant_group: vg.map(String::from),
             arc_tags: vec![],
             chapter_order: None,
+            advance_when: None,
         }
     }
     /// 宿命节点 + 模型给的原始 `chapterOrder`（**故意用章号量级**，见归一函数的注释）。
@@ -242,6 +243,7 @@ mod tests {
             variant_group: None,
             arc_tags: vec![],
             chapter_order: raw_order,
+            advance_when: None,
         }
     }
     fn pool(id: &str, reward: Option<&str>, vg: Option<&str>) -> PoolItemDraft {
@@ -253,6 +255,7 @@ mod tests {
             reward_item_ref: reward.map(String::from),
             variant_group: vg.map(String::from),
             arc_tags: vec![],
+            produces_world_facts: vec![],
         }
     }
     fn item(id: &str) -> ItemDraft {

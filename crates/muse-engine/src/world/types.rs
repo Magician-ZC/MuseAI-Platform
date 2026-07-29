@@ -242,6 +242,38 @@ pub struct MainlineNodeDraft {
     /// 数值稠密重排成 1..K（见 `normalize_chapter_order`）。原因见那个函数的注释。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chapter_order: Option<i64>,
+    /// **推进门**：这个主线节点还需要什么条件才能翻过去（受限谓词 DSL，支持 `A || B` 析取）。
+    ///
+    /// 🔵 「支线通向主线」的那半条链就在这里：写 `world.<key> == <字面量>`，
+    /// 而那个 `key` 由某条支线的 `producesWorldFacts` 留下。
+    /// 于是「完成支线 → 主线更轻松」不是一个新机制，是这两个字段对上号。
+    ///
+    /// 🔴 **悬空的门（引用了没有任何支线能产出的事实）在这里刻意不丢弃、不修补。**
+    /// 丢弃会把模型的错误藏起来，产出一个「能跑但没有作者本意那条链」的模板；
+    /// 那正是 `forbiddenPredicates` 吃过的亏（拼错一个键 → 整条约束被静默丢掉，
+    /// 世界照常开，只是那条约束从来没生效过）。**正门在发布期**：
+    /// `assets::worlds::validate_superset` 直接 400，作者当场看得见、当场能改。
+    ///
+    /// `None` ⇒ 无门（只看 `threshold` 累积），与本字段落地前逐字节一致。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advance_when: Option<String>,
+}
+
+/// 一条支线了结后留下的世界事实（对齐 server `assembly::WorldFactSpec`）。
+///
+/// 🔴 `key` 必须是**合法的世界键**：非空、不含 `.` 与 `[`（引擎 `reducer::parse_path` 的口径）。
+/// 非法键会让这条痕迹永远落不了地，而支线看起来做完了——由发布期校验直接拒。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorldFactDraft {
+    pub key: String,
+    /// 变成什么。缺省 `true`——绝大多数事实是「发生过 / 知道了 / 拿到了」这类布尔。
+    #[serde(default = "fact_true")]
+    pub value: serde_json::Value,
+}
+
+fn fact_true() -> serde_json::Value {
+    serde_json::Value::Bool(true)
 }
 
 /// 内容池条目（对齐 server `assembly::PoolItem` + 超集采样元数据）。
@@ -258,6 +290,11 @@ pub struct PoolItemDraft {
     /// 通关兑现的隐藏道具对 worldItems 目录的引用。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reward_item_ref: Option<String>,
+    /// **这条支线了结之后，世界上会多出的事实**（`world.<key> = <value>`）。
+    /// 主线节点的 [`MainlineNodeDraft::advance_when`] 读的正是这里留下的东西。
+    /// 空 = 这条支线不改变世界，只是一段各自的戏（绝大多数支线的形态）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub produces_world_facts: Vec<WorldFactDraft>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub variant_group: Option<String>,
     #[serde(default)]

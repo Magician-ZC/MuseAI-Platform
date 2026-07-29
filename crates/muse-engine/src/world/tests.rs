@@ -73,13 +73,16 @@ fn char_synth() -> String {
 fn plot_synth() -> String {
     r#"{
         "mainlineNodes":[
-            {"id":"mn-1","fated":true,"chapterOrder":12,"variantGroup":"vg-trial","arcTags":["arc-revenge"]},
+            {"id":"mn-1","fated":true,"chapterOrder":12,"variantGroup":"vg-trial","arcTags":["arc-revenge"],
+             "advanceWhen":"world.剑冢秘密已知 == true || world.谢云身份已揭穿 == true"},
             {"id":"mn-2","fated":false,"chapterOrder":40,"variantGroup":"vg-trial","arcTags":["arc-revenge"]},
             {"id":"mn-3","fated":false,"arcTags":["arc-revenge"]}
         ],
         "hiddenContentPool":[
-            {"id":"hc-1","themes":["复仇"],"template":"{name}发现{seed}","rewardItemRef":"itm-fenji","variantGroup":"vg-secret","arcTags":["arc-revenge"]},
-            {"id":"hc-2","themes":["背叛"],"template":"{name}遭遇{seed}","variantGroup":"vg-secret","arcTags":["arc-revenge"]}
+            {"id":"hc-1","themes":["复仇"],"template":"{name}发现{seed}","rewardItemRef":"itm-fenji","variantGroup":"vg-secret","arcTags":["arc-revenge"],
+             "producesWorldFacts":[{"key":"剑冢秘密已知"}]},
+            {"id":"hc-2","themes":["背叛"],"template":"{name}遭遇{seed}","variantGroup":"vg-secret","arcTags":["arc-revenge"],
+             "producesWorldFacts":[{"key":"谢云身份已揭穿","value":true}]}
         ],
         "sideHookPool":[{"id":"sh-1","themes":[],"template":"支线钩子","arcTags":["arc-revenge"]}],
         "storylines":[{"id":"arc-revenge","summary":"复仇线","mainlineNodeIds":["mn-1","mn-2","mn-3"],"hiddenPoolIds":["hc-1","hc-2"],"endingIds":["end-1"],"affinity":"combat"}]
@@ -183,6 +186,28 @@ async fn full_pipeline_produces_world_superset() {
     assert_eq!(draft.mainline_nodes[1].variant_group, Some("vg-trial".to_string()));
     assert_eq!(draft.mainline_nodes[2].variant_group, None); // 未分组
     assert_eq!(draft.hidden_content_pool[0].variant_group, Some("vg-secret".to_string()));
+    // 🔴 **支线通向主线**：这条链必须真的从管线里出来，两端都在。
+    //
+    // ⚠️ 这一条端到端断言的是「产物里有」，不是「产物对」——「引用的 key 真的有人产出」
+    // 那一半在**发布期**（`assets::worlds::validate_superset`）拦，理由见
+    // `MainlineNodeDraft::advance_when` 的注释：悬空的门在这里刻意不丢弃、不修补，
+    // 丢弃会把模型的错误藏起来，产出一个「能跑但没有作者本意那条链」的模板。
+    let gate = draft.mainline_nodes[0].advance_when.as_deref().expect("宿命节点应带推进门");
+    assert!(gate.contains("||"), "🔴 关键主线必须是多条路——只有一条路时没走那条支线的人会卡死：{gate}");
+    let facts: Vec<&str> = draft
+        .hidden_content_pool
+        .iter()
+        .flat_map(|p| p.produces_world_facts.iter().map(|f| f.key.as_str()))
+        .collect();
+    assert!(facts.contains(&"剑冢秘密已知"), "支线的产出必须留在产物里：{facts:?}");
+    assert!(facts.contains(&"谢云身份已揭穿"), "第二条路同样：{facts:?}");
+    for key in &facts {
+        assert!(gate.contains(*key), "🔴 支线产出的 `{key}` 没有任何主线门在读它——那条链是断的");
+    }
+    // 缺省 value 为 true；显式给的原样保留。
+    let f0 = &draft.hidden_content_pool[0].produces_world_facts[0];
+    assert_eq!(f0.value, serde_json::json!(true), "value 缺省应是 true");
+
     // chapterOrder：模型给的是章号（12/40），产出必须是归一后的宿命序号，且只落在宿命节点上。
     // 🔴 这条守着「主线遵循原著」这一整条链的**上游**——runtime 那头
     // （`chapter_order_becomes_a_fated_moment_on_the_timeline`）一直在测「有 chapterOrder 就变 due_at」，

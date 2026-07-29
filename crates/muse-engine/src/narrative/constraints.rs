@@ -215,6 +215,34 @@ pub fn parse_predicate(expression: &str) -> Result<(), EngineError> {
     parse_gate(expression).map(|_| ())
 }
 
+/// 这道推进门的**每一条路**分别依赖什么：`Some((key, value))` = 依赖一条世界事实；
+/// `None` = 由叙事自然驱动（关系 / 角色谓词），没有「谁产出它」这回事。
+///
+/// ══════════════════════════════════════════════════════════════════════════
+/// 🔴 它存在的唯一理由：让**发布期**能回答「这扇门有没有人能打开」
+/// ══════════════════════════════════════════════════════════════════════════
+/// 主线门引用了一个**没有任何支线能产出**的世界事实 ⇒ 那条路永远走不通；
+/// 若**所有**路都走不通，那扇门就永远打不开，而世界照常开、照常跑、照常结算，
+/// **没有任何报错**——玩家只会觉得「这主线卡住了」。这是「支线通向主线」这套设计
+/// **唯一的静默失败点**，与 `forbiddenPredicates` 曾经的失败形状完全一样。
+///
+/// 🔴 **按析取项返回，而不是拍平成一张键表。** 拍平之后发布期只能问「每个引用都有产出吗」，
+/// 那会把「多给一条备用路」变成一种负担——而多给备用路恰恰是我们希望作者做的事
+/// （没有 DM 兜底时，单路门会让没走那条支线的人卡死）。正确的判据是**任一条路通即可**。
+/// ⚠️ 这个错法是被 `a_gate_with_one_open_branch_passes_even_if_another_branch_is_dead`
+/// 当场抓出来的——第一版正是拍平的。
+///
+/// 表达式非法 → `Err`（调用方那边语法校验先行，这里不重复报）。
+pub fn gate_branches(expression: &str) -> Result<Vec<Option<(String, Value)>>, EngineError> {
+    Ok(parse_gate(expression)?
+        .into_iter()
+        .map(|p| match p {
+            Predicate::WorldEq { key, value } => Some((key, value)),
+            _ => None,
+        })
+        .collect())
+}
+
 /// 求值：状态命中谓词返回 true。表达式非法 → Validation；引用的实体缺失视为「未命中」（false）。
 ///
 /// 多个析取项时**任一命中即 true**，且**短路**：前一条成立就不再算后面的。
@@ -516,6 +544,26 @@ mod tests {
     fn conjunction_is_deliberately_unsupported() {
         let e = parse_predicate("world.x == true && world.y == true").unwrap_err();
         assert_eq!(e.code(), "validation", "`&&` 必须被拒，而不是被当成某种意思悄悄接受");
+    }
+
+    /// 🔴 **按析取项返回，不拍平。**
+    ///
+    /// 拍平之后发布期只能问「每个引用都有产出吗」，那会把「多给一条备用路」变成负担——
+    /// 而多给备用路恰恰是我们希望作者做的事。正确的判据是**任一条路通即可**。
+    #[test]
+    fn gate_branches_are_returned_per_path_not_flattened() {
+        let got = gate_branches(
+            "world.密道位置已知 == true || relations[li->wang].trust > 0.5 || world.门 == \"opened\"",
+        )
+        .unwrap();
+        assert_eq!(got.len(), 3, "三条路就是三项，不合并、不去重");
+        assert_eq!(got[0], Some(("密道位置已知".to_string(), json!(true))));
+        assert_eq!(got[1], None, "关系谓词由叙事驱动，没有「谁产出它」这回事");
+        assert_eq!(got[2], Some(("门".to_string(), json!("opened"))));
+        // 单条世界谓词 → 一项。
+        assert_eq!(gate_branches("world.x == true").unwrap(), vec![Some(("x".to_string(), json!(true)))]);
+        // 纯关系门 → 一项 None（完全合法：这扇门不依赖任何支线）。
+        assert_eq!(gate_branches("relations[a->b].trust > 0.5").unwrap(), vec![None]);
     }
 
     #[test]

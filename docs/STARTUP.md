@@ -219,7 +219,7 @@ cd server && MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo ru
 
 ## 7. 冒烟验证
 
-全绿基线(**校验于 2026-07-29（第四轮：气运机缘改回角色级——产品退回了我把它做成世界级的那一版）**,数字随开发增长——对不上先确认是新增测试还是漏跑):
+全绿基线(**校验于 2026-07-29（第五轮：支线通向主线六步 + 三个真 bug）**,数字随开发增长——对不上先确认是新增测试还是漏跑):
 
 > ⚠️ **2026-07-29 有两次反向变动,记在这里免得被误判成「测试跑挂了」**:
 > ① 服务端从 1137 降到 1100 —— **`memorial` 整块删除**带走了它自己的 1475 行测试
@@ -238,13 +238,13 @@ cd server && MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo ru
 
 ```bash
 # 引擎 + 后端 + 桌面壳
-cargo test --manifest-path crates/muse-engine/Cargo.toml          # 333 passed
+cargo test --manifest-path crates/muse-engine/Cargo.toml          # 348 passed
 # 🔵 真实 provider 冒烟（**恒 #[ignore]，绝不进 CI**）：本仓 2026-07-28 之前一次真实模型调用都没发生过
 #    key 只从 env 读，不落盘、不进仓库、不进日志
 # MUSE_SMOKE_API_KEY=sk-... MUSE_SMOKE_BASE_URL=https://api.deepseek.com/v1 MUSE_SMOKE_MODEL=deepseek-chat \
 #   cargo test --manifest-path crates/muse-engine/Cargo.toml real_provider -- --ignored --nocapture
-(cd server && cargo test)                                          # 1155 passed(default,含黄金世界回归)
-(cd server && cargo test --features billing,arena)                 # 1239 passed
+(cd server && cargo test)                                          # 1178 passed(default,含黄金世界回归)
+(cd server && cargo test --features billing,arena)                 # 1262 passed
 (cd server && cargo test --features billing)                       # 1200 passed（CI 不跑，2026-07-29 手验）
 (cd server && cargo test --features arena)                         # 1229 passed（同上）
 (cd server && cargo test golden)                                   # 15 passed(13 项 runtime::golden::* + 2 项录放 round-trip)

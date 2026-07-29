@@ -272,9 +272,9 @@ const CharacterArchive: React.FC = () => {
           <Space direction="vertical" size={12} style={{ width: '100%' }}>
             {[
               { key: 'fortune', name: '气运', axis: data.life.swing.fortune, color: '#b07a4a',
-                what: '这个世界的事有多两极——可能捡到不该捡的，也可能撞上不该撞的' },
+                what: '找上你的事有多两极——可能捡到不该捡的，也可能撞上不该撞的' },
               { key: 'opportunity', name: '机缘', axis: data.life.swing.opportunity, color: '#5b8266',
-                what: '主线间隙里的事有多密' },
+                what: '事多久找上你一次' },
             ].map(({ key, name, axis, color, what }) => {
               const capped = axis.nextAt === null;
               // 档内进度：(点数 − 本档门槛) / (下一档门槛 − 本档门槛)。顶档恒 100%。
@@ -310,9 +310,9 @@ const CharacterArchive: React.FC = () => {
           </Space>
 
           <Paragraph type="secondary" style={{ fontSize: 12, marginTop: 12, marginBottom: 0 }}>
-            {data.life.swing.howItGrows}两个数都作用于<Text strong style={{ fontSize: 12 }}>世界</Text>
-            、同房所有人共享，不改变任何产出上限，也不让任何人更容易赢——比较两张卡看的是
-            「它们会把世界变成什么样」，不是「谁更强」。
+            {data.life.swing.howItGrows}两个数都只作用于<Text strong style={{ fontSize: 12 }}>这张卡自己</Text>
+            ，不改变任何产出上限（这一局最多有几件好东西，在你入场之前就定死了），也不让你更容易赢——
+            比较两张卡看的是「它们会遇到什么样的事」，不是「谁更强」。
           </Paragraph>
         </Card>
       )}

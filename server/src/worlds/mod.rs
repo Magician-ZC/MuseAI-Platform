@@ -1087,6 +1087,46 @@ async fn join_world(
         return Err(ApiError::Conflict("同一世界每位用户仅可投放一张角色卡".into()));
     }
 
+    // ---------- 一卡一世界（2026-07-29 定）----------
+    //
+    // 🔴 **一张卡在同一时刻只能在一个世界里。** 这一条是「角色卡永不损失」模型下**唯一还剩的节流阀**。
+    //
+    // 为什么需要它：卡零损失、退场即可再投，于是玩家的最优策略会变成**广撒网**——
+    // 同一张卡同时投进 N 个世界，反正不亏。现有防刷面（采样使收益不可预测）挡的是
+    // 「刷同一条高收益路径」，**挡不住这种并发铺开**：每个世界的收益都是真的，只是各不相同。
+    //
+    // 为什么是这一条而不是别的：
+    // - 它是「这张卡此刻正在那个世界里活着」这个直觉的**直接编码**，不是外加的配额；
+    // - 它让**即时退场**真正有价值——退场不只是省时间，它**释放了卡**；
+    // - 它与既有卡位制（`users.card_slots`，默认 3、历练解锁至 6）相乘，
+    //   得到「**同时可探索的世界数 ≤ 卡位数**」，而那正是产品要的那条闸。
+    //   ⇒ 并发上限**不需要新参数**：卡位已经是它，且已经参数化、已经可解锁。
+    //
+    // 口径与上面两条资格校验一致：只数 `status='active'`（已退场的不占），排除本卡自身
+    // （同卡重复 join / 复活走下方幂等与复活分支，行为不回退）。
+    //
+    // 取舍说明（体例同上两条）：不加条件唯一索引——「一张卡按 status='active' 全局唯一」
+    // 同样需要带 WHERE 的部分唯一索引，不在双库可移植子集内。应用层校验覆盖正常路径；
+    // 并发窗口下同一张卡理论上可在两个世界各落一行 active，且**这一条的撞车后果比上面两条重**
+    // （那张卡会在两个世界同时被推演）。故此处**不只报错，还带上是哪个世界**，让玩家能自己去退场
+    // ——一个说不清「我卡在哪」的拒绝，会变成客服工单。
+    let occupied: Option<(String, String)> = sqlx::query_as(
+        "SELECT w.id, w.title FROM world_members wm \
+         JOIN worlds w ON w.id = wm.world_id \
+         WHERE wm.cloud_character_id = $1 AND wm.status = 'active' AND wm.world_id != $2 \
+         ORDER BY wm.world_id ASC LIMIT 1",
+    )
+    .bind(&body.cloud_character_id)
+    .bind(&id)
+    .fetch_optional(&state.db)
+    .await?;
+    if let Some((busy_world_id, busy_title)) = occupied {
+        return Err(ApiError::Conflict(format!(
+            "这张卡正在「{busy_title}」里。一张卡同一时刻只能在一个世界——\
+             等它在那边的剧本结束，或先让它退场（世界 id：{busy_world_id}）"
+        )));
+    }
+
     // 已有成员记录（唯一键 world+character）：active 直接幂等返回；left/retired 复活。
     let existing = sqlx::query(
         "SELECT id, status FROM world_members WHERE world_id = $1 AND cloud_character_id = $2",

@@ -581,7 +581,10 @@ async fn join_low_star_worlds_skip_mileage_gate() {
     let state = test_state().await;
     let app = build_router(state.clone());
     seed_user(&state, "usrS").await;
+    // 两张卡：本用例要投两个世界，而「一张卡同一时刻只能在一个世界」（2026-07-29）会拦下
+    // 同卡二投。用两张卡是**正确的夹具**——被测的是星级门槛，不是并发占用。
     seed_char(&state, "chS", "usrS", "approved", 0).await; // mileage 默认 0
+    seed_char(&state, "chS2", "usrS", "approved", 0).await;
     let ts = token(&state, "usrS");
 
     seed_star_template(&state, "tpl_s2", 2).await;
@@ -594,7 +597,7 @@ async fn join_low_star_worlds_skip_mileage_gate() {
     let w_ghost =
         create_world(&state.db, CreateWorldParams::official("tpl_ghost", 1, "无模板世界")).await.unwrap();
     let (st, body) =
-        post_json(&app, &format!("/api/worlds/{w_ghost}/join"), &ts, None, json!({ "cloudCharacterId": "chS" })).await;
+        post_json(&app, &format!("/api/worlds/{w_ghost}/join"), &ts, None, json!({ "cloudCharacterId": "chS2" })).await;
     assert_eq!(st, StatusCode::OK, "模板缺失应按 1★ 免检: {body}");
 }
 
@@ -3091,4 +3094,103 @@ mod be_biography_read {
             get_json(&app, &format!("/api/worlds/{wid}/biography"), &token(&state, "outsider")).await;
         assert_eq!(st_out, StatusCode::FORBIDDEN, "非成员不得读私有世界的传记");
     }
+}
+
+// ---------- 一卡一世界：卡零损失模型下唯一还剩的节流阀（2026-07-29） ----------
+
+/// 一张卡同时只能在一个世界里。
+///
+/// 🔴 这一条不是配额，是「这张卡此刻正在那个世界里活着」这个直觉的直接编码。
+/// 它与既有卡位制（`users.card_slots`）相乘，得到「同时可探索的世界数 ≤ 卡位数」——
+/// 而那正是「角色卡永不损失」模型下唯一还剩的节流阀：卡零损失、退场即可再投，
+/// 若不拦，玩家的最优策略会变成同一张卡广撒网并发铺开，而现有防刷面
+/// （采样使收益不可预测）挡的是「刷同一条路径」，挡不住这个。
+#[tokio::test]
+async fn a_card_can_only_be_in_one_world_at_a_time() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    seed_user(&state, "usrA").await;
+    seed_char(&state, "chA", "usrA", "approved", 0).await;
+    let w1 = create_world(&state.db, CreateWorldParams::official("tpl", 1, "雾海纪")).await.unwrap();
+    let w2 = create_world(&state.db, CreateWorldParams::official("tpl", 1, "燕南篇")).await.unwrap();
+    let ta = token(&state, "usrA");
+
+    let (st, body) = post_json(
+        &app,
+        &format!("/api/worlds/{w1}/join"),
+        &ta,
+        None,
+        json!({ "cloudCharacterId": "chA" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "首个世界应成功: {body}");
+
+    // 同一张卡投第二个世界 → 409，且**必须说清它卡在哪**。
+    let (st2, body2) = post_json(
+        &app,
+        &format!("/api/worlds/{w2}/join"),
+        &ta,
+        None,
+        json!({ "cloudCharacterId": "chA" }),
+    )
+    .await;
+    assert_eq!(st2, StatusCode::CONFLICT, "同卡投第二个世界应 409: {body2}");
+    let msg = body2["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("一张卡同一时刻只能在一个世界"), "文案: {msg}");
+    // 🔴 必须带上占用世界的标识：一个说不清「我卡在哪」的拒绝会直接变成客服工单。
+    assert!(msg.contains("雾海纪"), "必须报出占用它的那个世界的标题: {msg}");
+    assert!(msg.contains(&w1), "必须报出占用它的那个世界的 id: {msg}");
+
+    // 第二个世界零副作用：没落成员行。
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_members WHERE world_id = $1")
+        .bind(&w2)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "被拒的 join 不得落成员行");
+}
+
+/// 反向配对：**退场之后立刻就能投下一个世界**。
+///
+/// 这一条比上一条更重要——它是「即时退场」这个设计的全部意义所在：
+/// 退场释放的不只是时间，是**卡**。若退场后还进不去，这套模型就不成立了。
+#[tokio::test]
+async fn leaving_a_world_immediately_frees_the_card_for_the_next_one() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    seed_user(&state, "usrA").await;
+    seed_char(&state, "chA", "usrA", "approved", 0).await;
+    let w1 = create_world(&state.db, CreateWorldParams::official("tpl", 1, "雾海纪")).await.unwrap();
+    let w2 = create_world(&state.db, CreateWorldParams::official("tpl", 1, "燕南篇")).await.unwrap();
+    let ta = token(&state, "usrA");
+
+    post_json(&app, &format!("/api/worlds/{w1}/join"), &ta, None, json!({ "cloudCharacterId": "chA" })).await;
+    post_json(&app, &format!("/api/worlds/{w1}/leave"), &ta, None, json!({ "cloudCharacterId": "chA" })).await;
+
+    let (st, body) = post_json(
+        &app,
+        &format!("/api/worlds/{w2}/join"),
+        &ta,
+        None,
+        json!({ "cloudCharacterId": "chA" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "退场后应能立刻投下一个世界: {body}");
+}
+
+/// 同一个世界内的重复 join 不受本闸影响（幂等分支照走）。
+#[tokio::test]
+async fn rejoining_the_same_world_is_not_blocked_by_the_one_world_gate() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    seed_user(&state, "usrA").await;
+    seed_char(&state, "chA", "usrA", "approved", 0).await;
+    let wid = create_world(&state.db, CreateWorldParams::official("tpl", 1, "雾海纪")).await.unwrap();
+    let ta = token(&state, "usrA");
+    let uri = format!("/api/worlds/{wid}/join");
+
+    let (st1, _) = post_json(&app, &uri, &ta, None, json!({ "cloudCharacterId": "chA" })).await;
+    assert_eq!(st1, StatusCode::OK);
+    let (st2, body2) = post_json(&app, &uri, &ta, None, json!({ "cloudCharacterId": "chA" })).await;
+    assert_eq!(st2, StatusCode::OK, "同世界重复 join 应走幂等分支而不是被本闸拦下: {body2}");
 }

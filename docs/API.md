@@ -12,7 +12,7 @@
 
 | 模块 | feature | 说明 |
 |---|---|---|
-| auth / assets / worlds / events / interventions / consents / invitations / notifications / reports / backpack / chapters / progression / subplot / memorial / onboarding / annotations / admin_api | 默认 | 默认构建即含 |
+| auth / assets / worlds / events / interventions / consents / invitations / notifications / reports / backpack / chapters / progression / subplot / onboarding / annotations / admin_api | 默认 | 默认构建即含 |
 | arena / livegate | `arena` | 赛事房与直播礼物网关 |
 | billing | `billing` | 计费闭环 |
 | shop | `billing` 或 `arena` | 依赖复式账本，与 ledger 同门控（`app.rs:61`） |
@@ -38,7 +38,7 @@
 `MUSE_ONBOARDING` 控制，**默认关闭 → 404**；`subplot`（副本卡）全部端点**与结算铸卡**由
 `MUSE_SUBPLOT_CARDS` 控制，**默认关闭 → 端点 404 且结算一张不铸**；自定义房容器装配
 （副本卡的消费端，无独立端点）由 `MUSE_CONTAINER_ASSEMBLY` 控制，**默认关闭 → 建模板期拒绝声明
-`subplotCardRefs`，装配期忽略容器字段走原路径**；`memorial`（传世卡 · 遗作馆）全部端点
+`subplotCardRefs`，装配期忽略容器字段走原路径**；~~`memorial`（传世卡 · 遗作馆）全部端点
 **与封卷本身**由 `MUSE_MEMORIAL` 控制，**默认关闭 → 端点 404 且不发生任何封卷**；世界的生死状档由
 `MUSE_LETHALITY_DEATHMATCH` 控制，默认关闭 → 读取侧降级为同意制；`annotations`（OOC 注解权）
 全部端点由 `MUSE_OOC_ANNOTATIONS` 控制，**默认关闭 → 六端点全 404 且一行都不落库**；
@@ -184,7 +184,7 @@
 > （其受众投影隔离与机审门不变，绝不给正文开第二条不过闸的读路径）；足迹只记角色 id 与面具名，
 > 不记 `user_id`（§14 恨隔面具原则——传记是角色的墓志铭，不是真人的花名册）。
 >
-> 与**传世卡**（§12，migration 0034，`memorial/`）是两件事：那是**角色**死后的封卷（遗作馆陈列），
+> ⚠️ 原先此处对比的**传世卡**（§12 旧版）已于 2026-07-29 整块删除；留下这句是因为对比的另一半仍在。旧版那是**角色**死后的封卷（遗作馆陈列），
 > 这是**世界**崩塌后的封卷。两者各自独立建表、互不读写。
 
 ### 错峰调度（migration 0038；总规格 §17【拍板 16】成本工程杠杆①）
@@ -253,7 +253,7 @@
 > 错峰折让只在 `cost.offPeak` 体现，两处**不重复相减**。错峰默认关闭时三列恒为中性值 ⇒ `offPeakTicks=0`、
 > 各比率为真实的 `0.0`、`savedCents=0`，看板显示空态而非报错。
 
-## 4. 玩家账户（me / backpack / progression / subplot / memorial / onboarding / annotations / ifline / reports / notifications）
+## 4. 玩家账户（me / backpack / progression / subplot / onboarding / annotations / ifline / reports / notifications）
 
 | 方法 | 路径 | 鉴权 | 说明 |
 |---|---|---|---|
@@ -380,52 +380,23 @@
 | 确定性 | 合并是纯函数（按模板序遍历、无 RNG）；卡权重乘进该卡各 storyline 的选取权重，**不新开 RNG 子流域**，故既有六个采样域的消费协议一字未动。同 (world_id, 阵容, template_version, 卡集合) 恒得同一份装配 |
 | 审计段 | `assembled_json./assembly/sampling` 新增 `cardSetFingerprint`（哈希，不存明文）+ `selectedCards`，均 `skip_serializing_if` → 非容器实例逐字节不变。**仅服务端/审计可见**，绝不进 members_projection 或日报 |
 
-### 传世卡 · 遗作馆（memorial，migration 0034；总规格 §12【拍板 23】）
+### ~~传世卡 · 遗作馆~~（memorial）—— **2026-07-29 整块删除**
 
-**死亡 = 传记封卷，不是资产清零。** 卡死后转「传世卡」：**只读、入遗作馆陈列、不可再入世界**；
-道具归账户背包；与其有羁绊的**在世**角色获得「故人」印记。
-**内核可复制，履历不可复制**——同内核开新卡 = 转世（双胞胎），不是复活：它没死过那一次。
+四个端点（遗作馆列表 / 传世卡详情 / 封卷 / 悼念）连同模块、迁移 0034 的
+`memorial_marks` 表、`MUSE_MEMORIAL` 开关、结算侧自动封卷、玩家端遗作馆页**已全部移除**。
 
-| 方法 | 路径 | 鉴权 | 说明 |
-|---|---|---|---|
-| GET | `/api/memorial/characters?limit=&offset=` | JWT | 遗作馆陈列（按封卷时刻倒序）。**开关默认关闭** |
-| GET | `/api/memorial/characters/{id}` | JWT | 传世卡详情：累计人生 = 历练 + 传记 + 足迹 + 谁还记得他。在世的卡 404 |
-| GET | `/api/me/memorial/marks` | JWT | 我的角色获得的「故人」印记 |
-| POST | `/api/me/characters/{id}/memorial` | JWT | **封卷**（本模块唯一写端点）。服务端核验死亡公共事实；幂等。`Idempotency-Key` 可选 |
+🔴 删的理由不是「暂时不用」：产品模型于同日改为**角色卡永不损失**——「死亡」只是这张卡在
+**那一个副本**里的剧本结束，退场即可进下一个世界。而 memorial 的全部语义建立在
+「死亡 = 封卷 = 不可再入任何世界」之上，在新模型下它是**错的行为**，留着只要有人打开开关，
+结算就会开始永久锁卡。
 
-| 项 | 取值 |
-|---|---|
-| 运营开关 | `MUSE_MEMORIAL`，**默认关闭**（VALIDATION.md §0.1；死亡属 §2 中 T5 才验证的范围，T0-T2 明写「暂不验证：死亡」）。关闭时四个端点全 404，**且不发生任何封卷**。已封卷的卡不因关阀回到在世——封卷是单向状态转换，不是可开可关的功能，关阀只让它暂时不可见 |
-| 🔴 不可再入世界 | 封卷是**原子双写**：`memorial_status='sealed'`（语义状态 + 幂等 CAS）**与** `withdrawn=1`。后者复用 `worlds::join_world` **既有**的 `withdrawn != 0` 门（→ `character_withdrawn`）——`worlds/mod.rs` **一行未改**。join 的资格查询是列名写死的 SELECT，新列它读不到，故只加新列等于没拦住 |
-| 🔴 withdrawn 必须单向 | 上面那道门成立的前提是全仓不存在把 `cloud_characters.withdrawn` 置回 0 的 SQL（已 grep 核实，并由 `red_line_withdrawn_is_one_way_across_the_repo` 跨 8 个模块源码断言守死）。任何「取消下架」端点都会变成复活侧门 |
-| 🔴 公共事实不可回滚（§0.3） | 封卷**不改写世界线**：不写 `world_events` / `narrative_state_json`，不改 `consent_requests`，不删 `world_members`（足迹是履历）。源码级断言 `red_line_never_rewrites_worldline` |
-| 🔴 故人印记落独立表 | `memorial_marks`，**绝不进 `worlds.narrative_state_json`**——那一列每 tick 经 `build_seed_state` 原样回灌进引擎 `RoundInput.state`，写进去即把记账喂给决策（§0.1 平权红线，口径同 0025 贡献账本 / 0030 critic / 0032 副本卡）。引擎侧零 `memorial` 引用，grep 级断言 |
-| 🔴 无隐藏数值（§12） | 传世卡与印记**不带任何加成/系数/强度**。卡的价值 = 历练 `mileage` + 传记 + 足迹 `world_members` + 羁绊 `memorial_marks`，全是**已存在的显性资产**。`memorial_marks` 只有「谁记得谁、在哪、何时」 |
-| 死亡核验（服务端权威） | **两条证据缺一不可**：(a) `consent_requests` 有 `event_kind='death'` / `status='approved'` 且 subject 含本卡；(b) 该世界 `narrative.pendingConsents` **已不含**本卡的 death 条目（= 引擎已落定并清账）。**授权 ≠ 死亡**：引擎在下一拍才凭 `approved_consents` 落定，只看 (a) 会把活角色误封卷（捏造死亡）。查不到证据 → 409，绝不 fail-open |
-| 幂等 | 两层：① `Idempotency-Key`（同一次点击的 HTTP 重试）；② **DB 状态 CAS**（`WHERE memorial_status='living'`）——抢到才归还道具、才打印记，重复封卷命中 0 行整段短路，`sealed:false` + 两个计数恒 0。印记另有 `memorial_marks(character_id, deceased_character_id)` 唯一键作第二道闸 |
-| 道具归还口径 | §12 原文「道具归账户背包（**道具本为账户资产**）」= **解除携带**（`carried\|sealed → owned`，清 `carried_world_id` 与 S-5 降档覆盖），**不是** `grant_item_tx`。后者是 INSERT 类**发货**路径，对本就在账户里的道具再发一次会凭空多出一行——一次死亡把道具变成两件，违反 §0.2 资产守恒。本模块**绝不 INSERT `backpacks`**（`red_line_never_mints_items` 断言）；背包总行数封卷前后恒等 |
-| 角色面具（§14） | 遗作馆与详情**只出角色维度事实**，不出 `owner_id`/昵称/任何真人身份。遗作馆是角色的墓园，不是玩家名录 |
-| 参数化（§0.2） | `MUSE_MEMORIAL_BOND_MIN`（够得上「故人」的羁绊强度阈值，默认 0.0 = 有关系记录即算；强度 = `max(\|trust\|,\|affinity\|,\|fear\|,\|debt\|)`，**取绝对值**——§12 说的是羁绊不是友谊，宿敌同样成立）· `MUSE_MEMORIAL_PAGE_SIZE`（默认 20，clamp [1,100]） |
-| 转世 | 同内核开新卡走既有 `POST /api/assets/characters`，本模块零特权：新卡新 id、零历练、空传记、无足迹、无印记，不进遗作馆。封卷置 `withdrawn=1` 顺带腾出卡位（`count_active_cards` 只数 `withdrawn=0`）。**同源唯一（0021）对转世卡照常生效**——同一提取源的 `pristine` 卡在同世界仍只允许一张，这是预期行为（「这个世界只有一个唐三」），未开任何后门 |
+连带移除：真人社交解锁的 `died_together`（「我们的角色一起死过」）**资格路径**——
+它的事实源是 `memorial_status`。⚠️ **方向是收紧不是放宽**：现在只剩正向羁绊一条路径，
+而那本来就是 §14 的主路径。若将来要补一条等价凭证（如「共历终局」），
+必须先答「退场是常见事件、死亡曾是罕见事件，照搬会让凭证极易获得」这个问题。
 
-> 🔴 **遗作馆只读**：`/api/memorial/*` 下**只有 GET**，没有任何编辑/删除/复活传世卡的端点。
-> 唯一的写端点 `POST /api/me/characters/{id}/memorial` 刻意放在 `/me/characters` 命名空间下——
-> 它是**卡的状态转换**，不是对陈列品的编辑。由路由白名单（含逐条方法核对）+ 运行时探测双重锁死
-> （`red_line_memorial_hall_is_read_only`）。
->
-> **接线待办（自动封卷）**：本批次的封卷入口是**玩家主动认领**（服务端核验公共事实）。
-> 自动封卷的正解是在「死亡落定」处直接调 `memorial::seal_character_tx`，但那一处在
-> `runtime::commit_tick` 内；且平权红线要求 `runtime/mod.rs` 对资产模块零引用（同副本卡的处理：
-> 结算铸卡挂在 `progression::settle_worldline_tx`，不挂 runtime）。故正确落点是**结算侧的薄接线层**。
-> 该接线未做前，**生死状档（`Lethality::Deathmatch`）的死亡无法封卷**——该档入场即签、
-> 引擎不产 `ConsentRequested`，证据 (a) 恒不成立。生死状档本身也默认关闭，故当前无实际缺口。
->
-> **已知副作用（待 progression 侧裁定）**：`withdrawn=1` 会让传世卡退出
-> `progression::total_mileage`（`SUM(mileage) WHERE withdrawn = 0`），于是**死亡会拉低"下一个卡位"
-> 的解锁进度**。已解锁的卡位不受影响（`users.card_slots` 是只增的存量列，非派生量）。
-> 这与 §12「死亡不是资产清零、履历是显性资产」有张力：更贴合规格的口径应是
-> **总历练把传世卡也算进去**（`WHERE withdrawn = 0 OR memorial_status = 'sealed'`）。
-> 该判断与改动均在 `progression/` 内，本批次未越界修改，留给该模块的负责人裁定。
+📄 迁移 0053 撤销结构；三个 `cloud_characters.memorial_*` 列作为**惰性残留列**保留
+（`DROP COLUMN` 不在双库可移植子集内，见该迁移的说明）。总规格 §12 已整体重写。
 
 ### OOC 注解权（annotations，migration 0037；总规格 §7「人设保险（三级出口）」**第 2 级**）
 
@@ -517,7 +488,7 @@ if 线：   从终局那一拍岔出去的、只属于你的一条平行线   �
 
 ```jsonc
 {
-  "characterId": "cc_1",        // 必须是本人在该世界的**在世**卡（传世卡 400，见下）
+  "characterId": "cc_1",        // 必须是本人在该世界的卡且未下架（`withdrawn=0`）
   "forkPoint": "terminal",      // 可省；当前**只接受** terminal，其它值 400（绝不静默降级）
   "tickNo": 12,                 // 可省；给了就必须**等于**终局拍，否则 400 并写明唯一可用的拍号
   "premise": "如果他在城门口没有退那一步。",  // 可选 ≤1000 字，过机审
@@ -559,7 +530,7 @@ if 线：   从终局那一拍岔出去的、只属于你的一条平行线   �
 | 🔴 产出不反哺（§0.1） | `ifline_worlds` **没有任何数值列**。开 if 线后历练 / 背包 / 贡献账本 / 荣誉全部零变化，副本卡**总行数不增**（本模块不 INSERT `subplot_cards`）。用例 `red_line_ifline_grants_nothing_back_to_origin` |
 | 🔴 读取面为何无法冒充世界线 | ① id 空间不同（`ifw_` 前缀）；② `owner_id NOT NULL` 而 `worlds` **没有 owner 列**——有主人的世界在形状上就不是「大家共处的那条世界线」；③ 读取管道分离（if 线只经 `/me/iflines**`，世界事实只经 `/worlds/{id}/events`）；④ 响应恒带 `layer="ifline"` / `isWorldFact=false` / `affectsOriginWorld=false` / `forkPoint.stateFidelity`；⑤ `runtime` 与 `crates/muse-engine` 对 `ifline_worlds` 零引用（grep 级断言） |
 | 🔴 单人平行线（§14 社交防火墙） | 冻结前**剥离他人玩家角色**：`characters` 条目 + 涉及它的 `relations` 边 + 剩余边里的 `knownTo` 引用，三处一并清除（少清一处就是引用悬空）。判定依据 `world_members`（NPC 不在其中，故 **NPC 保留**——NPC 是世界的，不是谁的）。剥离台账落 `redaction_json` 并**对玩家可见**：不能既剥离了又不说剥离了什么。将来「经他人同意带入」应走 `consents` 同意流程，不是在本模块加开关。用例 `red_line_foreign_player_characters_are_redacted_from_snapshot` |
-| 🔴 传世卡不得进 if 线（§12） | 主角卡须 `memorial_status='living'` 且 `withdrawn=0`。允许了就是**付费复活** = 付费改命，正是本项最该避免的形态。用例 `red_line_memorial_sealed_character_cannot_open_ifline` |
+| ~~传世卡不得进 if 线~~ | **2026-07-29 随 memorial 删除**：角色卡永不损失，不存在封卷，「付费复活」这个担心也不成立了。闸只剩 `withdrawn=0`（下架卡不可进，那是内容处置的结果，与产品模型无关） |
 | 「花资源」= 烧副本卡（§10） | **不新造货币**（§0.5 无提现下多一种货币就多一条 RMT 侧门）。消耗 `MUSE_IFLINE_CARD_COST`（默认 **1**、上限 10）张在手副本卡，走副本卡**既有状态机**：`status='owned' → 'consumed'` 的 CAS，`consumed_into` 指向 if 线 id（反向血缘，与 `cost.subplotCardIds` 互为对账）。🔴 本模块**不 INSERT `subplot_cards`**——铸卡的唯一写入路径仍是 `subplot::grant_card_tx`（§0.2）。副作用是 if 线成为副本卡的**第二个回收口**（第一个是合成升级），对经济体净收缩 |
 | 为何「烧」而非「占用」 | 「占用」需要一张绑定表，而 `subplot::synthesize` 的 CAS 只看 `status='owned'`，会把被占用的卡照熔不误 → 「卡熔了、if 线还开着」的白嫖漏洞，堵它必须改 `subplot/`。「烧」天然复用同一个状态机：卡一旦 `consumed`，合成端自动排除它，零跨模块接线 |
 | 幂等 | 三层：① `Idempotency-Key`（同一次点击的 HTTP 重试）；② **DB 唯一键** `(owner_id, fork_key)`，`fork_key = {worldId}:{characterId}:{forkPoint}:{forkTickNo}`——换 key 再点也只读回既有那条；③ 副本卡 `status='owned'` 的 **CAS**。抢不到卡 → **整笔回滚**（if 线不留、已烧的卡不留），`409` |
@@ -567,7 +538,7 @@ if 线：   从终局那一拍岔出去的、只属于你的一条平行线   �
 | 机审 | 分叉前提走 `safety::moderate_and_queue`（Pending 自动进 `audit_queue` 人审），**在开事务之前**调用（事务内做网络调用会把单连接池锁死）。无论裁决都落库，读取面仅 `approved` 才给正文（否则 `premise:null` + `premiseWithheld:true`） |
 | **推进（跑拍，0041）** | 生命周期 `sealed`（已立项未推进）→ `running`（跑过拍）→ `ended`（已收尾）。**玩家拉动，不是调度器推动**：世界按调度器流逝，if 线由买它的人一拍一拍翻页——于是**没有任何调度器会碰 `ifline_worlds`**（`runtime::scheduler_loop` 只扫 `worlds`），付费内容也不会在他没看的时候自己烧完。一拍一行落 `ifline_beats`（**不是 `world_ticks`**），活态另存 `live_state_json` + `live_revision`（CAS 令牌） |
 | 🔴 **终局绝不进结算管线**（本批次头号红线） | `progression::settle_*` / `subplot::settle_subplot_card_tx` / `arena_rewards` **一条都不进**。那三条全挂在 `commit_tick → end_world_tx → finalize_ending_tx` 这一条自动链路上，而该链路入口只有一行 `worlds` + 若干 `world_members`——if 线两者都不是，路径在物理上够不着它。推进走 `ifline::runner::commit_beat`，与 `runtime::commit_tick` 零交叉。🔴 **接线时最容易走错的一步**是为复用 `process_tick_inner` 而把 if 线塞回 `worlds`/`world_ticks`：tick 管线与结算管线是**连体的**（CAS 成功即评估终局、终局即结算），没有「跑但不结算」的开关可拨。用例：运行时 `red_line_ifline_ending_grants_nothing`（跑到终局后 `SUM(mileage)` / `subplot_cards` 行数 / `backpacks` / `arena_rewards` / `world_contributions` / `world_ticks` 行数**全部零变化**）+ 源码级 `red_line_runner_never_enters_settlement` |
-| 🔴 终局产物 = **内容** | `ifline_beats.prose` 按拍序拼起来的私人传记 + `endingReason`/`endingLabel` 两个**字符串**。终局投影恒带 `isContentOnly:true` / `grantedAssets:[]`，审计 `audit_logs` 落 `ifline.ended`，reason 含 `grantedAssets=none\|settlementEntered=none\|worldlineChanged=false`。🔴 if 线里主角「死了」**不会封卷传世卡**（封卷是 `UPDATE cloud_characters`，属被禁写入）——既不能复活（0039 已挡传世卡入场），也不会杀死你在真实世界线的卡，两个方向都不通才叫平行线 |
+| 🔴 终局产物 = **内容** | `ifline_beats.prose` 按拍序拼起来的私人传记 + `endingReason`/`endingLabel` 两个**字符串**。终局投影恒带 `isContentOnly:true` / `grantedAssets:[]`，审计 `audit_logs` 落 `ifline.ended`，reason 含 `grantedAssets=none\|settlementEntered=none\|worldlineChanged=false`。🔴 if 线里主角「死了」**不影响真实世界线的卡**（写 `cloud_characters` 属被禁写入）——那才叫平行线。⚠️ 原文这里还提到「不会封卷传世卡 / 0039 已挡传世卡入场」，那两句随 memorial 删除已不适用 |
 | 🔴 成本记在哪 | if 线跑拍烧 token，但**不能写 `world_ticks`**（写进去就等于接回上面那条自动链路）。故：`ifline_beats.cost_tokens`（逐拍实测，共用 `runtime::TokenMeter`，与 `world_ticks.cost_tokens` **口径逐字一致**故可比）+ `ifline_worlds.cost_tokens_total`（实例累计，同事务累加，两处互为对账）+ 运营端点 `GET /api/admin/iflines/cost`。✅ **已并入主看板**（此处原写「尚未并入」，已过期）：`GET /api/admin/metrics/overview` 现有 `cost.ifline`（allTime / window）+ `cost.combined`（世界线 + if 线合计）。🔴 但 `cost.total` 的语义**一个字没改**，仍是世界线口径——把 if 线悄悄加进去会让所有历史对账在同一个字段名下变含义，而看板上看不出发生过这件事。平台总开销读 `cost.combined` |
 | 🔴 SLO 归属：**不并入世界线 SLO** | 五项 SLO 度量的是**多人世界线**。基尼（单人样本恒为满分 → **稀释真实的多人不公平，让指标失去报警能力**）/ 无戏份率（单人线结构上不可能有人没戏份）/ 二次入世率（if 线没有「入世」这件事）/ 收尾率（if 线常由拍数上限强制收尾，与「叙事弧完成」不是同一件事）——**四项全部排除**。仅「状态-文本矛盾」同质，故逐拍存 `ifline_beats.critic_json` 供将来做**独立**读数，不并进世界线池子。工程上本就默认排除（`slo/` 取数口径是 `world_ticks.status='done' AND cost_tokens>0`），本批次是把这个默认变成**有意的决定并写下来**。本批次不动 `slo/`。用例 `ifline_beats_never_enter_worldline_slo_input` |
 | 成本闸（§0.2 参数化） | `MUSE_IFLINE_MAX_BEATS`（默认 **12**、上限 60）：一张副本卡换一条 if 线，推进无上限则单条算力开销无界。到顶**强制收尾**（`endingReason='beat_cap'`，不调模型、不花 token），玩家拿到的是完整而非断掉的线。另有 `MUSE_IFLINE_BEAT_TOKENS`（单拍预算，默认 40000）、`MUSE_IFLINE_CAST_SIZE`（每拍上场人数，默认 4，clamp 2–5）。**这是成本闸，不是玩法数值，与胜负无关** |
@@ -607,7 +578,7 @@ if 线：   从终局那一拍岔出去的、只属于你的一条平行线   �
 | 🔴 敌对线永久匿名 | 任一方向 `trust`/`affinity ≤ -MUSE_SOCIAL_HOSTILE_MAX` 或 `fear ≥ MUSE_SOCIAL_HOSTILE_FEAR` → **一票否决**，在任何补偿路径之前，且「一起死过」也不豁免 |
 | 解锁门槛 | ①非敌对 ②共历世界数 ≥ `MUSE_SOCIAL_MIN_SHARED_WORLDS` ③两条正向路径任一成立：正向羁绊分 ≥ `MUSE_SOCIAL_UNLOCK_MIN_BOND`（`max(trust,affinity,debt)` 取非负，**两方向取较小者**——单方面好感不算羁绊线）／ 「我们的角色一起死过」（`MUSE_SOCIAL_DEATH_BOND_COUNTS`） |
 | 双向自愿 | 发起 → 对方接受。**接受时用当下数据重算资格**（世界线会继续跑，昨天的盟友今天可能已翻脸），发起时的 `eligibility_json` 只作审计、不参与判定 |
-| 🔴 「我们的角色一起死过」 | **关系凭证，不是数值**。由 `cloud_characters.memorial_status/memorial_world_id` + `world_members` **只读派生，无任何存储**；三档 `grade`：`both_fell`／`they_fell`／`i_fell`。对历练/卡位/背包/副本卡/贡献账本/结算/引擎决策**一律零影响**（运行时九表快照 + 源码级写入白名单双用例锁死） |
+| ~~「我们的角色一起死过」~~ | **2026-07-29 随 memorial 删除**（事实源是 `memorial_status`）。⚠️ 这是**两条资格路径之一**，删掉后只剩正向羁绊达阈值——方向是**收紧不是放宽**，而那本来就是 §14 的主路径。若要补一条等价凭证（如「共历终局」），必须先答：退场在新模型下是常见事件，而死亡曾是罕见事件，照搬会让凭证极易获得 |
 | 拒绝文案 | 未成年 / 被拉黑 / 敌对 / 不够格**全部共用同一句** `REFUSE_GENERIC`——区分原因即把端点变成「探测对方是否未成年 / 是否拉黑了我」的接口 |
 | 拉黑实效 | **按 user 判定、按面具录入**（按角色判定会被换卡绕过）。落库同时**撤销**双方 `pending`/`accepted` 解锁 → `revoked`（已授予的身份可见性立即收回）；被拉黑者发不出解锁请求；🔴 **跨通道生效**——`invitations::create_invitation` 前门也调 `social::is_blocked_pair`，且**不看社交开关**（拉黑是保护态，急停不应让它失效，方向同 `MUSE_SAFETY_LEXICON` 的 fail-safe） |
 | 终局态 | `declined`/`expired`/`revoked` 均为**终局**，唯一索引 `(world_id, requester_character_id, target_character_id)` 使同一条线只有一行 → **拒绝后不能再问一次**（真人身份是最敏感的一次授予，不给反复施压的空间）。解除拉黑**不恢复**已撤销的解锁 |
@@ -760,8 +731,8 @@ if 线：   从终局那一拍岔出去的、只属于你的一条平行线   �
 
 | kind | 表.列 | 关掉的既有闸门 |
 |---|---|---|
-| `character` | `cloud_characters.moderation` | `join` 409 `character_not_approved`；邀请接受同判；**卡名解引用闸门**（roster / 遗作馆 / 悼念名单 / 社交与邀请对手方名，见下「卡名读取面闸门」）|
-| `character_avatar` | `cloud_characters.avatar_moderation` | `CharacterView` / world roster / backpack / 遗作馆 **四处**「仅 approved 才下发 avatarUrl」（遗作馆那处是后补的：0016 立规矩时它还不存在，此前无条件下发）|
+| `character` | `cloud_characters.moderation` | `join` 409 `character_not_approved`；邀请接受同判；**卡名解引用闸门**（roster / 社交与邀请对手方名，见下「卡名读取面闸门」）|
+| `character_avatar` | `cloud_characters.avatar_moderation` | `CharacterView` / world roster / backpack **三处**「仅 approved 才下发 avatarUrl」（⚠️ 原为四处，遗作馆那处随 memorial 删除）|
 | `world_cover` | `worlds.cover_moderation` | `worlds::visible_cover_url`（大厅 / 世界详情 / 后台世界列表唯一闸门）|
 | `world_template` | `world_templates.moderation` | `create_room` 409 `template_not_approved`；assembly 蓝图解引用同判 |
 
@@ -779,14 +750,14 @@ if 线：   从终局那一拍岔出去的、只属于你的一条平行线   �
 
 ### 卡名读取面闸门（`MUSE_DISPOSAL_NAME_GATE`，**默认关闭**）
 
-上表 `character` 那一行的既有闸门只管「进新世界」。roster / 遗作馆 / 悼念名单 / 社交与邀请的对手方名
+上表 `character` 那一行的既有闸门只管「进新世界」。roster / 社交与邀请的对手方名
 都是拿着 `card_json` **现读现解**出一个名字，从来不看审核态——于是下架一张卡断得掉入场与立绘，
 断不掉它在**存量世界里已经露出的名字**。实现 `server/src/safety/disposal.rs`。
 
 | 项 | 口径 |
 |---|---|
 | 🔴 边界 | 闸门只作用于「现在去读卡拿名字」的展示面。`world_events` 正文、`world_biographies.summary_json` 封卷快照是**已落定的事实**，一个字节不改（§0.3）。判据：关掉闸门这段文字会不会变——会变的才归它管 |
-| 接了哪些 | world roster（`GET /worlds/{id}`）· 同源冲突 409 文案 · 遗作馆四处（馆列表 / 传世卡详情的 `name` 与整段 `identity` / 悼念名单 / 我的悼念）· `social` 与 `invitations` 的对手方角色名 |
+| 接了哪些 | world roster（`GET /worlds/{id}`）· 同源冲突 409 文案 · `social` 与 `invitations` 的对手方角色名。⚠️ 原为 8 处，**遗作馆那四处随 memorial 于 2026-07-29 删除**，口径一字未改，只是被保护的读取面少了四个 |
 | 刻意没接 | **引擎输入**（`assembly::load_active_cards`、`runtime` 的 `other_cards_brief`、`ifline`）——改它等于改运行中世界的叙事，是产品决策且会让黄金世界回归对不上；**已封卷快照**（`GET /worlds/{id}/biography`）——§0.3；**后台审核面**——人审要看的正是真名与全文；**作者自查面**（`GET /me/memberships` 是自己看自己）——替代文本是为了不把名字摆给**别人**看 |
 | 🔴 为什么有开关 | 打开它会改变**运行中世界**对玩家的显示（昨天还在的名字今天变成占位）。那是产品决策（什么时候开、开了给玩家看什么），不是工程能自作主张的事。故按 §0.1 登记进 `flags` 体系、默认关闭；关闭时各读取面输出与本闸门存在之前**逐字节一致** |
 | 替代文本 | `暂不可见的角色·<4 位十六进制>`，前缀参数化 `MUSE_DISPOSAL_DISPLAY_NAME`。判别位是主体 id 的 FNV-1a 折叠——**稳定**（无时间无随机）、**可区分**（同一列表上两张被处置的卡不塌成一个人）、**不泄露新信息**（这些响应体本就明文带着 `cloudCharacterId`）。刻意中性：它渲染在**第三方**页面上，平台不借占位符对被处置者做公开定性 |

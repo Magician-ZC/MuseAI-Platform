@@ -210,6 +210,22 @@ pub struct RoundInput {
     /// `Some(空戏服)` 与 `None` 等价（`RealmCostume::is_blank`）。
     /// 平台由 runtime 从 `assembled_json./assembly/realmTier` 回灌；桌面壳恒 `None`。
     pub realm_costume: Option<RealmCostume>,
+    /// 世界线烙印（`spec-worldline-imprint.md` §2.2 b「共鸣 · 表现层」，即该提案的第 5 步）：
+    /// 每张卡**在别的世界里**经历过什么，已按褪色阶梯措辞好的短句，`卡id → 句子表`。
+    ///
+    /// 🔴 **它不在卡里，这是整套设计的地基。** 卡 JSON 可导出、可逐字复刻，任何写进卡的东西
+    /// 都能被复刻走；烙印落服务端、绑云端卡 id，只经本字段进上下文。
+    /// 所以这里**只能是 `RoundInput` 上的一格**——照 [`RoundInput::realm_costume`] 的先例，
+    /// 绝不能走「给 `CharacterCardV2` 加字段」那条路。
+    ///
+    /// 🔴 **不是判定输入**：只流向 `decide::append_worldline_imprints` 的展示层 JSON。
+    /// 不进 `active_cards`、不进 `CharacterState.resources`、不进仲裁 / StatePatch /
+    /// DomainEvent / 同意门控——仲裁器读不到它。
+    ///
+    /// 🔴 **只给自己那一条**：`卡id` 对应的句子只喂给该卡本人，信息隔离铁律不容许例外。
+    ///
+    /// 空表（默认，桌面壳恒空）⇒ 追加函数**根本不会被调到** ⇒ 上下文与接线前逐字节一致。
+    pub worldline_imprints: BTreeMap<String, Vec<String>>,
 }
 
 impl Default for RoundInput {
@@ -238,6 +254,8 @@ impl Default for RoundInput {
             lethality: Lethality::default(),
             // 本篇无戏服（§6）：不传 → 导演 prompt 一个字节都不多，与接线前完全一致。
             realm_costume: None,
+            // 无烙印（桌面壳恒空）：追加函数根本不会被调到，可见上下文与接线前逐字节一致。
+            worldline_imprints: BTreeMap::new(),
         }
     }
 }
@@ -471,6 +489,12 @@ impl NarrativeEngine {
                             //（按角色分发会造出「谁的观众多谁看到更多」这条差异通道）。
                             &inp_ref.ambient_events,
                         )?;
+                        // 世界线烙印（表现层）：**只取 `cid` 自己那一条**喂给 `cid` 本人。
+                        // 空表 / 无此卡 ⇒ 函数原样返回 ⇒ 与接线前逐字节一致。
+                        let ctx = decide::append_worldline_imprints(
+                            &ctx,
+                            inp_ref.worldline_imprints.get(cid).map(Vec::as_slice).unwrap_or(&[]),
+                        )?;
                         decide::role_decide(
                             host, decide_stage, dp_ref, inp_ref.temperature_decide,
                             inp_ref.max_output_tokens, rid_ref, inp_ref.now_hint, cid, &ctx,
@@ -561,6 +585,12 @@ impl NarrativeEngine {
                         input.whispers.get(cid).map(|s| s.as_str()),
                         input.self_identities.get(cid).map(|s| s.as_str()),
                         &input.ambient_events,
+                    )?;
+                    // 底线重出这条路径同样要带上烙印——两条路径的可见上下文必须同源，
+                    // 否则「触底线后重决策」时角色会突然失去自己的过去。
+                    let base = decide::append_worldline_imprints(
+                        &base,
+                        input.worldline_imprints.get(cid).map(Vec::as_slice).unwrap_or(&[]),
                     )?;
                     let ctx = decide::append_bottom_line_rejection(
                         &base,
@@ -2128,6 +2158,7 @@ mod tests {
             lethality: Lethality::default(),
             // 默认档 = 无戏服：既有全部用例的导演 prompt 与接线前逐字节一致（回归保护）。
             realm_costume: None,
+            worldline_imprints: BTreeMap::new(),
         }
     }
 
@@ -2784,6 +2815,7 @@ mod tests {
             lethality: Lethality::default(),
             // 默认档 = 无戏服：既有全部用例的导演 prompt 与接线前逐字节一致（回归保护）。
             realm_costume: None,
+            worldline_imprints: BTreeMap::new(),
         }
     }
 
@@ -3742,6 +3774,109 @@ mod tests {
         assert!(!resources.contains("斗王"), "红线：戏服不得物化进 CharacterState.resources");
     }
 
+    // ===== 世界线烙印 · 表现层（提案第 5 步，2026-07-29） =====
+
+    fn pasts(cid: &str, lines: &[&str]) -> BTreeMap<String, Vec<String>> {
+        let mut m = BTreeMap::new();
+        m.insert(cid.to_string(), lines.iter().map(|s| s.to_string()).collect());
+        m
+    }
+
+    /// 🔴 **只给自己那一条**：信息隔离铁律不容许例外。
+    ///
+    /// 烙印是「这张卡在别的世界里经历过什么」，别人既不该知道，也没有任何理由知道。
+    #[tokio::test]
+    async fn a_cards_past_reaches_only_that_card() {
+        let model = Arc::new(CapturingModel::new(two_char_script()));
+        let host = host_capturing(model.clone());
+        init_run(host.as_ref(), "run-1", true);
+        let engine = NarrativeEngine::new(host.clone());
+        let mut input = round_input("run-1", big_budget());
+        input.worldline_imprints = pasts("li", &["他在断桥前退了一步，那一步之后同伴死了"]);
+
+        let out = engine.run_round(&routes(), &prompts(), input, &CancelFlag::new()).await.unwrap();
+        assert!(out.blocked.is_none());
+
+        let mine = decide_ctx_json(&model.decide_prompt_of("li"));
+        assert!(mine["yourPast"]["lived"].to_string().contains("断桥"), "本人必须看得到自己的过去");
+        for other in ["wang"] {
+            let ctx = model.decide_prompt_of(other);
+            assert!(!ctx.contains("断桥"), "🔴 {other} 看到了别人的烙印");
+            assert!(!ctx.contains("yourPast"), "🔴 {other} 没有烙印却出现了 yourPast 这一格");
+        }
+    }
+
+    /// 🔴 **烙印不进任何判定域**：patch / 事件 / 世界状态 / DNA / resources 一个字节都不许有。
+    ///
+    /// 这一条与 `realm_costume_never_reaches_state_or_events` 同款，理由更硬：
+    /// 烙印一旦物化成 `resources` 或状态，就从「一段过去」变成了「一份持有」，
+    /// 而持有是仲裁读得到的东西——那一刻「经历」就变成了「养成数值」，当场违平权红线。
+    #[tokio::test]
+    async fn a_past_never_becomes_a_holding() {
+        let model = Arc::new(CapturingModel::new(two_char_script()));
+        let host = host_capturing(model.clone());
+        init_run(host.as_ref(), "run-1", true);
+        let engine = NarrativeEngine::new(host.clone());
+        let mut input = round_input("run-1", big_budget());
+        input.worldline_imprints = pasts("li", &["他见过一个世界线整个崩塌"]);
+
+        let out = engine.run_round(&routes(), &prompts(), input, &CancelFlag::new()).await.unwrap();
+        let dumped = serde_json::to_string(&out.scene.state_patch).unwrap()
+            + &serde_json::to_string(&out.scene.events).unwrap()
+            + &serde_json::to_string(&out.new_state).unwrap();
+        assert!(!dumped.contains("崩塌"), "🔴 烙印渗进了 patch/事件/世界状态");
+
+        let ctx = decide_ctx_json(&model.decide_prompt_of("li"));
+        assert!(!ctx["yourDna"].to_string().contains("崩塌"), "🔴 烙印不得进 DNA 卡（那等于进了可导出的卡）");
+        assert!(!ctx["yourState"].to_string().contains("崩塌"), "🔴 烙印不得进角色状态");
+        let resources = serde_json::to_string(
+            &out.new_state.characters.get("li").map(|c| c.resources.clone()).unwrap_or_default(),
+        )
+        .unwrap();
+        assert!(!resources.contains("崩塌"), "🔴 烙印不得物化进 CharacterState.resources");
+    }
+
+    /// 🔴 **不传 / 传空表 ⇒ 可见上下文逐字节一致。**
+    ///
+    /// 桌面壳恒空、新卡恒空——这一层能作为纯增量上线的全部依据。
+    #[tokio::test]
+    async fn absent_or_empty_pasts_keep_the_context_byte_identical() {
+        let mut seen: Vec<String> = Vec::new();
+        for imprints in [
+            BTreeMap::new(),
+            pasts("li", &[]),           // 有这张卡的键，但没有句子
+            pasts("li", &["", "   "]),  // 全是空白句
+        ] {
+            let model = Arc::new(CapturingModel::new(two_char_script()));
+            let host = host_capturing(model.clone());
+            init_run(host.as_ref(), "run-1", true);
+            let engine = NarrativeEngine::new(host.clone());
+            let mut input = round_input("run-1", big_budget());
+            input.worldline_imprints = imprints;
+            engine.run_round(&routes(), &prompts(), input, &CancelFlag::new()).await.unwrap();
+            seen.push(model.decide_prompt_of("li"));
+        }
+        assert!(seen.windows(2).all(|w| w[0] == w[1]), "🔴 空烙印改变了可见上下文");
+        assert!(!seen[0].contains("yourPast"), "无烙印时不得出现 yourPast 这一格");
+    }
+
+    /// 🔴 说明文字必须**显式否掉**优势语义，而不是「没提」。
+    ///
+    /// 模型是会自己脑补数值语义的——不写死「这不让你更强」，「他见过世界崩塌」
+    /// 就会被演成「所以他更沉得住气、更容易成功」。同 `ambient` 那格 note 的教训
+    /// （那边不写死「送得多不等于更管用」，`×5` 就会被演成「效果更强」）。
+    ///
+    /// ⚠️ 这条只管引擎自己写死的这段 note。**烙印句子本身**的措辞风险在服务端的措辞表，
+    /// 那边有一条同取向的红线（`imprint` 的 `phrases_state_what_happened_not_what_it_grants`）。
+    /// 两边都要有：它们是两份独立的文案，任何一边写歪都足以让整套设计滑向养成。
+    #[test]
+    fn the_note_explicitly_denies_being_an_advantage() {
+        let ctx = decide::append_worldline_imprints("{}", &["他退过一次".to_string()]).unwrap();
+        for must in ["不让你更强", "不提高任何成功率", "不给你豁免或特权", "不决定你现在该怎么做"] {
+            assert!(ctx.contains(must), "🔴 说明里少了这句显式否认：「{must}」\n{ctx}");
+        }
+    }
+
     /// 不传戏服（默认档）→ 导演 prompt 里**一个字节都不多**。
     /// 空戏服（两段皆空）必须与不传**逐字节等价**——否则"声明了一件没词儿的戏服"会悄悄改写
     /// 所有已声明世界的导演输入，而黄金骨架恰恰不声明 realmTier，那正是回归基线赖以不变的前提。
@@ -3828,6 +3963,7 @@ mod tests {
             lethality: Lethality::default(),
             // 默认档 = 无戏服：既有全部用例的导演 prompt 与接线前逐字节一致（回归保护）。
             realm_costume: None,
+            worldline_imprints: BTreeMap::new(),
         }
     }
 

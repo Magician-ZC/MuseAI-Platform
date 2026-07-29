@@ -389,13 +389,21 @@ fn red_line_only_safety_chain_defaults_on() {
     // 「死亡 = 封卷 = 不可再入世界」在新模型下不是暂时关着，是错的。见 VALIDATION §3.61。
     // 棘轮往下走时同样要逼一次人工评审：**少了一个开关，意味着少了一块可灰度的功能面**，
     // 而那块功能面若只是被关掉、代码还在，就会变成一条没人守的旁路。删干净才对得起这个减一。
+    //
+    // 21 → 22：`MUSE_WORLDLINE_IMPRINT_CONTEXT`（2026-07-29，世界线烙印进决策上下文，提案第 5 步）。
+    // 🔵 这次评审要答的是「为什么这一个要带闸，而同批的另外四件事都没带」：
+    // 那四件（chapterOrder 归一 / 气运机缘量化 / 量化显示 / 生命层）要么是确定性数据处理、
+    // 要么是只读展示，都有「零输入时逐字节不变」兜底；而这一个**直接改模型 prompt**，
+    // 且效果无法证伪（「这张卡表现得不一样」是主观判断）。测不出好坏的东西默认开着，
+    // 等于把判断权交给了没人看的日志。见 VALIDATION §3.64。
     assert_eq!(
         KNOWN_FLAGS.len(),
-        21,
+        22,
         "登记表应覆盖 9 个存量 env 开关 + R3 新建的 MUSE_OOC_ANNOTATIONS / MUSE_IFLINE_PARALLEL / \
          MUSE_SOCIAL_IDENTITY_UNLOCK / MUSE_LIVE_STAGE + MUSE_DISPOSAL_NAME_GATE + \
          MUSE_SAFETY_SEMANTIC_RECHECK + MUSE_SAFETY_RECHECK_SWEEP + MUSE_IFLINE_ADVANCE_SWEEP \
-         + 健康档三维度（MUSE_ATTENTION_TICK_FAILURE / _BLOCKED_STREAK / _STALLED），\
+         + 健康档三维度（MUSE_ATTENTION_TICK_FAILURE / _BLOCKED_STREAK / _STALLED）\
+         + MUSE_WORLDLINE_IMPRINT_CONTEXT，\
          其中 MUSE_OFFPEAK_SCHEDULING 已由纯 env 迁入体系；MUSE_MEMORIAL 已随功能删除"
     );
 }

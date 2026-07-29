@@ -153,6 +153,11 @@ pub async fn start_narrative_round(app: AppHandle, request: RoundRequestDto) -> 
             // assemble_instance 钉进 assembled_json）。本地模式没有副本、没有阶段模板，故恒 None
             // ——引擎对 None 的处理与本字段落地前逐字节一致（导演 prompt 不多一个字节）。
             realm_costume: None,
+            // 世界线烙印（提案第 5 步）：烙印**落服务端、绑云端卡 id**，本地模式压根没有这个概念，
+            // 故恒空——引擎对空表的处理是「追加函数根本不被调到」，可见上下文逐字节不变。
+            // 🔴 这一条不是「暂时不接」：烙印之所以能兑现「复刻内核也复刻不了这张卡」，
+            // 正是因为它不在本地那份可导出的卡 JSON 里。本地能读到它的那天，它就失效了。
+            worldline_imprints: BTreeMap::new(),
         };
         let result = engine.run_round(&routes, &prompts, input, &flag).await;
         let payload = match &result {

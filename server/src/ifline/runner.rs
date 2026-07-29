@@ -768,6 +768,11 @@ pub(super) async fn advance_one_beat(
             // 那件戏服，等世界线这一维真的被观察过之后再单独决定（未验证功能默认关闭，
             // VALIDATION §0.1），而不是顺手跟着接线一起悄悄开出去。
             realm_costume: None,
+            // 世界线烙印（提案第 5 步）：if 线同样保持空 = 与接线前逐字节一致，理由同上一段。
+            // 🔵 这一维还多一层：if 线是**从某一拍分叉出去的私人副本**，而烙印记的是
+            // 「这张卡在**别的世界**里经历过什么」——分叉线要不要继承那份跨世界记忆，
+            // 是个产品问题（分叉出去的是同一张卡，还是一个假设？），不是接线的顺手事。
+            worldline_imprints: Default::default(),
         };
         let cancel = CancelFlag::new();
         // 🔴 恒走 `run_round`，**不走 `run_event_step`**：DES 调度依赖 `timeline.next_time`

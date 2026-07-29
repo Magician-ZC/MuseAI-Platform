@@ -2645,6 +2645,27 @@ async fn process_tick_inner(
         // 观众礼物同样**在这里、进事务之前**解析并取数（理由同上一行：单连接池上，
         // 引擎回合与 commit 事务之间再插查库就是自锁）。
         let (ambient_events, fed_ambient_ids) = load_pending_ambient(state, world_id).await;
+        // 世界线烙印进决策上下文（提案第 5 步）。同样**在这里、进事务之前**取数（理由同上两行）。
+        //
+        // 🔴 默认关（`MUSE_WORLDLINE_IMPRINT_CONTEXT`，按世界解析）：这是这批里唯一直接改
+        // 模型 prompt 的功能，而它的效果无法证伪——理由全文见该开关在 `flags::KNOWN_FLAGS` 里的声明。
+        // ⚠️ 读失败降级为空表（按无烙印跑），不阻断 tick：烙印是叙事差异化，不是资格判定，
+        // 让一次读库抖动把整个世界卡住，代价与收益完全不成比例（口径同装配侧那处）。
+        let worldline_imprints = if crate::flags::is_enabled(
+            &state.db,
+            "MUSE_WORLDLINE_IMPRINT_CONTEXT",
+            crate::flags::FlagCtx::world(world_id),
+        )
+        .await
+        {
+            let cids: Vec<String> = active_cards.keys().cloned().collect();
+            crate::imprint::worldline_pasts(&state.db, &cids).await.unwrap_or_else(|e| {
+                tracing::warn!(world_id, error = %e, "烙印措辞读取失败，本拍按无烙印跑");
+                Default::default()
+            })
+        } else {
+            Default::default()
+        };
         let input = RoundInput {
             run_id: run_id.clone(),
             mode: RunMode::Observe,
@@ -2692,6 +2713,8 @@ async fn process_tick_inner(
             //    不开权限、不调难度；不进 active_cards（卡不可变），不进 CharacterState.resources。
             // None（老世界 / 未声明 / 文案皆空）→ 导演 prompt 与接线前逐字节一致。
             realm_costume: realm_costume.clone(),
+            // 世界线烙印（提案第 5 步）：默认关；开闸后每张卡只拿到自己那一段过去。
+            worldline_imprints: worldline_imprints.clone(),
             // 观众礼物 → 场上环境（总规格红线 1「不卖胜负与数值平权」，open-decisions §5 选项 A）。
             //
             // 🔴 **它买到的是「被看见」，不是「影响力」**：只进引擎的展示层上下文，

@@ -189,6 +189,23 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
         scopes: SCOPES_USER,
     },
     FlagDef {
+        name: "MUSE_WORLDLINE_IMPRINT_CONTEXT",
+        default_enabled: false,
+        owner: "imprint",
+        desc: "世界线烙印进决策上下文（提案第 5 步，`Integrated` 未 `Validated`）",
+        // 🔵 已接线（runtime → RoundInput.worldline_imprints）。
+        // 🔴 **这批里唯一直接改模型 prompt 的功能，所以它必须带闸**：
+        // 前四步（表 / 派生 / 进种子 / 风化）都是确定性数据处理，「零烙印时逐字节不变」
+        // 就足以让它们裸奔上线；这一步不同——它给每个带烙印的角色多喂一段文字，
+        // 既影响 token 账单，也影响模型输出，而**它的效果无法证伪**
+        //（「这张卡表现得不一样」是主观判断，要真验得做同种子 A/B + 真实模型凭据）。
+        // 一个测不出好坏的东西默认开着，就等于把判断权交给了没人看的日志。
+        wired: true,
+        // 解析档：按 **world**——「先在一个房里试」是这类叙事改动的自然灰度单位；
+        // 按 user 会让同一个房里有的角色带着过去、有的不带，那是两套世界规则在同一场戏里。
+        scopes: SCOPES_WORLD,
+    },
+    FlagDef {
         name: "MUSE_SUBPLOT_CARDS",
         default_enabled: false,
         owner: "subplot",

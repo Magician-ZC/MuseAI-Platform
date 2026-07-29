@@ -332,6 +332,58 @@ pub fn append_bottom_line_rejection(
     Ok(serde_json::to_string_pretty(&ctx)?)
 }
 
+/// 世界线烙印（`spec-worldline-imprint.md` §2.2 b「共鸣 · 表现层」，第 5 步）：
+/// 把这张卡**在别的世界里**经历过什么，追加进它已组装好的可见上下文。
+///
+/// ══════════════════════════════════════════════════════════════════════════
+/// 🔴 它与 `yourMemory` 是**两件事**，别合并
+/// ══════════════════════════════════════════════════════════════════════════
+/// | | 记的是 | 来源 | 跨世界吗 |
+/// |---|---|---|---|
+/// | `yourMemory` | 我在**这个**世界里做过什么 | `narrative.pacingNotes` | ❌ |
+/// | `yourPast`（本函数） | 我在**别的**世界里经历过什么 | 服务端 `character_imprints` | ✅ |
+///
+/// 合并会毁掉后者的全部意义：烙印之所以能兑现「复刻内核也复刻不了这张卡」，
+/// 正是因为它**不在卡里、不在本世界状态里**，只能由服务端按这张卡的编号取出来。
+///
+/// **为何是后置追加而不是给 `assemble_visible_context` 加参数**：同
+/// [`append_bottom_line_rejection`] 的理由——桌面壳与新卡根本不会调到本函数，
+/// 「默认行为零变化」由「代码路径压根不经过」保证，而不是靠一个每次都要求值的空分支。
+///
+/// 🔴 平权（§0.1）：措辞显式声明「这是你带过来的过去，不是你的能力」。
+/// 烙印**不含优势语义**——同一条「他退过一次」落在不同内核上会产生相反的行为，
+/// 方向由卡自己的决策模型决定，所以它强化的恰恰是「内核决定一切」。
+///
+/// ⚠️ **这一步的效果不可证伪**：能测的只有「注入了什么」，测不了「模型因此怎么变」。
+/// 真要验它得做 A/B——同内核、同世界、同种子，只差烙印，跑 N 次比较决策分布，
+/// 而那需要真实模型凭据（本仓至今一次真实模型调用都没发生过）。
+/// 因此本步状态是 `Integrated`，**不是** `Validated`（状态语言七档）。
+///
+/// 空表 → 原样返回（连解析都不做，逐字节恒等）。
+/// 确定性：纯函数（解析 → 插一个固定键 → 重新序列化），无随机、不依赖任何迭代序。
+pub fn append_worldline_imprints(
+    visible_context: &str,
+    past: &[String],
+) -> Result<String, EngineError> {
+    let lines: Vec<&String> = past.iter().filter(|s| !s.trim().is_empty()).collect();
+    if lines.is_empty() {
+        return Ok(visible_context.to_string());
+    }
+    let mut ctx: Value = serde_json::from_str(visible_context)?;
+    if let Some(obj) = ctx.as_object_mut() {
+        obj.insert(
+            "yourPast".to_string(),
+            json!({
+                "lived": lines,
+                "note": "这些是你在别的世界里经历过的事，越靠后的越久远、越模糊。\
+它是你带过来的过去，不是你的能力：它不让你更强、不提高任何成功率、不给你豁免或特权，\
+也不决定你现在该怎么做。你可以被它塑造，也可以偏偏不认它——怎么用由你的性格决定。",
+            }),
+        );
+    }
+    Ok(serde_json::to_string_pretty(&ctx)?)
+}
+
 /// 决策用户提示：可见上下文 + 严格 JSON 输出契约。
 fn build_decide_user_prompt(character_id: &str, visible_context: &str) -> String {
     format!(

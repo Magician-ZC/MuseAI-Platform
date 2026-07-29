@@ -2354,6 +2354,7 @@ export const NarrativeRuntimePanel: React.FC = () => {
   const sceneIds = useCharacterRuntimeStore((s) => s.sceneIds);
   const roundStatus = useCharacterRuntimeStore((s) => s.roundStatus);
   const blockedReason = useCharacterRuntimeStore((s) => s.blockedReason);
+  const blockedRejects = useCharacterRuntimeStore((s) => s.blockedRejects);
   const lastError = useCharacterRuntimeStore((s) => s.lastError);
   const costEstimate = useCharacterRuntimeStore((s) => s.costEstimate);
 
@@ -2737,7 +2738,31 @@ export const NarrativeRuntimePanel: React.FC = () => {
         <Tag>{roundStatus === 'running' ? '运行中' : roundStatus === 'done' ? '已完成' : roundStatus === 'blocked' ? '受阻' : roundStatus === 'failed' ? '失败' : '空闲'}</Tag>
       </Space>
       {blockedReason && (
-        <Alert type="warning" showIcon style={{ marginTop: 8 }} message={`回合受阻：${blockedReason}`} description="约束互相冲突或不可满足时进入 blocked，请调整节点或禁止谓词后重试。" />
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginTop: 8 }}
+          message={`回合受阻：${blockedReason}`}
+          description={
+            <>
+              <div>约束互相冲突或不可满足时进入 blocked，请调整节点或禁止谓词后重试。</div>
+              {/* 谁触了哪条底线。这是规格 §7 人设保险第 1 级（事前·底线硬约束）唯一的反馈出口——
+                  只给一句「全部提案均违反底线」，用户改不了任何东西。
+                  旧桌面壳不发这个字段 → 数组为空 → 这一段整块不出现，退回接线前的形态。 */}
+              {blockedRejects.length > 0 && (
+                <ul style={{ margin: '8px 0 0', paddingLeft: 18 }}>
+                  {blockedRejects.map((r, i) => (
+                    <li key={`${r.characterId}-${i}`}>
+                      <b>{r.characterId}</b>
+                      {r.ruleRefs.length > 0 && <span>（{r.ruleRefs.join('、')}）</span>}
+                      {r.consequence && <>：{r.consequence}</>}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </>
+          }
+        />
       )}
       {lastError && (
         <Alert type="error" showIcon style={{ marginTop: 8 }} message={`${lastError.code}：${lastError.message}`} />

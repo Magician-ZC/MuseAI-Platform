@@ -158,7 +158,36 @@ pub async fn start_narrative_round(app: AppHandle, request: RoundRequestDto) -> 
         let payload = match &result {
             Ok(outcome) => {
                 if let Some(reason) = &outcome.blocked {
-                    serde_json::json!({ "kind": "roundBlocked", "runId": request.run_id, "reason": reason })
+                    // 🔴 **谁触了哪条底线**必须一起下发，否则这条 blocked 对用户是不可行动的。
+                    //
+                    // 引擎在全员触底线那一支里是**特意**把 `bottom_line_rejects` 装进 stub_scene 的
+                    // （`narrative/mod.rs` 的分支 ③），而此处此前只取 `reason` 一个字符串——
+                    // 那句话说的是「本拍全部 N 条提案均违反角色自己卡上的底线」，
+                    // 却不说是哪几个角色、触的是哪一条。用户拿到它**改不了任何东西**，
+                    // 而这正是规格 §7 人设保险第 1 级（事前·底线硬约束）唯一的反馈出口。
+                    //
+                    // ⚠️ 只下发 outcomes 的三个字段，**刻意不下发整个 scene**：
+                    // 那个 scene 是 `stub_scene` —— 没有 prose、没有 events、state_patch 为空，
+                    // 它不是一场戏。前端若把它并进 `scenes`，场景列表会多出一条不存在的场景，
+                    // 快照/分支按钮点下去会指向一个从未提交过的 tick。
+                    let rejects: Vec<serde_json::Value> = outcome
+                        .scene
+                        .outcomes
+                        .iter()
+                        .map(|o| {
+                            serde_json::json!({
+                                "characterId": o.character_id,
+                                "ruleRefs": o.rule_refs,
+                                "consequence": o.consequence,
+                            })
+                        })
+                        .collect();
+                    serde_json::json!({
+                        "kind": "roundBlocked",
+                        "runId": request.run_id,
+                        "reason": reason,
+                        "bottomLineRejects": rejects,
+                    })
                 } else {
                     serde_json::json!({
                         "kind": "roundDone",

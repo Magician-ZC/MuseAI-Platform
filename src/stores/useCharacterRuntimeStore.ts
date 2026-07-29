@@ -231,7 +231,19 @@ export interface RoundStarted {
 
 export type NarrativePayload =
   | { kind: 'roundDone'; runId: string; sceneId: string; scene: SceneRecord; critic: unknown; spentTokens: number }
-  | { kind: 'roundBlocked'; runId: string; reason: string }
+  | {
+      kind: 'roundBlocked';
+      runId: string;
+      reason: string;
+      /**
+       * 谁触了哪条底线（规格 §7 人设保险第 1 级的唯一反馈出口）。
+       *
+       * 🔴 旧版本的 Tauri 壳**不发这个字段**，故必须按可选处理：
+       * 桌面壳与前端各自打包、版本可以不同步（用户装着旧包、跑着新前端是正常形态）。
+       * 缺它时退回只显示 `reason`——那是接线前的行为，一个字不多不少。
+       */
+      bottomLineRejects?: { characterId: string; ruleRefs: string[]; consequence: string }[];
+    }
   | { kind: 'roundFailed'; runId: string; code: string; message: string }
   | { kind: 'synthesisDone'; taskId: string; cards: CharacterCardV2[] }
   | { kind: 'synthesisFailed'; taskId: string; code: string; message: string };
@@ -277,6 +289,8 @@ interface RuntimeStoreState {
   currentRoundId: string | null;
   roundStatus: RoundStatus;
   blockedReason: string | null;
+  /** 受阻时「谁触了哪条底线」。旧桌面壳不发此字段 → 空数组，展示退回只有 reason 的形态。 */
+  blockedRejects: { characterId: string; ruleRefs: string[]; consequence: string }[];
   lastCritic: unknown | null;
   lastError: { code: string; message: string } | null;
   costEstimate: CostEstimate | null;
@@ -316,6 +330,7 @@ export const useCharacterRuntimeStore = create<RuntimeStoreState>()(
       currentRoundId: null,
       roundStatus: 'idle',
       blockedReason: null,
+      blockedRejects: [],
       lastCritic: null,
       lastError: null,
       costEstimate: null,
@@ -346,7 +361,7 @@ export const useCharacterRuntimeStore = create<RuntimeStoreState>()(
       },
 
       startRound: async (request) => {
-        set({ roundStatus: 'running', blockedReason: null, lastError: null });
+        set({ roundStatus: 'running', blockedReason: null, blockedRejects: [], lastError: null });
         try {
           const { roundId } = await appInvoke('start_narrative_round', { request });
           set({ currentRoundId: roundId });
@@ -419,7 +434,12 @@ export const useCharacterRuntimeStore = create<RuntimeStoreState>()(
           }
           case 'roundBlocked': {
             if (currentRunId && payload.runId !== currentRunId) return;
-            set({ roundStatus: 'blocked', blockedReason: payload.reason, currentRoundId: null });
+            set({
+              roundStatus: 'blocked',
+              blockedReason: payload.reason,
+              blockedRejects: payload.bottomLineRejects ?? [],
+              currentRoundId: null,
+            });
             break;
           }
           case 'roundFailed': {
@@ -477,6 +497,7 @@ export const useCharacterRuntimeStore = create<RuntimeStoreState>()(
           currentRoundId: null,
           roundStatus: 'idle',
           blockedReason: null,
+      blockedRejects: [],
           lastCritic: null,
           lastError: null,
         }),

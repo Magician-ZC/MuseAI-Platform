@@ -709,6 +709,8 @@ if 线：   从终局那一拍岔出去的、只属于你的一条平行线   �
 | 方法 | 路径 | 角色 | 说明 |
 |---|---|---|---|
 | POST | `/api/admin/dev-login` | 公开 | **仅 `MUSE_DEV=1`**，生产直接 403。密钥 `MUSE_ADMIN_DEV_SECRET`（默认 `muse-dev-admin`） |
+| GET | `/api/admin/me` | 任一后台角色 | **我是谁**：`{userId, role, nickname, status}`。`role` 取自 **token**（那是这次请求实际被授权、也是 `audit_logs` 会记下的那个），不取自 users 表。🔴 **不下发权限清单**——能力由角色在前后端各自推导，下发一份就是同一判定的第二份拷贝。⚠️ **没有 `avatarUrl`**：`users` 表没有头像列，造一个空字段会让人以为「接上了但没数据」。dev 引导账号 `admin_dev` 在 users 里没有行 → `nickname` 空、`status` 为 `unknown`，**不是 404** |
+| GET | `/api/admin/me/pending` | 任一后台角色 | **有什么在等我**：`{total, queues:[{key,label,module,count}]}`。🔴 **只含这个角色能处置的队列**（角色门与各队列自己的处置端点逐一对齐：审核/申诉/处置申诉→reviewer，社交举报→reviewer+support，数据请求→support，admin 全见）——给一个角色报它打不开的队列，等于催他做一件点进去就 403 的事。⚠️ **刻意不含 `risk_events`**：那是流水不是队列（没有「已处理」状态、没有配对的处置端点），挂红点就是一个永远消不掉的角标。替代的是后台顶栏那个恒为 0 的假红点（原 `TODO(接口缺字段): 未读通知数`——那条 TODO 的措辞本身指错了方向，后台从来没有「通知」概念，`notification_outbox` 是玩家侧的） |
 | GET | `/api/admin/users` | support | 用户检索 |
 | POST | `/api/admin/users/{id}/ban`·`/unban` | support | 封禁/解封 |
 | GET | `/api/admin/audit-queue` | reviewer | 审核队列 |

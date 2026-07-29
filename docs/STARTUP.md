@@ -216,8 +216,8 @@ cd server && MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo ru
 
 全绿基线(**校验于 2026-07-29**,数字随开发增长——对不上先确认是新增测试还是漏跑):
 
-> ⚠️ **2026-07-29 顺带发现的一件事,记在这里而不是订正掉**:本批次给前端加了 35 条用例
-> (22 条自定义房装配 + 13 条后台建模板写入路径),实测 563 / 87 文件。**563 − 35 = 528 / 85**,
+> ⚠️ **2026-07-29 顺带发现的一件事,记在这里而不是订正掉**:本批次给前端加了 39 条用例
+> (22 条自定义房装配 + 17 条后台建模板写入路径与全局搜索),实测 567 / 87 文件。**567 − 39 = 528 / 85**,
 > 而上一版这里写的是 523 / 84 —— 即**上一批**改动没有同步这一节。
 > 这正是「唯一维护基线的地方」也会失守的方式:它不会报错,只会让下一个人把
 > 「数字对不上」误判成「我把测试跑挂了」。改了测试就顺手改这里,不要留给下一轮。
@@ -234,14 +234,14 @@ cargo test --manifest-path crates/muse-engine/Cargo.toml          # 314 passed
 #    key 只从 env 读，不落盘、不进仓库、不进日志
 # MUSE_SMOKE_API_KEY=sk-... MUSE_SMOKE_BASE_URL=https://api.deepseek.com/v1 MUSE_SMOKE_MODEL=deepseek-chat \
 #   cargo test --manifest-path crates/muse-engine/Cargo.toml real_provider -- --ignored --nocapture
-(cd server && cargo test)                                          # 1132 passed(default,含黄金世界回归)
-(cd server && cargo test --features billing,arena)                 # 1216 passed
+(cd server && cargo test)                                          # 1137 passed(default,含黄金世界回归)
+(cd server && cargo test --features billing,arena)                 # 1221 passed
 (cd server && cargo test --features billing)                       # 1173 passed（CI 不跑，2026-07-28 手验）
 (cd server && cargo test --features arena)                         # 1202 passed（同上）
 (cd server && cargo test golden)                                   # 14 passed(12 项 runtime::golden::* + 2 项录放 round-trip)
 cargo test --manifest-path src-tauri/Cargo.toml                    # 245 passed
 # 前端 + 后台
-npm run test                                                       # 563 passed / 87 files（含后台组件用例，见 VALIDATION §3.47 A5）
+npm run test                                                       # 567 passed / 87 files（含后台组件用例，见 VALIDATION §3.47 A5）
 npx tsc --noEmit                                                   # 0 错误
 (cd admin && npx tsc --noEmit && npm run build)                    # 0 错误 + 产出 dist
 ```
@@ -393,11 +393,34 @@ curl -sX POST 127.0.0.1:8787/api/auth/challenge -H 'Content-Type: application/js
 1. 🔴 **Postgres 生产路径从未在真实部署下跑过。** 两个 feature 组合的测试在 PG 上全绿
    (占位符与 `SUM()` 返回 `numeric` 两类根因已修完),但那只证明**SQL 可移植**;
    连接池行为、超时、迁移锁、故障恢复**零验证**。按 §0.3 是 `Implemented`,不是 `Production-ready`。
-2. ⚠️ **`MemQueue` 不持久**——第 3 层的丢包**已有补漏,但那条补漏默认关着,且自己也有上限**。
-   队列仍不持久(进程重启带走在飞任务),补的是**下游**:`MUSE_SAFETY_RECHECK_SWEEP`
-   按 `world_ticks ⋈ safety_recheck_runs` 对账,把「没有终局复核行」的拍补投回去。
+2. ⚠️ **`MemQueue` 不持久**——四个 topic **各有各的补偿,不是只有一条**。
+   （🔴 **2026-07-29 订正**：本条原先只写了第 3 层那条 `MUSE_SAFETY_RECHECK_SWEEP`,
+   读起来像「MemQueue 丢包只有一条默认关的补救」。逐条核过之后那是**低估了现状**——
+   而一条会被误读的声明和一条过期的声明一样危险:它会让人去补一个已经补过的洞,
+   或者反过来,以为整条链都像第 3 层那样默认关着。）
+
+   | topic | 补偿 | 默认 | 回看上限 |
+   |---|---|---|---|
+   | `world_tick` | `scheduler_loop`(`runtime`,无条件 spawn):超时 `running` 回收成 `pending` + 滞留 `pending` 重投 | **常开,无开关** | 无 |
+   | `notify` | `spawn_outbox_worker` 的 `rescan_pending`:每 60s 重扫全部 `status='pending' AND due_at<=now` | **常开,无开关** | **无**(判据是 DB 行状态,比持久队列还强) |
+   | `ifline_advance` | `MUSE_IFLINE_ADVANCE_SWEEP`(迁移 0052) | 关 | 有补投封顶 |
+   | `safety_semantic_recheck` | `MUSE_SAFETY_RECHECK_SWEEP` | 关 | **24h 硬上限** |
+
+   下面三条讲的是**最后那一行**（第 3 层那条）。它补的是**下游**:按
+   `world_ticks ⋈ safety_recheck_runs` 对账,把「没有终局复核行」的拍补投回去。
    它同时覆盖持久队列覆盖不了的「压根没入队」——包括一类此前无人登记的漏:
    tick 走 blocked / cas_conflict 收尾时**根本没执行到入队那一行**。
+
+   🔵 **顺带把「要不要接 Redis」这件事的结论记下来,免得下一轮再查一遍**:
+   逐条核过后**现在不该接**,三条理由——① `Queue` trait 的 `push`/`pop`
+   **没有错误通道**(返回 `()` / `String`),Redis 的网络失败只能被吞,
+   等于用一个**新的、跨网络的静默丢弃**换掉一个已被上表四条对账覆盖的进程内丢弃,方向是负的;
+   ② 这条链上最常见的失败是「压根没入队」(开关当时关着 / 走了没有入队那行的分支 /
+   `push_json` 序列化失败被吞),**队列换成什么都关不掉**;
+   ③ `docker-compose.yml` 里那个 redis 是裸镜像、AOF 关着,照它接上去会得到一个
+   「看起来接了持久队列、实际仍丢最后一个快照窗口」的系统——一个**假的安全声明**,比不接更糟。
+   真要接,前置条件是先给 trait 加错误通道、给 compose 开 AOF、给 CI 加 redis service。
+
    上线要知道三件事:
    - 🔴 **默认关**。第 3 层开着、轮询关着 = 复核会跑,但丢掉的拍没人捡。这条链**三个开关**
      (provider 配置 / `MUSE_SAFETY_SEMANTIC_RECHECK` / `MUSE_SAFETY_RECHECK_SWEEP`)都得按。

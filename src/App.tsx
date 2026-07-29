@@ -63,9 +63,6 @@ const JourneyOoc = lazy(() =>
 const JourneyIfline = lazy(() =>
   import('./pages/platform/journey/JourneyStories').then((m) => ({ default: m.JourneyIfline })),
 );
-const JourneyMemorial = lazy(() =>
-  import('./pages/platform/journey/JourneyStories').then((m) => ({ default: m.JourneyMemorial })),
-);
 const JourneySubplot = lazy(() =>
   import('./pages/platform/journey/JourneyStories').then((m) => ({ default: m.JourneySubplot })),
 );
@@ -173,7 +170,6 @@ function App() {
               <Route path="journey/ooc" element={<RequireAuth><JourneyOoc /></RequireAuth>} />
               <Route path="journey/iflines" element={<RequireAuth><JourneyIfline /></RequireAuth>} />
               <Route path="journey/subplot" element={<RequireAuth><JourneySubplot /></RequireAuth>} />
-              <Route path="journey/memorial" element={<RequireAuth><JourneyMemorial /></RequireAuth>} />
               <Route path="journey/social" element={<RequireAuth><JourneySocial /></RequireAuth>} />
               <Route path="journey/chapters" element={<RequireAuth><JourneyChapters /></RequireAuth>} />
               <Route path="journey/live" element={<RequireAuth><JourneyLive /></RequireAuth>} />

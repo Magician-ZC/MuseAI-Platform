@@ -1,14 +1,12 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Alert, Button, Checkbox, Input, Modal, Select, Space, Tag } from 'antd';
+import { Alert, Button, Checkbox, Input, Select, Space, Tag } from 'antd';
 import {
   ApartmentOutlined,
-  BookOutlined,
   FireOutlined,
-  HourglassOutlined,
   LockOutlined,
   PlusOutlined,
 } from '@ant-design/icons';
-import { cloudFetch, resolveObjectUrl } from '../../../utils/cloudApi';
+import { cloudFetch } from '../../../utils/cloudApi';
 import {
   formatJourneyTime,
   journeyError,
@@ -266,90 +264,7 @@ export const JourneySubplot: React.FC = () => {
   );
 };
 
-interface MemorialCharacter {
-  id: string;
-  name: string;
-  avatarUrl?: string | null;
-  mileage: number;
-  sealedAt?: number | null;
-  sealedIn?: { worldId?: string | null; title?: string | null };
-}
+// ⚠️ 此处原有「遗作馆 / 封卷」页（JourneyMemorial）—— 2026-07-29 随 memorial 整块删除。
+// 产品模型改为**角色卡永不损失**：「死亡」只是这张卡在那一个副本里的剧本结束，
+// 退场即可进下一个世界，不存在「封卷成只读传世卡」这回事。见 VALIDATION §3.61。
 
-export const JourneyMemorial: React.FC = () => {
-  const preview = useJourneyPreview();
-  const { context, memberships, loading: contextLoading, error: contextError, changeWorld, reload } = useJourneyContext();
-  const [hall, setHall] = useState<MemorialCharacter[]>(preview ? [{ id: 'legacy-elena', name: '艾琳娜·风语', avatarUrl: '/assets/characters/elena-windwhisper-portrait.png', mileage: 1280, sealedAt: Date.now() - 12 * 86_400_000, sealedIn: { title: '余烬酒馆' } }] : []);
-  const [loading, setLoading] = useState(!preview);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [confirmOpen, setConfirmOpen] = useState(false);
-  const [understood, setUnderstood] = useState(false);
-  const [sealed, setSealed] = useState(false);
-
-  const load = async () => {
-    if (preview) return;
-    setLoading(true); setError(null);
-    try { const data = await cloudFetch<{ characters: MemorialCharacter[] }>('/api/memorial/characters?limit=20&offset=0'); setHall(data.characters ?? []); }
-    catch (err) { setError(journeyError(err)); } finally { setLoading(false); }
-  };
-  useEffect(() => { void load(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const seal = async () => {
-    if (!context || !understood) return;
-    setBusy(true); setError(null);
-    try {
-      if (!preview) await cloudFetch(`/api/me/characters/${context.characterId}/memorial`, { method: 'POST', idempotent: true });
-      setSealed(true); setConfirmOpen(false);
-    } catch (err) { setError(journeyError(err)); } finally { setBusy(false); }
-  };
-
-  return (
-    <JourneyPage title={`为${context?.characterName || '角色'}封卷`} description="封卷把一张已有真实死亡证据的角色卡变成不可变的传世档案：只读、公开陈列、永不复活。" wide>
-      <JourneyState loading={contextLoading} error={contextError} empty={!context} emptyText="没有可进入封卷流程的角色" onRetry={reload}>
-        <JourneyContextBar context={context} memberships={memberships} onChange={changeWorld} />
-        {error && <Alert type="error" showIcon title={error} style={{ marginBottom: 16 }} />}
-        {sealed && <Alert type="success" showIcon title="封卷完成" description="角色已成为只读传世卡，道具已回到账户背包。" style={{ marginBottom: 16 }} />}
-        <div className="journey-grid">
-          <section className="journey-panel journey-panel--8 journey-memorial">
-            <div className="journey-memorial__banner">
-              <img src="/assets/platform/mist-sea-world.png" alt="雾海纪元世界终景" />
-              <div className="journey-memorial__copy">
-                <img src="/assets/characters/kane-night-oath-portrait.png" alt={`${context?.characterName || '角色'}肖像`} />
-                <div><Tag color="volcano">传世封卷</Tag><h2>{context?.characterName}</h2><p>他的选择、历练、羁绊与足迹会成为公开可读的一生档案。封卷承接已经落定的死亡事实，不制造死亡，也不能撤回。</p></div>
-              </div>
-            </div>
-            <div className="journey-memorial__body">
-              <div className="journey-timeline">
-                <div className="journey-timeline__item"><span className="journey-timeline__dot" /><div className="journey-timeline__content"><h3>确认公共死亡证据</h3><p>由服务端检查世界事件与同意记录，客户端不能自行声明。</p></div></div>
-                <div className="journey-timeline__item"><span className="journey-timeline__dot" /><div className="journey-timeline__content"><h3>归还随身物品</h3><p>角色携带的合法物品回到账户背包，不随传世卡冻结。</p></div></div>
-                <div className="journey-timeline__item"><span className="journey-timeline__dot" /><div className="journey-timeline__content"><h3>生成只读传世档案</h3><p>角色不再进入任何世界；同内核新卡被视为转世，而不是复活。</p></div></div>
-              </div>
-              <div className="journey-panel__footer"><Button danger type="primary" size="large" icon={<BookOutlined />} disabled={sealed} onClick={() => setConfirmOpen(true)}>{sealed ? '已封卷' : '审阅并确认封卷'}</Button></div>
-            </div>
-          </section>
-          <aside className="journey-panel journey-panel--4">
-            <h2>遗作馆新近封卷</h2>
-            <JourneyState loading={loading} empty={!hall.length} emptyText="遗作馆目前还没有传世卡">
-              <div className="journey-list">
-                {hall.map((item) => (
-                  <article className="journey-list-item" key={item.id}>
-                    <img className="journey-list-item__image" style={{ width: 64, height: 82, objectPosition: 'top' }} src={preview ? item.avatarUrl || '/assets/characters/elena-windwhisper-portrait.png' : resolveObjectUrl(item.avatarUrl) || '/assets/characters/elena-windwhisper-portrait.png'} alt={`${item.name}传世肖像`} />
-                    <div className="journey-list-item__body"><h3>{item.name}</h3><p>历练 {item.mileage} · {item.sealedIn?.title || '未知世界'}</p><p>{formatJourneyTime(item.sealedAt)}</p></div>
-                  </article>
-                ))}
-              </div>
-            </JourneyState>
-          </aside>
-        </div>
-        <Modal title="确认不可逆封卷" open={confirmOpen} onCancel={() => setConfirmOpen(false)} footer={[
-          <Button key="cancel" onClick={() => setConfirmOpen(false)}>再想想</Button>,
-          <Button key="seal" danger type="primary" loading={busy} disabled={!understood} onClick={() => void seal()}>确认封卷</Button>,
-        ]}>
-          <p>封卷后，这张角色卡将永久只读、进入遗作馆，并且不能再加入任何世界。</p>
-          <Checkbox checked={understood} onChange={(event) => setUnderstood(event.target.checked)}>我理解这是不可逆操作，也理解转世不等于复活。</Checkbox>
-          <div className="journey-notice" style={{ marginTop: 16 }}><HourglassOutlined /> 如果世界里的死亡尚未真正落定，服务端会拒绝本次封卷，所有资产保持不变。</div>
-        </Modal>
-      </JourneyState>
-    </JourneyPage>
-  );
-};

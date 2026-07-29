@@ -16,7 +16,6 @@
 //! | `MUSE_LETHALITY_DEATHMATCH`  | 关 | `worlds`（生死状档） |
 //! | `MUSE_ROOM_INVITATIONS`      | 关 | `invitations`（房间邀请） |
 //! | `MUSE_CONTAINER_ASSEMBLY`    | 关 | `assembly`（自定义房装配） |
-//! | `MUSE_MEMORIAL`              | 关 | `memorial`（传世卡·遗作馆） |
 //! | `MUSE_WORLD_SERIES_AUTOSCALE`| 关 | `worlds`（世界系列扩容） |
 //! | `MUSE_WORLD_BE_BIOGRAPHY`    | 关 | `progression`（BE 结局传记） |
 //! | `MUSE_SAFETY_LEXICON`        | **开** | `safety`（运行时敏感词库·审核链） |
@@ -47,7 +46,7 @@
 //! |---|---|---|
 //! | user + global | `MUSE_ONBOARDING` · `MUSE_ROOM_INVITATIONS` | 动作发起人就是被灰度的人 |
 //! | world + global | `MUSE_LETHALITY_DEATHMATCH`（读取侧） · `MUSE_WORLD_BE_BIOGRAPHY`（两侧） | 被灰度的是「这个世界」 |
-//! | 两处不同 | `MUSE_SUBPLOT_CARDS` · `MUSE_MEMORIAL`（端点 user / 结算 world） · `MUSE_CONTAINER_ASSEMBLY`（装配 world / 建模板 global） | 一侧结构上拿不到另一侧的维度（建房/建模板时世界还不存在；结算是一个世界事件、多个卡主） |
+//! | 两处不同 | `MUSE_SUBPLOT_CARDS`（端点 user / 结算 world） · `MUSE_CONTAINER_ASSEMBLY`（装配 world / 建模板 global） | 一侧结构上拿不到另一侧的维度（建房/建模板时世界还不存在；结算是一个世界事件、多个卡主） |
 //! | 只有 global | `MUSE_WORLD_SERIES_AUTOSCALE` | **主动放弃灰度**：逐系列的闸已经是 `world_series.status`，再加一档就是第三道容易被忘记的闸 |
 //! | 不迁（纯 env） | `MUSE_SAFETY_LEXICON` | 审核链、默认开启、消费点在 tick 事务内的闸上：事务里查库风险最大、收益最小 |
 //!
@@ -238,17 +237,6 @@ pub const KNOWN_FLAGS: &[FlagDef] = &[
         wired: true,
         // 解析档：装配期按 world；建模板前门只能 global（那时没有世界）。
         scopes: SCOPES_WORLD,
-    },
-    FlagDef {
-        name: "MUSE_MEMORIAL",
-        default_enabled: false,
-        owner: "memorial",
-        desc: "传世卡 · 遗作馆（关闭时端点 404 且不发生任何封卷）",
-        // 🔵 已接线。ctx 口径同副本卡：端点侧按 **user**，结算内自动封卷按 **world**
-        // （经 `progression::SettlementFlags`）。口径表见 `memorial::memorial_enabled`。
-        wired: true,
-        // 解析档：端点侧按 user、结算内自动封卷按 world。
-        scopes: SCOPES_ALL,
     },
     FlagDef {
         name: "MUSE_WORLD_SERIES_AUTOSCALE",
@@ -581,11 +569,10 @@ pub const fn declared_default(name: &str) -> bool {
 ///   `load_container_cards` 的唯一调用点在 C-7 那次 CAS 占位写入**之前**，事务还没开。
 ///   `validate_container_refs` 收 bool 保持同步，是为了让它继续是一个**纯校验函数**
 ///   （可被任意上下文复用），而不是因为事务边界。
-/// - ~~`MUSE_MEMORIAL`~~ —— **已迁（2026-07-27）**。端点 404 且封卷本身不发生；封卷在结算事务内，
-///   故与副本卡共用 [`crate::progression::SettlementFlags`]（往里加一个字段，没有新增 bool 参数）。
-///   ⚠️ 原注那条提醒仍然有效且**依然没被违反**：`MUSE_MEMORIAL_BOND_MIN` /
-///   `MUSE_MEMORIAL_PAGE_SIZE` 是**参数化 env（非布尔）**，本体系只管布尔开关，
-///   参数化配置是另一件事（§0.2），迁移时一个都没往 `runtime_flags` 里塞。
+/// - ~~`MUSE_MEMORIAL`~~ —— **整块功能已于 2026-07-29 删除**（传世卡 · 遗作馆）。
+///   理由是产品模型变了：角色卡**永不损失**，「死亡」只是这张卡在**那一个副本**里的剧本结束、
+///   退场即可进下一个世界。而 memorial 的全部语义建立在「死亡 = 封卷 = 不可再入世界」之上，
+///   在新模型下它不是「暂时关着的功能」，是**错的行为**。开关连同模块一并摘除，见 VALIDATION §3.61。
 /// - ~~`MUSE_WORLD_SERIES_AUTOSCALE`~~ —— **已迁（2026-07-27）**。原注对「语义重叠」的提醒
 ///   直接决定了结论：它**只接 global 档，不给 world 档**。逐系列的闸已经是
 ///   `world_series.status`，再加一档 world 作用域就是第三道容易被忘记的闸；而且系列是

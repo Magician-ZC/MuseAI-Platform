@@ -98,20 +98,6 @@ async fn seed_char(state: &AppState, id: &str, owner: &str, name: &str) {
     .unwrap();
 }
 
-/// 把一张卡封卷为传世卡（模拟 `memorial::seal_character_tx` 的落定结果）。
-async fn seal_char(state: &AppState, char_id: &str, world_id: &str) {
-    sqlx::query(
-        "UPDATE cloud_characters SET memorial_status = 'sealed', memorial_sealed_at = $1, \
-         memorial_world_id = $2, withdrawn = 1 WHERE id = $3",
-    )
-    .bind(now_ms())
-    .bind(world_id)
-    .bind(char_id)
-    .execute(&state.db)
-    .await
-    .unwrap();
-}
-
 /// 写世界的关系图（引擎 `relation_dynamics` 的产出形状）。
 async fn set_relations(state: &AppState, world_id: &str, relations: Value) {
     sqlx::query("UPDATE worlds SET narrative_state_json = $1 WHERE id = $2")
@@ -120,6 +106,23 @@ async fn set_relations(state: &AppState, world_id: &str, relations: Value) {
         .execute(&state.db)
         .await
         .unwrap();
+}
+
+/// 造一条**双向正向羁绊**（替代原先用「一起死过」当资格的写法）。
+///
+/// ⚠️ 2026-07-29 起「一起死过」这条资格路径**已删除**（随 memorial 整块移除，
+/// 见 `social/mod.rs` 里那段说明）。现在唯一的资格路径是正向羁绊达阈值，
+/// 所以测试构造资格也只能走这条——**这不是等价替换，是口径变了**。
+async fn set_positive_bond(state: &AppState, world_id: &str, a: &str, b: &str) {
+    set_relations(
+        state,
+        world_id,
+        json!([
+            { "from": a, "to": b, "trust": 0.9, "affinity": 0.9 },
+            { "from": b, "to": a, "trust": 0.9, "affinity": 0.9 },
+        ]),
+    )
+    .await;
 }
 
 /// 改年龄声明（0 未声明 / 1 成年 / 2 未成年）。
@@ -189,7 +192,7 @@ const SIDE_EFFECT_TABLES: &[&str] = &[
 
 /// 🔴 资产 / 进度 / 世界线表 —— 社交资产「我们的角色一起死过」绝不能碰的那一批。
 const ASSET_TABLES: &[&str] = &[
-    "cloud_characters",   // mileage / memorial_* / withdrawn
+    "cloud_characters",   // mileage / withdrawn
     "backpacks",          // 道具
     "users",              // card_slots
     "world_contributions",// 三层结算 ③ 贡献账本
@@ -197,7 +200,6 @@ const ASSET_TABLES: &[&str] = &[
     "worlds",             // narrative_state_json（引擎回灌面）
     "world_events",       // 公共事实
     "world_members",      // 足迹
-    "memorial_marks",     // 「故人」印记
 ];
 
 /// 玩家面 + 运营面全部端点（method, uri, body, 是否 admin token）。
@@ -381,9 +383,19 @@ async fn red_line_minor_target_refused_with_indistinguishable_message() {
     seed_char(&state, "c3", "u3", "阿箬").await;
     seed_member(&state.db, "m3", "w1", "u3", "c3", "active").await;
     open_flag(&state, "global", "").await;
-    // c2/c3 都与 c1 一起死过（够格），差别只在年龄与拉黑。
-    seal_char(&state, "c2", "w1").await;
-    seal_char(&state, "c3", "w1").await;
+    // c2/c3 都与 c1 有达标的正向羁绊（够格），差别只在年龄与拉黑。
+    // （原先用「一起死过」当资格，该路径已随 memorial 删除。）
+    set_relations(
+        &state,
+        "w1",
+        json!([
+            { "from": "c1", "to": "c2", "trust": 0.9, "affinity": 0.9 },
+            { "from": "c2", "to": "c1", "trust": 0.9, "affinity": 0.9 },
+            { "from": "c1", "to": "c3", "trust": 0.9, "affinity": 0.9 },
+            { "from": "c3", "to": "c1", "trust": 0.9, "affinity": 0.9 },
+        ]),
+    )
+    .await;
     set_age(&state, "u2", 2).await; // 对端未成年
     let tk1 = token(&state, "u1");
 
@@ -442,17 +454,9 @@ async fn red_line_social_asset_has_zero_numeric_effect() {
     let state = test_state().await;
     base_world(&state).await;
     open_flag(&state, "global", "").await;
-    // 造出「我们的角色一起死过」：c2 在 w1 封卷（c1 在场送别）。
-    seal_char(&state, "c2", "w1").await;
-    // 顺带造一条「故人」印记与一些资产，确保快照不是在空表上比较。
-    sqlx::query(
-        "INSERT INTO memorial_marks (id, character_id, owner_id, deceased_character_id, world_id, kind, granted_at) \
-         VALUES ('mm1', 'c1', 'u1', 'c2', 'w1', 'departed', $1)",
-    )
-    .bind(now_ms())
-    .execute(&state.db)
-    .await
-    .unwrap();
+    // 造出达标的正向羁绊（唯一还剩的资格路径）。
+    set_positive_bond(&state, "w1", "c1", "c2").await;
+    // 顺带造一些资产，确保快照不是在空表上比较。
     sqlx::query("UPDATE cloud_characters SET mileage = 777 WHERE id = 'c1'")
         .execute(&state.db)
         .await
@@ -468,11 +472,8 @@ async fn red_line_social_asset_has_zero_numeric_effect() {
     let (s, body) = send(&state, "GET", "/api/worlds/w1/social/bonds", &tk1, None).await;
     assert_eq!(s, StatusCode::OK);
     let bond = &body["bonds"][0];
-    assert_eq!(bond["credential"]["present"], json!(true), "应派生出「我们的角色一起死过」");
-    assert_eq!(bond["credential"]["worlds"][0]["grade"], "they_fell");
-    assert_eq!(bond["paths"]["diedTogether"], json!(true));
-    assert_eq!(bond["paths"]["positiveBond"], json!(false), "没有关系记录 → 正向羁绊路径不成立");
-    assert_eq!(bond["eligible"], json!(true), "「一起死过」单独即构成合格的正向羁绊线");
+    assert_eq!(bond["paths"]["positiveBond"], json!(true), "双向正向羁绊达阈值 → 资格成立");
+    assert_eq!(bond["eligible"], json!(true), "正向羁绊是当前唯一的资格路径");
 
     // ② 发起 → ③ 接受。
     let (s, req) = send(
@@ -578,12 +579,11 @@ fn red_line_module_writes_only_social_tables() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn red_line_hostile_line_never_unlocks_even_after_dying_together() {
+async fn red_line_hostile_line_never_unlocks_no_matter_what() {
     let state = test_state().await;
     base_world(&state).await;
     open_flag(&state, "global", "").await;
-    seal_char(&state, "c2", "w1").await; // 一起死过（最强的正向凭证）
-    // …但关系是宿敌。
+    // 关系是宿敌 —— 敌对判据一票否决，任何正向路径都不豁免。
     set_relations(&state, "w1", json!([{ "from": "c1", "to": "c2", "trust": -0.9, "affinity": -0.8 }]))
         .await;
     let tk1 = token(&state, "u1");
@@ -592,7 +592,6 @@ async fn red_line_hostile_line_never_unlocks_even_after_dying_together() {
     let bond = &body["bonds"][0];
     assert_eq!(bond["hostile"], json!(true));
     assert_eq!(bond["eligible"], json!(false), "🔴 §14：敌对线永久匿名，一票否决");
-    assert_eq!(bond["credential"]["present"], json!(true), "凭证仍如实展示（事实不改），但不解锁");
     assert!(
         bond["blockers"].as_array().unwrap().iter().any(|b| b == BLOCK_HOSTILE),
         "拒绝原因应明示为敌对线"
@@ -1332,59 +1331,18 @@ fn filter_value_defaults_and_whitelist() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 「我们的角色一起死过」的派生口径
+// ⚠️ 此处原有两组「我们的角色一起死过」用例 —— 2026-07-29 随该资格路径一并删除
 // ═══════════════════════════════════════════════════════════════════════════
+//
+// 删掉的是：① `died_together` 三档派生口径（they_fell / both_fell / 无共同世界）；
+// ② 「传世卡 withdrawn=1 但仍是合格社交对手」那条（它守的是「别拿 withdrawn 当门」，
+// 而在卡永不损失的模型下根本不会有 withdrawn=1 的在世卡去参与社交）。
+//
+// 🔴 留一句给下一个人：现在**只剩正向羁绊一条资格路径**，社交门槛比之前**更严**。
+// 若将来要补一条等价凭证（如「共历终局」），必须先答一个问题——
+// 退场在新模型下是常见事件，而死亡曾是罕见事件，照搬会让凭证极易获得，
+// 等于**放宽**这道连着未成年保护与网暴防线的门。见 `social/mod.rs` 里那段说明。
 
-#[tokio::test]
-async fn died_together_grades_derive_from_memorial_facts_only() {
-    let state = test_state().await;
-    base_world(&state).await;
-
-    // 都在世 → 无凭证。
-    assert!(!died_together(&state.db, "c1", "c2").await.unwrap().present());
-
-    // 对方倒下 → they_fell。
-    seal_char(&state, "c2", "w1").await;
-    let cred = died_together(&state.db, "c1", "c2").await.unwrap();
-    assert_eq!(cred.worlds[0]["grade"], "they_fell");
-    assert_eq!(cred.worlds[0]["markedAsDeparted"], json!(false), "还没打印记");
-
-    // 我也倒下 → both_fell；且从对方视角是同一段经历。
-    seal_char(&state, "c1", "w1").await;
-    assert_eq!(died_together(&state.db, "c1", "c2").await.unwrap().worlds[0]["grade"], "both_fell");
-    assert_eq!(died_together(&state.db, "c2", "c1").await.unwrap().worlds[0]["grade"], "both_fell");
-
-    // 没有共同世界 → 无凭证（哪怕两张卡都死了）。
-    seed_user(&state.db, "u9").await;
-    seed_char(&state, "c99", "u9", "路人").await;
-    seal_char(&state, "c99", "w_other").await;
-    assert!(!died_together(&state.db, "c1", "c99").await.unwrap().present());
-}
-
-/// 传世卡的 `withdrawn` 恒为 1 —— 社交资格判定绝不能拿它当门，否则这条独有社交资产整条被掐死。
-#[tokio::test]
-async fn sealed_character_is_still_a_valid_social_counterpart() {
-    let state = test_state().await;
-    base_world(&state).await;
-    open_flag(&state, "global", "").await;
-    seal_char(&state, "c2", "w1").await;
-    let withdrawn: i64 =
-        sqlx::query_scalar("SELECT withdrawn FROM cloud_characters WHERE id = 'c2'")
-            .fetch_one(&state.db)
-            .await
-            .unwrap();
-    assert_eq!(withdrawn, 1, "前置：封卷会把 withdrawn 置 1");
-
-    let (s, _) = send(
-        &state,
-        "POST",
-        "/api/worlds/w1/social/unlock-requests",
-        &token(&state, "u1"),
-        Some(json!({ "targetCharacterId": "c2" })),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "🔴 死者仍是合法的社交对端（否则「一起死过」永远兑现不了）");
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 纯函数：羁绊折算与参数回落
@@ -1515,7 +1473,16 @@ async fn the_audit_snapshot_records_the_value_that_was_compared_not_only_the_thr
     // 源码级：两者必须**同时**出现在审计快照里。
     let i = src.find("fn to_audit_json").expect("审计快照函数应存在");
     let j = src[i..].find("fn ").map(|k| i + k + 3).unwrap_or(src.len());
-    let body = &src[i..j.max(i + 800).min(src.len())];
+    // 🔴 按**字符边界**收敛，不能直接切字节：这份源码是中文注释为主，
+    // `i + 800` 落在多字节字符中间会直接 panic（2026-07-29 改动上游内容时踩到过一次）。
+    let end = {
+        let mut e = j.max(i + 800).min(src.len());
+        while e < src.len() && !src.is_char_boundary(e) {
+            e += 1;
+        }
+        e
+    };
+    let body = &src[i..end];
     assert!(
         body.contains("\"bond\": self.bond.positive"),
         "🔴 审计快照必须记下被比较的正向分本身；只记 thresholds.minBond 等于记了标尺没记读数"
@@ -1525,7 +1492,14 @@ async fn the_audit_snapshot_records_the_value_that_was_compared_not_only_the_thr
     // 🔴 而**自查视图仍然不给分**——那是刻意的：正向分由双方的边共同决定（跨边取 min），
     // 露给本人等于泄露对方对他的感受（§14 信息边界）。
     let k = src.find("fn to_self_json").expect("自查视图应存在");
-    let self_body = &src[k..(k + 700).min(src.len())];
+    let self_end = {
+        let mut e = (k + 700).min(src.len());
+        while e < src.len() && !src.is_char_boundary(e) {
+            e += 1;
+        }
+        e
+    };
+    let self_body = &src[k..self_end];
     assert!(
         !self_body.contains("self.bond.positive"),
         "🔴 自查视图不得下发原始羁绊分 —— 它由双方的边共同决定，露给本人就是泄露对方的感受"

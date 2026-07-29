@@ -657,23 +657,10 @@ async fn red_line_foreign_player_characters_are_redacted_from_snapshot() {
     assert_eq!(detail["snapshot"]["narrative"], json!({ "pendingConsents": [] }));
 }
 
-/// 🔴 **传世卡不得进 if 线**（§12「只读、不可再入世界」）：if 线不是付费复活。
-#[tokio::test]
-async fn red_line_memorial_sealed_character_cannot_open_ifline() {
-    let state = test_state().await;
-    seed_ended_world(&state).await;
-    sqlx::query("UPDATE cloud_characters SET memorial_status='sealed', withdrawn=1 WHERE id='c1'")
-        .execute(&state.db)
-        .await
-        .unwrap();
-    open_flag(&state, crate::flags::SCOPE_GLOBAL, "").await;
-    let tk = token(&state, "u1");
+// ⚠️ 此处原有 `red_line_memorial_sealed_character_cannot_open_ifline`：传世卡不可进 if 线
+// （否则就是「付费复活」）。**2026-07-29 随 memorial 整块删除**——角色卡永不损失，
+// 不存在封卷这回事，「付费复活」这个担心也就不成立了。`withdrawn` 那一半的闸仍在。
 
-    let (st, resp) = send(&state, "POST", "/api/worlds/w1/iflines", &tk, Some(open_body()), None).await;
-    assert_eq!(st, StatusCode::BAD_REQUEST, "🔴 传世卡开 if 线 = 付费复活，必须拒绝：{resp}");
-    assert!(resp["error"]["message"].as_str().unwrap().contains("传世卡"));
-    assert_eq!(card_status(&state.db, "sc1").await.0, "owned", "被拒时不许烧卡");
-}
 
 /// 拿别人的卡开 if 线 → 风控拦截（403 risk_blocked）+ 记险，且不烧卡。
 #[tokio::test]

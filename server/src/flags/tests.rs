@@ -382,14 +382,21 @@ fn red_line_only_safety_chain_defaults_on() {
     // 钉死「world_events 上只许有 3 条写路径」）。与 CLAUDE.md 里去掉的那几处硬编码计数
     // 性质相反——那些是**描述现状**的文档数字（过期即误导），这个是**约束变更**的闸门
     // （过期即报警，正是它要的）。
+    //
+    // 22 → 21：`MUSE_MEMORIAL` **随整块功能删除**（2026-07-29，传世卡 · 遗作馆）。
+    // 🔴 这是这条棘轮第一次**往下走**，值得单独说一句：此前每次变红都是「新增了一个默认关闭的开关」，
+    // 而这次是「一块功能被判定为**错的行为**并整体摘除」——产品模型改成了角色卡永不损失，
+    // 「死亡 = 封卷 = 不可再入世界」在新模型下不是暂时关着，是错的。见 VALIDATION §3.61。
+    // 棘轮往下走时同样要逼一次人工评审：**少了一个开关，意味着少了一块可灰度的功能面**，
+    // 而那块功能面若只是被关掉、代码还在，就会变成一条没人守的旁路。删干净才对得起这个减一。
     assert_eq!(
         KNOWN_FLAGS.len(),
-        22,
+        21,
         "登记表应覆盖 9 个存量 env 开关 + R3 新建的 MUSE_OOC_ANNOTATIONS / MUSE_IFLINE_PARALLEL / \
          MUSE_SOCIAL_IDENTITY_UNLOCK / MUSE_LIVE_STAGE + MUSE_DISPOSAL_NAME_GATE + \
          MUSE_SAFETY_SEMANTIC_RECHECK + MUSE_SAFETY_RECHECK_SWEEP + MUSE_IFLINE_ADVANCE_SWEEP \
          + 健康档三维度（MUSE_ATTENTION_TICK_FAILURE / _BLOCKED_STREAK / _STALLED），\
-         其中 MUSE_OFFPEAK_SCHEDULING 已由纯 env 迁入体系"
+         其中 MUSE_OFFPEAK_SCHEDULING 已由纯 env 迁入体系；MUSE_MEMORIAL 已随功能删除"
     );
 }
 

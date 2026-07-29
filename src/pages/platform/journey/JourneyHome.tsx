@@ -2,7 +2,6 @@ import React from 'react';
 import {
   ApartmentOutlined,
   AuditOutlined,
-  BookOutlined,
   BulbOutlined,
   CompassOutlined,
   GiftOutlined,
@@ -22,7 +21,6 @@ const features = [
   { path: 'ooc', icon: <AuditOutlined />, title: '角色解释权', text: '对落定节拍提出 OOC 申诉，保存私人批注。' },
   { path: 'iflines', icon: <ApartmentOutlined />, title: '开启私人平行线', text: '从可信分叉点出发，体验不改写原世界的另一种可能。' },
   { path: 'subplot', icon: <BulbOutlined />, title: '我的副本卡', text: '整理旅程碎片，用同星卡合成新的剧情蓝图。' },
-  { path: 'memorial', icon: <BookOutlined />, title: '为凯恩·夜誓封卷', text: '将完整一生封存为传世档案，并接受不可逆边界。' },
   { path: 'social', icon: <LinkOutlined />, title: '解锁真实身份', text: '在双方同意后，把角色关系延伸到现实社交。' },
   { path: 'chapters', icon: <ReadOutlined />, title: '欢迎回到故事里', text: '查看离线成长与跨世界物品，继续章节房。' },
   { path: 'live', icon: <PlayCircleOutlined />, title: '今夜开演', text: '跟随公开舞台事件流，在不泄露身份的前提下互动。' },

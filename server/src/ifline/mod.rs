@@ -737,22 +737,25 @@ async fn open_ifline(
         return Err(ApiError::RiskBlocked);
     }
 
+    // 卡必须仍可用（未下架）。
+    //
+    // ⚠️ 这道闸此前还查 `memorial_status = 'living'`（传世卡不可再入世界，§12）。
+    // **2026-07-29 随 memorial 整块删除而去掉那一半**：产品模型已改为**角色卡永不损失**，
+    // 「死亡」只是这张卡在那一个副本里的剧本结束，不存在「封卷后不可再入」这回事，
+    // 于是「付费复活」这个担心也不成立了——if 线开的是**平行线**，卡本来就还活着。
+    // 留下的 `withdrawn` 那一半仍然必要：下架是内容处置的结果，与产品模型无关。
     let card_row = sqlx::query(
-        "SELECT memorial_status, withdrawn FROM cloud_characters WHERE id = $1 AND owner_id = $2",
+        "SELECT withdrawn FROM cloud_characters WHERE id = $1 AND owner_id = $2",
     )
     .bind(&character_id)
     .bind(&user.user_id)
     .fetch_optional(&state.db)
     .await?;
     let Some(card_row) = card_row else { return Err(ApiError::NotFound) };
-    let memorial_status: String = card_row.try_get("memorial_status").unwrap_or_default();
     let withdrawn: i64 = card_row.try_get("withdrawn").unwrap_or(0);
-    if memorial_status != "living" || withdrawn != 0 {
-        // 🔴 §12：传世卡只读、不可再入世界。放它进 if 线就是「付费复活」= 付费改命。
+    if withdrawn != 0 {
         return Err(ApiError::BadRequest(
-            "这张卡已封卷为传世卡（或已下架），不可进入 if 线——传世卡不可再入世界（§12），\
-             if 线不是付费复活。内核可复制，履历不可复制：同内核开新卡是转世，不是复活。"
-                .into(),
+            "这张卡已下架，不可进入 if 线。".into(),
         ));
     }
 

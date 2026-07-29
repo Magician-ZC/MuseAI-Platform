@@ -11,14 +11,15 @@ const renderPreview = (node: React.ReactNode, path: string) => render(
 );
 
 describe('我的旅程设计预览', () => {
-  it('首页提供九个完整功能入口', () => {
+  // ⚠️ 九 → 八：「为凯恩·夜誓封卷」（遗作馆）随 memorial 整块删除（2026-07-29）。
+  // 产品模型改为角色卡永不损失，「封卷成只读传世卡」这件事不存在了。见 VALIDATION §3.61。
+  it('首页提供八个完整功能入口', () => {
     renderPreview(<JourneyHome />, '/platform/journey');
     expect(screen.getAllByText('从第一段旅程开始').length).toBeGreaterThan(0);
     expect(screen.getByText('房间邀请')).toBeInTheDocument();
     expect(screen.getByText('角色解释权')).toBeInTheDocument();
     expect(screen.getByText('开启私人平行线')).toBeInTheDocument();
     expect(screen.getByText('我的副本卡')).toBeInTheDocument();
-    expect(screen.getByText('为凯恩·夜誓封卷')).toBeInTheDocument();
     expect(screen.getByText('解锁真实身份')).toBeInTheDocument();
     expect(screen.getByText('欢迎回到故事里')).toBeInTheDocument();
     expect(screen.getByText('今夜开演')).toBeInTheDocument();

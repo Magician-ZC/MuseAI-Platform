@@ -368,9 +368,6 @@ pub(crate) fn resolve_payout_tier(table: &PayoutTable, score: f64) -> Option<&Pa
 pub(crate) struct SettlementFlags {
     /// 副本卡铸卡（`MUSE_SUBPLOT_CARDS`）。关 = 结算一张不铸，**不报错**。
     pub(crate) subplot_cards: bool,
-    /// 死者自动封卷为传世卡（`MUSE_MEMORIAL`）。关 = 整段短路，**不报错**
-    /// （封卷是纪念不是账目；玩家还可用主动认领入口补上）。
-    pub(crate) memorial: bool,
     /// 崩塌世界的 BE 结局传记（`MUSE_WORLD_BE_BIOGRAPHY`）。关 = 不封卷，
     /// 且**再打开也不追溯补写**（传记是封卷那一刻的快照）。
     pub(crate) be_biography: bool,
@@ -381,11 +378,6 @@ impl SettlementFlags {
     pub(crate) async fn resolve(db: &AnyPool, world_id: &str) -> Self {
         Self {
             subplot_cards: crate::subplot::subplot_cards_enabled(
-                db,
-                crate::flags::FlagCtx::world(world_id),
-            )
-            .await,
-            memorial: crate::memorial::memorial_enabled(
                 db,
                 crate::flags::FlagCtx::world(world_id),
             )
@@ -564,23 +556,12 @@ pub(crate) async fn settle_idle_world_ending_tx(
     // 结算回滚则传记同滚，绝不出现"奖罚没落地但墓志铭已刻好"。正常终局不产出（有输才有痛）。
     seal_be_biography_tx(tx, world_id, collapsed, &ctx, flags.be_biography).await?;
 
-    // 自动封卷（§12【拍板 23】「死亡 = 传记封卷，不是资产清零」）：本世界里已死的卡转传世卡。
+    // ⚠️ 此处原有一段「自动封卷」：结算时把本世界里已死的卡转为传世卡（`memorial_status='sealed'`
+    // + `withdrawn=1` ⇒ 不可再入任何世界）。**2026-07-29 随整块 memorial 功能一并删除**。
     //
-    // 落在结算侧而非死亡落定处，是因为后者在 runtime::commit_tick 内，而平权红线要求
-    // runtime/mod.rs 对资产模块零引用（与 subplot 铸卡同一条理由：挂 progression 不挂 runtime）。
-    //
-    // 顺序在 ①③ 与 BE 传记**之后**：封卷会把 withdrawn 置 1，而 total_mileage 虽已按
-    // 「withdrawn=0 OR memorial_status='sealed'」统计（死者历练仍算数），但结算发放本身
-    // 只认 participants 名单、不重查库，放在后面可确保「先把这局该给的给完，再封卷」这个直觉次序。
-    //
-    // 幂等由 seal_character_tx 的 CAS 承担；开关关闭时整段短路。失败不阻断结算——
-    // 封卷是纪念不是账目，玩家还可随时用主动认领入口补上。
-    if let Err(e) =
-        crate::memorial::auto_seal_dead_participants_tx(tx, world_id, participants, flags.memorial)
-            .await
-    {
-        tracing::warn!(world_id, error = %e, "自动封卷失败（结算照常落定，玩家可主动认领）");
-    }
+    // 删的理由不是「暂时不用」，是它在现行产品模型下**是错的行为**：角色卡永不损失，
+    // 「死亡」只是这张卡在**这一个副本**里的剧本结束，退场即可进下一个世界。
+    // 一个把卡永久锁死的结算副作用，与那条模型直接冲突。见 VALIDATION §3.61。
     Ok(())
 }
 
@@ -1071,15 +1052,15 @@ async fn seal_be_biography_tx(
 /// **主动撤回仍然不算**：那是玩家自己把卡收回、不再参与，与「死得其所」是两回事，
 /// 保持原口径（撤回可逆，封卷不可逆）。
 ///
-/// 与 `count_active_cards` 的区别是刻意的：那个统计**卡位占用**，传世卡已不可再入世界、
-/// 不该继续占着容器位，所以那边必须保持 `withdrawn = 0`。
-/// 一句话：**传世卡不再占位，但它挣来的历练永远算数。**
+/// ⚠️ 此处原有一条「传世卡（`memorial_status='sealed'`）的历练仍算数」的放行分支。
+/// **2026-07-29 随 memorial 整块删除**：角色卡永不损失，不存在封卷这回事，
+/// 于是「已封卷但仍要计入历练」这个特例也一并消失，口径回归单一的 `withdrawn = 0`。
 ///
 /// 汇总在 Rust 侧完成（避免 SQL SUM 的双库类型差异，遵守 db.rs 可移植子集约定）。
 pub(crate) async fn total_mileage(db: &AnyPool, owner_id: &str) -> Result<i64, ApiError> {
     let rows: Vec<(i64,)> = sqlx::query_as(
         "SELECT mileage FROM cloud_characters \
-         WHERE owner_id = $1 AND (withdrawn = 0 OR memorial_status = 'sealed')",
+         WHERE owner_id = $1 AND withdrawn = 0",
     )
     .bind(owner_id)
     .fetch_all(db)

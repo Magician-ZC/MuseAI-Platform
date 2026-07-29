@@ -264,12 +264,6 @@ const DEFAULT_MIN_SHARED_WORLDS: i64 = 1;
 const ENV_BOND_COUNTS_DEBT: &str = "MUSE_SOCIAL_BOND_COUNTS_DEBT";
 const DEFAULT_BOND_COUNTS_DEBT: bool = false;
 
-/// 「我们的角色一起死过」是否单独构成一条合格的正向羁绊线（默认开）。
-///
-/// 规格把「共历生死」列在三条正向线之首，故默认 `true`：**羁绊分不够但一起死过**也够格。
-/// 🔴 它**不是**敌对判据的例外——敌对线一票否决在它之前生效（见 `evaluate_eligibility`）。
-const ENV_DEATH_BOND_COUNTS: &str = "MUSE_SOCIAL_DEATH_BOND_COUNTS";
-const DEFAULT_DEATH_BOND_COUNTS: bool = true;
 
 /// 每人每日（滚动 24h）可发起的解锁请求数上限（默认 3）。**跨世界合计**——
 /// 只按世界限流会被「换个世界继续问同一个人」绕过（口径同 `invitations::invite_daily_limit`）。
@@ -355,9 +349,6 @@ fn min_shared_worlds() -> i64 {
 }
 fn bond_counts_debt() -> bool {
     parse_bool(std::env::var(ENV_BOND_COUNTS_DEBT).ok().as_deref(), DEFAULT_BOND_COUNTS_DEBT)
-}
-fn death_bond_counts() -> bool {
-    parse_bool(std::env::var(ENV_DEATH_BOND_COUNTS).ok().as_deref(), DEFAULT_DEATH_BOND_COUNTS)
 }
 fn unlock_daily_limit() -> i64 {
     parse_positive(std::env::var(ENV_UNLOCK_DAILY_LIMIT).ok().as_deref(), DEFAULT_UNLOCK_DAILY_LIMIT)
@@ -579,115 +570,24 @@ fn bond_between(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 🔴 独有社交资产：「我们的角色一起死过」（关系凭证，不是数值）
+// ⚠️ 此处原有「我们的角色一起死过」凭证（§14 独有社交资产）—— 2026-07-29 删除
 // ═══════════════════════════════════════════════════════════════════════════
+//
+// 它是真人身份解锁的**两条资格路径之一**（另一条是正向羁绊达阈值），
+// 判据源是 `cloud_characters.memorial_status='sealed'` + `memorial_world_id`。
+// 随 memorial 整块功能删除而一并移除——产品模型已改为**角色卡永不损失**，
+// 「死亡」只是这张卡在那一个副本里的剧本结束，「一起死过」这个事实源不再存在。
+//
+// 🔴 **删的方向是收紧不是放宽**：现在只剩正向羁绊那一条路径，
+// 而那本来就是 §14 的主路径（「仅正向羁绊线达阈值后双向自愿解锁」）。
+// 社交解锁的门槛只会比之前更严，不会更松——这一点很重要，因为这道门连着
+// 未成年保护与「敌对线永久匿名」的网暴防线，任何放宽都要单独评审。
+//
+// 📄 若将来要补回一条等价凭证，最自然的替代是「**共历终局**」
+// （双方都在场至终局 / 一方退场另一方送别），事实源换成 `world_members.status` + `left_at`。
+// ⚠️ 但要先答一个问题：退场在新模型下是**常见事件**，而死亡曾是罕见事件——
+// 照搬会让这条凭证变得极易获得，等于**放宽**社交门槛。所以它不是改个字段就能补回来的。
 
-/// 一对角色的「一起死过」凭证。**只读派生，没有任何存储**（见模块头 ④）。
-#[derive(Debug, Clone, Default)]
-struct DiedTogether {
-    /// 构成凭证的世界（按 world_id 升序，确定性）。空 = 没有这段共同经历。
-    worlds: Vec<Value>,
-}
-
-impl DiedTogether {
-    fn present(&self) -> bool {
-        !self.worlds.is_empty()
-    }
-
-    /// 下发形状。🔴 `note` 是写给未来读代码的人的：这条凭证**永远**不该长出数值字段。
-    fn to_json(&self) -> Value {
-        json!({
-            "kind": "died_together",
-            "present": self.present(),
-            "worlds": self.worlds,
-            "note": "关系凭证，非数值：不计分、不发道具、不影响历练 / 卡位 / 背包 / 结算 / 引擎决策",
-        })
-    }
-}
-
-/// 派生「我们的角色一起死过」（只读；`db.rs` 可移植 SQL 子集内完成）。
-///
-/// 判据的**唯一事实源**是既有的死亡公共事实，本函数一个字节都不新增：
-/// - 共同世界 = 两张卡在 `world_members` 里都有行的世界（足迹一行不删，死亡不抹掉走过的路）；
-/// - 死亡落定 = `cloud_characters.memorial_status = 'sealed'` 且 `memorial_world_id` 指向该世界
-///   （封卷是 `memorial` 模块对死亡公共事实的服务端权威核验之后才发生的，本函数不再重复核验，
-///   也**绝不**接受任何客户端声明）。
-///
-/// 三档 `grade`（都算数，因为「一起死过」说的是共同经历而不是同时咽气）：
-/// - `both_fell`  两张卡都在这个世界里封了卷 —— 同殁；
-/// - `they_fell`  对方倒下、我还在场 —— 我送别了他；
-/// - `i_fell`     我倒下、对方在场 —— 他送别了我。
-///
-/// `markedAsDeparted` 另附既有的「故人」印记（`memorial_marks`）是否已打——它是同一段关系
-/// 在 `memorial` 侧的独立记录，两边对得上才说明这段共同经历是真的（对不上也不影响判定，
-/// 只作展示，因为印记本身还受 `MUSE_MEMORIAL_BOND_MIN` 阈值影响）。
-async fn died_together(db: &AnyPool, mine: &str, theirs: &str) -> Result<DiedTogether, ApiError> {
-    // 共同世界（按 world_id 升序 → 结果确定，可 replay）。
-    let shared: Vec<(String,)> = sqlx::query_as(
-        "SELECT DISTINCT m1.world_id FROM world_members m1 \
-         JOIN world_members m2 ON m2.world_id = m1.world_id \
-         WHERE m1.cloud_character_id = $1 AND m2.cloud_character_id = $2 \
-         ORDER BY m1.world_id ASC",
-    )
-    .bind(mine)
-    .bind(theirs)
-    .fetch_all(db)
-    .await?;
-    if shared.is_empty() {
-        return Ok(DiedTogether::default());
-    }
-
-    let my_grave = grave_of(db, mine).await?;
-    let their_grave = grave_of(db, theirs).await?;
-    if my_grave.is_none() && their_grave.is_none() {
-        // 两张卡都还在世 —— 没有「一起死过」这回事。
-        return Ok(DiedTogether::default());
-    }
-
-    // 「故人」印记（任一方向即算：他记得你、你记得他，是同一段羁绊）。
-    let marked: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM memorial_marks \
-         WHERE (character_id = $1 AND deceased_character_id = $2) \
-            OR (character_id = $3 AND deceased_character_id = $4)",
-    )
-    .bind(mine)
-    .bind(theirs)
-    .bind(theirs)
-    .bind(mine)
-    .fetch_one(db)
-    .await?;
-
-    let mut out = DiedTogether::default();
-    for (world_id,) in shared {
-        let i_fell = my_grave.as_deref() == Some(world_id.as_str());
-        let they_fell = their_grave.as_deref() == Some(world_id.as_str());
-        let grade = match (i_fell, they_fell) {
-            (true, true) => "both_fell",
-            (false, true) => "they_fell",
-            (true, false) => "i_fell",
-            (false, false) => continue,
-        };
-        out.worlds.push(json!({
-            "worldId": world_id,
-            "grade": grade,
-            "markedAsDeparted": marked > 0,
-        }));
-    }
-    Ok(out)
-}
-
-/// 某张卡封卷于哪个世界；在世 / 卡不存在 / 未记录落款 → `None`。
-async fn grave_of(db: &AnyPool, character_id: &str) -> Result<Option<String>, ApiError> {
-    let row: Option<(String, Option<String>)> =
-        sqlx::query_as("SELECT memorial_status, memorial_world_id FROM cloud_characters WHERE id = $1")
-            .bind(character_id)
-            .fetch_optional(db)
-            .await?;
-    Ok(match row {
-        Some((status, world)) if status == "sealed" => world.filter(|w| !w.trim().is_empty()),
-        _ => None,
-    })
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 运营读数：解锁资格的正向分分布
@@ -820,9 +720,8 @@ async fn bond_distribution_admin(
 struct Eligibility {
     eligible: bool,
     bond: BondView,
-    credential: DiedTogether,
     shared_worlds: i64,
-    /// 命中的合格路径（`positive_bond` / `died_together`）。
+    /// 命中的合格路径（当前只有 `positive_bond`）。
     paths: Vec<&'static str>,
     /// 不合格原因（**只对本人展示**，绝不作为对他人的拒绝文案——见 `REFUSE_GENERIC`）。
     blockers: Vec<&'static str>,
@@ -837,10 +736,8 @@ impl Eligibility {
             "sharedWorlds": self.shared_worlds,
             "paths": {
                 "positiveBond": self.paths.contains(&PATH_POSITIVE_BOND),
-                "diedTogether": self.paths.contains(&PATH_DIED_TOGETHER),
             },
             "blockers": self.blockers,
-            "credential": self.credential.to_json(),
         })
     }
 
@@ -864,20 +761,17 @@ impl Eligibility {
             "bond": self.bond.positive,
             "sharedWorlds": self.shared_worlds,
             "paths": self.paths,
-            "diedTogetherWorlds": self.credential.worlds.len(),
             "thresholds": {
                 "minBond": unlock_min_bond(),
                 "hostileMax": hostile_max(),
                 "hostileFear": hostile_fear(),
                 "minSharedWorlds": min_shared_worlds(),
-                "deathBondCounts": death_bond_counts(),
             },
         })
     }
 }
 
 const PATH_POSITIVE_BOND: &str = "positive_bond";
-const PATH_DIED_TOGETHER: &str = "died_together";
 
 const BLOCK_HOSTILE: &str = "hostile_line_permanently_anonymous";
 const BLOCK_SHARED: &str = "insufficient_shared_worlds";
@@ -902,7 +796,6 @@ async fn evaluate_eligibility(
         .await?
         .unwrap_or_else(|| "{}".to_string());
     let bond = bond_between(&state_json, mine, theirs, hostile_max(), hostile_fear(), bond_counts_debt());
-    let credential = died_together(db, mine, theirs).await?;
 
     let shared_worlds: i64 = sqlx::query_scalar(
         "SELECT COUNT(DISTINCT m1.world_id) FROM world_members m1 \
@@ -923,7 +816,6 @@ async fn evaluate_eligibility(
         return Ok(Eligibility {
             eligible: false,
             bond,
-            credential,
             shared_worlds,
             paths,
             blockers,
@@ -937,15 +829,12 @@ async fn evaluate_eligibility(
     if bond.positive >= unlock_min_bond() && bond.edges > 0 {
         paths.push(PATH_POSITIVE_BOND);
     }
-    if credential.present() && death_bond_counts() {
-        paths.push(PATH_DIED_TOGETHER);
-    }
     if paths.is_empty() {
         blockers.push(BLOCK_BOND);
     }
 
     let eligible = blockers.is_empty();
-    Ok(Eligibility { eligible, bond, credential, shared_worlds, paths, blockers })
+    Ok(Eligibility { eligible, bond, shared_worlds, paths, blockers })
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

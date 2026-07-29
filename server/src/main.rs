@@ -24,6 +24,7 @@ mod events;
 // 本批次只接线 `MUSE_ONBOARDING` 一个，其余 8 个的迁移清单见 `flags::MIGRATION_NOTES`。
 mod flags;
 mod idempotency;
+mod imprint;
 // R3 if 线付费副本（总规格 §7「人设保险（三级出口）」第 3 级，三级出口的最后一级）：
 // 世界结束后花副本卡以**终局**为分叉点开单人平行线副本。
 // 🔴 **平行线不是改写**：原世界的 world_events / narrative_state / 结算账本一个字节不动（§0.3）；

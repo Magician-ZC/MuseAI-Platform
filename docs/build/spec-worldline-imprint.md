@@ -1,7 +1,17 @@
 # 提案：世界线烙印（Worldline Imprint）—— 让卡不可被复刻
 
-> 🔴 **状态：提案，未拍板。** 产品规则唯一权威仍是 `docs/build/spec-world-ecosystem.md`。
-> 按 §0.3 状态语言，本文全部内容处于 `Concept`。
+> 🔴 **状态：§3 的第 1-4 步已 `Implemented`（2026-07-29），第 5 步仍是 `Concept`。**
+> 产品规则唯一权威仍是 `docs/build/spec-world-ecosystem.md`。
+>
+> | 步 | 状态 | 落点 |
+> |---|---|---|
+> | 1 表 | `Implemented` | 迁移 `0054_character_imprints.sql` |
+> | 2 派生器 | `Implemented` | `server/src/imprint/mod.rs` 的 `derive_imprints`（纯函数）+ 结算侧接线 |
+> | 3 进实例种子 | `Implemented` | `assembly::resolve_instance_seed` 的第五段（**空指纹 → 走原路径，零烙印时逐字节不变**） |
+> | 4 风化 | `Implemented` | `imprint::weather`，容量 `MUSE_IMPRINT_CAPACITY`（默认 12） |
+> | 5 进决策上下文 | **`Concept`** | 效果只能靠真实模型验证，而本仓至今一次真实模型调用都没发生过 |
+>
+> 落地记录与一处需要盯的观察（仿真回归的结局多样性 3 → 2）见 `docs/VALIDATION.md` §3.62。
 
 ---
 

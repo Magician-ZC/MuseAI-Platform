@@ -192,12 +192,22 @@ async fn chapter_finish(
         attempt += 1;
 
         // 每次重试重读最新 assembled_json + state_revision（CAS 基准）。
-        let row = sqlx::query("SELECT assembled_json, state_revision FROM worlds WHERE id = $1")
-            .bind(&world_id)
-            .fetch_optional(&state.db)
-            .await?
-            .ok_or(ApiError::NotFound)?;
+        let row = sqlx::query(
+            "SELECT assembled_json, narrative_state_json, state_revision FROM worlds WHERE id = $1",
+        )
+        .bind(&world_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or(ApiError::NotFound)?;
         let raw: Option<String> = row.try_get("assembled_json")?;
+        // 完成判定的**唯一数据源**：引擎自己写下的世界状态。
+        // 🔴 与 `progression::fed_milestone` 同一条纪律——纯读引擎已定序的记录，不做二次推断，
+        // 更不新开一次模型调用去问「这条钩子完成了吗」（那既不确定也不可 replay）。
+        let narrative_state: Value = row
+            .try_get::<String, _>("narrative_state_json")
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| json!({}));
         let base_revision: i64 = row.try_get("state_revision")?;
         let mut wrapper = raw
             .as_deref()
@@ -225,6 +235,25 @@ async fn chapter_finish(
             let Some(reward) = &hook.reward_item else {
                 continue;
             };
+            // 「完成即锁定」（总规格 §9 ②）。
+            //
+            // 🔴 **默认不启用**：`hook_completion_required` 是模板字段，默认 false ⇒
+            // 走本行之前的老路径（通关就发），存量世界逐字节不变。理由见
+            // `AssemblyRules::hook_completion_required` 的注释——存量模板的钩子从来
+            // 没进过任何人的上下文，对它们打开这道闸等于把第 ② 层直接归零。
+            //
+            // 判据：引擎世界状态里 `world.<doneKey> == true`（模型在这条线索了结时写下）。
+            // ⚠️ `done_key` 为空 = **算不出合法的世界键**，不是「没完成」——照发。
+            if assembled.hook_completion_required && !hook.done_key.is_empty() {
+                let done = narrative_state
+                    .pointer("/world")
+                    .and_then(|w| w.get(&hook.done_key))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if !done {
+                    continue;
+                }
+            }
             let key = format!("{}:{}", hook.character_id, hook.pool_item_id);
             if granted_ids.contains(&key) {
                 continue;

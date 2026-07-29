@@ -30,6 +30,15 @@ use muse_engine::narrative::types::{IntensityWeights, LocationDef, LocationGate}
 #[serde(rename_all = "camelCase")]
 pub struct AssembledInstance {
     pub per_character_hooks: Vec<CharacterHook>,
+    /// 结算是否要求钩子真的完成（见 `AssemblyRules::hook_completion_required`）。
+    ///
+    /// 🔴 `skip_serializing_if` 不可省：只 `#[serde(default)]` 的话，`false` 也会被**写出来**，
+    /// 于是**每一个世界**的 `assembled_json` 字节形态都变了。
+    /// 这不是洁癖——`realm_tier_absent_keeps_assembled_json_byte_identical` 当场把它抓了出来，
+    /// 而它守的是「既有实例的装配产物可逐字节对账」，也是黄金世界回归赖以成立的前提。
+    /// 不写出来 ⇒ 没声明这条规则的模板产出与本层落地前**一个字节都不差**。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hook_completion_required: bool,
     pub enabled_endings: Vec<String>,
     /// 本实例**定盘**的结局 id（总规格 §5「一个模板，千个平行世界」）：在 `enabled_endings` 之内
     /// 按加权权重、由 `DOMAIN_ENDING` 子流掷点选定，随实例钉住。`runtime::select_ending` 读它。
@@ -315,6 +324,15 @@ pub struct CharacterHook {
     pub pool_item_id: String,
     pub parameterized_text: String,
     pub difficulty_score: f32,
+    /// 完成标记的世界键（`hookDone_<卡id>_<钩子id>`）。随钩子一起投放给角色，
+    /// 由模型在这条线索了结时写 `true`；结算按它判定「完成即锁定」。
+    ///
+    /// 空 = **算不出合法的世界键**（引擎要求 `world.<key>` 单段、不含 `.` 与 `[`）⇒
+    /// 这条钩子不参与完成判定，退化为「通关就发」。
+    /// 🔴 空**不是**「未完成」：把算不出键当成没完成，会让一个 id 里带点号的钩子
+    /// 永远拿不到奖励，而且没有任何症状。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub done_key: String,
     /// 从预审核池挑出的隐藏道具：通关结算（chapters::finish）经 grant_item 兑现。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reward_item: Option<ItemDefinition>,
@@ -667,11 +685,28 @@ struct AssemblyRules {
     hidden_per_character: usize,
     #[serde(default = "half")]
     ending_weight_threshold: f32,
+    /// 结算时是否**要求钩子真的完成**才发它的奖励（总规格 §9 ② 「完成即锁定」）。
+    ///
+    /// ══════════════════════════════════════════════════════════════════════════
+    /// 🔴 默认 `false` = 今天的行为：**通关就发**。
+    /// ══════════════════════════════════════════════════════════════════════════
+    /// 规格与实现在这里分叉已久：§9 写的是「完成自己隐藏钩子的卡，完成即锁定」，
+    /// 而 `chapters::chapter_finish` 一直是「这张卡的钩子只要带 `reward_item` 就发」。
+    /// 于是第 ② 层（成就层，奖励「编卡功力」）实际奖励的是**出席**——与第 ① 层重复。
+    ///
+    /// 为什么用**模板字段**而不是运营开关：这是**内容契约**，不是灰度。
+    /// 要求「完成才发」的前提是这个模板的钩子**真的被投放、真的可能被了结**；
+    /// 而存量模板的钩子从来没进过任何人的上下文（见 `RoundInput::personal_threads`），
+    /// 对它们打开这道闸等于把第 ② 层直接归零。
+    /// 🔴 于是闸的粒度必须与「这个模板有没有为此写过内容」对齐——那正是模板字段的粒度。
+    /// 「未声明即不启用」也满足平台三约束第 1 条（新功能经**数据配置**启用）。
+    #[serde(default)]
+    hook_completion_required: bool,
 }
 
 impl Default for AssemblyRules {
     fn default() -> Self {
-        Self { hidden_per_character: 1, ending_weight_threshold: 0.5 }
+        Self { hidden_per_character: 1, ending_weight_threshold: 0.5, hook_completion_required: false }
     }
 }
 
@@ -681,6 +716,10 @@ fn one() -> f32 {
 fn half() -> f32 {
     0.5
 }
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 fn one_usize() -> usize {
     1
 }
@@ -2367,6 +2406,12 @@ pub(crate) async fn save_wrapper(db: &AnyPool, world_id: &str, wrapper: &Value) 
 pub(crate) mod testing {
     use super::{instance_seed, resolve_instance_seed, Skeleton};
 
+    /// 暴露完成键的算法给 `runtime` 的用例——两边必须是**同一个函数**，
+    /// 否则「投放时算的键」与「结算时查的键」会各自漂移，而症状是「钩子永远完不成」。
+    pub(crate) fn hook_done_key_for_test(cid: &str, pool_item_id: &str) -> Option<String> {
+        super::hook_done_key(cid, pool_item_id)
+    }
+
     pub(crate) fn instance_seed_for_test(world_id: &str, fp: &str, ver: i64) -> u64 {
         instance_seed(world_id, fp, ver)
     }
@@ -2504,6 +2549,7 @@ pub async fn assemble_instance(state: &AppState, world_id: &str) -> Result<Assem
             hooks.push(CharacterHook {
                 character_id: cid.clone(),
                 pool_item_id: pool_item.id.clone(),
+                done_key: hook_done_key(cid, &pool_item.id).unwrap_or_default(),
                 parameterized_text: text,
                 difficulty_score: difficulty,
                 reward_item: resolve_reward_item(pool_item, &skeleton.world_items),
@@ -2571,6 +2617,7 @@ pub async fn assemble_instance(state: &AppState, world_id: &str) -> Result<Assem
 
     let assembled = AssembledInstance {
         per_character_hooks: hooks,
+        hook_completion_required: rules.hook_completion_required,
         enabled_endings,
         selected_ending,
         lineup_params,
@@ -2854,7 +2901,7 @@ pub(crate) const SKELETON_KEY_SETS: &[(&str, &str, &[&str])] = &[
     ("locations[]", "LocationSpec", &["id", "name", "connections", "isSecretRealm", "gate", "residentItemIds"]), // LocationSpec
     // LocationGate 属 muse-engine（跨 crate 契约，§3.7 那一类）
     ("locations[].gate", "LocationGate", &["requiredItemIds", "requiredEffectTags", "requiredCosmologies", "maxPowerTier"]),
-    ("assemblyRules", "AssemblyRules", &["hiddenPerCharacter", "endingWeightThreshold"]), // AssemblyRules
+    ("assemblyRules", "AssemblyRules", &["hiddenPerCharacter", "endingWeightThreshold", "hookCompletionRequired"]), // AssemblyRules
     // StorylineSpec + `assets::worlds::world_scan_text` 手读的 `summary`（结构体里没有这个字段）
     ("storylines[]", "StorylineSpec", &["id", "mainlineNodeIds", "hiddenPoolIds", "endingIds", "affinity", "summary"]),
     ("identityPool[]", "IdentitySpec", &["id", "label", "quota", "themes", "hookAffinity", "isLead"]), // IdentitySpec
@@ -3501,6 +3548,21 @@ fn rank_pool_items<'a>(
     // 排序分降序；稳定排序保留池内原顺序作为平手序。
     scored.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
     scored.into_iter().map(|(p, m, term, _)| (p, m, term)).collect()
+}
+
+/// 钩子完成标记的世界键：`hookDone_<卡id>_<钩子id>`。
+///
+/// 🔴 引擎的 `world.<key>` 要求**单段键**（不含 `.` 与 `[`，见 `reducer::parse_path`）。
+/// 任一段带非法字符 ⇒ 返回 `None`，该钩子不参与完成判定、退化为「通关就发」。
+///
+/// ⚠️ **算不出键不等于没完成。** 把它当成「未完成」会让一个 id 里带点号的钩子
+/// 永远拿不到奖励，且没有任何症状——那正是本仓反复吃亏的静默失败形状。
+fn hook_done_key(character_id: &str, pool_item_id: &str) -> Option<String> {
+    let illegal = |s: &str| s.is_empty() || s.contains('.') || s.contains('[');
+    if illegal(character_id) || illegal(pool_item_id) {
+        return None;
+    }
+    Some(format!("hookDone_{character_id}_{pool_item_id}"))
 }
 
 /// 参数化连接文本：填充模板并显式嵌入绑定的执念词条（保证可验证的执念绑定）。
@@ -4991,6 +5053,7 @@ mod sampling_tests {
     fn realm_tier_absent_keeps_assembled_json_byte_identical() {
         let base = AssembledInstance {
             per_character_hooks: vec![],
+            hook_completion_required: false,
             enabled_endings: vec![],
             selected_ending: None,
             lineup_params: serde_json::json!({}),

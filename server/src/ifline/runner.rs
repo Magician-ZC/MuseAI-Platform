@@ -773,6 +773,9 @@ pub(super) async fn advance_one_beat(
             // 「这张卡在**别的世界**里经历过什么」——分叉线要不要继承那份跨世界记忆，
             // 是个产品问题（分叉出去的是同一张卡，还是一个假设？），不是接线的顺手事。
             worldline_imprints: Default::default(),
+            // 私有线索：if 线同样保持空。分叉出去的是一条私人平行线，
+            // 原世界那几条未了的事要不要跟过去，是产品问题（跟过去就等于把同一条钩子发两次）。
+            personal_threads: Default::default(),
         };
         let cancel = CancelFlag::new();
         // 🔴 恒走 `run_round`，**不走 `run_event_step`**：DES 调度依赖 `timeline.next_time`

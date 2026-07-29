@@ -740,6 +740,103 @@ async fn chapter_start_assembles_and_finish_grants_reward_and_offline() {
     assert_eq!(count(&state.db, "SELECT COUNT(*) FROM backpacks WHERE user_id='usrA' AND item_id='item_relic'").await, 1);
 }
 
+/// 要求「完成即锁定」的骨架：与 `CHAPTER_SKELETON` 只差 `hookCompletionRequired: true`。
+const CHAPTER_SKELETON_COMPLETION_REQUIRED: &str = r#"{
+  "sourceWork": { "sourceId": "src_novel", "title": "测试小说" },
+  "mainlineNodes": [ { "id": "n1", "fated": true }, { "id": "n2", "fated": false } ],
+  "endingPool": [ { "id": "ending_smart", "affinity": "strategist", "baseWeight": 0.6 } ],
+  "hiddenContentPool": [
+    { "id": "hc_abandon", "themes": ["遗忘", "孤独"], "template": "{name} 必须直面 {fear}。", "difficultyBase": 0.5,
+      "rewardItem": { "id": "item_relic", "narrative": "记忆残片", "effectTags": ["info:reveal"],
+        "origin": { "worldTemplateId": "tpl_chapter", "cosmology": ["myth"], "powerTier": 2 } } }
+  ],
+  "assemblyRules": { "hiddenPerCharacter": 1, "hookCompletionRequired": true }
+}"#;
+
+/// 把引擎世界状态里的完成标记置上（模型了结这条线索时本该自己写的那个键）。
+async fn mark_hook_done(state: &crate::app::AppState, world_id: &str, key: &str) {
+    let raw: String = sqlx::query("SELECT narrative_state_json FROM worlds WHERE id=$1")
+        .bind(world_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+        .try_get("narrative_state_json")
+        .unwrap();
+    let mut v: Value = serde_json::from_str(&raw).unwrap_or_else(|_| json!({}));
+    if !v["world"].is_object() {
+        v["world"] = json!({});
+    }
+    v["world"][key] = json!(true);
+    sqlx::query("UPDATE worlds SET narrative_state_json=$1 WHERE id=$2")
+        .bind(v.to_string())
+        .bind(world_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+}
+
+/// 🔴 **「完成即锁定」：没完成就不发。**
+///
+/// 总规格 §9 ② 一直写着「完成自己隐藏钩子的卡，完成即锁定」，而实现一直是
+/// 「这张卡的钩子只要带 reward_item 就发」——于是第 ② 层（奖励「编卡功力」）
+/// 实际奖励的是**出席**，与第 ① 层重复。这条用例是那句规格第一次真的成立。
+#[tokio::test]
+async fn an_unfinished_hook_grants_nothing_when_the_template_asks_for_completion() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    seed_user(&state, "usrA").await;
+    let card = make_card("chA", "苏未央", "害怕被遗忘", &["寻找失散的姐姐"], Some(("src_novel", "测试小说")), true);
+    seed_char(&state, "chA", "usrA", &card).await;
+    seed_template(&state, "tpl_req", "chapter", CHAPTER_SKELETON_COMPLETION_REQUIRED, r#"{"mode":"open"}"#).await;
+    let wid = make_chapter_world(&state, "tpl_req").await;
+    seed_member(&state, &wid, "usrA", "chA").await;
+    let ta = token(&state, "usrA");
+
+    let (st, _) = post(&app, &format!("/api/worlds/{wid}/chapters/start"), &ta, None, json!({})).await;
+    assert_eq!(st, StatusCode::OK);
+
+    // 没有任何完成标记 → 一件都不发。
+    let (_, bf) = post(&app, &format!("/api/worlds/{wid}/chapters/finish"), &ta, None, json!({})).await;
+    assert_eq!(
+        bf["grantedItems"].as_array().unwrap().len(),
+        0,
+        "🔴 钩子没完成却发了奖——「完成即锁定」没有生效：{bf}"
+    );
+
+    // 置上完成标记（模型了结时本该写的那个键）→ 下一次结算发货。
+    mark_hook_done(&state, &wid, "hookDone_chA_hc_abandon").await;
+    let (_, bf2) = post(&app, &format!("/api/worlds/{wid}/chapters/finish"), &ta, None, json!({})).await;
+    let granted = bf2["grantedItems"].as_array().unwrap();
+    assert_eq!(granted.len(), 1, "完成之后必须发：{bf2}");
+    assert_eq!(granted[0]["itemId"], "item_relic");
+}
+
+/// 🔴 **未声明 `hookCompletionRequired` 的模板：一个字节都不变（通关就发）。**
+///
+/// 这是这一层能作为纯增量上线的全部依据。存量模板的钩子从来没进过任何人的上下文，
+/// 对它们打开这道闸等于把第 ② 层直接归零——所以闸的粒度必须是**模板**，
+/// 而不是运营开关（后者会一次打开所有存量模板）。
+#[tokio::test]
+async fn a_template_that_never_asked_for_completion_keeps_granting_on_clear() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    seed_user(&state, "usrB").await;
+    let card = make_card("chB", "苏未央", "害怕被遗忘", &["寻找失散的姐姐"], Some(("src_novel", "测试小说")), true);
+    seed_char(&state, "chB", "usrB", &card).await;
+    seed_template(&state, "tpl_legacy", "chapter", CHAPTER_SKELETON, r#"{"mode":"open"}"#).await;
+    let wid = make_chapter_world(&state, "tpl_legacy").await;
+    seed_member(&state, &wid, "usrB", "chB").await;
+    let tb = token(&state, "usrB");
+
+    post(&app, &format!("/api/worlds/{wid}/chapters/start"), &tb, None, json!({})).await;
+    let (_, bf) = post(&app, &format!("/api/worlds/{wid}/chapters/finish"), &tb, None, json!({})).await;
+    assert_eq!(
+        bf["grantedItems"].as_array().unwrap().len(),
+        1,
+        "🔴 存量模板的发放行为被改变了——这一层必须是纯增量：{bf}"
+    );
+}
+
 #[tokio::test]
 async fn chapter_endpoints_reject_non_chapter_room() {
     let state = test_state().await;

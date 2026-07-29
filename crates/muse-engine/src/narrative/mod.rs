@@ -226,6 +226,24 @@ pub struct RoundInput {
     ///
     /// 空表（默认，桌面壳恒空）⇒ 追加函数**根本不会被调到** ⇒ 上下文与接线前逐字节一致。
     pub worldline_imprints: BTreeMap<String, Vec<String>>,
+    /// 私有线索（per-character 钩子的**投放通道**）：`卡id → 这张卡手上还没了结的事`。
+    ///
+    /// ══════════════════════════════════════════════════════════════════════════
+    /// 🔴 它补的是一个更大的空洞：**支线钩子此前从来没有被投放进世界**
+    /// ══════════════════════════════════════════════════════════════════════════
+    /// 平台侧的装配器一直在挑钩子、按这张卡的执念参数化文本、过机审、存进 `assembled_json`，
+    /// 然后——**没有任何人读那段文字**：模型没看到，玩家也没看到。它唯一的下游是通关时发一件道具。
+    /// 于是总规格 §8 那条「钩子私有制（按卡的执念绑定归属，偷不走别人的）」在实现上是空的：
+    /// 没有任何东西可以被偷，因为从没有人**拥有**过任何东西。本字段是那条通道。
+    ///
+    /// 🔴 **只给自己那一条**：`卡id` 对应的线索只喂给该卡本人——这才是「钩子私有制」的字面含义。
+    ///
+    /// 🔴 **不是判定输入**：只流向 `decide::append_personal_threads` 的展示层 JSON。
+    /// 不进 `active_cards`、不进 `CharacterState.resources`、不进仲裁 / StatePatch /
+    /// DomainEvent / 同意门控。它是「你心里还惦记着一件事」，不是「你手上有一张牌」。
+    ///
+    /// 空表（默认，桌面壳恒空）⇒ 追加函数根本不会被调到 ⇒ 上下文与接线前逐字节一致。
+    pub personal_threads: BTreeMap<String, Vec<(String, String)>>,
 }
 
 impl Default for RoundInput {
@@ -256,6 +274,8 @@ impl Default for RoundInput {
             realm_costume: None,
             // 无烙印（桌面壳恒空）：追加函数根本不会被调到，可见上下文与接线前逐字节一致。
             worldline_imprints: BTreeMap::new(),
+            // 无私有线索（桌面壳恒空）：同上。
+            personal_threads: BTreeMap::new(),
         }
     }
 }
@@ -495,6 +515,11 @@ impl NarrativeEngine {
                             &ctx,
                             inp_ref.worldline_imprints.get(cid).map(Vec::as_slice).unwrap_or(&[]),
                         )?;
+                        // 私有线索（per-character 钩子）：同样**只取 `cid` 自己那一条**。
+                        let ctx = decide::append_personal_threads(
+                            &ctx,
+                            inp_ref.personal_threads.get(cid).map(Vec::as_slice).unwrap_or(&[]),
+                        )?;
                         decide::role_decide(
                             host, decide_stage, dp_ref, inp_ref.temperature_decide,
                             inp_ref.max_output_tokens, rid_ref, inp_ref.now_hint, cid, &ctx,
@@ -591,6 +616,11 @@ impl NarrativeEngine {
                     let base = decide::append_worldline_imprints(
                         &base,
                         input.worldline_imprints.get(cid).map(Vec::as_slice).unwrap_or(&[]),
+                    )?;
+                    // 两条路径的可见上下文必须同源，否则触底线重决策时角色会突然忘了自己在惦记什么。
+                    let base = decide::append_personal_threads(
+                        &base,
+                        input.personal_threads.get(cid).map(Vec::as_slice).unwrap_or(&[]),
                     )?;
                     let ctx = decide::append_bottom_line_rejection(
                         &base,
@@ -2159,6 +2189,7 @@ mod tests {
             // 默认档 = 无戏服：既有全部用例的导演 prompt 与接线前逐字节一致（回归保护）。
             realm_costume: None,
             worldline_imprints: BTreeMap::new(),
+            personal_threads: BTreeMap::new(),
         }
     }
 
@@ -2816,6 +2847,7 @@ mod tests {
             // 默认档 = 无戏服：既有全部用例的导演 prompt 与接线前逐字节一致（回归保护）。
             realm_costume: None,
             worldline_imprints: BTreeMap::new(),
+            personal_threads: BTreeMap::new(),
         }
     }
 
@@ -3877,6 +3909,108 @@ mod tests {
         }
     }
 
+    // ===== 私有线索 · per-character 钩子的投放（2026-07-29） =====
+
+    fn threads(cid: &str, items: &[(&str, &str)]) -> BTreeMap<String, Vec<(String, String)>> {
+        let mut m = BTreeMap::new();
+        m.insert(
+            cid.to_string(),
+            items.iter().map(|(w, k)| (w.to_string(), k.to_string())).collect(),
+        );
+        m
+    }
+
+    /// 🔴 **只给自己那一条**——「钩子私有制」的字面含义就在这里。
+    ///
+    /// 在这一层落地之前，钩子文本全仓没有任何消费方，于是「按执念绑定归属、偷不走别人的」
+    /// 是一句空话：没有任何东西可以被偷，因为从没有人拥有过任何东西。
+    #[tokio::test]
+    async fn a_thread_reaches_only_the_card_it_belongs_to() {
+        let model = Arc::new(CapturingModel::new(two_char_script()));
+        let host = host_capturing(model.clone());
+        init_run(host.as_ref(), "run-1", true);
+        let engine = NarrativeEngine::new(host.clone());
+        let mut input = round_input("run-1", big_budget());
+        input.personal_threads = threads("li", &[("断桥下埋着他母亲的遗物", "hookDone_li_hc-3")]);
+
+        let out = engine.run_round(&routes(), &prompts(), input, &CancelFlag::new()).await.unwrap();
+        assert!(out.blocked.is_none());
+
+        let mine = decide_ctx_json(&model.decide_prompt_of("li"));
+        assert!(mine["yourThreads"]["unfinished"].to_string().contains("断桥"), "本人必须看得到自己的线索");
+        let other = model.decide_prompt_of("wang");
+        assert!(!other.contains("断桥"), "🔴 别人看到了不属于他的线索");
+        assert!(!other.contains("yourThreads"), "🔴 没有线索的角色不该出现这一格");
+    }
+
+    /// 🔴 **线索不进任何判定域**：patch / 事件 / 世界状态 / DNA / resources 一个字节都不许有。
+    ///
+    /// 它是「你心里还惦记着一件事」，不是「你手上有一张牌」。一旦物化成 `resources`，
+    /// 仲裁就读得到它，那一刻「私有线索」变成了「私有资源」——而资源是可比的、可抢的、可买的。
+    #[tokio::test]
+    async fn a_thread_never_becomes_a_resource() {
+        let model = Arc::new(CapturingModel::new(two_char_script()));
+        let host = host_capturing(model.clone());
+        init_run(host.as_ref(), "run-1", true);
+        let engine = NarrativeEngine::new(host.clone());
+        let mut input = round_input("run-1", big_budget());
+        input.personal_threads = threads("li", &[("剑冢深处那柄断剑", "hookDone_li_hc-9")]);
+
+        let out = engine.run_round(&routes(), &prompts(), input, &CancelFlag::new()).await.unwrap();
+        let dumped = serde_json::to_string(&out.scene.state_patch).unwrap()
+            + &serde_json::to_string(&out.scene.events).unwrap()
+            + &serde_json::to_string(&out.new_state).unwrap();
+        assert!(!dumped.contains("剑冢深处"), "🔴 线索渗进了 patch/事件/世界状态");
+        let ctx = decide_ctx_json(&model.decide_prompt_of("li"));
+        assert!(!ctx["yourDna"].to_string().contains("剑冢深处"), "🔴 线索不得进 DNA 卡");
+        let resources = serde_json::to_string(
+            &out.new_state.characters.get("li").map(|c| c.resources.clone()).unwrap_or_default(),
+        )
+        .unwrap();
+        assert!(!resources.contains("剑冢深处"), "🔴 线索不得物化进 resources");
+    }
+
+    /// 🔴 **不传 / 传空 ⇒ 可见上下文逐字节一致。**
+    #[tokio::test]
+    async fn absent_or_empty_threads_keep_the_context_byte_identical() {
+        let mut seen: Vec<String> = Vec::new();
+        for t in [
+            BTreeMap::new(),
+            threads("li", &[]),
+            threads("li", &[("", "hookDone_li_x"), ("   ", "  ")]), // 空文本 / 空键
+        ] {
+            let model = Arc::new(CapturingModel::new(two_char_script()));
+            let host = host_capturing(model.clone());
+            init_run(host.as_ref(), "run-1", true);
+            let engine = NarrativeEngine::new(host.clone());
+            let mut input = round_input("run-1", big_budget());
+            input.personal_threads = t;
+            engine.run_round(&routes(), &prompts(), input, &CancelFlag::new()).await.unwrap();
+            seen.push(model.decide_prompt_of("li"));
+        }
+        assert!(seen.windows(2).all(|w| w[0] == w[1]), "🔴 空线索改变了可见上下文");
+        assert!(!seen[0].contains("yourThreads"), "无线索时不得出现这一格");
+    }
+
+    /// 🔴 说明文字必须**显式否掉**优势语义，并明确「不是非做不可」。
+    ///
+    /// 后半句同样重要：一条被措辞成「任务」的线索会让所有角色变成一个样子（都去做任务），
+    /// 而这套系统的地基是「内核决定行为」。
+    #[test]
+    fn the_thread_note_denies_advantage_and_denies_obligation() {
+        let ctx = decide::append_personal_threads(
+            "{}",
+            &[("一件未了的事".to_string(), "hookDone_a_b".to_string())],
+        )
+        .unwrap();
+        for must in ["不给你任何优势", "不提高成功率", "不保证你做得成", "不是非做不可"] {
+            assert!(ctx.contains(must), "🔴 说明里少了这句显式否认：「{must}」\n{ctx}");
+        }
+        // 完成标记必须随线索一起给出，否则模型不知道该写哪个键。
+        assert!(ctx.contains("hookDone_a_b"), "doneKey 必须出现在上下文里");
+        assert!(ctx.contains("没了结就不要写"), "必须写明「没完成不要写」——否则会被无脑标完成");
+    }
+
     /// 不传戏服（默认档）→ 导演 prompt 里**一个字节都不多**。
     /// 空戏服（两段皆空）必须与不传**逐字节等价**——否则"声明了一件没词儿的戏服"会悄悄改写
     /// 所有已声明世界的导演输入，而黄金骨架恰恰不声明 realmTier，那正是回归基线赖以不变的前提。
@@ -3964,6 +4098,7 @@ mod tests {
             // 默认档 = 无戏服：既有全部用例的导演 prompt 与接线前逐字节一致（回归保护）。
             realm_costume: None,
             worldline_imprints: BTreeMap::new(),
+            personal_threads: BTreeMap::new(),
         }
     }
 

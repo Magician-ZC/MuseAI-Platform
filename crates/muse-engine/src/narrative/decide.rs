@@ -384,6 +384,62 @@ pub fn append_worldline_imprints(
     Ok(serde_json::to_string_pretty(&ctx)?)
 }
 
+/// 私有线索（per-character 钩子的投放）：把「这张卡手上还没了结的事」追加进它的可见上下文。
+///
+/// ══════════════════════════════════════════════════════════════════════════
+/// 🔴 这是「钩子私有制」第一次真的成立
+/// ══════════════════════════════════════════════════════════════════════════
+/// 平台侧的装配器一直在按每张卡的执念挑钩子、参数化、过机审、落库，
+/// 而那段文字**全仓没有任何消费方**——模型没见过，玩家也没见过。
+/// 于是「按执念绑定归属，偷不走别人的」这句话在实现上是空的：
+/// 没有任何东西可以被偷，因为从没有人拥有过任何东西。本函数是那条投放通道。
+///
+/// 🔴 **只给自己那一条**，信息隔离铁律不容许例外——这也正是「私有」二字的字面含义。
+///
+/// 🔴 **它是牵挂，不是牌**：措辞显式声明「不给你任何优势，也不保证你做得成」。
+/// 一条私有线索让这个角色**有事可做、有方向**，不让他**更容易赢**——
+/// 差别在于前者改变的是「他会去干什么」，后者改变的是「他干成的概率」。
+///
+/// ⚠️ 关于完成标记那句话：它是**机制说明混进叙事上下文**，我知道这不干净。
+/// 替代方案（服务端按事件流反推「这条钩子了结了没有」）需要一条从仲裁结果回到钩子 id 的链路，
+/// 而那条链路今天不存在，凭空造一条比让模型记一个键更重。
+/// 🔵 真正兜住风险的不是这句话写得多好，而是**默认不启用**：
+/// 模板不显式声明 `hookCompletionRequired` 时，结算走老路径（通关就发），
+/// 模型不写这个键也不会有任何人少拿东西。
+///
+/// **为何是后置追加**：同 [`append_bottom_line_rejection`]——桌面壳与无钩子的世界
+/// 根本不会调到本函数，「默认行为零变化」由「代码路径压根不经过」保证。
+///
+/// 空表 → 原样返回（连解析都不做，逐字节恒等）。纯函数，无随机、不依赖任何迭代序。
+pub fn append_personal_threads(
+    visible_context: &str,
+    threads: &[(String, String)],
+) -> Result<String, EngineError> {
+    let items: Vec<Value> = threads
+        .iter()
+        .filter(|(what, key)| !what.trim().is_empty() && !key.trim().is_empty())
+        .map(|(what, key)| json!({ "what": what.trim(), "doneKey": key.trim() }))
+        .collect();
+    if items.is_empty() {
+        return Ok(visible_context.to_string());
+    }
+    let mut ctx: Value = serde_json::from_str(visible_context)?;
+    if let Some(obj) = ctx.as_object_mut() {
+        obj.insert(
+            "yourThreads".to_string(),
+            json!({
+                "unfinished": items,
+                "note": "这些是只属于你的线索——别人不知道你惦记着它们，你也不知道别人惦记着什么。\
+它们不给你任何优势、不提高成功率、不保证你做得成，也不是非做不可：\
+它只说明这个世界上有几件事和你有关，去不去、怎么去，由你的性格决定。",
+                "howToClose": "其中一条真的有了了结（做成了，或者彻底断了念想）时，\
+在本回合的状态更新里把它的 doneKey 记为 true；没了结就不要写。",
+            }),
+        );
+    }
+    Ok(serde_json::to_string_pretty(&ctx)?)
+}
+
 /// 决策用户提示：可见上下文 + 严格 JSON 输出契约。
 fn build_decide_user_prompt(character_id: &str, visible_context: &str) -> String {
     format!(

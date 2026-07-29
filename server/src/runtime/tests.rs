@@ -2567,6 +2567,82 @@ async fn identity_assignments_decorate_other_cards_brief() {
     );
 }
 
+/// 🔴 **端到端：钩子真的进了它主人的可见上下文，也真的没进别人的。**
+///
+/// ⚠️ **这条必须端到端，纯函数用例守不住它。** 我先写的是
+/// `hooks_are_actually_delivered_and_only_to_their_owner`（测 `parse_personal_threads` 本身），
+/// 做故障注入——把 runtime 那一行的入参换成 `None`，等于投放通道整条断掉——
+/// **它照样绿**。因为它测的是「解析器会不会解析」，而空洞在「有没有人调它」。
+/// 🔵 这正是本层要修的那个空洞**在测试上的同构**：
+/// **「产物被生成」与「产物被消费」是两件事，而只测前者的用例集看起来是完备的。**
+#[tokio::test]
+async fn a_hook_reaches_its_owners_prompt_and_nobody_elses() {
+    let state = test_state().await;
+    let wid = running_world_with_identities(
+        &state,
+        "threads",
+        standard_identity_pool(),
+        json!([["chA", "official"], ["chB", "merchant"]]),
+    )
+    .await;
+    // 覆写 assembled_json：两张卡各一条私有线索。
+    sqlx::query("UPDATE worlds SET assembled_json=$1 WHERE id=$2")
+        .bind(
+            json!({ "assembly": { "perCharacterHooks": [
+                { "characterId": "chA", "poolItemId": "hc-1", "parameterizedText": "甲惦记着断桥下的旧物",
+                  "difficultyScore": 0.5, "doneKey": "hookDone_chA_hc-1" },
+                { "characterId": "chB", "poolItemId": "hc-9", "parameterizedText": "乙惦记着剑冢里的断剑",
+                  "difficultyScore": 0.6, "doneKey": "hookDone_chB_hc-9" }
+            ] } })
+            .to_string(),
+        )
+        .bind(&wid)
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let model: Arc<dyn ModelClient> = Arc::new(CapturingMock { decide_prompts: prompts.clone() });
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 0, model).await.unwrap(), TickStatus::Done);
+
+    let captured = prompts.lock().unwrap().clone();
+    let a = ctx_of(&captured, "chA");
+    assert!(
+        a["yourThreads"]["unfinished"].to_string().contains("断桥下的旧物"),
+        "🔴 钩子没有被投放给它的主人——投放通道断了：{a}"
+    );
+    assert!(
+        a["yourThreads"]["unfinished"].to_string().contains("hookDone_chA_hc-1"),
+        "完成键必须随线索一起投放，否则模型不知道该写哪个键"
+    );
+    // 🔴 信息隔离：甲的上下文里不得有乙的任何字节。
+    let a_all = a.to_string();
+    assert!(!a_all.contains("剑冢里的断剑"), "🔴 甲看到了乙的线索");
+    assert!(!a_all.contains("hookDone_chB"), "🔴 甲看到了乙的完成键");
+    let b_all = ctx_of(&captured, "chB").to_string();
+    assert!(!b_all.contains("断桥下的旧物"), "🔴 乙看到了甲的线索");
+}
+
+/// 无钩子的世界：可见上下文里根本不出现 `yourThreads` 这一格（逐字节退化）。
+#[tokio::test]
+async fn a_world_without_hooks_shows_no_threads_block() {
+    let state = test_state().await;
+    let wid = running_world_with_identities(
+        &state,
+        "nothreads",
+        standard_identity_pool(),
+        json!([["chA", "official"], ["chB", "merchant"]]),
+    )
+    .await;
+    let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let model: Arc<dyn ModelClient> = Arc::new(CapturingMock { decide_prompts: prompts.clone() });
+    insert_tick(&state.db, &wid, 0, 0).await.unwrap();
+    assert_eq!(process_tick_with_model(&state, &wid, 0, model).await.unwrap(), TickStatus::Done);
+    let captured = prompts.lock().unwrap().clone();
+    assert!(ctx_of(&captured, "chA").get("yourThreads").is_none(), "无钩子时不得出现这一格");
+}
+
 /// 🔴 红线：身份**绝不**进 active_cards——角色卡快照一个字节都不许被改。
 /// 断言口径：本人可见上下文里的 `yourDna.identity.name`（直接来自 active_cards 的卡）必须是原始卡名；
 /// DB 里的 card_json 也必须原样。
@@ -4335,4 +4411,78 @@ async fn the_spacing_between_fated_moments_is_a_parameter_not_a_hardcoded_one() 
     // 默认间距 600：章序 2 → 1200，而**不是** 2。
     assert_eq!(n1.due_at, Some(1200));
     assert!(n1.due_at.unwrap() > 60, "🔴 必须远大于单次行动时长，否则原著会在开局瞬间演完");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 私有线索（per-character 钩子的投放，2026-07-29）
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 🔴 **钩子必须真的被投放出去，而且只投给它的主人。**
+///
+/// 这条守的是一个此前**存在了很久、没有任何用例会红**的空洞：装配器一直在按每张卡的执念
+/// 挑钩子、参数化文本、过机审、存进 `assembled_json`，而全仓**没有任何人读那段文字**——
+/// 模型没见过、玩家也没见过，它唯一的下游是通关时发一件道具。
+/// 于是总规格 §8 三重防线之二「钩子私有制（按执念绑定归属，偷不走别人的）」是空的：
+/// 没有任何东西可以被偷，因为从没有人拥有过任何东西。
+///
+/// 🔵 它当时不会红，是因为**每一条既有用例都只测到 `assembled_json` 为止**——
+/// 断言「钩子被挑出来了」「文本参数化对了」「奖励发了」，没有一条问「谁看见了它」。
+/// **「产物被生成」与「产物被消费」是两件事，而只测前者的用例集看起来是完备的。**
+#[test]
+fn hooks_are_actually_delivered_and_only_to_their_owner() {
+    let assembled = serde_json::json!({
+        "assembly": {
+            "perCharacterHooks": [
+                { "characterId": "chA", "poolItemId": "hc-1", "parameterizedText": "甲的心结",
+                  "difficultyScore": 0.5, "doneKey": "hookDone_chA_hc-1" },
+                { "characterId": "chA", "poolItemId": "hc-2", "parameterizedText": "甲的第二件事",
+                  "difficultyScore": 0.4, "doneKey": "hookDone_chA_hc-2" },
+                { "characterId": "chB", "poolItemId": "hc-9", "parameterizedText": "乙的心结",
+                  "difficultyScore": 0.6, "doneKey": "hookDone_chB_hc-9" }
+            ]
+        }
+    })
+    .to_string();
+
+    let out = super::parse_personal_threads(Some(&assembled));
+    assert_eq!(out.len(), 2, "两张卡各自成格：{out:?}");
+    assert_eq!(out["chA"].len(), 2);
+    assert_eq!(out["chB"].len(), 1);
+    // 🔴 分格即隔离：甲那一格里不得出现乙的任何字节。
+    let a = format!("{:?}", out["chA"]);
+    assert!(!a.contains("乙的心结"), "🔴 别人的线索混进了甲的那一格");
+    assert!(a.contains("hookDone_chA_hc-1"), "完成键必须随线索一起投放");
+}
+
+/// `doneKey` 为空的条目**跳过不投**：那条线索算不出合法的完成键（钩子 id 含 `.` 或 `[`）。
+///
+/// ⚠️ 它仍会按老路径在通关时发奖——**跳过投放不等于取消奖励**。
+#[test]
+fn a_hook_without_a_legal_done_key_is_not_delivered_but_is_not_punished_either() {
+    let assembled = serde_json::json!({
+        "assembly": {
+            "perCharacterHooks": [
+                { "characterId": "chA", "poolItemId": "hc.bad", "parameterizedText": "算不出键的那条",
+                  "difficultyScore": 0.5, "doneKey": "" }
+            ]
+        }
+    })
+    .to_string();
+    assert!(super::parse_personal_threads(Some(&assembled)).is_empty(), "无合法完成键 → 不投放");
+    // 结算侧不惩罚它：`chapter_finish` 里 `!hook.done_key.is_empty()` 那一条守着，
+    // 由 `an_unfinished_hook_grants_nothing_when_the_template_asks_for_completion` 的反面覆盖。
+    assert_eq!(super::super::assembly::testing::hook_done_key_for_test("chA", "hc.bad"), None);
+    assert_eq!(
+        super::super::assembly::testing::hook_done_key_for_test("chA", "hc-1"),
+        Some("hookDone_chA_hc-1".to_string())
+    );
+}
+
+/// 老实例 / 无钩子 / 结构损坏 → 空表 = 完全退化，可见上下文逐字节不变。
+#[test]
+fn a_world_without_hooks_delivers_nothing() {
+    assert!(super::parse_personal_threads(None).is_empty());
+    assert!(super::parse_personal_threads(Some("不是 JSON")).is_empty());
+    assert!(super::parse_personal_threads(Some(r#"{"assembly":{}}"#)).is_empty());
+    assert!(super::parse_personal_threads(Some(r#"{"assembly":{"perCharacterHooks":[]}}"#)).is_empty());
 }

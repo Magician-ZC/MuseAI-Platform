@@ -1390,6 +1390,52 @@ async fn load_carried_item_facts(
 // 确定性：分配结果由装配层按 cid 升序钉死在 `assembled_json`，本节纯读、纯拼接，无随机、
 // 不依赖 map 迭代序产生分支 —— 同一 (world_id, 阵容, template_version) 恒得同一份身份呈现。
 
+/// 从实例 `assembled_json` 读回 per-character 钩子的**投放形态**：`卡id → [(线索文本, 完成键)]`。
+///
+/// ══════════════════════════════════════════════════════════════════════════
+/// 🔴 这个函数补的是一个此前没人注意到的空洞：**钩子从来没有被投放进世界**
+/// ══════════════════════════════════════════════════════════════════════════
+/// 装配器一直在按每张卡的执念挑钩子、参数化文本、过机审、存进 `assembled_json`，
+/// 而在这个函数之前，**全仓没有任何人读 `parameterizedText`**——
+/// 模型没见过、玩家也没见过，它唯一的下游是通关时发一件道具。
+/// 于是总规格 §8 三重防线之二「钩子私有制（按执念绑定归属，偷不走别人的）」是空的。
+///
+/// 🔴 **按卡分格**：每张卡只拿自己那几条，信息隔离在数据层就成立，不指望引擎那头去切。
+///
+/// ⚠️ `doneKey` 为空的条目**跳过不投**：那条线索算不出合法的完成键（钩子 id 含 `.` 或 `[`），
+/// 投给模型只会让它无从落笔。它仍会按老路径在通关时发奖，不受影响。
+///
+/// 退化口径同 `parse_identity_assignments`：任一层结构不符 → 空表 = 完全退化；
+/// 单个条目损坏只跳过该条。
+fn parse_personal_threads(
+    assembled_json: Option<&str>,
+) -> std::collections::BTreeMap<String, Vec<(String, String)>> {
+    let mut out: std::collections::BTreeMap<String, Vec<(String, String)>> = Default::default();
+    let Some(raw) = assembled_json else {
+        return out;
+    };
+    let Ok(v) = serde_json::from_str::<Value>(raw) else {
+        return out;
+    };
+    let Some(arr) = v.pointer("/assembly/perCharacterHooks").and_then(Value::as_array) else {
+        return out;
+    };
+    for hook in arr {
+        let (Some(cid), Some(text), Some(key)) = (
+            hook.get("characterId").and_then(Value::as_str).map(str::trim),
+            hook.get("parameterizedText").and_then(Value::as_str).map(str::trim),
+            hook.get("doneKey").and_then(Value::as_str).map(str::trim),
+        ) else {
+            continue;
+        };
+        if cid.is_empty() || text.is_empty() || key.is_empty() {
+            continue;
+        }
+        out.entry(cid.to_string()).or_default().push((text.to_string(), key.to_string()));
+    }
+    out
+}
+
 /// 从实例 `assembled_json` 读回身份分配 `[[cid, identityId], …]`（`/assembly/identityAssignments`）。
 /// 任一层结构不符（无 assembled / 非 JSON / 无该字段 / 非数组）→ 空 Vec = 完全退化；
 /// 单个条目损坏只跳过该条，不牵连其余（防御式，同 `worldCharacterEntries` 口径）。
@@ -2666,6 +2712,11 @@ async fn process_tick_inner(
         } else {
             Default::default()
         };
+        // 私有线索（per-character 钩子的投放，2026-07-29）：装配早就挑好、参数化好、过完机审
+        // 存在 `assembled_json` 里，而在这一行之前**全仓没有任何人读那段文字**——
+        // 模型没见过、玩家也没见过。于是「钩子私有制」（总规格 §8 三重防线之二）在实现上是空的。
+        // 每张卡只拿自己那几条；空 = 无钩子 / 老实例 ⇒ 可见上下文逐字节不变。
+        let personal_threads = parse_personal_threads(world.assembled_json.as_deref());
         let input = RoundInput {
             run_id: run_id.clone(),
             mode: RunMode::Observe,
@@ -2715,6 +2766,8 @@ async fn process_tick_inner(
             realm_costume: realm_costume.clone(),
             // 世界线烙印（提案第 5 步）：默认关；开闸后每张卡只拿到自己那一段过去。
             worldline_imprints: worldline_imprints.clone(),
+            // 私有线索：每张卡只拿自己那几条（见上一段）。
+            personal_threads: personal_threads.clone(),
             // 观众礼物 → 场上环境（总规格红线 1「不卖胜负与数值平权」，open-decisions §5 选项 A）。
             //
             // 🔴 **它买到的是「被看见」，不是「影响力」**：只进引擎的展示层上下文，

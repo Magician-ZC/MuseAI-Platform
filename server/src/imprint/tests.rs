@@ -246,6 +246,216 @@ fn two_cards_with_identical_cores_but_different_pasts_get_different_seeds() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 气运与机缘：「很难增加」这条产品约束的可执行版本
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 🔴 **「这两个数值必须设置的很难增加」是产品约束，这里把它变成可执行的断言。**
+///
+/// 阶梯本身（4/12/28/60/124）只说明「需要多少点」。真正决定「要跑多少局」的是
+/// **派生器每局产出多少条烙印**——而这两处相隔很远：最容易发生的改动是
+/// 给 [`derive_imprints`] 加一类烙印（看起来与气运机缘毫无关系），
+/// 而那会**静默地**让这两个数变得好涨。
+///
+/// 所以这里按派生器的真实规则算出「满档要跑多少局」，要求 ≥ 50。
+/// 50 不是目标值，是**下限**：低于它「很难增加」这句话就不成立了。
+///
+/// 🔵 这条同时让文档里那句「满档要跑六十局以上」有了来源——
+/// 它是**算出来的**，不是拍的（同 CLAUDE.md 顶上那条：写死的精确数字过期比没有更糟）。
+#[test]
+fn maxing_out_must_take_dozens_of_worlds() {
+    let top = swing_threshold(SWING_MAX_LEVEL);
+    // 两种典型卡：活跃（推动过里程碑、留下过痕迹）与安静（什么都没推动）。
+    for (label, ms, events) in [("活跃卡", 900i64, 5i64), ("安静卡", 0, 0)] {
+        let one_world = derive_imprints(&facts(false, 40, vec![card("c", true, ms, events)]));
+        let rows: Vec<(String, String, String)> = one_world
+            .iter()
+            .map(|i| (i.character_id.clone(), i.kind.to_string(), i.code.to_string()))
+            .collect();
+        let gain = swing_points_by_card(&rows, &no_swing_grants())["c"];
+        for (axis, per_world) in [("气运", gain.fortune), ("机缘", gain.opportunity)] {
+            if per_world == 0 {
+                continue; // 这一向这类卡根本不涨——那比「难涨」更难
+            }
+            let worlds = (top + per_world - 1) / per_world; // 向上取整（本仓 MSRV 无 div_ceil）
+            assert!(
+                worlds >= 50,
+                "🔴 {label}的{axis}只要 {worlds} 局就满档（{per_world} 点/局），「很难增加」不成立。\n\
+                 若这是有意放宽，请同时改 SWING_STEP 或 derive_imprints，并更新总规格 §12.5.1 里的说法。"
+            );
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 第 5 步：措辞（烙印 → 决策上下文的句子）
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn weathered(seq: i64, code: &str, stage: WeatherStage) -> WeatheredImprint {
+    WeatheredImprint { seq, kind: "circumstance".into(), code: code.into(), stage }
+}
+
+/// 🔴 **这是这套系统里唯一有内容风险的红线。**
+///
+/// 前四步全是确定性数据处理，写歪了顶多是 bug。措辞写歪了会直接把「经历」变成「养成」：
+/// 只要有一句写成「他因此更擅长临阵决断」，模型就会照着演，
+/// 而所有既有的红线（不进 resources / 不进仲裁 / 恒定容量 / 互换不变强）**一条都不会红**——
+/// 因为它们守的全是数据通道，而这条风险走的是**文字**。
+///
+/// 判据：陈述发生了什么，不陈述因此获得了什么。
+#[test]
+fn phrases_state_what_happened_not_what_it_grants() {
+    // 「能力/优势」类词。⚠️ 是排除表不是包含表，天然会漏——
+    // 但这里没有包含表可写（自然语言没有有限的合法词表），
+    // 所以配套的是下面那条「必须是过去式陈述」的正向判据。
+    const GRANTING: &[&str] = &[
+        "更强", "更容易", "擅长", "优势", "加成", "成功率", "更快", "更好", "精通", "提升",
+        "因此能", "所以能", "获得了", "掌握",
+    ];
+    let mut n = 0;
+    for (code, tiers) in PHRASES {
+        for (i, phrase) in tiers.iter().enumerate() {
+            for bad in GRANTING {
+                assert!(
+                    !phrase.contains(bad),
+                    "🔴 措辞 `{code}` 第 {i} 档出现了优势语义「{bad}」：{phrase}"
+                );
+            }
+            // 正向判据：每一句都必须是**对过去的陈述**（发生过 / 知道是什么滋味），
+            // 而不是对现在能力的断言。
+            assert!(
+                ["过", "了", "曾", "知道"].iter().any(|m| phrase.contains(m)),
+                "🔴 措辞 `{code}` 第 {i} 档不像一句过去式陈述：{phrase}"
+            );
+            n += 1;
+        }
+    }
+    assert_eq!(n, PHRASES.len() * 3, "每个 code 必须三档齐全");
+}
+
+/// 每一档措辞都必须**比上一档短**——恒定上下文成本与「老卡只会更模糊」都靠这个。
+#[test]
+fn each_step_of_fading_says_less_than_the_one_before() {
+    for (code, tiers) in PHRASES {
+        let lens: Vec<usize> = tiers.iter().map(|s| s.chars().count()).collect();
+        assert!(lens[0] > lens[1] && lens[1] >= lens[2], "🔴 `{code}` 的褪色阶梯没有变短：{lens:?}");
+    }
+}
+
+/// 新的在前、旧的在后——与引擎那句「越靠后的越久远、越模糊」必须一致。
+#[test]
+fn the_newest_experience_comes_first() {
+    let lines = phrase_imprints(&[
+        weathered(1, "left_midway", WeatherStage::Distant),
+        weathered(2, "witnessed_collapse", WeatherStage::Faded),
+        weathered(3, "walked_to_the_end", WeatherStage::Fresh),
+    ]);
+    assert_eq!(lines.len(), 3);
+    assert!(lines[0].contains("从头走到了尽头"), "最新的（Fresh）必须在最前：{lines:?}");
+    assert!(lines[2].contains("滋味"), "最旧的（Distant）必须在最后：{lines:?}");
+}
+
+/// 沉底的不单独占位，聚合成一句带条数的底色——风化机制存在的全部理由。
+#[test]
+fn settled_imprints_collapse_into_one_line() {
+    let mut ws: Vec<WeatheredImprint> =
+        (1..=5).map(|i| weathered(i, "left_a_trace", WeatherStage::Settled)).collect();
+    ws.push(weathered(6, "walked_to_the_end", WeatherStage::Fresh));
+    let lines = phrase_imprints(&ws);
+    assert_eq!(lines.len(), 2, "5 条沉底 + 1 条鲜活 = 2 行：{lines:?}");
+    assert!(lines[1].contains("5 段更早的经历"));
+}
+
+/// 🔴 未登记的 code **跳过**（fail-closed）：新加一类烙印忘了补措辞，
+/// 后果是「这条不出现」，而不是输出一句 `some_new_code` 那样的鬼东西。
+#[test]
+fn an_unknown_code_is_skipped_not_rendered_raw() {
+    let lines = phrase_imprints(&[weathered(1, "some_future_code", WeatherStage::Fresh)]);
+    assert!(lines.is_empty(), "未登记的 code 不得产出任何句子：{lines:?}");
+}
+
+/// 纯函数：同一批烙印恒得同一份句子（它进模型 prompt，变了就不是同一个世界了）。
+#[test]
+fn phrasing_is_deterministic() {
+    let ws = [
+        weathered(1, "no_milestone_reached", WeatherStage::Faded),
+        weathered(2, "pushed_a_milestone", WeatherStage::Fresh),
+    ];
+    let first = phrase_imprints(&ws);
+    for _ in 0..5 {
+        assert_eq!(phrase_imprints(&ws), first);
+    }
+}
+
+/// 🔴 **一张跑了很多世界的卡，占位不会更多**——恒定容量在措辞层的兑现。
+///
+/// 这是「老卡不会更强，只会更模糊」那条平权论证的最后一环：
+/// 前面 `weather` 保证了档位分布恒定，这里保证了**渲染出来的行数**也恒定。
+#[test]
+fn a_veteran_card_produces_no_more_lines_than_a_young_one() {
+    let render = |n: i64| {
+        let rows: Vec<(i64, String, String)> = (1..=n)
+            .map(|i| (i, "circumstance".to_string(), "walked_to_the_end".to_string()))
+            .collect();
+        phrase_imprints(&weather(&rows)).len()
+    };
+    let young = render(6);
+    for n in [20, 60, 200] {
+        assert!(render(n) <= young.max(imprint_capacity() + 1), "跑了 {n} 局的卡占位涨到了 {}", render(n));
+    }
+    // 更强的判据：40 局与 200 局占位完全一样。
+    assert_eq!(render(40), render(200), "🔴 占位随经历增长——恒定容量破了");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 气运与机缘的**展示形态**（产品：量化显示，好知道哪张卡带来什么）
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 展示层要画「这一档走了多少」，必须同时拿到当前档门槛与下一档门槛。
+///
+/// ⚠️ 只给 `points` 和 `nextAt` 是不够的：那样只能用 `points / nextAt` 画进度，
+/// 而这个比值在**升档那一刻会往回跳**（点数刚过 12，下一档变 28，比值从 1.0 掉到 0.43）。
+#[test]
+fn the_view_carries_both_ends_of_the_current_step() {
+    let v = axis_view(14); // 第 2 档（12）之上，离第 3 档（28）还差 14
+    assert_eq!(v["level"], 2);
+    assert_eq!(v["levelAt"], 12);
+    assert_eq!(v["nextAt"], 28);
+    assert_eq!(v["toNext"], 14);
+    // 档内进度 = (14-12)/(28-12) = 12.5%，单调不回跳。
+    let pct = |p: i64| {
+        let v = axis_view(p);
+        let (a, b) = (v["levelAt"].as_i64().unwrap(), v["nextAt"].as_i64().unwrap());
+        (v["level"].as_i64().unwrap(), (p - a) as f64 / (b - a) as f64)
+    };
+    let mut last = (0i64, -1.0f64);
+    for p in 0..120 {
+        let cur = pct(p);
+        assert!(cur.0 > last.0 || cur.1 > last.1, "档内进度在 {p} 点处回跳了：{last:?} → {cur:?}");
+        last = cur;
+    }
+}
+
+/// 🔴 顶档之后 `nextAt` / `toNext` 必须是 `null`，不是一个够不着的大数。
+///
+/// 给个大数等于在暗示「这条刻度还能往上」，而它不能——封顶是这套系统不违平权的一条锁。
+#[test]
+fn a_maxed_axis_shows_no_next_step_at_all() {
+    let v = axis_view(999);
+    assert_eq!(v["level"], SWING_MAX_LEVEL);
+    assert!(v["nextAt"].is_null(), "顶档不得给出下一档门槛：{v}");
+    assert!(v["toNext"].is_null());
+}
+
+/// 全新卡：两个方向都是 0 档、下一档在 4 点——**看得出来它才刚开始**。
+#[test]
+fn a_brand_new_card_reads_as_zero_not_as_missing() {
+    let v = axis_view(0);
+    assert_eq!(v["level"], 0);
+    assert_eq!(v["points"], 0);
+    assert_eq!(v["nextAt"], 4);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 世界记忆层（迁移 0055）
 // ═══════════════════════════════════════════════════════════════════════════
 //

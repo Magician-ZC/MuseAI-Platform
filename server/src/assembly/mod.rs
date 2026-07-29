@@ -753,10 +753,24 @@ const RARE_TIER: u8 = 3;
 //
 // 来源是**入场卡的烙印集合**（而不是某张卡的属性）：你带什么样的人进来，这个世界就长成什么样。
 // 与烙印进种子同一条路——没有人更强，只是世界不一样。
+//
+// ────────────────────────────────────────────────────────────────────────────
+// 第二版（同日）：从哈希改成**可解释的档位**
+// ────────────────────────────────────────────────────────────────────────────
+// 产品追加「量化显示，好知道哪张卡带来什么；两个数必须很难增加」。第一版是整份烙印指纹
+// 哈希取高低位——挡在「量化显示」前面的毛病有三个：不可解释（换一条烙印数会跳）、
+// 不单调（跑更多世界不一定变大，「很难增加」无从谈起）、不可分解（整房间一个哈希，没法比卡）。
+//
+// 现在两个数是**由档位线性缩放的单调量**，档位在 `crate::imprint`（计点 → 几何阶梯 → 封顶），
+// 本模块只负责「档位 → 采样参数」这一步。完整论证见 `imprint` 那一节与总规格 §12.5.1。
+//
+// ⚠️ **机缘因此变成只增不减**（第一版可正可负）。「内容更多」离「更好」只剩一步，
+// 挡住那一步的是 `opportunity_never_reaches_the_weights`：机缘只决定抽几条，
+// 一个字都不进权重 ⇒ 抽的还是同一个池，好事和麻烦等比例变多。
 
-/// 机缘：间隙内容条数的乘数上限（万分比）。默认 ±20%。
+/// 机缘满档时间隙内容条数的乘数增量（万分比）。默认 +20%。
 const OPPORTUNITY_SWING_BP: i64 = 2_000;
-/// 气运：权重两极化的强度上限（万分比）。默认 ±50%。
+/// 气运满档时权重两极化的强度（万分比）。默认 0.5。
 const FORTUNE_SWING_BP: i64 = 5_000;
 const ENV_OPPORTUNITY_SWING_BP: &str = "MUSE_OPPORTUNITY_SWING_BP";
 const ENV_FORTUNE_SWING_BP: &str = "MUSE_FORTUNE_SWING_BP";
@@ -769,26 +783,47 @@ fn swing_bp(name: &str, default: i64) -> i64 {
         .unwrap_or(default)
 }
 
-/// 这个世界的气运与机缘，由**烙印指纹**确定性派生。
+/// 这批入场卡带进来的「经历」。**同源不同用**的两件事，刻意分成两个字段：
 ///
-/// 🔴 空指纹（无人带着经历进来）→ 恒返回 `(1.0, 0.0)` = **中性**，
-/// 即「密度不变、不两极化」⇒ 采样产物与本层落地前**逐字节相同**。
-/// 这是它能作为纯增量上线的全部依据（黄金世界回归、既有采样向量全不受影响）。
+/// | 字段 | 用途 |
+/// |---|---|
+/// | `fingerprint` | 进实例种子（抽到哪条剧情线、哪些钩子） |
+/// | `fortune_level` / `opportunity_level` | 这个世界的气运与机缘（内容的幅度与密度） |
 ///
-/// 纯函数：同一份指纹恒得同一对数。
-fn world_fortune_and_opportunity(imprint_fingerprint: &str) -> (f32, f32) {
-    if imprint_fingerprint.is_empty() {
-        return (1.0, 0.0);
-    }
-    let h = fnv1a_64(imprint_fingerprint.as_bytes());
-    // 两个独立子流：机缘取低位、气运取高位，避免两个数被同一段比特绑死。
-    let opp_bp = swing_bp(ENV_OPPORTUNITY_SWING_BP, OPPORTUNITY_SWING_BP);
-    let for_bp = swing_bp(ENV_FORTUNE_SWING_BP, FORTUNE_SWING_BP);
-    // 映射到 [-1, 1]，再按各自的摆幅缩放。
-    let unit = |v: u64| ((v % 2001) as f32 - 1000.0) / 1000.0;
-    let opportunity = 1.0 + unit(h & 0xFFFF_FFFF) * (opp_bp as f32 / 10_000.0);
-    let fortune = unit(h >> 32).abs() * (for_bp as f32 / 10_000.0);
-    (opportunity.max(0.5), fortune)
+/// 🔴 **分成两个字段本身就是一条工程结论。** 上一版这两件事共用一个 `&str` 参数，
+/// 于是「换烙印 → 产出变了」既可能是种子在起作用、也可能是气运——两个功能的对照实验
+/// 会互相污染，写出来的红线**在气运被整个改成恒等函数之后照样绿**
+/// （VALIDATION §3.63 ②）。拆开之后，钉住指纹只动档位就是一次干净的对照实验，
+/// 上一版为此引入的那把 env 锁也随之不再需要。
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct WorldlineInput<'a> {
+    /// 烙印指纹。空 = 无烙印 ⇒ 种子与接线前逐字节相同。
+    pub fingerprint: &'a str,
+    /// 气运档：入场卡各自档位的平均，范围 `[0, SWING_MAX_LEVEL]`。
+    pub fortune_level: f32,
+    /// 机缘档：同上。
+    pub opportunity_level: f32,
+}
+
+/// 档位 → 采样参数。**线性**：满档拿到全部摆幅，零档恒中性。
+///
+/// 🔴 零档（无人带着经历进来）→ 恒返回 `(1.0, 0.0)` = 「密度不变、不两极化」
+/// ⇒ 采样产物与本层落地前**逐字节相同**。这是它能作为纯增量上线的全部依据
+/// （黄金世界回归、既有采样向量全不受影响）。
+///
+/// 🔴 **两个都是单调递增的，而这不构成优势**：
+/// - 机缘只改 `hk`（多抽几条），抽的是**同一个池**——好事和麻烦等比例变多
+///   （红线 `denser_worlds_are_not_easier_worlds` 端到端守着这一条）；
+/// - 气运只改权重形状（两极化），高气运既抬起温和的一极也抬起凶险的一极。
+///
+/// 纯函数：同一对档位恒得同一对数。
+fn world_fortune_and_opportunity(w: &WorldlineInput) -> (f32, f32) {
+    let max = crate::imprint::SWING_MAX_LEVEL as f32;
+    let opp_frac = (w.opportunity_level / max).clamp(0.0, 1.0);
+    let for_frac = (w.fortune_level / max).clamp(0.0, 1.0);
+    let opportunity = 1.0 + opp_frac * (swing_bp(ENV_OPPORTUNITY_SWING_BP, OPPORTUNITY_SWING_BP) as f32 / 10_000.0);
+    let fortune = for_frac * (swing_bp(ENV_FORTUNE_SWING_BP, FORTUNE_SWING_BP) as f32 / 10_000.0);
+    (opportunity, fortune)
 }
 
 /// 气运把权重**两极化**：离常态越远的内容，权重被抬得越多。
@@ -1273,8 +1308,8 @@ fn plan_sampling(
     cards: &[(String, CharacterCardV2)],
     ending_threshold: f32,
     star_rating: i64,
-    // 世界线烙印指纹（空 = 无烙印 ⇒ 种子与接线前逐字节相同）。
-    imprint_fingerprint: &str,
+    // 这批入场卡带进来的经历（见 `WorldlineInput`：指纹进种子，档位定气运机缘）。
+    worldline: &WorldlineInput,
 ) -> Selection {
     let superset_mode =
         skeleton.is_superset && !skeleton.storylines.is_empty() && !skeleton.sampling.is_empty();
@@ -1284,7 +1319,7 @@ fn plan_sampling(
         // → 老模板零行为变化（assemble 侧 skip_serializing_if 保证 assembled_json 也逐字节不变）。
         // 退化路径无采样，故"在演内容" = 全部 storyline / 隐藏 / 支线钩子。
         let degraded_seed =
-            resolve_instance_seed(skeleton, world_id, fingerprint, template_version, imprint_fingerprint);
+            resolve_instance_seed(skeleton, world_id, fingerprint, template_version, worldline.fingerprint);
         let identity_assignments = if skeleton.identity_pool.is_empty() {
             Vec::new()
         } else {
@@ -1311,7 +1346,7 @@ fn plan_sampling(
         };
     }
 
-    let seed = resolve_instance_seed(skeleton, world_id, fingerprint, template_version, imprint_fingerprint);
+    let seed = resolve_instance_seed(skeleton, world_id, fingerprint, template_version, worldline.fingerprint);
 
     // 1) Storyline 脊柱（阵容依赖 + 种子扰动）。
     //    容器形态额外乘上**卡权重**（`subplotCardRefs[].weight`，按 id 前缀归属查表）——
@@ -1410,7 +1445,7 @@ fn plan_sampling(
     let mut rng_hidden = Rng(seed ^ DOMAIN_HIDDEN);
     let resolved_hidden = resolve_variant_groups(&mut rng_hidden, &hidden_candidates, |p| p.variant_group.as_deref());
     // 气运与机缘（世界级，由入场卡的烙印集合派生；空烙印 → 中性 → 逐字节不变）。
-    let (opportunity, fortune) = world_fortune_and_opportunity(imprint_fingerprint);
+    let (opportunity, fortune) = world_fortune_and_opportunity(worldline);
     // 常态 = 这批候选自己的难度均值（不是写死的 0.5，见 `polarize_weight` 的注释）。
     let (mean_difficulty, max_deviation) = difficulty_center(&resolved_hidden);
     let weighted_hidden: Vec<(&PoolItem, f32)> = resolved_hidden
@@ -2444,15 +2479,26 @@ pub async fn assemble_instance(state: &AppState, world_id: &str) -> Result<Assem
     //
     // ⚠️ 读失败一律降级为空串（按无烙印装配），不阻断建房：烙印是**叙事差异化**，
     // 不是资格判定；让一次读库抖动把整个房开不起来，代价与收益完全不成比例。
-    let imprint_fp = {
+    //
+    // 同一批行还派生这个世界的**气运与机缘**（`world_swing_levels`）——
+    // 🔴 授予点数在这里恒为空（`no_swing_grants`）：道具加值是**预留接口，本轮不接线**。
+    let (imprint_fp, swing_levels) = {
         let cids: Vec<String> = cards.iter().map(|(c, _)| c.clone()).collect();
         match crate::imprint::load_imprints_for_cards(&state.db, &cids).await {
-            Ok(rows) => crate::imprint::imprint_fingerprint(&rows),
+            Ok(rows) => (
+                crate::imprint::imprint_fingerprint(&rows),
+                crate::imprint::world_swing_levels(&rows, &cids, &crate::imprint::no_swing_grants()),
+            ),
             Err(e) => {
                 tracing::warn!(world_id, error = %e, "烙印读取失败，本次按无烙印装配");
-                String::new()
+                (String::new(), (0.0, 0.0))
             }
         }
+    };
+    let worldline = WorldlineInput {
+        fingerprint: &imprint_fp,
+        fortune_level: swing_levels.0,
+        opportunity_level: swing_levels.1,
     };
     let agg_terms = aggregate_obsession_terms(&cards);
     let selection = plan_sampling(
@@ -2465,7 +2511,7 @@ pub async fn assemble_instance(state: &AppState, world_id: &str) -> Result<Assem
         &cards,
         rules.ending_weight_threshold,
         star_rating,
-        &imprint_fp,
+        &worldline,
     );
     let sampled = selection.audit.is_some();
 
@@ -3757,13 +3803,13 @@ mod sampling_tests {
     }
 
     fn plan_star(sk: &Skeleton, world_id: &str, fp: &str, star: i64) -> Selection {
-        plan_sampling(sk, fp, world_id, 1, &PROFILE, &[], &[], 0.5, star, "")
+        plan_sampling(sk, fp, world_id, 1, &PROFILE, &[], &[], 0.5, star, &WorldlineInput::default())
     }
 
     /// 带阵容的规划（身份池分配需要卡本体做内核匹配）。
     fn plan_with_roster(sk: &Skeleton, world_id: &str, cards: &[(String, CharacterCardV2)]) -> Selection {
         let fp = roster_fingerprint(cards);
-        plan_sampling(sk, &fp, world_id, 1, &PROFILE, &[], cards, 0.5, 5, "")
+        plan_sampling(sk, &fp, world_id, 1, &PROFILE, &[], cards, 0.5, 5, &WorldlineInput::default())
     }
 
     // #10 PRNG 测试向量：锁死跨版本一致性（FNV-1a / SplitMix64 均为规范实现）。
@@ -3939,7 +3985,7 @@ mod sampling_tests {
 
     /// 按给定阈值规划（`plan` 把阈值写死成 0.5，零权/未启用语义需要自定阈值）。
     fn plan_with_threshold(sk: &Skeleton, world_id: &str, threshold: f32) -> Selection {
-        plan_sampling(sk, "cidA\ncidB", world_id, 1, &PROFILE, &[], &[], threshold, 5, "")
+        plan_sampling(sk, "cidA\ncidB", world_id, 1, &PROFILE, &[], &[], threshold, 5, &WorldlineInput::default())
     }
 
     /// 同实例（同 world_id / 同阵容 / 同模板版本）反复规划 → 定盘结局逐字相同。
@@ -4165,10 +4211,40 @@ mod sampling_tests {
         sk
     }
 
+    /// 无奖励、难度铺开的隐藏池（6 条，0.2–0.5，均值 0.35）。
+    ///
+    /// 与 `reward_superset_with_spread_difficulty` 的分工：那份用来测**封顶**（必须有稀有奖励），
+    /// 这份用来测**密度与分布**（必须没有封顶来干扰，否则抽多了也看不见）。
+    fn plain_superset_with_spread_difficulty() -> Skeleton {
+        let pool: Vec<serde_json::Value> = (0..6)
+            .map(|i| serde_json::json!({
+                "id": format!("hp-{i}"), "arcTags": ["arc-P"], "difficultyBase": 0.2 + 0.06 * i as f32
+            }))
+            .collect();
+        let ids: Vec<String> = (0..6).map(|i| format!("hp-{i}")).collect();
+        serde_json::from_value(serde_json::json!({
+            "isSuperset": true,
+            "storylines": [
+                { "id": "arc-P", "mainlineNodeIds": ["mn-1"], "hiddenPoolIds": ids, "endingIds": ["end-1"] }
+            ],
+            "mainlineNodes": [ { "id": "mn-1", "fated": true, "arcTags": ["arc-P"] } ],
+            "hiddenContentPool": pool,
+            "endingPool": [ { "id": "end-1", "arcTags": ["arc-P"] } ],
+            "sampling": { "instanceStorylineCount": 1, "instanceHiddenCount": 3 }
+        }))
+        .unwrap()
+    }
+
+    /// 满档的世界线（气运机缘都拉满），指纹按 `i` 变化。
+    fn maxed_worldline(fp: &str) -> WorldlineInput<'_> {
+        let max = crate::imprint::SWING_MAX_LEVEL as f32;
+        WorldlineInput { fingerprint: fp, fortune_level: max, opportunity_level: max }
+    }
+
     /// 🔴 **平权红线（端到端）：气运再极端，产出封顶也不动一寸。**
     ///
     /// 这一条不测「气运有没有生效」，测的是**它生效之后有没有越界**——
-    /// 20 组不同的烙印指纹（⇒ 20 组不同的气运/机缘）跑同一个 5★ 模板，
+    /// 20 组不同的实例种子 × 满档气运机缘跑同一个 5★ 模板，
     /// 每一组的稀有奖励数都必须 ≤ `RARE_BUDGET`。
     ///
     /// 为什么必须端到端测：单元测试只能证明 `polarize_weight` 自己不碰上限，
@@ -4178,21 +4254,21 @@ mod sampling_tests {
     fn no_amount_of_fortune_can_lift_the_output_cap() {
         let mut sk = reward_superset_with_spread_difficulty();
         sk.sampling.instance_hidden_count = Some(3);
-        // 摆幅拉到极端（±100% 机缘 / ±300% 气运），远超默认值——红线必须在最坏情况下成立。
+        // 摆幅另外拉到极端（+100% 机缘 / 300% 气运），远超默认值——红线必须在最坏情况下成立。
         let _env = super::container_tests::FortuneEnv::set(&[
             (ENV_OPPORTUNITY_SWING_BP, "10000"),
             (ENV_FORTUNE_SWING_BP, "30000"),
         ]);
         for i in 0..20 {
-            let imprint_fp = format!("cid{i}:choice:pushed_a_milestone\ncid{i}:unfinished:x");
+            let fp = format!("cid{i}:choice:pushed_a_milestone\ncid{i}:unfinished:x");
             let sel = plan_sampling(
-                &sk, "cidA\ncidB", "world_equity", 1, &PROFILE, &[], &[], 0.5, 5, &imprint_fp,
+                &sk, "cidA\ncidB", "world_equity", 1, &PROFILE, &[], &[], 0.5, 5, &maxed_worldline(&fp),
             );
             let audit = sel.audit.unwrap();
             let rare = audit.selected_hidden.iter().filter(|id| id.as_str() != "hr-1").count();
             assert!(
                 rare <= RARE_BUDGET,
-                "🔴 气运把产出封顶顶穿了（烙印组 {i}）：{:?}",
+                "🔴 气运把产出封顶顶穿了（第 {i} 组）：{:?}",
                 audit.selected_hidden
             );
         }
@@ -4211,10 +4287,10 @@ mod sampling_tests {
         for sl in sk.storylines.iter_mut() {
             sl.hidden_pool_ids.clear();
         }
-        let _env = super::container_tests::FortuneEnv::set(&[(ENV_OPPORTUNITY_SWING_BP, "10000")]);
         for i in 0..8 {
             let fp = format!("cid{i}:choice:pushed_a_milestone");
-            let sel = plan_sampling(&sk, "cidA", "world_empty", 1, &PROFILE, &[], &[], 0.5, 5, &fp);
+            let sel =
+                plan_sampling(&sk, "cidA", "world_empty", 1, &PROFILE, &[], &[], 0.5, 5, &maxed_worldline(&fp));
             assert!(sel.audit.unwrap().selected_hidden.is_empty(), "空池只能选出空集");
         }
     }
@@ -4229,16 +4305,16 @@ mod sampling_tests {
     fn opportunity_cannot_drain_the_whole_pool() {
         let mut sk = reward_superset_with_spread_difficulty();
         sk.sampling.instance_hidden_count = Some(1);
-        // 机缘摆幅 +100% ⇒ 条数至多翻倍（1 → 2），无论指纹落在哪里。
+        // 机缘摆幅 +100% ⇒ 满档时条数至多翻倍（1 → 2）。
         let _env = super::container_tests::FortuneEnv::set(&[(ENV_OPPORTUNITY_SWING_BP, "10000")]);
         for i in 0..20 {
             let fp = format!("cid{i}:circumstance:walked_to_the_end");
-            let n = plan_sampling(&sk, "cidA\ncidB", "world_opp", 1, &PROFILE, &[], &[], 0.5, 5, &fp)
+            let n = plan_sampling(&sk, "cidA\ncidB", "world_opp", 1, &PROFILE, &[], &[], 0.5, 5, &maxed_worldline(&fp))
                 .audit
                 .unwrap()
                 .selected_hidden
                 .len();
-            assert!(n <= 2, "🔴 机缘越过摆幅（烙印组 {i}）：基线 1 条，实得 {n} 条");
+            assert!(n <= 2, "🔴 机缘越过摆幅（第 {i} 组）：基线 1 条，实得 {n} 条");
         }
     }
 
@@ -4249,26 +4325,105 @@ mod sampling_tests {
     /// 但把 `polarize_weight` 整个改成恒等（= 气运彻底失效）之后**它照样绿**。
     /// 原因是烙印指纹**同时**是实例种子的第五段，产出的差异全来自换种子，与气运无关。
     ///
-    /// ⇒ 正确的对照必须**把种子钉死**：同一份烙印指纹（⇒ 同一个种子）、
-    /// 只让气运摆幅变化。差异只可能来自权重形状。
+    /// 🔵 第二版靠「钉死指纹、只动 env 摆幅」做对照，为此欠了一把进程级 env 锁。
+    /// 现在 `WorldlineInput` 把「指纹」和「档位」拆成两个字段，对照实验退化成
+    /// **同一份指纹、只改一个 f32**——env 一个都不用碰，那把锁在这条上也不再需要。
+    /// 而且它用的是**默认摆幅**：证明的是生产配置下气运真的在改变产出，
+    /// 而不是「拉到 300% 才看得出来」。
     #[test]
     fn fortune_actually_changes_what_gets_drawn_with_the_seed_held_fixed() {
         let mut sk = reward_superset_with_spread_difficulty();
         sk.sampling.instance_hidden_count = Some(2);
-        // 🔴 同一份指纹贯穿两次规划 ⇒ 种子恒等，唯一变量是气运摆幅。
-        let fp = "cidZ:circumstance:walked_to_the_end";
-        let plan = |swing: &str| {
-            let _env = super::container_tests::FortuneEnv::set(&[(ENV_FORTUNE_SWING_BP, swing)]);
-            plan_sampling(&sk, "cidA\ncidB", "world_same", 1, &PROFILE, &[], &[], 0.5, 5, fp)
+        let fp = "cidZ:circumstance:walked_to_the_end"; // 🔴 贯穿两次规划 ⇒ 种子恒等
+        let plan = |fortune_level: f32| {
+            let w = WorldlineInput { fingerprint: fp, fortune_level, opportunity_level: 0.0 };
+            plan_sampling(&sk, "cidA\ncidB", "world_same", 1, &PROFILE, &[], &[], 0.5, 5, &w)
                 .audit
                 .unwrap()
                 .selected_hidden
         };
-        let calm = plan("0"); // 气运为 0：权重完全不动
-        let wild = plan("30000"); // 气运拉满：两极被大幅抬起
         assert_ne!(
-            calm, wild,
-            "🔴 种子相同、气运从 0 拉到 300%，抽到的东西却一样——气运没有生效"
+            plan(0.0),
+            plan(crate::imprint::SWING_MAX_LEVEL as f32),
+            "🔴 种子相同、气运从零档到满档，抽到的东西却一样——气运没有生效"
+        );
+    }
+
+    /// 🔴 **更密不等于更容易：机缘多抽的那几条不是从简单的一头挑的。**
+    ///
+    /// 这是第二版新增的红线，守的是这次改动最大的那个让步——第一版的机缘可正可负
+    /// （哈希决定方向），第二版为了「可解释、单调、很难增加」把它改成了**只增不减**。
+    /// 「内容更多」离「更好」只有一步之遥，而挡住那一步的是这条：
+    /// 机缘只动 `hk`（抽几条），**一个字都不进权重**，抽的还是同一个池子
+    /// ⇒ 多出来的内容在难度上与原本那些同分布，好事和麻烦等比例变多。
+    ///
+    /// ⚠️ **这一条单独用不住，必须与 `opportunity_never_reaches_the_weights` 成对。**
+    /// 第一版只有这条端到端断言（容差 0.05），做故障注入——把机缘乘进权重、
+    /// 让它偏向简单内容——**它照样绿**：注入项在零机缘那一组也生效（乘数恒 ≥1，不是 0），
+    /// 两组的均值**一起**偏移，而「各自贴近池均值」这个判据对共同偏移不敏感，
+    /// 剩下的那点差异又被容差吃掉了。抓住注入的是源码级那条。
+    /// 🔵 教训与 §3.8.1 已记的三类又不一样：断言没写松、变量也控住了，
+    /// 是**判据本身对这个失败方向不敏感**——注入产生的偏差恰好落在断言的零空间里。
+    #[test]
+    fn denser_worlds_are_not_easier_worlds() {
+        // ⚠️ 刻意**不用** `reward_superset_*`：那份夹具的池项带稀有奖励，
+        // 于是 `hk` 抬上去之后会被稀有预算削回来（3 条封顶），"更密"根本落不到产出上，
+        // 这条测试会退化成一个恒等断言。这里用一份无奖励的池，让机缘的效果直接可见。
+        let mut sk = plain_superset_with_spread_difficulty();
+        sk.sampling.instance_hidden_count = Some(3);
+        let pool_mean: f32 = sk.hidden_content_pool.iter().map(|p| p.difficulty_base).sum::<f32>()
+            / sk.hidden_content_pool.len() as f32;
+        let difficulty_of = |id: &str| {
+            sk.hidden_content_pool.iter().find(|p| p.id == id).map(|p| p.difficulty_base).unwrap_or(0.0)
+        };
+
+        // 气运恒零（隔离变量：两极化会有意改变分布，这条测的不是它）。
+        let mean_at = |opportunity_level: f32| {
+            let (mut sum, mut n) = (0.0_f32, 0usize);
+            for i in 0..40 {
+                let fp = format!("cid{i}:choice:x");
+                let w = WorldlineInput { fingerprint: &fp, fortune_level: 0.0, opportunity_level };
+                for id in plan_sampling(&sk, "cidA", "world_dense", 1, &PROFILE, &[], &[], 0.5, 5, &w)
+                    .audit
+                    .unwrap()
+                    .selected_hidden
+                {
+                    sum += difficulty_of(&id);
+                    n += 1;
+                }
+            }
+            (sum / n as f32, n)
+        };
+
+        let (calm_mean, calm_n) = mean_at(0.0);
+        let (dense_mean, dense_n) = mean_at(crate::imprint::SWING_MAX_LEVEL as f32);
+        assert!(dense_n > calm_n, "满档机缘应当抽出更多条（{calm_n} → {dense_n}），否则这条测了个恒等函数");
+        // 两边都应贴近池子自身的均值——「多抽的那几条」没有偏向任何一端。
+        for (label, mean) in [("零机缘", calm_mean), ("满机缘", dense_mean)] {
+            assert!(
+                (mean - pool_mean).abs() < 0.02,
+                "🔴 {label}下抽到的内容难度均值 {mean} 偏离池均值 {pool_mean}——机缘在挑难度"
+            );
+        }
+    }
+
+    /// 🔴 **机缘一个字都不进权重**——它只决定「抽几条」，不决定「抽哪几条」。
+    ///
+    /// 源码级，与 `fortune_never_touches_the_rare_budget_or_the_tier_cap` 同款：
+    /// 权重表达式那一段里不得出现 `opportunity`。
+    /// 这是「更密 ≠ 更容易」在实现上的**充分**保证——只要它不进权重，
+    /// 多抽出来的那几条就是从同一个分布里抽的，好事和麻烦等比例变多。
+    ///
+    /// 上面那条端到端断言抓不住这个失败方向（见其注释），这条抓得住。
+    #[test]
+    fn opportunity_never_reaches_the_weights() {
+        let src = include_str!("mod.rs");
+        let start = src.find("let weighted_hidden").expect("权重构造段应存在");
+        let end = src[start..].find("let base_hk").map(|i| start + i).expect("条数计算段应存在");
+        let weights_block = &src[start..end];
+        assert!(
+            !weights_block.contains("opportunity"),
+            "🔴 机缘渗进了权重表达式——它只该决定抽几条：\n{weights_block}"
         );
     }
 
@@ -5316,7 +5471,7 @@ mod container_tests {
     }
 
     fn plan(sk: &Skeleton, world_id: &str, fp: &str, star: i64) -> Selection {
-        plan_sampling(sk, fp, world_id, 1, &PROFILE, &[], &[], 0.5, star, "")
+        plan_sampling(sk, fp, world_id, 1, &PROFILE, &[], &[], 0.5, star, &WorldlineInput::default())
     }
 
     /// 一组地点 id 在给定图上是否连通（无向）。
@@ -5882,23 +6037,53 @@ mod container_tests {
 
 
 
-    /// 🔴 **无烙印 ⇒ 中性 ⇒ 采样逐字节不变。**
+    /// 🔴 **零档 ⇒ 中性 ⇒ 采样逐字节不变。**
     ///
-    /// 这是这一层能作为纯增量上线的全部依据：全新库、全新卡没有烙印，
+    /// 这是这一层能作为纯增量上线的全部依据：全新库、全新卡没有烙印 ⇒ 两个档都是 0，
     /// 黄金世界回归与全部既有采样向量一个 bit 都不受影响。
     #[test]
     fn no_imprints_means_neutral_fortune_and_opportunity() {
-        assert_eq!(world_fortune_and_opportunity(""), (1.0, 0.0));
+        assert_eq!(world_fortune_and_opportunity(&WorldlineInput::default()), (1.0, 0.0));
     }
 
-    /// 纯函数：同一份烙印指纹恒得同一对数（它要进采样，必须可 replay）。
+    /// 纯函数：同一对档位恒得同一对数（它要进采样，必须可 replay）。
     #[test]
-    fn fortune_and_opportunity_are_a_pure_function_of_the_imprint_set() {
-        let fp = "cidA:choice:pushed_a_milestone\ncidB:unfinished:no_milestone_reached";
-        let first = world_fortune_and_opportunity(fp);
+    fn fortune_and_opportunity_are_a_pure_function_of_the_levels() {
+        let w = WorldlineInput { fingerprint: "无关紧要", fortune_level: 2.5, opportunity_level: 1.0 };
+        let first = world_fortune_and_opportunity(&w);
         for _ in 0..5 {
-            assert_eq!(world_fortune_and_opportunity(fp), first);
+            assert_eq!(world_fortune_and_opportunity(&w), first);
         }
+    }
+
+    /// 🔴 **指纹一个字节都不进气运机缘。**
+    ///
+    /// 这条钉的是上一版最贵的那个教训：种子和气运共用同一份指纹时，
+    /// 「换烙印 → 产出变了」证明的是**种子**在起作用，与气运无关，
+    /// 于是照着这个思路写出来的红线在气运被整个改成恒等函数之后照样绿
+    /// （VALIDATION §3.63 ②）。拆开之后这条断言让那种混淆不可能再发生。
+    #[test]
+    fn the_fingerprint_never_leaks_into_fortune_or_opportunity() {
+        let base = WorldlineInput { fingerprint: "", fortune_level: 3.0, opportunity_level: 2.0 };
+        let expected = world_fortune_and_opportunity(&base);
+        for fp in ["a", "cidA:choice:x", "完全不同的一份指纹\n第二行"] {
+            let w = WorldlineInput { fingerprint: fp, ..base };
+            assert_eq!(world_fortune_and_opportunity(&w), expected, "指纹 {fp:?} 改变了气运机缘");
+        }
+    }
+
+    /// 满档拿到全部摆幅；超出封顶的档位被夹住（不因数据异常而失控）。
+    #[test]
+    fn full_level_takes_the_whole_swing_and_no_more() {
+        let _env = FortuneEnv::set(&[]); // 断言的是默认摆幅，必须挡住并行的写方
+        let max = crate::imprint::SWING_MAX_LEVEL as f32;
+        let full = WorldlineInput { fingerprint: "", fortune_level: max, opportunity_level: max };
+        let (opp, fortune) = world_fortune_and_opportunity(&full);
+        assert!((opp - (1.0 + OPPORTUNITY_SWING_BP as f32 / 10_000.0)).abs() < 1e-6, "满档机缘 {opp}");
+        assert!((fortune - FORTUNE_SWING_BP as f32 / 10_000.0).abs() < 1e-6, "满档气运 {fortune}");
+        // 越界档位（不该发生，但发生了也不能失控）。
+        let over = WorldlineInput { fingerprint: "", fortune_level: 99.0, opportunity_level: 99.0 };
+        assert_eq!(world_fortune_and_opportunity(&over), (opp, fortune), "越界档位须被夹到满档");
     }
 
     /// 🔴 **气运两极化，两个方向一起抬。**
@@ -5980,12 +6165,182 @@ mod container_tests {
     #[test]
     fn opportunity_stays_within_what_the_template_actually_offers() {
         let _env = FortuneEnv::set(&[]); // 只锁不改：断言的是默认摆幅，必须挡住并行的写方
-        // 摆幅上限 ±20% ⇒ 乘数恒在 [0.8, 1.2]，且下限被 0.5 兜住。
-        for fp in ["a", "bb", "ccc", "dddd", "eeeee"] {
-            let (opp, _) = world_fortune_and_opportunity(fp);
-            assert!(opp >= 0.5, "机缘乘数不得把内容压没：{opp}");
-            assert!(opp <= 1.0 + OPPORTUNITY_SWING_BP as f32 / 10_000.0 + 1e-6, "超出摆幅：{opp}");
+        let cap = 1.0 + OPPORTUNITY_SWING_BP as f32 / 10_000.0;
+        for level in [0.0_f32, 0.4, 1.0, 2.7, 5.0] {
+            let (opp, _) =
+                world_fortune_and_opportunity(&WorldlineInput { opportunity_level: level, ..Default::default() });
+            assert!(opp >= 1.0, "机缘不得把内容压没：{opp}");
+            assert!(opp <= cap + 1e-6, "超出摆幅：{opp}");
         }
+    }
+
+    // ---------- 点数与档位：产品要的「量化显示」+「很难增加」落在这里 ----------
+
+    /// 🔴 **「很难增加」不是一句形容词，是这道几何阶梯。**
+    ///
+    /// 每一档的门槛是上一档增量的两倍：4 / 12 / 28 / 60 / 124。
+    /// 一局世界给一张卡 1-3 条烙印、分摊到两个方向后每向约 1-2 点
+    /// ⇒ 满档要跑八十局以上，而且越往后越慢。
+    #[test]
+    fn the_ladder_doubles_every_step_so_the_numbers_climb_slowly() {
+        use crate::imprint::{swing_level, swing_threshold, SWING_MAX_LEVEL};
+        let steps: Vec<i64> = (1..=SWING_MAX_LEVEL).map(swing_threshold).collect();
+        assert_eq!(steps, vec![4, 12, 28, 60, 124], "阶梯被改动过——「很难增加」这条产品约束在这里");
+        // 每一档的**增量**必须严格大于上一档的增量（否则后期会越涨越快）。
+        let mut prev_gap = steps[0];
+        for w in steps.windows(2) {
+            let gap = w[1] - w[0];
+            assert!(gap > prev_gap, "第 {}→{} 档的增量没有变大", w[0], w[1]);
+            prev_gap = gap;
+        }
+        // 门槛前一点还在上一档，门槛上就进下一档。
+        assert_eq!(swing_level(3), 0);
+        assert_eq!(swing_level(4), 1);
+        assert_eq!(swing_level(123), 4);
+        assert_eq!(swing_level(124), 5);
+    }
+
+    /// 🔴 **档位封顶：老卡最终都撞到同一个顶，不会无限拉开。**
+    ///
+    /// 没有顶的刻度迟早会被人当成战力表——这与 `LifeStage::Storied` 之上没有了是同一个理由。
+    #[test]
+    fn levels_are_capped_so_old_cards_stop_pulling_away() {
+        use crate::imprint::{swing_level, SWING_MAX_LEVEL};
+        for points in [124, 500, 10_000, i64::MAX / 2] {
+            assert_eq!(swing_level(points), SWING_MAX_LEVEL, "点数 {points} 越过了封顶");
+        }
+    }
+
+    /// 每一类烙印必须**明确**落在某一个方向上，或者明确不计点。
+    ///
+    /// 🔵 这条守的是「新加一类烙印时忘了决定它算哪边」——未知类目不计点（fail-closed），
+    /// 后果是「不生效」而不是「悄悄改变所有老卡的档位」。
+    #[test]
+    fn every_imprint_kind_lands_on_exactly_one_axis() {
+        use crate::imprint::{swing_points_by_card, no_swing_grants};
+        let rows: Vec<(String, String, String)> = [
+            ("choice", 0), ("witness", 0), ("bond", 0),          // 机缘侧
+            ("circumstance", 1), ("unfinished", 1),               // 气运侧
+        ]
+        .iter()
+        .map(|(k, _)| ("c1".to_string(), k.to_string(), "x".to_string()))
+        .collect();
+        let pts = swing_points_by_card(&rows, &no_swing_grants());
+        let s = pts["c1"];
+        assert_eq!(s.opportunity, 3, "choice/witness/bond 应计机缘");
+        assert_eq!(s.fortune, 2, "circumstance/unfinished 应计气运");
+        // 未知类目：不计点，不 panic。
+        let unknown = vec![("c1".into(), "某个将来才有的类目".to_string(), "x".into())];
+        assert_eq!(swing_points_by_card(&unknown, &no_swing_grants())["c1"], Default::default());
+    }
+
+    /// 同一条烙印进种子只算一次（`imprint_fingerprint` 会 dedup），但**计点不去重**。
+    ///
+    /// 一张卡在三个世界里都「走到了终局」是三段经历，不是一段。
+    #[test]
+    fn living_the_same_thing_three_times_counts_three_times() {
+        use crate::imprint::{no_swing_grants, swing_points_by_card};
+        let rows: Vec<(String, String, String)> = (0..3)
+            .map(|_| ("c1".into(), "circumstance".into(), "walked_to_the_end".into()))
+            .collect();
+        assert_eq!(swing_points_by_card(&rows, &no_swing_grants())["c1"].fortune, 3);
+    }
+
+    /// 🔴 **世界值取平均，不是求和——否则「多拉几个人进来」就是一条可优化的差异通道。**
+    #[test]
+    fn more_members_alone_never_raises_the_world_swing() {
+        use crate::imprint::{no_swing_grants, world_swing_levels};
+        // 一张满档卡（124 点气运）单独进场。
+        let veteran: Vec<(String, String, String)> =
+            (0..124).map(|_| ("vet".into(), "circumstance".into(), "x".into())).collect();
+        let (solo_f, _) = world_swing_levels(&veteran, &["vet".to_string()], &no_swing_grants());
+        assert!((solo_f - 5.0).abs() < 1e-6, "满档卡单人房应是 5 档，实得 {solo_f}");
+        // 再拉四个新卡进来：分母变大，世界被拉回常态——而不是变得更极端。
+        let crowd: Vec<String> = ["vet", "n1", "n2", "n3", "n4"].iter().map(|s| s.to_string()).collect();
+        let (crowd_f, _) = world_swing_levels(&veteran, &crowd, &no_swing_grants());
+        assert!((crowd_f - 1.0).abs() < 1e-6, "五人房应是 5/5=1 档，实得 {crowd_f}");
+        assert!(crowd_f < solo_f, "🔴 人多不得让世界的气运更高");
+    }
+
+    /// 名册为空 / 全是新卡 ⇒ 零档 ⇒ 中性。
+    #[test]
+    fn a_roster_of_brand_new_cards_leaves_the_world_at_baseline() {
+        use crate::imprint::{no_swing_grants, world_swing_levels};
+        assert_eq!(world_swing_levels(&[], &[], &no_swing_grants()), (0.0, 0.0));
+        let fresh: Vec<String> = (0..4).map(|i| format!("new{i}")).collect();
+        assert_eq!(world_swing_levels(&[], &fresh, &no_swing_grants()), (0.0, 0.0));
+    }
+
+    // ---------- 🔮 道具加值：预留接口的两条红线 ----------
+
+    /// 🔴 **道具能加速到顶，不能突破顶。**
+    ///
+    /// 这一条把「花钱买上限」从设计层堵死：授予的点数与经历得来的点数走**同一道阶梯**，
+    /// 因此天量授予也只能到 `SWING_MAX_LEVEL`——买到的是**更快到达**，
+    /// 到达之后与一个跑了八十局的人完全一样。
+    #[test]
+    fn granted_points_cannot_break_the_ceiling() {
+        use crate::imprint::{world_swing_levels, Swing, SwingGrants, SWING_MAX_LEVEL};
+        let mut grants = SwingGrants::new();
+        grants.insert("buyer".to_string(), Swing { fortune: i64::MAX / 4, opportunity: i64::MAX / 4 });
+        let (f, o) = world_swing_levels(&[], &["buyer".to_string()], &grants);
+        assert_eq!(f as i64, SWING_MAX_LEVEL, "🔴 道具把气运顶穿了：{f}");
+        assert_eq!(o as i64, SWING_MAX_LEVEL, "🔴 道具把机缘顶穿了：{o}");
+    }
+
+    /// 🔴 **给一张不在场的卡加点，抬不高任何房间的气运。**
+    ///
+    /// 这条守的是道具接口真接线那天才会显形的一个洞：`grants` 是外部给的表，
+    /// 若 `world_swing_levels` 只拿到「名册长度」而不是名册本身，一张不在这个房间里的卡
+    /// 也会被算进分子——花钱给一张不进场的卡加点，就能抬高任意房间的气运。
+    /// 现在入参是名册本身，不在里面的条目根本不参与求和。
+    ///
+    /// ⚠️ 这个洞今天不存在（生产恒传空授予）。**预留接口的意义就是将来接线时它已经是安全的**——
+    /// 等到真要发道具那天再想这件事，想到的概率不高。
+    #[test]
+    fn granting_points_to_an_absent_card_changes_nothing() {
+        use crate::imprint::{world_swing_levels, Swing, SwingGrants};
+        let roster = vec!["here".to_string()];
+        let base = world_swing_levels(&[], &roster, &SwingGrants::new());
+        let mut grants = SwingGrants::new();
+        grants.insert("not_in_this_room".to_string(), Swing { fortune: 999, opportunity: 999 });
+        assert_eq!(
+            world_swing_levels(&[], &roster, &grants),
+            base,
+            "🔴 不在场的卡影响了这个世界的气运机缘"
+        );
+    }
+
+    /// 🔴 **本轮没有任何生产路径给出非零授予**（未验证功能默认关闭，平台三约束第 1 条）。
+    ///
+    /// 源码级断言：生产代码里每一处 `world_swing_levels(` 调用都必须传 `no_swing_grants()`。
+    /// 将来真接线时这条会红——那正是它的用途：**逼一次显式评审**，
+    /// 把 `SwingGrants` 文档里那两个问题（顶不可破 / 买的是不一样而不是更容易赢）当场答一遍。
+    ///
+    /// ⚠️ 扫描面走 `testkit::production_sources()`（**全仓**，花括号配平剥测试模块），
+    /// 不是手工列两个文件。第一版就是手工列的，还自带一个 `split("#[cfg(test)]")` 的土法剥离器——
+    /// 它把本文件的扫描面悄悄砍成前 2400 行（`mod testing` 夹在生产代码中间），
+    /// 于是那处唯一需要被扫的生产调用根本没进扫描面，红线绿着但什么都没扫到。
+    /// 这是 VALIDATION §3.8.1「手工列举的扫描面」的又一例，且**没有任何症状**——
+    /// 🔵 抓住它的是最后那句 `calls > 0`：**红线必须扫到过东西**。这条元断言值得抄进每一条源码级红线。
+    #[test]
+    fn no_production_path_grants_swing_points_yet() {
+        let mut calls = 0;
+        for (path, src) in crate::testkit::production_sources() {
+            for (i, _) in src.match_indices("world_swing_levels(") {
+                if src[..i].ends_with("fn ") {
+                    continue; // 函数定义本身，不是调用
+                }
+                let stmt = &src[i..][..src[i..].find(';').unwrap_or(src.len() - i)];
+                assert!(
+                    stmt.contains("no_swing_grants()"),
+                    "🔴 {path} 有一处 world_swing_levels 传了非空授予——道具接口本轮只预留不接线：\n{stmt}"
+                );
+                calls += 1;
+            }
+            assert!(!src.contains("grants.insert"), "🔴 {path} 的生产代码在给某张卡加点");
+        }
+        assert!(calls > 0, "全仓一处生产调用都没扫到——这条红线失去了守护对象（见上面那段注释）");
     }
 
     #[test]

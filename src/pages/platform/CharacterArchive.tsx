@@ -1,7 +1,7 @@
 // 角色一生档案（C1，规格 §2.5）：单角色跨世界的一生——身份卡 + 走过的世界 + 逐日人生 + 带来的信物 + 羁绊。
 // 纯前端组合已有端点（fan-out，无新后端）；各分区错误相互隔离，任一失败不拖垮整页。
 import React, { useEffect, useMemo, useState } from 'react';
-import { Typography, Card, Tag, Alert, Spin, Empty, Space, Button, Timeline, List, Divider } from 'antd';
+import { Typography, Card, Tag, Alert, Spin, Empty, Space, Button, Timeline, List, Divider, Progress, Tooltip } from 'antd';
 import {
   ReadOutlined,
   BranchesOutlined,
@@ -10,6 +10,7 @@ import {
   HeartOutlined,
   RobotOutlined,
   ArrowLeftOutlined,
+  InfoCircleOutlined,
 } from '@ant-design/icons';
 import { useParams, useNavigate } from 'react-router-dom';
 import { cloudFetch } from '../../utils/cloudApi';
@@ -30,13 +31,38 @@ import {
 
 const { Title, Text, Paragraph } = Typography;
 
+/** 气运/机缘单个方向的展示形态（GET /me/characters/{id}/life 的 swing 块）。 */
+interface SwingAxis {
+  level: number;
+  max: number;
+  points: number;
+  /** 当前这一档的门槛；与 nextAt 一起才能画出不回跳的档内进度。 */
+  levelAt: number;
+  /** 顶档时为 null——这条刻度到此为止，不是「还差很多」。 */
+  nextAt: number | null;
+  toNext: number | null;
+}
+
+interface CharacterLife {
+  life: { stage: 'blank' | 'marked' | 'storied'; memories: number; worlds: number; imprints: number };
+  swing: { fortune: SwingAxis; opportunity: SwingAxis; note: string; howItGrows: string };
+}
+
 interface ArchiveData {
   worlds: Membership[];
   reports: ReportListItem[];
   items: BackpackItem[];
   cloudChar?: CloudCharacter;
   bonds: BondEdge[];
+  /** 生命层 + 气运机缘；读失败降级为 null（本页各分区错误相互隔离的既有口径）。 */
+  life: CharacterLife | null;
 }
+
+const LIFE_STAGE_LABEL: Record<string, { label: string; color: string; hint: string }> = {
+  blank: { label: '崭新', color: 'default', hint: '还没有足够的经历' },
+  marked: { label: '有痕', color: 'blue', hint: '开始有说得出来的经历' },
+  storied: { label: '有史', color: 'purple', hint: '经历成型，这张卡有自己的过去了' },
+};
 
 const CharacterArchive: React.FC = () => {
   const { cid } = useParams<{ cid: string }>();
@@ -61,7 +87,7 @@ const CharacterArchive: React.FC = () => {
         return;
       }
       // 次级分区（日报 / 背包 / 云端角色）各自失败降级为空，避免单点拖垮档案。
-      const [reports, items, chars] = await Promise.all([
+      const [reports, items, chars, life] = await Promise.all([
         cloudFetch<{ reports: ReportListItem[] }>('/api/me/reports')
           .then((d) => d.reports ?? [])
           .catch(() => [] as ReportListItem[]),
@@ -69,6 +95,7 @@ const CharacterArchive: React.FC = () => {
           .then((d) => d.items ?? [])
           .catch(() => [] as BackpackItem[]),
         cloudFetch<CloudCharacter[]>('/api/assets/characters/mine').catch(() => [] as CloudCharacter[]),
+        cloudFetch<CharacterLife>(`/api/me/characters/${cid}/life`).catch(() => null),
       ]);
 
       const worlds = ms.filter((m) => m.cloudCharacterId === cid);
@@ -113,7 +140,7 @@ const CharacterArchive: React.FC = () => {
       );
       const bonds = bondLists.flat().sort((a, b) => Math.abs(b.affinity) - Math.abs(a.affinity));
 
-      setData({ worlds, reports: reportsOfChar, items: itemsOfChar, cloudChar, bonds });
+      setData({ worlds, reports: reportsOfChar, items: itemsOfChar, cloudChar, bonds, life });
     } catch (e) {
       setError(describeCloudError(e));
     } finally {
@@ -215,6 +242,80 @@ const CharacterArchive: React.FC = () => {
           </Space>
         </Space>
       </Card>
+
+      {/* 这张卡活过什么：生命阶位 + 气运机缘。读失败整块不渲染（不给出误导性的「0 档」）。 */}
+      {data.life && (
+        <Card
+          title={
+            <Space>
+              <HeartOutlined style={{ color: '#d97757' }} /> 这张卡活过什么
+              <Tooltip title={data.life.swing.note}>
+                <InfoCircleOutlined style={{ color: '#8c857b', fontSize: 13 }} />
+              </Tooltip>
+            </Space>
+          }
+          size="small"
+          style={{ marginBottom: 16, borderRadius: 12, border: 'none', boxShadow: '0 1px 3px rgba(0,0,0,0.05)' }}
+          styles={{ body: { padding: 18 } }}
+        >
+          <Space size={8} wrap style={{ marginBottom: 14 }}>
+            <Tooltip title={LIFE_STAGE_LABEL[data.life.life.stage]?.hint}>
+              <Tag color={LIFE_STAGE_LABEL[data.life.life.stage]?.color ?? 'default'}>
+                {LIFE_STAGE_LABEL[data.life.life.stage]?.label ?? data.life.life.stage}
+              </Tag>
+            </Tooltip>
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              {data.life.life.memories} 条记忆 · {data.life.life.worlds} 个世界 · {data.life.life.imprints} 道烙印
+            </Text>
+          </Space>
+
+          <Space direction="vertical" size={12} style={{ width: '100%' }}>
+            {[
+              { key: 'fortune', name: '气运', axis: data.life.swing.fortune, color: '#b07a4a',
+                what: '这个世界的事有多两极——可能捡到不该捡的，也可能撞上不该撞的' },
+              { key: 'opportunity', name: '机缘', axis: data.life.swing.opportunity, color: '#5b8266',
+                what: '主线间隙里的事有多密' },
+            ].map(({ key, name, axis, color, what }) => {
+              const capped = axis.nextAt === null;
+              // 档内进度：(点数 − 本档门槛) / (下一档门槛 − 本档门槛)。顶档恒 100%。
+              const span = capped ? 1 : axis.nextAt! - axis.levelAt;
+              const pct = capped ? 100 : Math.round(((axis.points - axis.levelAt) / span) * 100);
+              return (
+                <div key={key}>
+                  <Space style={{ justifyContent: 'space-between', width: '100%' }} wrap>
+                    <Space size={8}>
+                      <Tooltip title={what}>
+                        <Text strong style={{ color: '#33312e' }}>
+                          {name}
+                        </Text>
+                      </Tooltip>
+                      <Text style={{ color, fontVariantNumeric: 'tabular-nums' }}>
+                        {axis.level} / {axis.max} 档
+                      </Text>
+                    </Space>
+                    <Text type="secondary" style={{ fontSize: 12 }}>
+                      {capped ? '已到顶' : `${axis.points} 点 · 再 ${axis.toNext} 点到第 ${axis.level + 1} 档`}
+                    </Text>
+                  </Space>
+                  <Progress
+                    percent={pct}
+                    showInfo={false}
+                    size="small"
+                    strokeColor={color}
+                    style={{ marginBottom: 0 }}
+                  />
+                </div>
+              );
+            })}
+          </Space>
+
+          <Paragraph type="secondary" style={{ fontSize: 12, marginTop: 12, marginBottom: 0 }}>
+            {data.life.swing.howItGrows}两个数都作用于<Text strong style={{ fontSize: 12 }}>世界</Text>
+            、同房所有人共享，不改变任何产出上限，也不让任何人更容易赢——比较两张卡看的是
+            「它们会把世界变成什么样」，不是「谁更强」。
+          </Paragraph>
+        </Card>
+      )}
 
       {/* 走过的世界 */}
       <Card

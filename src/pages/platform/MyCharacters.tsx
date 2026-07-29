@@ -1,7 +1,7 @@
 // 我的角色 · 各世界（C1，规格 §2.1）：以「角色」为轴（与「我的世界」以世界为轴互补）。
 // 权威来源 GET /me/memberships（补日报反推盲区：刚投放没日报也在场）；未读日报角标由 /me/reports 派生。
 import React, { useEffect, useMemo, useState } from 'react';
-import { Typography, Card, Badge, Button, Tag, Alert, Spin, Empty, Space, Popconfirm, message } from 'antd';
+import { Typography, Card, Badge, Button, Tag, Alert, Spin, Empty, Space, Popconfirm, Tooltip, message } from 'antd';
 import { UserOutlined, ReadOutlined, BranchesOutlined, LoginOutlined, LogoutOutlined } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
 import { cloudFetch } from '../../utils/cloudApi';
@@ -13,6 +13,19 @@ import {
 } from '../../stores/usePlatformStore';
 
 const { Title, Text } = Typography;
+
+/**
+ * 一张卡的气运/机缘档位（GET /me/characters/{id}/life 的 swing 块，只取档位）。
+ *
+ * 🔴 这两个数**不是战力**：它们说的是「你带这张卡进去的世界会长成什么样」——
+ * 机缘高 = 间隙里的事更密，气运高 = 那些事更两极（可能捡到不该捡的，也可能撞上不该撞的）。
+ * 两者作用于世界、同房所有人共享，不改变任何产出上限。措辞不可改成「战力/评分/强度」。
+ */
+interface CharacterSwing {
+  fortune: number;
+  opportunity: number;
+  max: number;
+}
 
 /** 世界运行态 → 展示标签。 */
 function worldStatusMeta(status: string): { label: string; color: string } {
@@ -41,6 +54,7 @@ const MyCharacters: React.FC = () => {
     loadReports,
   } = usePlatformStore();
   const [leaving, setLeaving] = useState<Record<string, boolean>>({});
+  const [swings, setSwings] = useState<Record<string, CharacterSwing>>({});
 
   const refresh = () => {
     void loadMemberships();
@@ -51,6 +65,34 @@ const MyCharacters: React.FC = () => {
     refresh();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // 气运/机缘：产品要的是「能知道哪张卡带来什么」，而那是**卡与卡之间**的比较——
+  // 只放在单卡详情页就得挨个点开，比较不起来。故在列表这一层直接给出档位。
+  // 每卡一次请求（卡数是个位数量级），任一失败降级为不显示：这是展示层，不该挡住主列表。
+  useEffect(() => {
+    const ids = [...new Set(memberships.map((m) => m.cloudCharacterId))];
+    if (ids.length === 0) return;
+    let cancelled = false;
+    void (async () => {
+      const rows = await Promise.all(
+        ids.map(async (id): Promise<[string, CharacterSwing] | null> => {
+          try {
+            const d = await cloudFetch<{
+              swing: { fortune: { level: number; max: number }; opportunity: { level: number } };
+            }>(`/api/me/characters/${id}/life`);
+            return [id, { fortune: d.swing.fortune.level, opportunity: d.swing.opportunity.level, max: d.swing.fortune.max }];
+          } catch {
+            return null;
+          }
+        }),
+      );
+      if (cancelled) return;
+      setSwings(Object.fromEntries(rows.filter((r): r is [string, CharacterSwing] => r !== null)));
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [memberships]);
 
   // 每（角色 × 世界）的日报统计（未读角标 + 最新日报深链）；reports 已按 createdAt DESC。
   const reportStats = useMemo(() => {
@@ -143,6 +185,20 @@ const MyCharacters: React.FC = () => {
                     {g.characterName || g.characterId}
                   </Text>
                   <Tag>{g.worlds.length} 个世界</Tag>
+                  {swings[g.characterId] && (
+                    <Tooltip
+                      title="气运 = 你带它进去的世界，事有多两极（可能捡到不该捡的，也可能撞上不该撞的）；机缘 = 事有多密。两个都不是战力：它们作用于世界、同房所有人共享，不改变任何产出上限，也不让任何人更容易赢。比卡看的是「会把世界变成什么样」。"
+                    >
+                      <Space size={4}>
+                        <Tag color="volcano">
+                          气运 {swings[g.characterId].fortune}/{swings[g.characterId].max}
+                        </Tag>
+                        <Tag color="green">
+                          机缘 {swings[g.characterId].opportunity}/{swings[g.characterId].max}
+                        </Tag>
+                      </Space>
+                    </Tooltip>
+                  )}
                 </Space>
                 <Button
                   size="small"

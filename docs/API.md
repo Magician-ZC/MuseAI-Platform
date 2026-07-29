@@ -414,6 +414,7 @@
 | GET | `/api/me/ooc-appeals?status=&limit=&offset=` | JWT | 我的申诉（含批注、复核结果、托梦补偿）。硬边界 `WHERE user_id = 本人` |
 | PUT | `/api/me/ooc-appeals/{id}/annotation` | JWT | 加/改内心批注（可在申诉之后补写）；`body` 空串 = 清空。改别人的一律 **404**（不是 403） |
 | GET | `/api/me/characters/{id}/annotations` | JWT | 我的角色传记批注（私人解释层）。卡非本人 → 404 |
+| GET | `/api/me/characters/{id}/life` | JWT | 这张卡活过什么：生命阶位 + 世界记忆（按世界分组）+ **气运/机缘档位**。卡非本人 → 404（不泄露「存在但不是你的」）。🔴 **只读，无任何写入端点**——生命层、记忆、气运机缘全部由系统按确定性事实派生，客户端一个字节都写不进来；这也是它不可伪造、因而不可复刻的全部依据。⚠️ `swing` 里的两个数**不是战力**：它们描述「你带这张卡进去的世界会长成什么样」（机缘=内容密度、气运=内容幅度），世界级、全员共享、不改任何产出上限。返回体自带 `note` 说明这一点 |
 | GET | `/api/admin/ooc-appeals?status=&limit=&offset=` | **reviewer** | 复核队列（默认 `status=pending`） |
 | POST | `/api/admin/ooc-appeals/{id}/review` | **reviewer** | 复核。`decision` = `confirm_model_error`（确认模型错误 → 补偿托梦配额）\| `dismiss`；`reason` 必填 ≤500 字 |
 

@@ -1,9 +1,17 @@
 //! 世界线烙印（Worldline Imprint）—— 让「复刻内核 ≠ 复刻这张卡」。
 //!
 //! 提案与完整设计：`docs/build/spec-worldline-imprint.md`；存储见迁移 0054。
-//! 本模块实现该提案的**第 1-4 步**：表 · 确定性派生器 · 进实例种子 · 风化。
-//! 第 5 步（烙印进决策上下文）**不在本模块**——它的效果只能靠真实模型验证，
-//! 而本仓至今一次真实模型调用都没发生过，写了也只能被替身跑。
+//! 本模块实现该提案的**全部五步**：表 · 确定性派生器 · 进实例种子 · 风化 · 措辞。
+//! 第 5 步（进决策上下文）的服务端半边在本模块（[`PHRASES`] / [`phrase_imprints`] /
+//! [`worldline_pasts`]），引擎半边是 `decide::append_worldline_imprints` 的 `yourPast`。
+//!
+//! 🔴 第 5 步**默认关**（`MUSE_WORLDLINE_IMPRINT_CONTEXT`，按世界解析），状态是
+//! `Integrated` 而非 `Validated`：它是这套系统里唯一直接改模型 prompt 的一步，
+//! 而它的效果**无法证伪**——「这张卡表现得不一样」是主观判断，要真验得做
+//! 同内核 / 同世界 / 同种子的 A/B，而那需要真实模型凭据（本仓至今一次真实调用都没发生过）。
+//!
+//! 本模块另外承载**气运与机缘的点数与档位**（见文件中部那一节）——
+//! 同一批烙印行的第二个用途：调这个世界的内容密度与幅度。
 //!
 //! ════════════════════════════════════════════════════════════════════════════
 //! 🔴 这套系统的地基：**烙印让两张卡「不一样」，但不让任何一张「更强」**
@@ -284,6 +292,307 @@ pub(crate) fn imprint_fingerprint(rows: &[(String, String, String)]) -> String {
     items.sort_unstable();
     items.dedup();
     items.join("\n")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 第 5 步：措辞（烙印 → 进决策上下文的句子）
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// 🔴 **这张表是这套系统里唯一有内容风险的地方。**
+// 前四步全是确定性数据处理，写歪了顶多是 bug；这张表写歪了会直接把「经历」变成「养成」——
+// 只要有一句写成「他因此更擅长临阵决断」，模型就会照着演，而所有既有的红线
+// （不进 resources、不进仲裁、恒定容量……）**一条都不会红**。
+//
+// 于是措辞的铁律只有一条：**陈述发生了什么，不陈述因此获得了什么。**
+// 由 `phrases_state_what_happened_not_what_it_grants` 扫描全表守着。
+//
+// ⚠️ 三档文案共 18 句，是工程写的，没过内容评审。规格 §4.3 已记这条风险
+// （「写得不好会让所有卡的上下文读起来像同一个人」）——这批只是让链路跑通的占位，
+// 要真上线得有人重写一遍。
+
+/// `code` → 三档褪色措辞：`[具体事实, 概括, 只剩滋味]`。
+///
+/// 🔴 越往后越模糊、越短——这既是记忆的真实形状，也是**恒定上下文成本**的落点。
+/// 🔴 也是「老卡不会更强，只会更模糊」那条平权论证在文案层的兑现。
+const PHRASES: &[(&str, [&str; 3])] = &[
+    (
+        "walked_to_the_end",
+        ["他在一个世界里从头走到了尽头。", "他有过一次走到底的经历。", "他知道走到尽头的滋味。"],
+    ),
+    (
+        "left_midway",
+        ["他在一个世界走到一半时离开了。", "他有过一次中途抽身的经历。", "他知道半路走开的滋味。"],
+    ),
+    (
+        "witnessed_collapse",
+        ["他见过一个世界线整个崩塌。", "他经历过一次崩塌。", "他知道崩塌的滋味。"],
+    ),
+    (
+        "pushed_a_milestone",
+        ["他亲手推动过一件足以改写局面的事。", "他推动过一件改写局面的事。", "他知道推动大事的滋味。"],
+    ),
+    (
+        "no_milestone_reached",
+        [
+            "他曾走到一件足以改写局面的事跟前，最终没有做成。",
+            "他有过一次差一步没走到。",
+            "他知道差一步的滋味。",
+        ],
+    ),
+    (
+        "left_a_trace",
+        ["他在一个世界的公共记载里留下过痕迹。", "他在某处留下过痕迹。", "他知道被记住的滋味。"],
+    ),
+];
+
+/// 已风化的烙印 → 喂给引擎的句子表（**新的在前**，与上下文里那句「越靠后的越久远」一致）。
+///
+/// **纯函数**：同一批烙印恒得同一份句子（含顺序）。这不是洁癖——它进模型 prompt，
+/// 而 prompt 变了同一个世界重放两次就不是同一件事了。
+///
+/// 未登记的 `code` **跳过**（fail-closed）：新加一类烙印时必须显式补措辞，
+/// 忘了补的后果是「这条不出现」，而不是「输出一句 `walked_to_the_end`」这种鬼东西。
+///
+/// `Settled`（沉底）不单独占位，聚合成一句带条数的底色——这正是风化机制存在的理由。
+pub(crate) fn phrase_imprints(weathered: &[WeatheredImprint]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut settled = 0usize;
+    for w in weathered.iter().rev() {
+        let tier = match w.stage {
+            WeatherStage::Fresh => 0,
+            WeatherStage::Faded => 1,
+            WeatherStage::Distant => 2,
+            WeatherStage::Settled => {
+                settled += 1;
+                continue;
+            }
+        };
+        if let Some((_, p)) = PHRASES.iter().find(|(code, _)| *code == w.code) {
+            out.push(p[tier].to_string());
+        }
+    }
+    if settled > 0 {
+        out.push(format!("此外还有 {settled} 段更早的经历，已经说不清楚了，只剩下一点底色。"));
+    }
+    out
+}
+
+/// 读一批卡的烙印并措辞好，供 runtime 注入 `RoundInput.worldline_imprints`。
+///
+/// 🔴 **每张卡只得到自己那一条**（返回值按卡 id 分格），信息隔离铁律在数据层就成立，
+/// 不指望引擎那头去切。
+///
+/// 无烙印的卡**不进表**（而不是进一个空 Vec）：引擎那边 `get(cid)` 落空 → 追加函数
+/// 原样返回 → 上下文与接线前逐字节一致。
+pub(crate) async fn worldline_pasts(
+    db: &sqlx::AnyPool,
+    character_ids: &[String],
+) -> Result<std::collections::BTreeMap<String, Vec<String>>, ApiError> {
+    let mut out: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for cid in character_ids {
+        // 🔴 `ORDER BY seq ASC` 不可省：`weather` 要求最旧在前，序错了褪色档就全反了。
+        let rows: Vec<(i64, String, String)> = sqlx::query_as(
+            "SELECT seq, kind, code FROM character_imprints WHERE character_id = $1 ORDER BY seq ASC",
+        )
+        .bind(cid)
+        .fetch_all(db)
+        .await?;
+        if rows.is_empty() {
+            continue;
+        }
+        let lines = phrase_imprints(&weather(&rows));
+        if !lines.is_empty() {
+            out.insert(cid.clone(), lines);
+        }
+    }
+    Ok(out)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 气运与机缘的**点数与档位**（2026-07-29 第二版：从哈希改成可解释的量化值）
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// 第一版把整份烙印指纹哈希一下取高低位——确定性有了，但它有三个毛病，
+// 而产品要「量化显示，好知道哪张卡带来什么」的时候，三个全都挡在路上：
+//
+// 1. **不可解释**：换一条烙印，两个数会**跳**（哈希无序）。玩家看不出「我做了什么让它变的」。
+// 2. **不单调**：跑更多世界不一定让数变大，也可能变小——「很难增加」这句话根本无从谈起。
+// 3. **不可分解**：它是整个房间的一个哈希，没法说「这张卡贡献了多少」，也就没法比卡。
+//
+// 第二版：**按烙印类目计点 → 几何阶梯换档 → 封顶**。三条毛病一次解决，
+// 且确定性反而更强（纯整数运算，不经浮点、不经哈希）。
+//
+// ══════════════════════════════════════════════════════════════════════════
+// 🔴 「量化」和「更强」之间那条线画在哪
+// ══════════════════════════════════════════════════════════════════════════
+// 产品要的是「知道哪张角色卡更好」。**在这套系统里没有「更好」这个量**，
+// 有的是「这张卡会把世界变成什么样」：
+//
+// | 数 | 高了会怎样 | 是优势吗 |
+// |---|---|---|
+// | **机缘** | 主线间隙里的事**更密** | ❌ 抽的是同一个池，好事和麻烦等比例变多 |
+// | **气运** | 那些事**更两极** | ❌ 可能捡到不该捡的，也可能撞上不该撞的 |
+//
+// 于是「哪张卡更好」的诚实答案是：**没有更好的卡，只有会把世界变成不同样子的卡**。
+// 一张机缘满档、气运零档的卡带来「热闹但平稳」的世界；反过来带来「安静但极端」的世界。
+// 玩家真正需要看的就是这个，而它恰好不违宪。
+//
+// 另外三条锁（与第一版相同，一条不减）：
+// - 世界级、全员共享 ⇒ 不存在「我气运高我拿得多」；
+// - 产出封顶与稀有预算一个字不动（`RARE_TIER` / `RARE_BUDGET` / 星级封顶都在气运**之后**）；
+// - 档位**有顶**（[`SWING_MAX_LEVEL`]）⇒ 老卡最终都撞到同一个顶，不会无限拉开。
+//   没有顶的刻度迟早会被当成战力表——这条与 [`LifeStage`] 的封顶是同一个理由。
+
+/// 一张卡在两个方向上的累计点数。两个方向都不是「好」的方向。
+///
+/// 也用作道具授予点数的载体（见 [`SwingGrants`]）——授予的就是同一种点数，
+/// 走同一道阶梯、撞同一个顶。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Swing {
+    /// 气运点：世界内容的**幅度**（离常态多远，两个方向都算）。
+    pub fortune: i64,
+    /// 机缘点：世界内容的**密度**（多久来一件事）。
+    pub opportunity: i64,
+}
+
+/// 🔮 **预留接口，本轮恒空**：道具直接给某张卡加点。
+///
+/// 产品说「后续可能会出直接加数值的道具，那个接口只需要预留即可」。预留的形态是这个
+/// 「卡 id → 授予点数」的表，而**生产路径唯一的构造方式是 [`no_swing_grants`]**
+/// （红线 `no_production_path_grants_swing_points_yet` 锁着）。
+///
+/// ══════════════════════════════════════════════════════════════════════════
+/// 🔴 将来真接线时，这两条必须先答，缺一不可
+/// ══════════════════════════════════════════════════════════════════════════
+/// 1. **道具能加速到顶，不能突破顶。** 授予的点数与经历得来的点数走**同一道阶梯**，
+///    因此 [`SWING_MAX_LEVEL`] 对它一样有效（红线 `granted_points_cannot_break_the_ceiling`）。
+///    这一条把「花钱买上限」这个方向从设计层堵死——买到的只是**更快到达**，
+///    而到达之后与一个跑了 80 局的人**完全一样**。
+/// 2. **它买到的是「世界变得不一样」，不是「我更容易赢」。** 气运机缘是世界级、全员共享的，
+///    买家掏钱改变的是整个房间的内容形态，对同房所有人一视同仁；产出封顶一个字不动。
+///    若将来有人想把它做成「只对我生效」，那就是另一套东西，且当场违宪。
+pub(crate) type SwingGrants = std::collections::BTreeMap<String, Swing>;
+
+/// 生产路径唯一的授予来源：**没有授予**。
+pub(crate) fn no_swing_grants() -> SwingGrants {
+    SwingGrants::new()
+}
+
+/// 档位封顶。**这个顶不是偷懒，是红线**——见本节开头第三条锁。
+pub(crate) const SWING_MAX_LEVEL: i64 = 5;
+
+/// 第 1 档需要的点数；之后每一档的**增量翻倍**。
+///
+/// ⚠️ 4 是拍脑袋的，和 [`DEFAULT_LIFE_MARKED_AT`] 一样——它该取多少取决于
+/// 「一局世界平均给一张卡留下多少条烙印」，而那个数要等真实模型跑过才有。
+const SWING_STEP: i64 = 4;
+
+/// 到达第 `level` 档需要的**累计**点数：`STEP × (2^level − 1)` ⇒ 4 / 12 / 28 / 60 / 124。
+///
+/// 产品要求「这两个数值必须设置的很难增加」，这道几何阶梯就是那个要求的落点：
+/// [`derive_imprints`] 一局给一张卡 1-3 条烙印，分摊到两个方向后每局每向 1-2 点
+/// ⇒ 满档要跑**六十局以上**，而且越往后越慢（每档的门槛是上一档增量的两倍）。
+///
+/// 🔵 「六十局」不是拍的，是 `maxing_out_must_take_dozens_of_worlds` 按派生器的真实规则
+/// 算出来的——而且那条用例会在**有人给 `derive_imprints` 加一类烙印**时变红，
+/// 那正是这个数最可能被静默改掉的方式（加烙印看起来与气运机缘毫无关系）。
+pub(crate) fn swing_threshold(level: i64) -> i64 {
+    if level <= 0 {
+        return 0;
+    }
+    SWING_STEP * ((1i64 << level.min(SWING_MAX_LEVEL)) - 1)
+}
+
+/// 累计点数 → 档位（0..=[`SWING_MAX_LEVEL`]）。**纯整数，无浮点、无哈希。**
+pub(crate) fn swing_level(points: i64) -> i64 {
+    let mut level = 0;
+    while level < SWING_MAX_LEVEL && points >= swing_threshold(level + 1) {
+        level += 1;
+    }
+    level
+}
+
+/// 一条烙印落在哪个方向上。
+///
+/// 🔴 这个映射是**语义的，不是数值的**：它说的是「这段经历让世界变密还是变极端」，
+/// 不说「因此这张卡更擅长什么」。同一条烙印不会让任何人更强。
+///
+/// 未知类目**不计点**（fail-closed）：新加一类烙印时必须显式决定它落在哪一边，
+/// 忘了决定的后果是「不生效」而不是「悄悄改变所有老卡的档位」。
+fn axis_of(kind: &str) -> Option<bool /* true = 气运 */> {
+    match kind {
+        // 做过事、见过世面、有过牵扯 → 事更容易找上门（密度）。
+        KIND_CHOICE | KIND_WITNESS | KIND_BOND => Some(false),
+        // 经历过的处境、差一步没走到的事 → 世界更两极（幅度）。
+        KIND_CIRCUMSTANCE | KIND_UNFINISHED => Some(true),
+        _ => None,
+    }
+}
+
+/// 按卡汇总点数。`rows` 为 `(卡id, kind, code)`，**顺序无关**（计数可交换）。
+///
+/// 🔵 与 [`imprint_fingerprint`] 的一个关键差别：那边 `dedup` 去重（同一条烙印进种子只算一次），
+/// 这边**不去重**——一张卡在三个世界里都「走到了终局」是三段经历，不是一段。
+pub(crate) fn swing_points_by_card(
+    rows: &[(String, String, String)],
+    grants: &SwingGrants,
+) -> std::collections::BTreeMap<String, Swing> {
+    let mut out: std::collections::BTreeMap<String, Swing> = Default::default();
+    for (cid, kind, _code) in rows {
+        let e = out.entry(cid.clone()).or_default();
+        match axis_of(kind) {
+            Some(true) => e.fortune += 1,
+            Some(false) => e.opportunity += 1,
+            None => {}
+        }
+    }
+    for (cid, g) in grants {
+        let e = out.entry(cid.clone()).or_default();
+        e.fortune += g.fortune;
+        e.opportunity += g.opportunity;
+    }
+    out
+}
+
+/// 这个世界的气运档与机缘档：**全体在场卡各自档位的平均**（可为小数）。
+///
+/// ══════════════════════════════════════════════════════════════════════════
+/// 🔴 平均，不是求和
+/// ══════════════════════════════════════════════════════════════════════════
+/// 求和会让「人多的房间气运更高」——那立刻造出一条可优化的差异通道
+/// （多拉几个人进来 = 世界内容更多），而房型规模本就是运营参数、不该有这种副作用。
+/// 平均之下，唯一的变量是**你带什么样的人进来**。
+///
+/// 🔴 分母是**全体在场卡数**，不是「有烙印的卡数」。
+/// 用后者会让「一个老手带四个新人」的房间和「五个老手」的房间算出同一个数——
+/// 新卡不是不存在，新卡就是 0 档，它**应该**把这个世界拉回常态。
+///
+/// 🔴 **入参是名册本身而不是它的长度**，于是「不在场的卡」在结构上进不来。
+/// 差别在道具接口真接线的那天才会显形：`grants` 是外部给的表，若它带进一张不在这个房间里的卡，
+/// 「只传长度」的版本会把那张卡的档位**加进分子**——花钱给一张不进场的卡加点，
+/// 就能抬高任意房间的气运。现在这条路不通：不在 `roster` 里的条目根本不参与求和。
+/// ⚠️ 这个洞今天不存在（生产恒传空授予），但预留接口的意义就是**将来接线时它已经是安全的**。
+///
+/// ⚠️ 一个已知且接受的性质：单人房 + 一张满档卡 = 这个世界的两个数都拉满。
+/// 它不构成优势（产出封顶不动、内容池不变），只是那个人的世界比别人的更密更极端；
+/// 而那张满档卡是八十局跑出来的，不是买来的。
+pub(crate) fn world_swing_levels(
+    rows: &[(String, String, String)],
+    roster: &[String],
+    grants: &SwingGrants,
+) -> (f32, f32) {
+    if roster.is_empty() {
+        return (0.0, 0.0);
+    }
+    let by_card = swing_points_by_card(rows, grants);
+    let (mut f, mut o) = (0i64, 0i64);
+    for cid in roster {
+        let s = by_card.get(cid).copied().unwrap_or_default();
+        f += swing_level(s.fortune);
+        o += swing_level(s.opportunity);
+    }
+    (f as f32 / roster.len() as f32, o as f32 / roster.len() as f32)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -604,6 +913,56 @@ pub(crate) async fn life_snapshot(
     }))
 }
 
+/// 一个方向的展示形态：**当前在哪一档、离下一档还差多少**。
+///
+/// 🔴 「还差多少」是这次量化显示的重点，不是「有多少点」。产品要的是玩家能看出
+/// 「这两个数很难增加」——只给一个点数看不出来，给出「下一档在 60 点、你在 31 点」才看得出来。
+///
+/// 顶档时 `nextAt` / `toNext` 都是 `null` 而不是某个够不着的大数：
+/// 展示层拿到大数会算出「还差一万点」，那是在暗示这条刻度还能往上，而它不能。
+fn axis_view(points: i64) -> serde_json::Value {
+    let level = swing_level(points);
+    if level >= SWING_MAX_LEVEL {
+        return json!({ "level": level, "max": SWING_MAX_LEVEL, "points": points,
+                       "nextAt": serde_json::Value::Null, "toNext": serde_json::Value::Null });
+    }
+    let next = swing_threshold(level + 1);
+    // `levelAt` 是**当前这一档的**门槛：展示层要画「这一档走了多少」就必须有它，
+    // 否则只能拿总点数除以下一档门槛，画出来的进度条在每次升档时会往回跳。
+    json!({ "level": level, "max": SWING_MAX_LEVEL, "points": points,
+            "levelAt": swing_threshold(level), "nextAt": next, "toNext": (next - points).max(0) })
+}
+
+/// 一张卡的气运与机缘快照（只读派生，无存储——同 [`life_snapshot`] 的理由）。
+///
+/// 🔴 授予点数恒空（[`no_swing_grants`]）：道具加值是预留接口，本轮不接线。
+pub(crate) async fn swing_snapshot(
+    db: &sqlx::AnyPool,
+    character_id: &str,
+) -> Result<serde_json::Value, ApiError> {
+    let kinds: Vec<(String,)> =
+        sqlx::query_as("SELECT kind FROM character_imprints WHERE character_id = $1")
+            .bind(character_id)
+            .fetch_all(db)
+            .await?;
+    let rows: Vec<(String, String, String)> = kinds
+        .into_iter()
+        .map(|(kind,)| (character_id.to_string(), kind, String::new()))
+        .collect();
+    let s = swing_points_by_card(&rows, &no_swing_grants()).get(character_id).copied().unwrap_or_default();
+    Ok(json!({
+        "fortune": axis_view(s.fortune),
+        "opportunity": axis_view(s.opportunity),
+        // 🔴 这段话是产品定义的一部分，不是 UI 文案的装饰。产品原话要「知道哪张角色卡更好」，
+        // 而这套系统里**没有「更好」这个量**——写在数据里比写在文档里更难被下游误用。
+        "note": "气运与机缘不是战力，是「你带这张卡进去的世界会长成什么样」：\
+机缘高，主线间隙里的事更密；气运高，那些事更两极——可能捡到不该捡的，也可能撞上不该撞的。\
+两个数都作用于世界、同房所有人共享，不改变任何产出上限，也不让任何人更容易赢。\
+比较两张卡时看的是「它们会把世界变成什么样」，不是「谁更强」。",
+        "howItGrows": "只能靠经历长，且越往后越慢（每一档的门槛是上一档增量的两倍），并且有封顶。",
+    }))
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // 玩家读取面：我的这张卡活过什么
 // ═══════════════════════════════════════════════════════════════════════════
@@ -650,7 +1009,8 @@ async fn my_character_life(
         .map(|(w, notes)| json!({ "worldId": w, "notes": notes }))
         .collect();
 
-    Ok(Json(json!({ "characterId": character_id, "life": life, "memories": worlds })))
+    let swing = swing_snapshot(&state.db, &character_id).await?;
+    Ok(Json(json!({ "characterId": character_id, "life": life, "swing": swing, "memories": worlds })))
 }
 
 pub fn router() -> Router<AppState> {

@@ -20,10 +20,10 @@
 //
 // 数据诚实纪律（设计文档 §9.1）：只渲染接口真实返回的字段，null 一律显示 `—`，
 // 比率为 null 时不得当 0% 渲染（formatPercent 已处理）。
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import { Alert, Button, Drawer, Empty, Space, Table, Tabs, Tag, Tooltip, Typography } from 'antd';
 import type { TableColumnsType } from 'antd';
-import { useLocation } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { adminFetch } from '../api';
 import { ErrorAlert, formatNumber, formatPercent, formatTime, friendlyError } from '../components/shared';
 import './Calibration.css';
@@ -422,12 +422,28 @@ function ModTag({ value }: { value: string }) {
   return <Tag color={t.color}>{t.text}</Tag>;
 }
 
-/** 只读徽标 + 唯一写入路径。文案取自接口的 editPath，后端开了写入面时界面自动跟上。 */
-function ReadOnlyBanner({ editable, editPath }: { editable?: boolean; editPath?: string }) {
+/**
+ * 只读徽标 + 唯一写入路径。文案取自接口的 editPath，后端开了写入面时界面自动跟上。
+ *
+ * `action` 是 2026-07-29 补的：此前这条横幅告诉运营「唯一写入路径是
+ * `POST /admin/world-templates`」，而后台那个建模板表单**根本没有 `sagaId` / `stageNo` 两格**
+ * ——那句话指向的是一条在后台走不通的路，只能自己去调 API。
+ * 现在两格补上了（见 `WorldsOps.tsx` 的 `parseTemplatePrefill`），这里把路口也摆出来。
+ * 🔴 它仍然是**跳到那条唯一写入路径**，不是在本页开第二条写路径——本页六个端点仍全只读。
+ */
+function ReadOnlyBanner({
+  editable,
+  editPath,
+  action,
+}: {
+  editable?: boolean;
+  editPath?: string;
+  action?: ReactNode;
+}) {
   if (editable === undefined) return null;
   if (editable) {
     // 目前后端恒为 false；真开了写入面时不该继续显示「只读」，故这里如实反映而不是写死。
-    return <Alert type="info" showIcon style={{ marginBottom: 16 }} title="本页支持编辑。" />;
+    return <Alert type="info" showIcon style={{ marginBottom: 16 }} title="本页支持编辑。" action={action} />;
   }
   return (
     <Alert
@@ -436,6 +452,7 @@ function ReadOnlyBanner({ editable, editPath }: { editable?: boolean; editPath?:
       style={{ marginBottom: 16 }}
       title="本页只可视化，不可编辑"
       description={editPath ?? '校准参数的写入路径不在本页。'}
+      action={action}
     />
   );
 }
@@ -533,7 +550,54 @@ function Notes({ notes }: { notes?: string[] }) {
 
 // ================= 维度一：阶段切分 =================
 
+/**
+ * 建议下一个该录入的阶段号：**先补缺号，没缺号才往后接**。
+ *
+ * 顺序不是随手定的——`missingStageNos` 的口径是 `1..=maxStageNo` 内没有模板的阶段号
+ * （从 1 起算，所以「缺开篇」也在里面）。缺号意味着玩家在这个系列里会撞上一段走不通的路，
+ * 比「还没写到那儿」严重得多，所以它排在续写前面。
+ *
+ * 🔵 取**最小**缺号而不是数组第一项：服务端目前确实按 `1..=max` 升序生成
+ * （`calibration::stage_continuity`），但那是它的实现细节，不是响应契约里承诺过的东西。
+ * 依赖它等于让这个函数的正确性挂在另一侧的循环方向上——而改那个循环的人不会想到这里。
+ */
+export function suggestedNextStageNo(row: {
+  missingStageNos: number[];
+  maxStageNo: number | null;
+}): number {
+  const valid = row.missingStageNos.filter((n) => Number.isFinite(n) && n >= 1);
+  if (valid.length > 0) return Math.min(...valid);
+  return (row.maxStageNo ?? 0) + 1;
+}
+
+/**
+ * 跳到**唯一写入路径**（建模板表单）并预填阶段坐标。
+ *
+ * 🔴 这里不做任何写入——它只是把 `editPath` 那句话变成一个能点的入口。
+ * 目标页在 `WorldsOps.tsx` 的 `parseTemplatePrefill` 消费这三个 query 参数。
+ */
+export function newTemplateHref(search: string, sagaId: string, stageNo?: number): string {
+  const q = new URLSearchParams(search);
+  q.set('view', 'templates');
+  q.set('newTemplate', '1');
+  q.set('sagaId', sagaId);
+  if (stageNo != null) q.set('stageNo', String(stageNo));
+  return `/worlds?${q.toString()}`;
+}
+
+/** 只切到模板库子视图（不预填、不弹框）。给「我要新开一个系列」用。 */
+export function templatesViewHref(search: string): string {
+  const q = new URLSearchParams(search);
+  q.set('view', 'templates');
+  // 🔴 必须清掉预填三件套：从别的系列点过来时地址栏里可能还留着上一次的坐标，
+  // 带着它跳过去会弹出一个填着**别人**系列号的建模板框。
+  for (const k of ['newTemplate', 'sagaId', 'stageNo']) q.delete(k);
+  return `/worlds?${q.toString()}`;
+}
+
 function StageSplitting({ deepLink }: { deepLink?: string }) {
+  const location = useLocation();
+  const navigate = useNavigate();
   const [data, setData] = useState<SagaListRes | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -641,13 +705,34 @@ function StageSplitting({ deepLink }: { deepLink?: string }) {
     {
       title: '操作',
       key: 'op',
-      width: 110,
+      width: 190,
       fixed: 'right',
-      render: (_, r) => (
-        <Button size="small" onClick={() => openDetail(r.sagaId)}>
-          查看阶段
-        </Button>
-      ),
+      render: (_, r) => {
+        const next = suggestedNextStageNo(r);
+        const fillingGap = r.missingStageNos.includes(next);
+        return (
+          <Space size={4}>
+            <Button size="small" onClick={() => openDetail(r.sagaId)}>
+              查看阶段
+            </Button>
+            <Tooltip
+              title={
+                fillingGap
+                  ? `这个系列缺第 ${next} 阶段——点它跳到建模板表单，坐标已预填。本页不写入，写入仍走 POST /admin/world-templates。`
+                  : `按第 ${next} 阶段续录一篇。本页不写入，写入仍走 POST /admin/world-templates。`
+              }
+            >
+              <Button
+                size="small"
+                type={fillingGap ? 'primary' : 'default'}
+                onClick={() => navigate(newTemplateHref(location.search, r.sagaId, next))}
+              >
+                {fillingGap ? `补第 ${next} 阶` : `录第 ${next} 阶`}
+              </Button>
+            </Tooltip>
+          </Space>
+        );
+      },
     },
   ];
 
@@ -655,7 +740,15 @@ function StageSplitting({ deepLink }: { deepLink?: string }) {
 
   return (
     <div>
-      <ReadOnlyBanner editable={data?.editable} editPath={data?.editPath} />
+      <ReadOnlyBanner
+        editable={data?.editable}
+        editPath={data?.editPath}
+        action={
+          <Button size="small" onClick={() => navigate(templatesViewHref(location.search))}>
+            去建模板
+          </Button>
+        }
+      />
 
       <dl className="calibration__stats">
         <div className="calibration__stat">

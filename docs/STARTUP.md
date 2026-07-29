@@ -214,7 +214,13 @@ cd server && MUSE_DATABASE_URL=postgres://muse:muse@127.0.0.1:5433/muse cargo ru
 
 ## 7. 冒烟验证
 
-全绿基线(**校验于 2026-07-27**,数字随开发增长——对不上先确认是新增测试还是漏跑):
+全绿基线(**校验于 2026-07-29**,数字随开发增长——对不上先确认是新增测试还是漏跑):
+
+> ⚠️ **2026-07-29 顺带发现的一件事,记在这里而不是订正掉**:本批次给前端加了 35 条用例
+> (22 条自定义房装配 + 13 条后台建模板写入路径),实测 563 / 87 文件。**563 − 35 = 528 / 85**,
+> 而上一版这里写的是 523 / 84 —— 即**上一批**改动没有同步这一节。
+> 这正是「唯一维护基线的地方」也会失守的方式:它不会报错,只会让下一个人把
+> 「数字对不上」误判成「我把测试跑挂了」。改了测试就顺手改这里,不要留给下一轮。
 
 > 🔴 **这里是全仓唯一维护基线数字的地方。** `CLAUDE.md` 与 `docs/VALIDATION.md` 都已改成
 > 指向本节、不再各留一份副本——此前四处各写各的,结果全部过期(CLAUDE.md 一度停在
@@ -228,14 +234,14 @@ cargo test --manifest-path crates/muse-engine/Cargo.toml          # 314 passed
 #    key 只从 env 读，不落盘、不进仓库、不进日志
 # MUSE_SMOKE_API_KEY=sk-... MUSE_SMOKE_BASE_URL=https://api.deepseek.com/v1 MUSE_SMOKE_MODEL=deepseek-chat \
 #   cargo test --manifest-path crates/muse-engine/Cargo.toml real_provider -- --ignored --nocapture
-(cd server && cargo test)                                          # 1128 passed(default,含黄金世界回归)
-(cd server && cargo test --features billing,arena)                 # 1212 passed
+(cd server && cargo test)                                          # 1132 passed(default,含黄金世界回归)
+(cd server && cargo test --features billing,arena)                 # 1216 passed
 (cd server && cargo test --features billing)                       # 1173 passed（CI 不跑，2026-07-28 手验）
 (cd server && cargo test --features arena)                         # 1202 passed（同上）
 (cd server && cargo test golden)                                   # 14 passed(12 项 runtime::golden::* + 2 项录放 round-trip)
 cargo test --manifest-path src-tauri/Cargo.toml                    # 245 passed
 # 前端 + 后台
-npm run test                                                       # 523 passed / 84 files（含后台组件用例，见 VALIDATION §3.47 A5）
+npm run test                                                       # 563 passed / 87 files（含后台组件用例，见 VALIDATION §3.47 A5）
 npx tsc --noEmit                                                   # 0 错误
 (cd admin && npx tsc --noEmit && npm run build)                    # 0 错误 + 产出 dist
 ```

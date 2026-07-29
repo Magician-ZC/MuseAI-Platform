@@ -348,6 +348,15 @@
 （`POST /api/assets/worlds` 创作者发布 / `POST /api/admin/world-templates` 运营建模板），
 两处都经 `assembly::validate_skeleton_refs` 校验；装配在 `assembly::assemble_instance` 内完成。
 
+🖥️ **玩家端入口**（2026-07-29 补）：`src/pages/platform/ContainerAssembly.tsx`，挂在世界发布向导
+第 5 步。它是**声明面不是编辑器**——只产出 `subplotCardRefs` / `anchors` / `nexus` 三个键，
+**刻意不提供 `seams` 编辑**：缝合边的卡内那一端形如 `卡id:地点id`，而 `GET /me/subplot-cards`
+按设计不下发卡的 skeleton（唯一暴露 `skeletonJson` 的是 operator 的 `GET /admin/world-templates`），
+玩家写不出那一端。不声明 seams 是合法完整路径——compose 步骤 5 会自动生成枢纽 `loc-nexus`。
+跨卡显式缝合仍是运营能力，走 admin 建模板。
+🔴 玩家没有可装的卡时整段**不渲染**，读卡 404 同样静默隐藏——不区分「功能没开」与「你没有卡」，
+与平台「关闭即 404 而非 403」的口径一致。
+
 `skeleton_json` 顶层新增字段（全部可选，未声明 = 普通模板，**行为与产物逐字节不变**）：
 
 ```jsonc
@@ -364,7 +373,7 @@
 | 卡内容来源 | 卡是**蓝图指针**：`subplot_cards.source_template_id@source_template_version` 指向的模板骨架即卡片段（0032 原话「内容蓝图指针，自定义房装配的解引用入口」）。蓝图未过审/已下架 → 停止后续建房 |
 | 实例种子 | **仅容器形态**升为四段式：`H(world_id‖阵容指纹‖template_version‖卡集合指纹)`，卡集合指纹 = 排序去重的 `{cardId}@{cardVersion}` 以 `\n` 连接。普通模板恒走原三段式（测试向量与黄金世界回归逐字节锁死）。防「换一张卡组合刷同一世界」 |
 | 缝合 | 卡内 `connections` 只许闭包在卡内；跨卡连接**只能**经 `seams` 显式声明且两端须在各自 `anchors` 白名单内、非秘境。合并后仍不连通 → 自动生成枢纽地点 `loc-nexus`（保留 id）接上各连通分量的代表锚点；枢纽与全部缝合端点进地点采样**必选种子** |
-| 建房期拒绝 | 静态门（`validate_skeleton_refs` 第 6 段）：卡引用重复/空/含 `:`、本体 id 含 `:`、占用 `loc-nexus`、锚点悬空或指向秘境、缝合边悬空/自环/指向未引用的卡、权重非法。合并门（`compose_container_skeleton`）：卡内 id 含 `:`、卡内引用悬空、缝合口不在锚点白名单、cosmology 不相容、分量无合法缝合口。**一律 400 拒绝装配，不留到运行时静默退化** |
+| 建房期拒绝 | 🔴 **是三道门、分布在两个时刻**，别把「模板发布通过」当成「这房一定开得起来」。① **静态门**（建模板期，`validate_skeleton_refs` **第 7 段** `validate_container_refs`；⚠️ 此处原写「第 6 段」是错的，第 6 段是 realmTier）：开关未开而声明了 `subplotCardRefs`、卡引用空/含 `:`/重复、`weight` 非有限或为负、`cardVersion` 显式为负、本体 id 含 `:`、本体占用 `loc-nexus`、锚点悬空或指向秘境、缝合边两端为空/自环/带前缀端点指向未引用的卡/裸端点不是本体地点**或不在本体 anchors 白名单内**。② **解引用门**（装配期，`load_container_cards`）：无房主、卡不存在或不属于房主（同一措辞，不泄露归属）、卡已 `consumed`、卡无来源模板、声明版本与实际不符、蓝图模板不存在、蓝图未过审或已下架。③ **合并门**（装配期，`compose_container_skeleton`）：卡内 id 含 `:`、卡内引用悬空、缝合口不在锚点白名单、缝合口是秘境、cosmology 不相容、分量无合法缝合口。**一律 400 拒绝装配，不留到运行时静默退化** |
 | 🔴 装配不消耗卡 | 副本卡是**永久蓝图**（§10【拍板 11】"装入自定义房，房散卡在"）。装配只在 `world_container_cards`（0033）INSERT 一行引用，**绝不 UPDATE/DELETE `subplot_cards`**（唯一销毁语义是合成，归 `subplot/` 独占）。一卡多房是正常形态；源码级断言 + DB 全链路用例双守 |
 | 🔴 永不加战力 | 卡只贡献**内容**（剧情线/主线/内容池/结局/NPC/道具/地点），**绝不贡献规则维度**——`payoutTable`/`identityPool`/`assemblyRules`/`sampling`/`isSuperset`/准入策略一律只认容器本体（顺带杜绝「卡里再引用卡」的递归）。卡内道具 `powerTier` 合并时夹到 `min(容器星级, 卡星级)`（只降不升，`effectTags` 恒不变）；钩子奖励再过既有星级封顶与稀有预算 |
 | 🔴 cosmology 相容 | 卡内道具逐件跑既有 `admission::check_admission`（零新机制）：`Rejected`/`Sealed` → 建房期拒绝；`Translated`（容器显式 `rejectedHandling=translate`）→ 降档放行 |
@@ -815,7 +824,7 @@ if 线：   从终局那一拍岔出去的、只属于你的一条平行线   �
 | GET | `/api/admin/worlds/summary` | operator | **全量**世界的健康分档汇总（不是当前页）。⚠️ 本行 **2026-07-28 补登**——端点 2026-07-27 就上线了却一直没进本表，正是「改路由必须同步改它」在防的事。<br>`total`/`fused`/`attention`/`running`/`paused`/`ended` + `attentionReasons[]` + `attentionAny`。<br>🔴 `attention` 的口径**永远只是预算那一条**（`今日消耗比 ≥ MUSE_ATTENTION_BUDGET_BP`，万分比整数，默认 9000）——运营开新维度不会让这个既有数字的含义悄悄变掉。<br>🔴 `attentionAny` = 命中**任意一条已启用规则**的世界数（server 侧 UNION **去重**）。新维度全关时恒等于 `attention`。<br>🔴 `attentionReasons[]` 各条**互相重叠、不可相加**（一个世界可同时预算吃紧 + 停摆）；未启用的维度 `count` 是 **`null` 不是 0**（0 会被读成「一个都没有」）。<br>三个新维度（open-decisions §1，2026-07-28 产品选定）**默认全关**，各有 `flags` 开关 + 自己的阈值 env：`MUSE_ATTENTION_TICK_FAILURE`（失败率，`_BP` 默认 3000，样本下限 `MUSE_ATTENTION_MIN_TICKS` 默认 5）· `MUSE_ATTENTION_BLOCKED_STREAK`（**尾部连续** blocked，`_MIN` 默认 3——不是窗口内占比，「上周堵过、现在好了」不算）· `MUSE_ATTENTION_STALLED`（停摆，`_MS` 默认 24h；「最后活动」= `COALESCE(MAX(world_ticks.created_at), worlds.created_at)`，**新建世界不算停摆**）|
 | POST | `/api/admin/worlds/{id}/pause`·`/resume` | operator | 暂停/恢复（需审计理由） |
 | GET | `/api/admin/world-templates?sagaId=` | operator, reviewer | 模板列表。带 `sagaId` 时切换为**阶段列表**语义：只返回该世界系列，按 `stage_no` 升序（剧情顺序）且不分页 |
-| POST | `/api/admin/world-templates` | operator | 建模板。可选 `sagaId` + `stageNo`（总规格 §3 Saga 归组），二者必须成对，`stageNo` ∈ 1-999；都不传 = 独立模板。骨架**任一已登记层**（`assembly::SKELETON_KEY_SETS`，32 条路径覆盖全部嵌套结构）出现无人读取的键（拼错 / 残留）→ 400，报**完整路径**（形如 `payoutTable.worldlineTiers[见证].itm`）并带编辑距离最近的「是不是想写 X？」。同一道校验也作用于创作者发布 `POST /assets/worlds` |
+| POST | `/api/admin/world-templates` | operator | 建模板。可选 `sagaId` + `stageNo`（总规格 §3 Saga 归组），二者必须成对，`stageNo` ∈ 1-999；都不传 = 独立模板。🖥️ **后台表单 2026-07-29 才补上这两格**——此前 `admin/src` 全域零命中，即这两个字段只能靠直接调 API 录入，而人工校准面的 `editPath` 一直在指这条路（见 VALIDATION §3.60 ④）。骨架**任一已登记层**（`assembly::SKELETON_KEY_SETS`，32 条路径覆盖全部嵌套结构）出现无人读取的键（拼错 / 残留）→ 400，报**完整路径**（形如 `payoutTable.worldlineTiers[见证].itm`）并带编辑距离最近的「是不是想写 X？」。同一道校验也作用于创作者发布 `POST /assets/worlds` |
 | POST | `/api/admin/world-templates/{id}/star` | operator | 星级 curation（**3-5★ 唯一晋升路径**） |
 | GET | `/api/admin/sagas` | operator | 人工校准：阶段切分总览（每系列的阶段数 / 缺号 / 重号 / 未编号 / 审核态 / 星级跨度 / 世界数）。见下方「人工校准面」 |
 | GET | `/api/admin/sagas/{sagaId}` | operator | 人工校准：单系列逐阶段结构（按 `stage_no` 升序 = 剧情顺序）+ 每阶段骨架形状指标。系列不存在 → 404 |
@@ -891,7 +900,10 @@ SQL 里），权限分 reviewer / admin 两档。三条写入路径由源码级�
 
 🔴 **端点全只读，只可视化、不可编辑**：无写入、无副作用、不落 `audit_logs`（没改数据，
 写审计只会制造噪声），因此**不挂运营开关**（同 dashboards：VALIDATION §0.1 约束的是写入面）。
-每个响应恒带 `editable: false` + `editPath`（说明唯一写入路径仍是 `POST /api/admin/world-templates`），
+每个响应恒带 `editable: false` + `editPath`（说明唯一写入路径仍是 `POST /api/admin/world-templates`；
+🖥️ 2026-07-29 起后台把这条路径做成了**可点的入口**——阶段切分表每行给出「补第 N 阶 / 录第 N 阶」，
+跳到建模板表单并预填 `sagaId` + `stageNo`（缺号优先于续写）。**六个端点仍然全只读，没有新增写路径**：
+模板是 append-only 的，两条模板之间没有血缘字段，新开写端点会同时带出「血缘怎么表达」这个未决问题），
 后台页面把这两个字段直接渲染出来，而不是自己写死「只读」二字。
 
 | 字段 | 口径 |

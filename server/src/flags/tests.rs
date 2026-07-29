@@ -1252,3 +1252,143 @@ fn red_line_only_flags_queries_the_runtime_flags_table() {
          绕过的后果不会立刻显形——指标照常出数（只是假的）、运营面照常 404（只是本该可见）。"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 文档同步闸：`KNOWN_FLAGS` ↔ `docs/VALIDATION.md` 的双坐标功能台账
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// 🔴 **这两道闸补的是 2026-07-29 实测到的一类漂移：代码前进了，台账没跟。**
+//
+// 当时 §3 台账里有三行还写着 `Specified`——单人微本 + 新手礼包、生死契约三档、
+// 副本卡 + 自定义房装配——而三者的模块、迁移、路由、开关**全都已经在跑**
+// （`onboarding/` + 0031、0026 三档 + join 契约门、`subplot/` + 0032/0033）。
+// 「内容中台工业线」那行写着 `Concept`，而它七道工序里有六道已是 `Implemented`。
+//
+// 这个方向的错**比写少了更贵**：一份说「还没做」的台账会让下一个人去**重做一遍**
+// （`slo` 那边差点因此造出同一读数的第二份实现，见
+// `slo::tests::validation_doc_mentions_every_calibration_dimension` 的注释），
+// 或者让评审在「这功能到底能不能开」上按着一份假状态做决定。
+//
+// 已有的 `KNOWN_FLAGS.len()` 棘轮只管**代码这一侧**（新增开关必须被人评审一次），
+// 它对「评审完了但台账没改」完全无感。下面两道闸各封一个方向。
+//
+// ⚠️ **它们挡不住什么，如实写在这里**（本仓 §3.8.1「红线本身会骗人」）：
+// 若某个已落地功能**在台账里整行缺失**、且它的开关名散落在别的小节里，
+// 两道闸都会绿。真正能封死那一半的做法是把「功能 → 台账行」做成机器可判的映射，
+// 而那份映射今天不存在（`FlagDef.owner` 是模块名，不是产品功能名）。
+// 因此这两道闸的定位是**收窄**漂移面，不是消灭它。
+
+/// 每个登记开关的名字，都必须在 `docs/VALIDATION.md` 里至少出现一次。
+///
+/// 判据刻意只要求「名字出现过」、不校验措辞——措辞会变，而「加了一个开关却
+/// 从没在验证计划里露过名字」是确定性的疏漏：那意味着这块功能**没有进过 T0-T5 的任何一格**，
+/// 而 §0.1 的全部约束（未验证功能默认关闭、按阶段开闸）都挂在那张表上。
+///
+/// 🔵 这道闸落地当天就抓到了健康档三维度：§3.40 通篇只说「三条 `FlagDef`」，
+/// 一个名字都没写（`MUSE_ATTENTION_TICK_FAILURE` / `_BLOCKED_STREAK` / `_STALLED`）。
+/// 形状与 `slo::tests::validation_doc_mentions_every_calibration_dimension` 同源。
+#[test]
+fn validation_doc_mentions_every_known_flag() {
+    let doc = include_str!("../../../docs/VALIDATION.md");
+    let missing: Vec<&str> = KNOWN_FLAGS
+        .iter()
+        .map(|f| f.name)
+        .filter(|name| !doc.contains(name))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "这些开关已在 `KNOWN_FLAGS` 登记，但 `docs/VALIDATION.md` 全文一次都没提过：{missing:?}。\n\
+         一个在验证计划里从没露过名字的开关 = 这块功能没进过 T0-T5 的任何一格。\n\
+         请在相应小节写清它开的是什么、按哪一阶段开闸，而不是只把这里的断言改绿。"
+    );
+}
+
+/// §3 双坐标台账里**点名了某个开关**的行，开发状态不得仍是 `Specified` / `Concept`。
+///
+/// 逻辑很短：开关存在 ⇒ 那块代码已经接线（`KNOWN_FLAGS` 全表 `wired: true`）⇒
+/// 开发状态至少是 `Implemented`。写着 `Specified` 只可能是台账没跟上。
+///
+/// 🔴 解析口径本身也要能失败：列数变了 / 表体空了 / 点名开关的行数塌了，
+/// 三种都直接红，而不是静默扫了个空表passing——「可被悄悄缩小的扫描面」是本仓
+/// §3.8.1 点名的红线骗人写法之一。
+#[test]
+fn ledger_rows_that_name_a_flag_are_not_still_specified() {
+    let doc = include_str!("../../../docs/VALIDATION.md");
+    let rows = ledger_rows(doc);
+
+    // 表体塌了要红：解析口径失效时，下面的循环会一条不扫地「全绿」。
+    assert!(
+        rows.len() >= 15,
+        "§3 台账只解析出 {} 行，解析口径疑似失效（标题被改？表格被换成别的写法？）",
+        rows.len()
+    );
+
+    let mut named = 0usize;
+    let mut offenders: Vec<String> = Vec::new();
+    for (dev_status, raw) in &rows {
+        let hits: Vec<&str> = KNOWN_FLAGS
+            .iter()
+            .map(|f| f.name)
+            .filter(|n| raw.contains(n))
+            .collect();
+        if hits.is_empty() {
+            continue;
+        }
+        named += 1;
+        if !(dev_status.contains("Implemented") || dev_status.contains("Integrated")) {
+            offenders.push(format!("{hits:?} 所在行的开发状态是「{}」", dev_status.trim()));
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "🔴 台账与代码漂了：这些行点名了已登记的运行时开关，开发状态却还不是 \
+         Implemented/Integrated：\n  {}\n\
+         开关存在 ⇒ 代码已接线（`KNOWN_FLAGS` 全表 wired）⇒ 状态至少是 Implemented。\n\
+         2026-07-29 就是这么抓到三行的（新手动线 / 生死契约 / 副本卡+装配）。",
+        offenders.join("\n  ")
+    );
+
+    // 扫描面下限：把开关名从台账里删掉就能让上面的循环一条都不扫——这条堵死那个出口。
+    // 🔵 它是**有意的棘轮**（同 `KNOWN_FLAGS.len()` 那条）：给台账新点名一个开关时它不会红，
+    // 只有**变少**才红；数字要往上抬时顺手确认一下少掉的那行是被合并了还是被漏了。
+    assert!(
+        named >= 6,
+        "§3 台账里点名运行时开关的行只剩 {named} 行（应 ≥ 6）。\
+         开关名是这道闸唯一的锚点，锚点被摘掉等于闸门失效。"
+    );
+}
+
+/// 解析 §3 双坐标功能台账的**表体**，返回 `(开发状态列, 整行原文)`。
+///
+/// 从 `## 3. 双坐标功能台账` 起、到下一个 `### ` 小节止；跳过表头与分隔行。
+/// 表格下方那段引用块（`> | 组合 | SQLite | …`）不会被误收——它的行首是 `>`。
+fn ledger_rows(doc: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut inside = false;
+    for line in doc.lines() {
+        if line.starts_with("## 3. 双坐标功能台账") {
+            inside = true;
+            continue;
+        }
+        if !inside {
+            continue;
+        }
+        if line.starts_with("### ") {
+            break;
+        }
+        let t = line.trim();
+        if !t.starts_with('|') || t.contains("---") || t.starts_with("| 功能 |") {
+            continue;
+        }
+        let cells: Vec<&str> = t.split('|').collect();
+        // 4 列 ⇒ split 出 6 段（首尾各一个空串）。列数变了必须红：静默跳过 = 扫描面被悄悄缩小。
+        assert_eq!(
+            cells.len(),
+            6,
+            "台账行的列数不是 4（解析口径失效，或某个单元格里混进了裸 `|`）：{t}"
+        );
+        out.push((cells[2].to_string(), t.to_string()));
+    }
+    out
+}

@@ -96,7 +96,7 @@
 | 功能 | 开发状态 | 验证状态 | 默认开关 |
 |---|---|---|---|
 | 世界引擎推演（决策/仲裁/写作/关系演化） | Integrated | **黄金世界回归已建（仅管线层）** | T0 起开 |
-| 单人微本 + 新手礼包 | Specified | T0 待测 | T0 开 |
+| 单人微本 + 新手礼包 | **Implemented**（0031 `onboarding/`：预制卡库 `presets.rs` + 大礼包幂等领取（DB 主键保证每人一次）+ 单人微本 `microworld.rs` open→running→**既有结算路径**。🔴 本模块**永不写 `world_members`**，入场仍走既有 `join`，故资格校验一条不少）| T0 待测 | T0 开（当前 `MUSE_ONBOARDING` **默认关**）⚠️ T0 门槛「10 分钟内完成首个微本」的被测对象就是它，开测前必须先打开 |
 | 日报召回 / 关键节点推送 | Implemented / Specified | T1 待测 | T1 开 |
 | 托梦（配额参数化） | Implemented（配额 Specified） | T1 待测 | 灰度 |
 | 历练 / 卡位 / 星级 / 准入 | Implemented | T1-T2 待测 | T1 开（参数保守） |
@@ -106,12 +106,12 @@
 | 已过审内容处置（再审 / 下架 / 恢复） | **Implemented**（0044；四类主体的展示态处置 + 两档可逆性 + 处置台账 + 举报队列跳转落地。2026-07-27 补：位图主体的**再审通道**已接上——`check_image` 入队 + `audit::review` 两条位图回写分支，补的是 0027 注释里记着的那处缺口；人审详情附图，否则只能盲审） | T2 起随开 | **恒开**（合规设施，见 §3.1 末段） |
 | 被处置内容的卡名读取面闸门 | **Implemented**（`safety/disposal.rs`；roster / 遗作馆四处 / 社交 / 邀请 / 同源冲突文案共 8 处解引用点。🔴 `world_events` 与已封卷传记快照一个字节不动——闸门停的是「现读现解」，不是回溯改写。替代文本 `暂不可见的角色·<hex>`，前缀参数化 `MUSE_DISPOSAL_DISPLAY_NAME`）| 未定（产品决策） | **关闭**（`MUSE_DISPOSAL_NAME_GATE`）。⚠️ 与上一行的「恒开」**不冲突**：那是处置能力，这是改变运行中世界显示的产品决策，见 §3.1 末段的补记 |
 | 处置申诉（被下架的作者的救济路径） | **Implemented**（0045 `disposal_appeals`；作者提交 `POST /assets/characters/{id}/disposal-appeal`、后台队列 + 裁决。改判**复用 `restore` 那一段实现**，不直接写 `approved`。🔴 每**次处置**一次而非每主体一次——恢复后再被下架的作者重新获得申诉权）| T2 起随开 | **恒开**（同为合规设施：一个能被关掉的申诉入口等于没有申诉入口）|
-| 生死契约（三档参数化） | Specified | T5 待测 | 关闭（默认庇护/同意制） |
-| 副本卡 + 自定义房装配 | Specified（R2） | T4 待测 | 关闭 |
+| 生死契约（三档参数化） | **Implemented**（0026；三档 `sanctuary`/`consent`/`deathmatch` 落库 + `effective_lethality` 读取侧降级 + `join` 的「入场即签」契约门（`worlds/mod.rs:995`）+ 未成年禁入（`worlds/mod.rs:991`，走全仓唯一的 `auth::is_declared_adult`））| T5 待测 | 关闭（`MUSE_LETHALITY_DEATHMATCH`）。🔴 关掉不只是挡新建：读取侧降级使**既有生死场立即降为同意制** |
+| 副本卡 + 自定义房装配 | **Implemented**（副本卡 0032 `subplot/`：结算铸卡 + 同星合成；装配 0033 `assembly::compose_container_skeleton`：命名空间重写 + 缝合 + 四段式种子，**无独立端点**——容器是骨架的一段声明，随既有建模板/发布路径入库。**玩家端入口 2026-07-29 补齐**：`ContainerAssembly.tsx` 挂在世界发布向导第 5 步，见 §3.60）| T4 待测 | 关闭（`MUSE_SUBPLOT_CARDS` / `MUSE_CONTAINER_ASSEMBLY`）|
 | 赛事直播 / 弹幕 | Implemented（观战）/ **Implemented**（直播场：0042；定档 + 延迟缓冲 + 弹幕，见 §3.4） | T5 待测 | 关闭（`MUSE_LIVE_STAGE`）⚠️ T5 开测前必须先打开，否则 `liveStage` 返回 `entry_not_open` 而非 0% |
 | 真人社交解锁 | **Implemented**（0040；解锁门槛 / 拉黑 / 举报队列 / 青少年服务端拒绝 / 「一起死过」凭证） | T4+ 待测 | 关闭（`MUSE_SOCIAL_IDENTITY_UNLOCK`） |
 | 人设保险三级出口（事前底线 / 事中注解权 / 事后 if 线） | 事前 engine Implemented · 事中 **Implemented**（0037）· 事后 **Implemented（开局 + 推进）**（0039/0041） | T1 起（注解权是 T1 门槛的测量手段）/ if 线 T3 待测 | 三级**全部默认关闭** |
-| 内容中台工业线 | Concept | — | — |
+| 内容中台工业线 | **逐工序不同，不是一个状态**（总规格 §4 七道工序）：选书/版权采购 = **运营动作，无代码** · 管线提取 `Implemented`（`muse_engine::WorldExtractionPipeline`）· 人工校准 `Implemented`（`admin_api/calibration.rs` + 后台页；**六个端点恒只读**，写入路径 2026-07-29 补通，见 §3.60）· 仿真试跑 `Implemented`（§4.4）· 安全审 `Implemented` · 定档定产出 `Implemented`（星级 0020 + 产出表）· 灰度 `Implemented`（`flags/` 0036）| 三指标口径（完读率/阻断率/结局分布）已建，**尚无真实内容跑过** | 校准/仿真是运营内部面，不挂用户开关 |
 
 > 🟡 **平台生产数据库（Postgres）测试全量通过 —— 2026-07-27 本地实测（PostgreSQL 16.9）**
 >
@@ -1048,6 +1048,120 @@ camelCase 与 snake_case 同形。`known_to` 才受影响，而那一处是类�
 
 ⚠️ 另一条边界：**存量模板不会被回头校验**，闸只在写入路径上。存量的发现面是运营台的
 `shape.unknownTopLevelKeys` / `shape.unknownNestedKeys` 两栏——**看得见，但不会自动修**。
+
+### 3.60 台账写着「还没做」的三行，代码里全在跑；而真做完的两格没人能点（**2026-07-29**）
+
+这一轮的起点是一个盘点问题「还有哪些没完成、或者只更新了开发文档」。
+盘完之后做了三件事：**修漂移 → 补玩家端那一格 → 把「唯一写入路径」补通**。
+三件事各自的价值不在实现量，在于它们暴露的**同一个形状**：
+
+> 🔴 **一份说「还没做」的文档，和一个说「唯一写入路径是 X」而 X 在界面上走不通的提示，
+> 是同一类缺陷的两个方向**——它们都让人对着一个不存在的地图做决定。
+
+#### ① 台账与代码漂开了四行
+
+| 台账原文 | 实际 |
+|---|---|
+| 单人微本 + 新手礼包 `Specified` | `onboarding/`（含 `presets.rs` / `microworld.rs`）+ 0031 + 路由 + 开关，全在跑 |
+| 生死契约（三档参数化）`Specified` | 三档常量 + `effective_lethality` 读取侧降级 + join 契约门 + 未成年禁入，全在跑 |
+| 副本卡 + 自定义房装配 `Specified（R2）` | `subplot/` + `assembly` 容器段 + 0032/0033 + 两个开关，全在跑 |
+| 内容中台工业线 `Concept` | 七道工序里六道 `Implemented`，只有「选书」是无代码的运营动作 |
+
+⚠️ **这个方向的错比写少了更贵**：一份说「还没做」的台账会让下一个人去**重做一遍**。
+`slo` 那边已经差点因此造出同一读数的第二份实现
+（见 `slo::tests::validation_doc_mentions_every_calibration_dimension` 的注释）。
+
+**补了两道闸**（在 `flags/tests.rs`，形状抄上面那条）：
+
+- `validation_doc_mentions_every_known_flag`：每个登记开关的名字必须在本文件出现过。
+  落地当天就抓到健康档三维度——§3.40 通篇只说「三条 `FlagDef`」，一个名字都没写。
+- `ledger_rows_that_name_a_flag_are_not_still_specified`：台账里点名了开关的行，
+  开发状态不得仍是 `Specified`/`Concept`。开关存在 ⇒ 代码已接线 ⇒ 状态至少 `Implemented`。
+
+🔴 **两道闸挡不住什么，写在闸自己的注释里**：某个已落地功能若**在台账里整行缺失**、
+而开关名散落在别的小节，两道闸都会绿。要封死那一半得有「功能 → 台账行」的机器可判映射，
+而那份映射今天不存在（`FlagDef.owner` 是模块名，不是产品功能名）。
+它们是**收窄**漂移面，不是消灭它。
+
+#### ② 自定义房闭环断在最后一步：服务端全做完了，玩家点不到
+
+`assembly::compose_container_skeleton`、`world_container_cards`（0033）、三道校验闸、四段式种子、
+命名空间重写——全部就位且有用例。而 `src/` 全域对 `subplotCardRefs` / `seams` / `anchors`
+的引用数是 **0**。「打世界 → 得卡 → 合成 → 装进自建房」，前三步玩家有界面，第四步只能由运营手写模板 JSON。
+
+补的是 `src/pages/platform/ContainerAssembly.tsx`（挂在世界发布向导第 5 步）。
+两条边界是**读代码读出来的，不是省事**：
+
+- **不提供 `seams` 编辑**：缝合边的卡内那一端形如 `卡id:地点id`，而 `GET /me/subplot-cards`
+  按设计不下发卡的 skeleton（唯一暴露 `skeletonJson` 的是 operator 的 `GET /admin/world-templates`）。
+  给玩家一个只能盲填的框，是在造一个必然写错的入口。不声明 seams 是**合法完整**路径：
+  compose 步骤 5 会自动生成枢纽 `loc-nexus`。跨卡显式缝合仍是运营能力。
+- **不做穷尽的提交前校验**，且**绝不重抄** `SKELETON_KEY_SETS` / `collect_id_like`——
+  同一判定的第二份拷贝，漂移方向恰是最坏的那个：**前端说没问题、后端 400**。
+  前端只做「不把明显选不了的东西摆出来」，其余交给服务端那些写得很清楚的中文 400。
+
+🔵 可见性沿用现有范式：玩家没有可装的卡时整段**不渲染**，读卡 404 同样静默隐藏——
+不区分「功能没开」与「你没有卡」，与「关闭即 404 而非 403、不泄露未开放功能的存在性」一致。
+⚠️ 如实说另一半：`MUSE_CONTAINER_ASSEMBLY` 是**另一个**开关，玩家端查不到它，
+「有卡但装配没开」时提交才被前门拒绝。补一个玩家可见的开关查询端点会一次性暴露全部未发布功能，
+与那条红线直接冲突，故不补。
+
+#### ③ 顺手查出的**真缺陷**：一条把错误推给别人的漏判
+
+写②时按接缝的思路核了两道门的口径，发现：
+
+- 建模板期（`validate_container_refs` 第 7 段）对缝合边的**裸 id 端点**只查「是不是本体地点」；
+- 而 `compose_container_skeleton` 步骤 4 要求**每一个**端点都在 anchors 白名单内。
+
+于是「anchors 留空 / 不含该地点 + seams 写本体地点」的模板**能通过发布**，
+一直到有玩家去开房那一刻才 400「seams 越界」——**撞上它的是玩家，写错的作者那边显示「发布成功」**。
+
+裸端点这一半在建模板期完全判得死：合并后的白名单 = 本体 anchors ∪ 各卡 anchors（**恒带 `卡id:` 前缀**），
+裸 id 不带前缀 ⇒ 只可能由本体 anchors 放行 ⇒ 卡解不解引用都不改变结论。已补上，
+带前缀那一半仍归 compose（要读卡蓝图），边界没动。
+
+🔵 故障注入两处全红：废掉新闸（退回缺陷形态）→ 正向用例红；无条件拒绝裸端点（把功能废掉）→
+**反向配对**与**接缝断言**双红。另加 `the_two_gates_agree_on_bare_seam_endpoints` 钉住两道门的口径——
+单看两边各自的用例都绿，漂开的恰恰是它们之间那条缝。
+
+⚠️ 另有一条**看着像缺陷、走一遍不成立**的，一并记下省得下次再查：
+`validate_skeleton_refs` 在未知键闸之后 `serde_json::from_value::<Skeleton>` 失败即 `return Ok(())`，
+看起来能绕过容器前门（开关关着也能声明 `subplotCardRefs`）。但装配期 `load_skeleton` 用的是同一套
+`unwrap_or_default()`：解析不出来的骨架在那边同样变成空 `Skeleton` ⇒ `subplot_card_refs` 为空
+⇒ **压根不会发生装配**。前门失效但后门也是关的，不构成开关绕过。
+
+#### ④ 「唯一写入路径」在后台是**走不通**的
+
+`admin_api/calibration.rs` 六个端点恒下发 `editable: false` + 一句 `editPath`：
+「阶段坐标只在建模板时录入：`POST /admin/world-templates` 的 `sagaId` + `stageNo`」。
+后台把这句话原样渲染给运营看——**而那个建模板表单里根本没有这两格**
+（`grep -rn "sagaId\|stageNo" admin/src` 当时零命中）。运营看得见「这个系列缺第 3 阶段」，
+只能自己去 curl。**只读 + 指一条走不通的路，比单纯只读更糟：它看起来是有出口的。**
+
+🔴 **补的是入口，不是写端点。** 模板是 append-only 的（改模板 = 建新行、新 id，
+admin 侧 `version` 恒为 1，两条模板之间**没有任何血缘字段**）。给校准面加写端点会同时带出
+「血缘怎么表达」这个未决问题，且必然与既有写入面的八段校验链漂成两份。
+所以：建模板表单补上那两格（含成对性拦截与 1..999 范围），校准页给出「补第 N 阶 / 录第 N 阶」的路口，
+**六个端点仍然全只读**。缺号优先于续写——缺号意味着玩家会撞上一段走不通的路。
+
+🔵 故障注入三处全红：去掉成对性拦截 → 那条用例红；无条件下发坐标（破掉「独立模板逐字不变」）→ 红；
+废掉预填 → 预填与坐标下发双红。
+
+⚠️ **顺带删掉了 394 行死代码，理由要说清楚**：给后台写用例就要 `import` 后台源码，
+而后台源码一旦被根 `src/__tests__/` 引用，就会进**根 tsc** 那道检查——
+根 tsconfig 的 `noUnusedLocals` 比 `admin/` 自己的严。于是 `WorldsOps.tsx` 里那个
+`WorldsMonitorConsole` 上线后就再没被任何路由引用的 `WorldsMonitor`（约 340 行）
+连同它专用的三个 interface、一张状态表、两个 import 一起报了出来。
+全仓零命中，已删。
+🔵 这条本身是 §3.47 A5「admin 没有自己的 `npm test`」那半条欠账的**延伸代价**：
+后台代码只要还寄住在根测试里，它就永远按根的严格档受检——这不是坏事，
+但下一个给 admin 写用例的人会毫无预兆地撞上一堆与自己改动无关的 `TS6133`。记在这里省他一次。
+
+#### 这一轮真正该留下的一句话
+
+**「还没做」和「做完了但点不到」在用户和评审那里是同一件事**，但在台账上长得完全不同：
+前者会被记成待办，后者连待办都不会有——因为负责实现的人看代码，代码是全的。
+本轮三件事里有两件属于后者（②④），而它们都不是靠读文档发现的，是靠**问「这条链的最后一步谁来点」**。
 
 ### 3.59 自审本轮 100 个提交：**我把别人的未提交改动卷进了自己的提交**（**2026-07-28**）
 
@@ -2006,6 +2120,16 @@ I1 是 `prose.contains(secret)`，**字面子串匹配**，而唯一的前置过
 落地按「三个都加、但**一律默认关闭**」处理，这样两种读法都成立：要用就开一个开关，
 要「先看真实运营数据再说」就什么都不做。若本意是后者，删掉三条 `FlagDef` 即可，
 没有别处依赖它们。**这一段不该被读成「已澄清」——它是记下来等回话的。**
+
+三条开关的名字（⚠️ **2026-07-29 补**：本节原先只说「三条 `FlagDef`」，一个名字都没写，
+于是新加的闸 `validation_doc_mentions_every_known_flag` 立刻把它抓了出来——
+一个在验证计划里从未露过名字的开关，等于没进过验证计划）：
+
+| 开关 | 维度 | 自带阈值 env（§0.2 参数化） |
+|---|---|---|
+| `MUSE_ATTENTION_TICK_FAILURE` | tick 失败率 | `MUSE_ATTENTION_TICK_FAILURE_BP`（默认 3000 = 30%）+ `MUSE_ATTENTION_MIN_TICKS`（默认 5） |
+| `MUSE_ATTENTION_BLOCKED_STREAK` | 尾部连续 blocked 拍数 | `MUSE_ATTENTION_BLOCKED_STREAK_MIN` |
+| `MUSE_ATTENTION_STALLED` | 停摆时长 | `MUSE_ATTENTION_STALLED_MS`（默认 24 小时） |
 
 #### 三条默认关闭的理由，与本仓别的开关都不同
 

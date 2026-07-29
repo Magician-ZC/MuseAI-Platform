@@ -220,6 +220,9 @@ pub fn parse_outline(text: &str) -> Result<Vec<OutlineNode>, EngineError> {
             threshold: None,
             advance_when: None,
             weights: None,
+            // 也不带宿命时刻：手写大纲没有「原著第几章」这个坐标，故恒等人来推。
+            due_at: None,
+            at_location: None,
         });
     }
     Ok(nodes)

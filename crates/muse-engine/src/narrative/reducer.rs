@@ -767,7 +767,7 @@ mod tests {
             status: NodeStatus::Pending,
             threshold: None,
             advance_when: None,
-            weights: None,
+            weights: None, due_at: None, at_location: None,
         });
         s.narrative.forbidden_predicates.push(ForbiddenPredicate {
             id: "f1".into(),

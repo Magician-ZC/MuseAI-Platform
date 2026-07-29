@@ -830,7 +830,7 @@ mod tests {
             status: NodeStatus::Pending,
             threshold: None,
             advance_when: None,
-            weights: None,
+            weights: None, due_at: None, at_location: None,
         });
         let d = decision("d1", "li", "杀死关键人物王五", vec![]);
         let (resolved, pending) = rule_arbitrate(&s, &[d], &active(), &no_locations());

@@ -887,6 +887,66 @@ impl NarrativeEngine {
         //    确定性：BTreeMap 键有序遍历 + 取 min，平手落到同一 cohort 后按 character_id 定序。
         let t = select_time(&state);
 
+        // 2a) **宿命时刻优先**（2026-07-29）：若 T 上有到期的主线节点，它**先于角色行动发生**。
+        //
+        // ══════════════════════════════════════════════════════════════════════
+        // 🔴 这一段就是「世界自己在运转」——它不需要任何角色参与
+        // ══════════════════════════════════════════════════════════════════════
+        // 原著里的大事到点就发生：在场的角色亲历它，不在场的只听说，
+        // **没有人在场它也照样发生**（世界状态照变，后来路过的人会发现痕迹）。
+        //
+        // 为什么先于角色行动：宿命是这一刻的**既成事实**，角色是对它做反应的。
+        // 反过来（角色先动、事件后发）会让同一刻的因果倒置——角色对一件还没发生的事作出了反应。
+        //
+        // 🔵 零宿命节点的世界（老模板、老存档、手写大纲）完全不进这一段，行为逐字节不变。
+        let fated_now: Vec<(usize, i64, String)> =
+            pending_fated_nodes(&state).into_iter().filter(|(_, due, _)| *due <= t).collect();
+        if !fated_now.is_empty() {
+            let mut st = state.clone();
+            st.timeline.now = t;
+            for (idx, _, at_loc) in &fated_now {
+                let (summary, node_id) = match st.narrative.outline_nodes.get(*idx) {
+                    Some(n) => (n.summary.clone(), n.id.clone()),
+                    None => continue,
+                };
+                // 宿命落定：不看阈值、不看谓词——那两样是「等人来推」的判据，与宿命互斥。
+                if let Some(n) = st.narrative.outline_nodes.get_mut(*idx) {
+                    n.status = NodeStatus::Done;
+                }
+                // 记忆：在场者亲历，不在场者只听说。两者都进各自的 `pacingNotes`——
+                // 那是 `assemble_visible_context` 的 `yourMemory` 唯一的数据源，
+                // 所以「听说过」与「亲历过」的差别会真的进到角色下一次决策的上下文里。
+                let witnesses: Vec<String> = st
+                    .characters
+                    .iter()
+                    .filter(|(_, c)| at_loc.is_empty() || c.location == *at_loc)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for (cid, cs) in st.characters.iter() {
+                    let seen = witnesses.iter().any(|w| w == cid);
+                    let _ = cs;
+                    let kind = if seen { "Witnessed" } else { "Heard" };
+                    st.narrative.pacing_notes.push(format!("{cid}｜{kind}｜{summary}"));
+                }
+                // 世界层留痕：即使一个角色都不在场，这件事也发生过。
+                st.world.insert(format!("fated_{node_id}"), json!(t));
+            }
+            let new_state = persist_timeline(
+                self.host.as_ref(),
+                &run_id,
+                st,
+                state.timeline.next_time.clone(),
+                t,
+            )?;
+            let terminal = is_terminal(&new_state);
+            return Ok(EventStep {
+                outcome: None,
+                activated: Vec::new(),
+                at_time: t,
+                terminal,
+            });
+        }
+
         // 2b) 选 cohort（Phase 3 = 同地点碰撞组：同 location + 时间窗 [T,T+dur) 重叠，退化为「空闲于 T」；
         //     单地点/无地点世界完全退化为 Phase 1「同刻」）。cohort 内恒同 location → 下方 run_round 内单组处理。
         let cohort = select_cohort(&state, t);
@@ -962,12 +1022,42 @@ impl NarrativeEngine {
 /// 确定性：BTreeMap 键有序 + `min`。
 fn select_time(state: &NarrativeState) -> i64 {
     let now = state.timeline.now;
-    state
+    let earliest_char = state
         .characters
         .keys()
         .map(|c| state.timeline.next_time.get(c).copied().unwrap_or(now))
-        .min()
-        .unwrap_or(now)
+        .min();
+    // 宿命节点也在时间轴上（2026-07-29）：**世界自己的事件源**。
+    //
+    // 🔴 这一行是「主线遵循原著」与「其余自然推演」的分界：在它之前，主线只能靠角色推
+    // （threshold 累积 + advance_when 谓词），于是「血洗黑角城」会因为在场的人都躲着走而
+    // 永远不发生。纳入之后，最小 T 可能来自一个**没有任何角色参与**的宿命时刻。
+    //
+    // 🔵 `due_at: None` 的节点不参与（`filter_map`）⇒ 老模板、老存档的 T 逐字节不变。
+    let earliest_fated = pending_fated_nodes(state).into_iter().map(|(_, t, _)| t).min();
+    match (earliest_char, earliest_fated) {
+        (Some(a), Some(b)) => a.min(b),
+        (Some(a), None) => a,
+        (None, Some(b)) => b,
+        (None, None) => now,
+    }
+}
+
+/// 尚未发生、且带宿命时刻的主线节点：`(节点下标, due_at, 地点)`。
+///
+/// 只取 `Pending`——已 Done/Bypassed/Blocked 的不再参与时间轴（宿命只发生一次）。
+/// 顺序由 `outline_nodes` 的数组序决定，确定性。
+fn pending_fated_nodes(state: &NarrativeState) -> Vec<(usize, i64, String)> {
+    state
+        .narrative
+        .outline_nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.status == NodeStatus::Pending)
+        .filter_map(|(i, n)| {
+            n.due_at.map(|t| (i, t, n.at_location.clone().unwrap_or_default()))
+        })
+        .collect()
 }
 
 /// Phase 3 cohort：**同地点碰撞组**——「同 `location` + 时间窗 `[T, T+dur)` 重叠」（复用 P3 的
@@ -2002,7 +2092,7 @@ mod tests {
                 // 旧式硬节点（无 threshold）：走 build_patch progressed=>done 兼容路径。
                 threshold: None,
                 advance_when: None,
-                weights: None,
+                weights: None, due_at: None, at_location: None,
             });
         }
         NarrativeStore::new(host.fs.clone()).init(&s).unwrap();
@@ -2661,7 +2751,7 @@ mod tests {
                 // is_terminal 的里程碑集（P1 调和后 MainlineDone 判据），供 terminal_not_wait_all 触发终局。
                 threshold: Some(1.0),
                 advance_when: None,
-                weights: None,
+                weights: None, due_at: None, at_location: None,
             });
         }
         NarrativeStore::new(host.fs.clone()).init(&s).unwrap();
@@ -2969,6 +3059,89 @@ mod tests {
         s
     }
 
+    // ===== 宿命时刻（2026-07-29）：主线自己发生，不等角色推 =====
+
+    /// 带宿命时刻的主线节点。
+    fn fated_node(id: &str, due_at: i64, at_loc: &str, summary: &str) -> OutlineNode {
+        OutlineNode {
+            id: id.into(),
+            summary: summary.into(),
+            constraint: ConstraintLevel::Hard,
+            status: NodeStatus::Pending,
+            threshold: None,
+            advance_when: None,
+            weights: None,
+            due_at: Some(due_at),
+            at_location: if at_loc.is_empty() { None } else { Some(at_loc.into()) },
+        }
+    }
+
+    /// 🔴 **宿命时刻会把 T 拉到它自己身上**——哪怕所有角色都还忙着。
+    ///
+    /// 这一条是「主线遵循原著」的可执行版本：在它之前，主线只能靠角色推
+    /// （threshold 累积 + advance_when 谓词），于是「血洗黑角城」会因为在场的人都躲着走
+    /// 而永远不发生。纳入时间轴之后，世界不等人。
+    #[test]
+    fn a_fated_moment_pulls_the_clock_to_itself_even_when_everyone_is_busy() {
+        let mut s = state_with_locs_times(&[("li", "城门", 500), ("wang", "客栈", 800)], 0);
+        s.narrative.outline_nodes.push(fated_node("n1", 120, "黑角城", "血洗黑角城"));
+        assert_eq!(select_time(&s), 120, "最小 T 应来自宿命时刻，而不是任何角色的 next_time");
+    }
+
+    /// 反向配对：**没有宿命时刻的世界，T 逐字节不变**。
+    ///
+    /// 这是这一层能作为纯增量上线的全部依据——老模板、老存档、手写大纲的 `due_at` 恒为 None，
+    /// 它们的时间轴一个刻度都不该变。
+    #[test]
+    fn worlds_without_fated_moments_pick_the_same_time_as_before() {
+        let mut s = state_with_locs_times(&[("li", "城门", 500), ("wang", "客栈", 800)], 0);
+        let before = select_time(&s);
+        // 塞一个**没有** due_at 的老式节点：不参与时间轴。
+        s.narrative.outline_nodes.push(OutlineNode {
+            id: "old".into(),
+            summary: "等人来推的软节点".into(),
+            constraint: ConstraintLevel::Soft,
+            status: NodeStatus::Pending,
+            threshold: Some(3.0),
+            advance_when: None,
+            weights: None,
+            due_at: None,
+            at_location: None,
+        });
+        assert_eq!(select_time(&s), before, "无宿命时刻 → T 不变");
+        assert_eq!(before, 500);
+    }
+
+    /// 已经发生过的宿命节点不再参与时间轴——**宿命只发生一次**。
+    #[test]
+    fn a_fated_moment_that_already_happened_no_longer_pulls_the_clock() {
+        let mut s = state_with_locs_times(&[("li", "城门", 500)], 0);
+        let mut n = fated_node("n1", 120, "黑角城", "血洗黑角城");
+        n.status = NodeStatus::Done;
+        s.narrative.outline_nodes.push(n);
+        assert_eq!(select_time(&s), 500, "已 Done 的宿命节点不得再把 T 拉回去");
+    }
+
+    /// 🔴 多个宿命时刻按**最早**那个来，且它们各自只发生一次。
+    #[test]
+    fn the_earliest_pending_fated_moment_wins() {
+        let mut s = state_with_locs_times(&[("li", "城门", 900)], 0);
+        s.narrative.outline_nodes.push(fated_node("n2", 300, "", "第二件大事"));
+        s.narrative.outline_nodes.push(fated_node("n1", 120, "", "第一件大事"));
+        assert_eq!(select_time(&s), 120);
+        let pending = pending_fated_nodes(&s);
+        assert_eq!(pending.len(), 2, "两个都还没发生");
+    }
+
+    /// 宿命节点的地点是「碰撞」的另一半坐标：它决定谁**亲历**、谁**只听说**。
+    #[test]
+    fn a_fated_moment_carries_its_location_as_the_other_half_of_the_collision() {
+        let mut s = state_with_locs_times(&[("li", "黑角城", 0)], 0);
+        s.narrative.outline_nodes.push(fated_node("n1", 10, "黑角城", "血洗黑角城"));
+        let got = pending_fated_nodes(&s);
+        assert_eq!(got, vec![(0usize, 10i64, "黑角城".to_string())]);
+    }
+
     #[test]
     fn select_cohort_same_location_collision() {
         // li@A、zhang@A、wang@B 三人 next_time 同为 0：T=0 的碰撞组只含锚地点
@@ -3101,6 +3274,8 @@ mod tests {
             threshold: Some(threshold),
             advance_when: advance_when.map(|s| s.into()),
             weights: None,
+            due_at: None,
+            at_location: None,
         }
     }
 
@@ -3279,7 +3454,7 @@ mod tests {
             status: NodeStatus::Done,
             threshold: None,
             advance_when: None,
-            weights: None,
+            weights: None, due_at: None, at_location: None,
         });
         assert_eq!(is_terminal(&s), None, "无 threshold 的硬节点全 Done 不触发 MainlineDone");
 
@@ -3307,7 +3482,7 @@ mod tests {
             status: NodeStatus::Pending,
             threshold: None,
             advance_when: None,
-            weights: None,
+            weights: None, due_at: None, at_location: None,
         });
         let decisions = vec![silent_decision("li", "d")];
 

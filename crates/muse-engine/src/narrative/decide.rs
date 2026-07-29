@@ -60,6 +60,13 @@ const DNA_VIEW_INCLUDE: &[&str] = &[
     "worldAdaptation",
 ];
 
+/// 世界记忆窗口：可见上下文里最多带多少条**自己的**历史条目（§0.2 参数化的产品口径）。
+///
+/// 取 12 的理由不是拍脑袋：它要同时满足两件相反的事——够长到让「上一场冲突」还在视野里
+/// （一场冲突通常产出 2-4 条），又短到不让上下文随世界长度无界增长（那会直接变成 token 账单）。
+/// ⚠️ 真实值应当在有真实模型账单之后再调，本仓至今一次真实模型调用都没发生过。
+const MEMORY_WINDOW: usize = 12;
+
 /// 明确**不进**角色可见上下文的卡字段：存储/版本元数据与证据索引。
 /// 与 [`DNA_VIEW_INCLUDE`] 的并集必须恰好等于卡的全部字段（用例钉住）。
 const DNA_VIEW_EXCLUDE: &[&str] =
@@ -221,6 +228,59 @@ pub fn assemble_visible_context(
                     }),
                 );
             }
+        }
+    }
+
+    // 9) 世界记忆（2026-07-29）：**这个角色记得自己在这个世界里做过什么、结果如何**。
+    //
+    // ══════════════════════════════════════════════════════════════════════════
+    // 🔴 它补的是一个此前没人注意到的空洞：**角色是失忆的**
+    // ══════════════════════════════════════════════════════════════════════════
+    // 在这一段落地之前，可见上下文里**没有任何历史**——没有上一拍正文、没有事件记录、
+    // 没有游戏时钟。角色每一拍都是从「同一份静态卡 + 同一份状态」重新开始面对世界的。
+    //
+    // 而 `narrative.pacingNotes` 一直在记录每一条仲裁结果（`build_patch` 每拍 Append），
+    // 却**全仓没有任何生产代码读它**——系统把「发生过什么」写下来，然后扔掉了。
+    // 本段就是那个缺失的读取方。
+    //
+    // ══════════════════════════════════════════════════════════════════════════
+    // 🔴 只给**自己的**条目：信息隔离铁律不容许任何例外
+    // ══════════════════════════════════════════════════════════════════════════
+    // `pacingNotes` 是**全局**流水（含所有角色的结果），而本函数的铁律是
+    // 「B 的私有状态永不出现在 A 的产物中」（`context_isolation` 系列用例守着）。
+    // 历史条目又不带地点，无法判断当时谁在场 ⇒ **按 `你的id｜` 前缀严格过滤，只留自己的**。
+    //
+    // 这样切下来的记忆是「我做过什么、结果如何」，而「我和别人怎么样」由既有的
+    // `yourRelations`（`relation_dynamics` 每拍确定性派生）承担。两者合起来才是完整的
+    // 「爱恨情仇」记忆基础——一半是行为史，一半是关系史，且都不越过信息边界。
+    //
+    // 窗口参数化（§0.2）：只取最近 `MEMORY_WINDOW` 条。取全部会让上下文随世界长度无界增长，
+    // 而近期记忆本就比远期更影响当下决策——这与 `pacingNotes` 自身的滚动截断同向。
+    //
+    // 退化：无自己的条目 → 该字段完全不出现，产物与接线前逐字节一致。
+    // 确定性：按 `pacingNotes` 的既有顺序取尾部，无排序、无随机、不依赖任何 map 迭代序。
+    let mine_prefix = format!("{character_id}｜");
+    let memory: Vec<&String> = state
+        .narrative
+        .pacing_notes
+        .iter()
+        .filter(|n| n.starts_with(&mine_prefix))
+        .rev()
+        .take(MEMORY_WINDOW)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    if !memory.is_empty() {
+        if let Some(obj) = ctx.as_object_mut() {
+            obj.insert(
+                "yourMemory".to_string(),
+                json!({
+                    "recent": memory,
+                    "note": "这是你在这个世界里做过的事和它们的结果，按发生先后排列（只有你自己的，别人的你不知道）。\
+它是你的记忆，不是命令——你可以记着教训、可以耿耿于怀、也可以照旧我行我素，怎么用由你的性格决定。",
+                }),
+            );
         }
     }
 
@@ -973,5 +1033,128 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.code(), "cancelled");
+    }
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+    use crate::character::types::{CardLifecycle, Identity};
+    use crate::narrative::types::CharacterState;
+
+    fn card(id: &str) -> CharacterCardV2 {
+        CharacterCardV2 {
+            schema_version: 2,
+            id: id.to_string(),
+            lifecycle: CardLifecycle::Draft,
+            identity: Identity { name: id.to_string(), ..Default::default() },
+            dramatic_core: Default::default(),
+            decision_model: Default::default(),
+            perception: Default::default(),
+            emotion_dynamics: Default::default(),
+            relation_grammar: Default::default(),
+            expression_fingerprint: Default::default(),
+            agency: Default::default(),
+            growth_arc: Default::default(),
+            world_adaptation: Default::default(),
+            evidence_index: Default::default(),
+            revision: 0,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    /// 造一个带 pacingNotes 流水的状态。格式与 `build_patch` 的产出逐字一致：
+    /// `{character_id}｜{result:?}｜{consequence}`。
+    fn state_with_notes(notes: &[&str]) -> NarrativeState {
+        let mut s = NarrativeState { schema_version: 1, run_id: "r".into(), ..Default::default() };
+        s.characters.insert("A".into(), CharacterState::default());
+        s.characters.insert("B".into(), CharacterState::default());
+        s.narrative.pacing_notes = notes.iter().map(|n| n.to_string()).collect();
+        s
+    }
+
+    fn ctx_of(s: &NarrativeState, who: &str) -> String {
+        assemble_visible_context(s, who, &card(who), &BTreeMap::new(), "场景", &[], None, None, &[])
+            .unwrap()
+    }
+
+    /// 🔴 **信息隔离铁律，记忆这一层同样一步不让**：A 的历史绝不出现在 B 的上下文里。
+    ///
+    /// `pacingNotes` 是**全局**流水，且历史条目不带地点（无法判断当时谁在场）。
+    /// 所以这里只能按 `你的id｜` 前缀严格过滤——任何"顺便也给同组的人看看"的放宽，
+    /// 都会让这条铁律出现第一个例外，而这类例外从来不会只有一个。
+    #[test]
+    fn iron_law_memory_never_leaks_another_characters_history() {
+        let s = state_with_notes(&[
+            "A｜Success｜A 推开了密室的门",
+            "B｜Failure｜B 没能拦住他",
+            "A｜Success｜A 拿走了那卷帛书",
+        ]);
+        let ctx_b = ctx_of(&s, "B");
+        assert!(ctx_b.contains("B 没能拦住他"), "自己的历史必须在：{ctx_b}");
+        assert!(!ctx_b.contains("推开了密室的门"), "🔴 A 的历史泄漏进了 B 的上下文：{ctx_b}");
+        assert!(!ctx_b.contains("拿走了那卷帛书"), "🔴 A 的历史泄漏进了 B 的上下文：{ctx_b}");
+    }
+
+    /// 🔴 前缀匹配不得被「id 是另一个 id 的前缀」骗过。
+    ///
+    /// `A` 与 `AB` 两张卡：按 `starts_with("A")` 会把 AB 的历史算给 A。
+    /// 分隔符 `｜` 必须进前缀，这条用例就是钉它的。
+    #[test]
+    fn a_character_id_that_prefixes_another_does_not_steal_its_memory() {
+        let mut s = state_with_notes(&["A｜Success｜甲做的事", "AB｜Success｜乙做的事"]);
+        s.characters.insert("AB".into(), CharacterState::default());
+        let ctx_a = ctx_of(&s, "A");
+        assert!(ctx_a.contains("甲做的事"));
+        assert!(!ctx_a.contains("乙做的事"), "🔴 AB 的历史被算给了 A：{ctx_a}");
+    }
+
+    /// 反向配对：**没有历史时该字段整块不出现**，产物与接线前逐字节一致。
+    ///
+    /// 这一条守的是「纯增量」：没有记忆的世界（第一拍、老存档）上下文一个字节都不该变，
+    /// 否则黄金世界回归与全部既有 prompt 指纹会跟着红——而那是这一层最不该付的代价。
+    #[test]
+    fn no_history_means_the_field_is_absent_entirely() {
+        let empty = state_with_notes(&[]);
+        assert!(!ctx_of(&empty, "A").contains("yourMemory"));
+        // 有流水但没有自己的那一条 → 同样不出现（不给一个空数组）。
+        let others_only = state_with_notes(&["B｜Success｜与我无关"]);
+        assert!(!ctx_of(&others_only, "A").contains("yourMemory"));
+    }
+
+    /// 窗口：只带最近 `MEMORY_WINDOW` 条，且**保留的是最新的、丢的是最旧的**。
+    ///
+    /// 🔴 方向不能反：丢新留旧会把「刚刚发生的冲突」挤出视野，
+    /// 而近期记忆恰恰是最影响当下决策的那一批（同 `pacingNotes` 自身滚动截断的取向）。
+    #[test]
+    fn the_window_keeps_the_newest_and_drops_the_oldest() {
+        let notes: Vec<String> =
+            (1..=MEMORY_WINDOW + 5).map(|i| format!("A｜Success｜第{i}件事")).collect();
+        let refs: Vec<&str> = notes.iter().map(|s| s.as_str()).collect();
+        let ctx = ctx_of(&state_with_notes(&refs), "A");
+        assert!(ctx.contains(&format!("第{}件事", MEMORY_WINDOW + 5)), "最新的必须在：{ctx}");
+        assert!(!ctx.contains("第1件事"), "🔴 最旧的应被丢掉，实得：{ctx}");
+    }
+
+    /// 顺序：按发生先后排列（旧 → 新）。
+    ///
+    /// 倒序会让模型把最后一条读成"最早发生的"，而因果次序是这段记忆的全部意义。
+    #[test]
+    fn memory_is_ordered_oldest_first() {
+        let ctx = ctx_of(&state_with_notes(&["A｜Success｜先", "A｜Success｜后"]), "A");
+        let i_first = ctx.find("先").expect("应含第一条");
+        let i_second = ctx.find("后").expect("应含第二条");
+        assert!(i_first < i_second, "记忆必须按发生先后排列：{ctx}");
+    }
+
+    /// 🔴 记忆是**记忆不是命令**：note 里必须明说"怎么用由你的性格决定"。
+    ///
+    /// 少了这句话，模型会把历史读成"上级指示"——「上次失败了，所以这次要成功」，
+    /// 而那正好抹掉角色的性格：一个执拗的人本来就该在同一个地方栽第二次。
+    #[test]
+    fn memory_is_framed_as_recollection_not_instruction() {
+        let ctx = ctx_of(&state_with_notes(&["A｜Failure｜没拦住"]), "A");
+        assert!(ctx.contains("不是命令"), "note 必须把记忆与命令区分开：{ctx}");
     }
 }

@@ -3100,6 +3100,9 @@ fn validate_container_refs(sk: &Skeleton, container_on: bool) -> Result<(), Stri
 
     // 6d) 本体 anchors：须指向本体存在的地点，且**非秘境**（秘境不可作缝合口）。
     let loc_ids: std::collections::BTreeSet<&str> = sk.locations.iter().map(|l| l.id.as_str()).collect();
+    // 本体锚点白名单（trim + 去空），6e 的裸端点判据要用。
+    let own_anchors: std::collections::BTreeSet<&str> =
+        sk.anchors.iter().map(|a| a.trim()).filter(|a| !a.is_empty()).collect();
     for a in &sk.anchors {
         let a = a.trim();
         if a.is_empty() {
@@ -3114,8 +3117,20 @@ fn validate_container_refs(sk: &Skeleton, container_on: bool) -> Result<(), Stri
     }
 
     // 6e) 缝合边：两端非空且不相等；带前缀的端点其 cardId 必须在 refs 内（悬空引用）；
-    //     裸 id 端点必须是本体地点。卡内那一端是否存在 / 是否在卡的 anchors 白名单内，
-    //     须待卡解引用后判，由 compose_container_skeleton 兜（同样是建房期，不是运行时）。
+    //     裸 id 端点必须是本体地点、**且在本体 anchors 白名单内**。卡内那一端是否存在 /
+    //     是否在卡的 anchors 白名单内，须待卡解引用后判，由 compose_container_skeleton 兜
+    //     （同样是建房期，不是运行时）。
+    //
+    // 🔴 「且在本体 anchors 白名单内」这半条是 2026-07-29 补的，补的是一条**把错误推给别人**的缺陷：
+    // `compose_container_skeleton` 步骤 4 要求缝合边的**每一个**端点都在白名单内
+    // （见那里的「seams 越界」），而本段此前只查「是不是本体地点」。于是
+    // 「anchors 留空 / 不含该地点 + seams 写本体地点」这种模板**能通过发布**，
+    // 一直到有玩家去开房那一刻才 400 —— 撞上它的是玩家，不是写错的作者，
+    // 而作者那边显示的是「发布成功」。
+    //
+    // 裸端点这一半在建模板期就能判死：合并后的白名单 = 本体 anchors ∪ 各卡 anchors（**带前缀**），
+    // 而裸 id 不带前缀，因此它只可能由本体 anchors 放行——卡解不解引用都不改变这个结论。
+    // 带前缀的那一半仍然只能留给 compose（要读卡蓝图），这条边界没有变。
     for seam in &sk.seams {
         let (from, to) = (seam.from.trim(), seam.to.trim());
         if from.is_empty() || to.is_empty() {
@@ -3136,6 +3151,11 @@ fn validate_container_refs(sk: &Skeleton, container_on: bool) -> Result<(), Stri
                 None => {
                     if !loc_ids.contains(end) {
                         return Err(format!("seams 悬空：缝合口 `{end}` 不是本容器本体的地点"));
+                    }
+                    if !own_anchors.contains(end) {
+                        return Err(format!(
+                            "seams 越界：缝合口 `{end}` 不在本容器的 anchors 白名单内（缝合边只能落在锚点上）"
+                        ));
                     }
                 }
             }
@@ -5505,6 +5525,68 @@ mod container_tests {
         let mut c = container_json();
         c["subplotCardRefs"] = json!([{ "cardId": "c1", "weight": -1.0 }]);
         assert!(validate(c).unwrap_err().contains("weight 非法"));
+    }
+
+    /// 🔴 缝合口落在**没进 anchors 白名单**的本体地点上，必须在**建模板期**就拒绝。
+    ///
+    /// 这条 2026-07-29 补。此前建模板期只查「裸端点是不是本体地点」，
+    /// 而 `compose_container_skeleton` 步骤 4 查的是「每个端点都得在白名单内」——
+    /// 于是这种模板**发布时一路绿灯**，直到有玩家去开房才 400「seams 越界」。
+    /// 错误被推给了撞上它的玩家，而写错的作者那边显示「发布成功」。
+    ///
+    /// 🔵 为什么裸端点这一半能在建模板期判死：合并后的白名单 =
+    /// 本体 anchors ∪ 各卡 anchors（**命名空间化后恒带 `卡id:` 前缀**），
+    /// 裸 id 不带前缀 ⇒ 只可能由本体 anchors 放行 ⇒ 卡解不解引用都不改变结论。
+    /// 带前缀那一半仍归 compose，这条边界没动。
+    #[test]
+    fn validate_rejects_seam_on_a_body_location_outside_the_anchor_whitelist() {
+        let _sw = ContainerSwitch::set(true);
+        let two_locations = json!([
+            { "id": "core-hub",  "connections": [] },
+            { "id": "side-yard", "connections": [] }
+        ]);
+
+        // 缺陷形态：side-yard 是本体地点，但不在 anchors 里。
+        let mut bad = container_json();
+        bad["subplotCardRefs"] = refs_json(&["c1"]);
+        bad["locations"] = two_locations.clone();
+        bad["anchors"] = json!(["core-hub"]);
+        bad["seams"] = json!([{ "from": "side-yard", "to": "c1:gate" }]);
+        let err = validate(bad).unwrap_err();
+        assert!(err.contains("seams 越界"), "实得：{err}");
+
+        // 反向配对：把 side-yard 补进 anchors，同一份骨架必须照常放行——
+        // 否则这条闸就是「把功能关掉」而不是「把缺陷挡掉」。
+        let mut good = container_json();
+        good["subplotCardRefs"] = refs_json(&["c1"]);
+        good["locations"] = two_locations;
+        good["anchors"] = json!(["core-hub", "side-yard"]);
+        good["seams"] = json!([{ "from": "side-yard", "to": "c1:gate" }]);
+        assert!(validate(good).is_ok(), "补进白名单后不该再拦");
+    }
+
+    /// 两道门口径一致：**建模板期放行的裸端点，compose 不得再以「越界」拒绝**。
+    ///
+    /// 这是上一条的**接缝断言**——单独看两边各自的用例都绿，漂开的恰恰是它们之间那条缝。
+    #[test]
+    fn the_two_gates_agree_on_bare_seam_endpoints() {
+        let _sw = ContainerSwitch::set(true);
+        let mut c = container_json();
+        c["subplotCardRefs"] = refs_json(&["c1"]);
+        c["seams"] = json!([{ "from": "core-hub", "to": "c1:gate" }]);
+
+        // 建模板期放行（core-hub 在 container_json 的 anchors 里）。
+        assert!(validate(c.clone()).is_ok(), "建模板期本应放行");
+
+        // 同一份骨架进 compose，卡片段的 gate 也在卡自己的 anchors 里 ⇒ 不该出现「越界」。
+        let composed = compose(sk(c), &[card("c1", 1, 5, 1.0, frag_json("甲", 1))], 5);
+        match composed {
+            Ok(_) => {}
+            Err(e) => assert!(
+                !e.contains("seams 越界"),
+                "建模板期放行了、compose 却报越界——两道门的口径又漂开了：{e}"
+            ),
+        }
     }
 
     #[test]

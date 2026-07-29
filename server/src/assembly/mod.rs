@@ -726,6 +726,107 @@ impl Rng {
 
 /// 稀有奖励档位下限：奖励道具 powerTier ≥ 此值视为「稀有」，受单实例预算约束。
 const RARE_TIER: u8 = 3;
+// ═══════════════════════════════════════════════════════════════════════════
+// 气运与机缘（2026-07-29）：**世界的**两个参数，不是角色的
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// 产品原话是「气运高的可以降低遇到 boss 或获取宝物的难度，机缘值高的更高几率遇到宝物」——
+// 🔴 **那个形态直接撞平台红线第一条**（不卖胜负与数值平权）：按「经历的世界数量」增长的
+// 数值，让老卡更容易拿到好东西，是教科书式的养成优势，而且比 `mileage` 更危险
+// （后者只进准入解锁，从不进引擎；前者要直接进采样与难度判定）。
+//
+// 但产品自己的描述里藏着不踩线的形态：
+//   「由于主角的运气差**或者**运气好，会不断让他捡到宝物**或者**遇到怪物
+//     **或者经历本来不该他这个境界所遇到的敌人**」
+// 注意运气好和运气差**都会让事件找上门**——那是**方差**，不是**均值**。于是重定义为：
+//
+// | | 是什么 | 作用于 |
+// |---|---|---|
+// | **机缘** | 主线间隙里内容的**密度**（多久来一件事） | 采样条数 |
+// | **气运** | 那些内容的**幅度**（离常态多远，**两个方向都算**） | 权重分布的形状 |
+//
+// 🔴 三条使它不构成优势，缺一不可：
+// 1. **它们是世界级的，全员共享**——不存在「我气运高我拿得多」。世界只是事更多、更极端。
+// 2. **高气运不等于更好**：它让分布**两极化**，可能捡到不该捡的宝物，也可能撞上不该撞的敌人。
+// 3. 🔴 **产出封顶与稀有预算一个字不动**（`RARE_TIER` / `RARE_BUDGET` / 星级封顶）。
+//    气运改的是「抽到哪些」，永远不改「最多能有几件好东西」——那条闸在气运之外、之后。
+//
+// 来源是**入场卡的烙印集合**（而不是某张卡的属性）：你带什么样的人进来，这个世界就长成什么样。
+// 与烙印进种子同一条路——没有人更强，只是世界不一样。
+
+/// 机缘：间隙内容条数的乘数上限（万分比）。默认 ±20%。
+const OPPORTUNITY_SWING_BP: i64 = 2_000;
+/// 气运：权重两极化的强度上限（万分比）。默认 ±50%。
+const FORTUNE_SWING_BP: i64 = 5_000;
+const ENV_OPPORTUNITY_SWING_BP: &str = "MUSE_OPPORTUNITY_SWING_BP";
+const ENV_FORTUNE_SWING_BP: &str = "MUSE_FORTUNE_SWING_BP";
+
+fn swing_bp(name: &str, default: i64) -> i64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|n| *n >= 0)
+        .unwrap_or(default)
+}
+
+/// 这个世界的气运与机缘，由**烙印指纹**确定性派生。
+///
+/// 🔴 空指纹（无人带着经历进来）→ 恒返回 `(1.0, 0.0)` = **中性**，
+/// 即「密度不变、不两极化」⇒ 采样产物与本层落地前**逐字节相同**。
+/// 这是它能作为纯增量上线的全部依据（黄金世界回归、既有采样向量全不受影响）。
+///
+/// 纯函数：同一份指纹恒得同一对数。
+fn world_fortune_and_opportunity(imprint_fingerprint: &str) -> (f32, f32) {
+    if imprint_fingerprint.is_empty() {
+        return (1.0, 0.0);
+    }
+    let h = fnv1a_64(imprint_fingerprint.as_bytes());
+    // 两个独立子流：机缘取低位、气运取高位，避免两个数被同一段比特绑死。
+    let opp_bp = swing_bp(ENV_OPPORTUNITY_SWING_BP, OPPORTUNITY_SWING_BP);
+    let for_bp = swing_bp(ENV_FORTUNE_SWING_BP, FORTUNE_SWING_BP);
+    // 映射到 [-1, 1]，再按各自的摆幅缩放。
+    let unit = |v: u64| ((v % 2001) as f32 - 1000.0) / 1000.0;
+    let opportunity = 1.0 + unit(h & 0xFFFF_FFFF) * (opp_bp as f32 / 10_000.0);
+    let fortune = unit(h >> 32).abs() * (for_bp as f32 / 10_000.0);
+    (opportunity.max(0.5), fortune)
+}
+
+/// 气运把权重**两极化**：离常态越远的内容，权重被抬得越多。
+///
+/// 🔴 「两个方向都算」在这里是字面的——取的是**绝对偏离**：
+/// 极温和的和极凶险的**一起**被抬起来，中庸的一起被压下去。
+/// 若只抬高难度那一半，它就变成了「高气运 = 更好的东西」，当场违宪。
+///
+/// ⚠️ **常态是这批候选自己的均值，不是写死的 0.5。**
+/// 第一版写的是 `(d - 0.5).abs()`，看着对称，但真实数据里 `difficultyBase`
+/// 落在 0.2–0.5（golden skeleton / 新手微本 / 提取产物都是这个量级），
+/// 0.5 在那儿是**上界而不是中心**——于是「两极」实际只剩下低难度一极，
+/// 「两个方向都算」退化成一句空话。用候选集自身的均值做中心，
+/// 无论提取管线把难度写在哪个区间，两极化都是相对**这个世界这批内容**而言的。
+///
+/// `max_dev` 是这批候选里最大的绝对偏离，用来把偏离度归一到 [0,1]；
+/// 全体难度相同时它为 0，此时函数恒等——没有"极端"可言，气运无处着力。
+/// 这批候选的难度常态：均值 + 最大绝对偏离。空集合返回 `(0.5, 0.0)`（恒等）。
+fn difficulty_center(items: &[&PoolItem]) -> (f32, f32) {
+    if items.is_empty() {
+        return (0.5, 0.0);
+    }
+    let mean = items.iter().map(|p| p.difficulty_base).sum::<f32>() / items.len() as f32;
+    let max_dev = items
+        .iter()
+        .map(|p| (p.difficulty_base - mean).abs())
+        .fold(0.0_f32, f32::max);
+    (mean, max_dev)
+}
+
+fn polarize_weight(base: f32, difficulty: f32, mean: f32, max_dev: f32, fortune: f32) -> f32 {
+    if max_dev <= f32::EPSILON {
+        return base.max(0.01);
+    }
+    let extremeness = ((difficulty - mean).abs() / max_dev).clamp(0.0, 1.0);
+    (base * (1.0 + fortune * extremeness)).max(0.01)
+}
+
 /// 单实例稀有预算：入选钩子中稀有奖励至多 RARE_BUDGET 个，超出的按确定性顺序剔除。
 const RARE_BUDGET: usize = 2;
 
@@ -1308,14 +1409,35 @@ fn plan_sampling(
     }
     let mut rng_hidden = Rng(seed ^ DOMAIN_HIDDEN);
     let resolved_hidden = resolve_variant_groups(&mut rng_hidden, &hidden_candidates, |p| p.variant_group.as_deref());
+    // 气运与机缘（世界级，由入场卡的烙印集合派生；空烙印 → 中性 → 逐字节不变）。
+    let (opportunity, fortune) = world_fortune_and_opportunity(imprint_fingerprint);
+    // 常态 = 这批候选自己的难度均值（不是写死的 0.5，见 `polarize_weight` 的注释）。
+    let (mean_difficulty, max_deviation) = difficulty_center(&resolved_hidden);
     let weighted_hidden: Vec<(&PoolItem, f32)> = resolved_hidden
         .iter()
         .map(|&p| {
             let (m, _) = score_pool_item(p, roster_terms);
-            (p, 1.0 + m as f32)
+            // 气运只改**分布形状**（两极化），不改任何上限——稀有预算在下面，它管不着。
+            (
+                p,
+                polarize_weight(
+                    1.0 + m as f32,
+                    p.difficulty_base,
+                    mean_difficulty,
+                    max_deviation,
+                    fortune,
+                ),
+            )
         })
         .collect();
-    let hk = skeleton.sampling.instance_hidden_count.unwrap_or(resolved_hidden.len());
+    // 机缘只改**条数**，且恒被候选总数夹住：它让世界事更多，不让世界凭空多出内容。
+    let base_hk = skeleton.sampling.instance_hidden_count.unwrap_or(resolved_hidden.len());
+    // ⚠️ 下限**也**必须被候选总数夹住。第一版写的是 `.clamp(if base_hk == 0 {0} else {1}, len)`，
+    // 隐藏池为空（完全合法的世界：只有主线、没有间隙内容）时就成了 `clamp(1, 0)` —— 直接 panic，
+    // 装配整条挂掉返 500。空池必须落到 0，而不是「至少来一条」。
+    let hidden_cap = resolved_hidden.len();
+    let hidden_floor = if base_hk == 0 { 0 } else { 1.min(hidden_cap) };
+    let hk = ((base_hk as f32 * opportunity).round() as usize).clamp(hidden_floor, hidden_cap);
     let selected_hidden_items = choose_k(&mut rng_hidden, &weighted_hidden, hk);
     // 3b) 稀有预算（产出封顶第二道）：入选钩子中奖励档位 ≥ RARE_TIER 的至多 RARE_BUDGET 个，
     //     超出的按入选序（choose_k 已还原模板序）从前往后保留、之后剔除——纯序规则无 RNG，replay 一致。
@@ -2689,6 +2811,13 @@ pub(crate) const MAINLINE_NODE_KEYS: &[&str] = &[
     "constraint",  // hard / soft / free
     "threshold",   // 里程碑阈值
     "advanceWhen", // 推进谓词
+    // ---- 宿命时刻（2026-07-29）：把原著顺序搬上游戏时间轴 ----
+    // 🔴 漏登记这两个键的后果**特别隐蔽**：模板作者写了 chapterOrder，
+    // 建模板期会被「无人读取的键」400 掉（那还算好的，至少当场报错）；
+    // 而若有人把它们从这张表里删掉，存量模板的宿命时刻会**静默失效**——
+    // 主线退回「等人来推」，世界看起来照常跑，只是原著再也不会自己发生。
+    "chapterOrder", // 原著里的先后 → due_at = chapterOrder × MUSE_FATED_TICK_SPACING
+    "atLocation",   // 这件事发生在哪儿（碰撞的另一半坐标：在场者亲历、不在场者只听说）
 ];
 
 /// `forbiddenPredicates[]` 元素的全部合法键。**没有任何类型化读者**——`Skeleton` 压根没有这个字段，
@@ -4023,6 +4152,126 @@ mod sampling_tests {
         }
     }
 
+    /// 难度铺开的 `reward_superset`——气运只在难度**有差异**的世界里有着力点。
+    ///
+    /// 共享夹具 `reward_superset()` 的池项难度全取默认值（均匀），
+    /// 那种世界里气运恒等（见 `a_world_of_uniform_difficulty_gives_fortune_nothing_to_grip`），
+    /// 拿它测气运只会测到一个恒等函数。这里按真实数据的量级（0.2–0.5）铺开。
+    fn reward_superset_with_spread_difficulty() -> Skeleton {
+        let mut sk = reward_superset();
+        for (i, p) in sk.hidden_content_pool.iter_mut().enumerate() {
+            p.difficulty_base = 0.2 + 0.075 * i as f32; // 0.2 / 0.275 / 0.35 / 0.425 / 0.5
+        }
+        sk
+    }
+
+    /// 🔴 **平权红线（端到端）：气运再极端，产出封顶也不动一寸。**
+    ///
+    /// 这一条不测「气运有没有生效」，测的是**它生效之后有没有越界**——
+    /// 20 组不同的烙印指纹（⇒ 20 组不同的气运/机缘）跑同一个 5★ 模板，
+    /// 每一组的稀有奖励数都必须 ≤ `RARE_BUDGET`。
+    ///
+    /// 为什么必须端到端测：单元测试只能证明 `polarize_weight` 自己不碰上限，
+    /// 证不了「被它改过的权重喂进 `choose_k` 之后、封顶闸还拦得住」。
+    /// 气运改的是**抽到哪些**，封顶管的是**最多留几件**——两道闸串在一起才是红线。
+    #[test]
+    fn no_amount_of_fortune_can_lift_the_output_cap() {
+        let mut sk = reward_superset_with_spread_difficulty();
+        sk.sampling.instance_hidden_count = Some(3);
+        // 摆幅拉到极端（±100% 机缘 / ±300% 气运），远超默认值——红线必须在最坏情况下成立。
+        let _env = super::container_tests::FortuneEnv::set(&[
+            (ENV_OPPORTUNITY_SWING_BP, "10000"),
+            (ENV_FORTUNE_SWING_BP, "30000"),
+        ]);
+        for i in 0..20 {
+            let imprint_fp = format!("cid{i}:choice:pushed_a_milestone\ncid{i}:unfinished:x");
+            let sel = plan_sampling(
+                &sk, "cidA\ncidB", "world_equity", 1, &PROFILE, &[], &[], 0.5, 5, &imprint_fp,
+            );
+            let audit = sel.audit.unwrap();
+            let rare = audit.selected_hidden.iter().filter(|id| id.as_str() != "hr-1").count();
+            assert!(
+                rare <= RARE_BUDGET,
+                "🔴 气运把产出封顶顶穿了（烙印组 {i}）：{:?}",
+                audit.selected_hidden
+            );
+        }
+    }
+
+    /// 🔴 **空隐藏池不得让装配 panic。**
+    ///
+    /// 只有主线、没有间隙内容的世界是合法的。机缘那道 clamp 的第一版
+    /// 把下限写死成 1，空池时成了 `clamp(1, 0)` —— Rust 的 `clamp` 在 `min > max` 时 panic，
+    /// 装配整条挂掉返 500。被 `idle_room_assembly_sampling_narrows_outline` 撞出来，
+    /// 症状是 `min > max. min = 1, max = 0`，与气运本身毫无关系。
+    #[test]
+    fn an_empty_hidden_pool_must_not_blow_up_assembly() {
+        let mut sk = reward_superset_with_spread_difficulty();
+        sk.hidden_content_pool.clear();
+        for sl in sk.storylines.iter_mut() {
+            sl.hidden_pool_ids.clear();
+        }
+        let _env = super::container_tests::FortuneEnv::set(&[(ENV_OPPORTUNITY_SWING_BP, "10000")]);
+        for i in 0..8 {
+            let fp = format!("cid{i}:choice:pushed_a_milestone");
+            let sel = plan_sampling(&sk, "cidA", "world_empty", 1, &PROFILE, &[], &[], 0.5, 5, &fp);
+            assert!(sel.audit.unwrap().selected_hidden.is_empty(), "空池只能选出空集");
+        }
+    }
+
+    /// 机缘只在**自己的摆幅内**改条数——它让世界事更多，不让世界抽干整个池子。
+    ///
+    /// ⚠️ 这条是补上来的：先前把 `hk` 的 clamp 换成 `* 3.0` 做故障注入，
+    /// 产出封顶那条**没有变红**（`choose_k` 内部的 `take = k.min(n)` 兜住了越界，
+    /// 所以不构成缺陷）——但那意味着那道 clamp 当时没有任何测试在守，
+    /// 它可以被悄悄改宽而无人察觉。红线不能只靠下游顺手兜住。
+    #[test]
+    fn opportunity_cannot_drain_the_whole_pool() {
+        let mut sk = reward_superset_with_spread_difficulty();
+        sk.sampling.instance_hidden_count = Some(1);
+        // 机缘摆幅 +100% ⇒ 条数至多翻倍（1 → 2），无论指纹落在哪里。
+        let _env = super::container_tests::FortuneEnv::set(&[(ENV_OPPORTUNITY_SWING_BP, "10000")]);
+        for i in 0..20 {
+            let fp = format!("cid{i}:circumstance:walked_to_the_end");
+            let n = plan_sampling(&sk, "cidA\ncidB", "world_opp", 1, &PROFILE, &[], &[], 0.5, 5, &fp)
+                .audit
+                .unwrap()
+                .selected_hidden
+                .len();
+            assert!(n <= 2, "🔴 机缘越过摆幅（烙印组 {i}）：基线 1 条，实得 {n} 条");
+        }
+    }
+
+    /// 反向配对：**气运确实改变了抽到的内容**（否则上一条测的是一个没生效的功能）。
+    ///
+    /// ⚠️ **这条测试的第一版是假的，记在这里防止有人改回去**：
+    /// 最初写成「喂 24 组不同烙印指纹 → 断言产出不止一种」，它绿——
+    /// 但把 `polarize_weight` 整个改成恒等（= 气运彻底失效）之后**它照样绿**。
+    /// 原因是烙印指纹**同时**是实例种子的第五段，产出的差异全来自换种子，与气运无关。
+    ///
+    /// ⇒ 正确的对照必须**把种子钉死**：同一份烙印指纹（⇒ 同一个种子）、
+    /// 只让气运摆幅变化。差异只可能来自权重形状。
+    #[test]
+    fn fortune_actually_changes_what_gets_drawn_with_the_seed_held_fixed() {
+        let mut sk = reward_superset_with_spread_difficulty();
+        sk.sampling.instance_hidden_count = Some(2);
+        // 🔴 同一份指纹贯穿两次规划 ⇒ 种子恒等，唯一变量是气运摆幅。
+        let fp = "cidZ:circumstance:walked_to_the_end";
+        let plan = |swing: &str| {
+            let _env = super::container_tests::FortuneEnv::set(&[(ENV_FORTUNE_SWING_BP, swing)]);
+            plan_sampling(&sk, "cidA\ncidB", "world_same", 1, &PROFILE, &[], &[], 0.5, 5, fp)
+                .audit
+                .unwrap()
+                .selected_hidden
+        };
+        let calm = plan("0"); // 气运为 0：权重完全不动
+        let wild = plan("30000"); // 气运拉满：两极被大幅抬起
+        assert_ne!(
+            calm, wild,
+            "🔴 种子相同、气运从 0 拉到 300%，抽到的东西却一样——气运没有生效"
+        );
+    }
+
     // ---------- R1 身份池进采样域（总规格 §5【拍板 4、5】）：内核匹配 + 种子随机 ----------
 
     /// 测试用角色卡（只填内核匹配读到的字段：core_fear + plot_seeds）。
@@ -4911,6 +5160,48 @@ mod container_tests {
 
     static CONTAINER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// 气运/机缘摆幅两个 env 的进程级串行化锁。
+    ///
+    /// 🔴 **只读那一条也必须进锁**。第一版只给「写 env」的两条端到端用例加了锁，
+    /// 结果 `opportunity_stays_within_the_template` 只读不写、没进锁，
+    /// 被并行跑的写方污染 → `hk` 从 2 变 3，症状表现为「气运看起来没生效」，
+    /// 排查方向被整个带偏（去查 `choose_k` 和 scale_weight 了，那两处都没问题）。
+    /// 口径与 `ContainerSwitch` 同源，理由见其上的注释。
+    static FORTUNE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII：进作用域拿锁并设值，出作用域自动还原（含 panic 路径）。
+    pub(crate) struct FortuneEnv {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        prev: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl FortuneEnv {
+        /// `pairs` 为 `(env 名, 值)`；传空即「只锁不改」，供只读用例用。
+        pub(crate) fn set(pairs: &[(&'static str, &str)]) -> Self {
+            let guard = FORTUNE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let keys = [super::ENV_OPPORTUNITY_SWING_BP, super::ENV_FORTUNE_SWING_BP];
+            let prev = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+            for k in keys {
+                std::env::remove_var(k); // 先清干净，避免上一条用例的残留混进来
+            }
+            for (k, v) in pairs {
+                std::env::set_var(k, v);
+            }
+            Self { _guard: guard, prev }
+        }
+    }
+
+    impl Drop for FortuneEnv {
+        fn drop(&mut self) {
+            for (k, v) in &self.prev {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
     impl ContainerSwitch {
         pub(crate) fn set(on: bool) -> Self {
             let sw = Self::take_lock();
@@ -5582,6 +5873,121 @@ mod container_tests {
         assert!(validate(b).unwrap_err().contains("秘境"));
     }
 
+    // ===== 气运与机缘（2026-07-29）：世界的两个参数，不是角色的 =====
+    /// 只填难度的池项夹具——从 JSON 反序列化，与真实来源同一条路径。
+    fn pool_item_with_difficulty(id: &str, difficulty: f32) -> PoolItem {
+        serde_json::from_value(serde_json::json!({ "id": id, "difficultyBase": difficulty }))
+            .expect("池项应可从 JSON 构造")
+    }
+
+
+
+    /// 🔴 **无烙印 ⇒ 中性 ⇒ 采样逐字节不变。**
+    ///
+    /// 这是这一层能作为纯增量上线的全部依据：全新库、全新卡没有烙印，
+    /// 黄金世界回归与全部既有采样向量一个 bit 都不受影响。
+    #[test]
+    fn no_imprints_means_neutral_fortune_and_opportunity() {
+        assert_eq!(world_fortune_and_opportunity(""), (1.0, 0.0));
+    }
+
+    /// 纯函数：同一份烙印指纹恒得同一对数（它要进采样，必须可 replay）。
+    #[test]
+    fn fortune_and_opportunity_are_a_pure_function_of_the_imprint_set() {
+        let fp = "cidA:choice:pushed_a_milestone\ncidB:unfinished:no_milestone_reached";
+        let first = world_fortune_and_opportunity(fp);
+        for _ in 0..5 {
+            assert_eq!(world_fortune_and_opportunity(fp), first);
+        }
+    }
+
+    /// 🔴 **气运两极化，两个方向一起抬。**
+    ///
+    /// 这一条是它不违宪的关键：极简单的和极凶险的**一起**被抬起来，中庸的一起被压下去。
+    /// 若只抬高难度那一半，「高气运」就等于「更好的东西」，当场变成付费/养成优势。
+    #[test]
+    fn fortune_lifts_both_extremes_never_only_the_good_half() {
+        // 常态 0.3、最大偏离 0.3（即这批候选难度铺在 0.0–0.6）。
+        let (mean, dev) = (0.3_f32, 0.3_f32);
+        let calm = polarize_weight(1.0, mean, mean, dev, 0.5); // 正中常态
+        let easy = polarize_weight(1.0, 0.0, mean, dev, 0.5); // 温和的那一极
+        let hard = polarize_weight(1.0, 0.6, mean, dev, 0.5); // 凶险的那一极
+        assert!(easy > calm, "温和的一端必须被抬起来");
+        assert!(hard > calm, "凶险的一端必须被抬起来");
+        assert!(
+            (easy - hard).abs() < 1e-6,
+            "🔴 两端必须被抬得一样多——否则气运就是在偏袒某一边"
+        );
+    }
+
+    /// 常态取的是**候选集自己的均值**，不是写死的 0.5。
+    ///
+    /// 真实数据里 `difficultyBase` 落在 0.2–0.5，若把 0.5 当中心，
+    /// 「凶险的那一极」在数据上根本不存在，两极化就只剩一边。
+    #[test]
+    fn the_baseline_is_this_worlds_own_average_not_a_hardcoded_half() {
+        let items = [
+            pool_item_with_difficulty("a", 0.2),
+            pool_item_with_difficulty("b", 0.3),
+            pool_item_with_difficulty("c", 0.4),
+        ];
+        let refs: Vec<&PoolItem> = items.iter().collect();
+        let (mean, dev) = difficulty_center(&refs);
+        assert!((mean - 0.3).abs() < 1e-6, "常态应是 0.3（这批的均值），实得 {mean}");
+        assert!((dev - 0.1).abs() < 1e-6, "最大偏离应是 0.1，实得 {dev}");
+        // 0.2 与 0.4 各在一极，被抬得一样多；0.3 是常态，不动。
+        let low = polarize_weight(1.0, 0.2, mean, dev, 0.5);
+        let mid = polarize_weight(1.0, 0.3, mean, dev, 0.5);
+        let high = polarize_weight(1.0, 0.4, mean, dev, 0.5);
+        assert!((low - high).abs() < 1e-6, "两极必须等量");
+        assert!(low > mid, "两极必须高于常态");
+    }
+
+    /// 全体难度相同 ⇒ 无"极端"可言 ⇒ 气运无处着力，权重恒等。
+    #[test]
+    fn a_world_of_uniform_difficulty_gives_fortune_nothing_to_grip() {
+        let items = [pool_item_with_difficulty("a", 0.4), pool_item_with_difficulty("b", 0.4)];
+        let refs: Vec<&PoolItem> = items.iter().collect();
+        let (mean, dev) = difficulty_center(&refs);
+        assert_eq!(dev, 0.0);
+        assert!((polarize_weight(1.7, 0.4, mean, dev, 9.0) - 1.7).abs() < 1e-6);
+    }
+
+    /// 反向配对：**零气运不改变任何权重**。
+    #[test]
+    fn zero_fortune_leaves_every_weight_untouched() {
+        for d in [0.0_f32, 0.25, 0.5, 0.75, 1.0] {
+            assert!((polarize_weight(1.7, d, 0.5, 0.5, 0.0) - 1.7).abs() < 1e-6, "d={d}");
+        }
+    }
+
+    /// 🔴 **气运不碰任何上限。**
+    ///
+    /// 稀有预算（`RARE_BUDGET`）与产出封顶在采样**之后**执行，气运只决定「抽到哪些」。
+    /// 这条用源码级断言钉住：气运/机缘的实现里不得出现那两个常量。
+    #[test]
+    fn fortune_never_touches_the_rare_budget_or_the_tier_cap() {
+        let src = include_str!("mod.rs");
+        let start = src.find("fn world_fortune_and_opportunity").expect("函数应存在");
+        let end = src[start..].find("\n}\n").map(|i| start + i).unwrap_or(src.len());
+        let body = &src[start..end];
+        assert!(!body.contains("RARE_BUDGET"), "🔴 气运不得触碰稀有预算");
+        assert!(!body.contains("RARE_TIER"), "🔴 气运不得触碰稀有档位");
+        assert!(!body.contains("star_rating"), "🔴 气运不得触碰星级封顶");
+    }
+
+    /// 机缘只改条数，且恒被候选总数夹住——它让世界事更多，不让世界凭空多出内容。
+    #[test]
+    fn opportunity_stays_within_what_the_template_actually_offers() {
+        let _env = FortuneEnv::set(&[]); // 只锁不改：断言的是默认摆幅，必须挡住并行的写方
+        // 摆幅上限 ±20% ⇒ 乘数恒在 [0.8, 1.2]，且下限被 0.5 兜住。
+        for fp in ["a", "bb", "ccc", "dddd", "eeeee"] {
+            let (opp, _) = world_fortune_and_opportunity(fp);
+            assert!(opp >= 0.5, "机缘乘数不得把内容压没：{opp}");
+            assert!(opp <= 1.0 + OPPORTUNITY_SWING_BP as f32 / 10_000.0 + 1e-6, "超出摆幅：{opp}");
+        }
+    }
+
     #[test]
     fn validate_rejects_negative_weight() {
         let _sw = ContainerSwitch::set(true);
@@ -6159,3 +6565,4 @@ mod member_order_tests {
         assert!(!runtime_src.contains(bad), "runtime 侧同样不得只按 joined_at 排序");
     }
 }
+

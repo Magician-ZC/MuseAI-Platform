@@ -27,6 +27,7 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter, Routes, Route } from 'react-router-dom';
 import { beforeEach, describe, expect, it } from 'vitest';
 import WorldsOps from '../../admin/src/pages/WorldsOps';
+import { resolveSearch } from '../../admin/src/globalSearch';
 import {
   suggestedNextStageNo,
   newTemplateHref,
@@ -211,5 +212,39 @@ describe('校准页的路口', () => {
     expect(await screen.findByText('补第 3 阶')).toBeInTheDocument();
     // 只读横幅还在——补的是路口，不是把这一页变成可写。
     expect(screen.getByText('本页只可视化，不可编辑')).toBeInTheDocument();
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 顶栏全局搜索：它此前是一个完全没有 onSearch 的输入框
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// 敲字、回车、点放大镜，什么都不会发生——而它长期看起来像已经接好了。
+// 现在它做**分发**（不是检索）：按 id 前缀把人送到真正处理这类主体的模块，
+// 其余文本交给唯一真能检索的 `users?query=`，都认不出来时明确说一句。
+
+describe('resolveSearch', () => {
+  it('按 id 前缀认领主体，送到真正处理它的模块', () => {
+    expect(resolveSearch('wld_abc123')).toMatchObject({ module: 'worlds', path: '/worlds' });
+    expect(resolveSearch('cchar_x')).toMatchObject({ module: 'audit' });
+    expect(resolveSearch('srp_x')).toMatchObject({ module: 'social' });
+    // 🔴 数据请求归客服与工单，不是风控——与 /admin/me/pending 的落地模块必须是同一个答案。
+    expect(resolveSearch('dr_x')).toMatchObject({ module: 'tickets' });
+  });
+
+  it('账号 id 额外把 id 带进 users 的检索参数（那是唯一支持文本检索的端点）', () => {
+    expect(resolveSearch('user_9')).toMatchObject({ module: 'users', path: '/users?query=user_9' });
+  });
+
+  it('手机号与邮箱交给 users', () => {
+    expect(resolveSearch('13800000000')?.module).toBe('users');
+    expect(resolveSearch('a@b.com')?.module).toBe('users');
+  });
+
+  it('🔴 认不出来返回 null——调用方据此说一句「没认出来」，而不是静默什么都不做', () => {
+    expect(resolveSearch('随便打的几个字')).toBeNull();
+    expect(resolveSearch('   ')).toBeNull();
+    // 未登记的前缀同样落空，而不是被猜到某个模块去。
+    expect(resolveSearch('zzz_unknown')).toBeNull();
   });
 });

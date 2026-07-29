@@ -41,7 +41,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sqlx::AnyPool;
+use sqlx::{AnyPool, Row};
 
 use crate::app::AppState;
 use crate::auth::{issue_access, AdminUser, AuthUser};
@@ -81,6 +81,8 @@ pub fn router() -> Router<AppState> {
     Router::new()
         // 管理员引导登录
         .route("/admin/dev-login", post(dev_login))
+        .route("/admin/me", get(admin_me))
+        .route("/admin/me/pending", get(admin_me_pending))
         // 用户管理
         .route("/admin/users", get(users::list_users))
         .route("/admin/users/{id}/ban", post(users::ban_user))
@@ -278,6 +280,148 @@ struct DevLoginReq {
 /// 将指定账号提权（例：`UPDATE users SET role='admin' WHERE phone=?`），随后走正式登录签发
 /// 携带该 role 的 access token（注：当前 /auth/login 恒发 role='user'，生产接入真实管理员
 /// 登录时需由 auth 侧读取 users.role 后签发对应 role——属 auth 模块职责，此处仅说明约定）。
+/// GET /admin/me：当前登录的后台账号是谁。
+///
+/// ═══════════════════════════════════════════════════════════════════════════
+/// 为什么这个端点值得单独存在
+/// ═══════════════════════════════════════════════════════════════════════════
+/// 后台外壳右上角此前挂着一条 `TODO(接口缺字段): GET /admin/me（displayName / avatarUrl）`，
+/// 于是正式模式下只能显示一个角色名（「运营」），**看不出自己登录的是哪个账号**。
+/// 在一个所有写操作都落 `audit_logs`（`actor_id` + `actor_role`）的后台里，
+/// 「我现在是谁」不是装饰：处置、改判、开关、定档全都记在这个人头上，
+/// 而运营常常同时开着好几个环境的标签页。
+///
+/// 🔴 **只回身份，不回权限清单。** 前端的 `rbac.ts` 已按 role 做可见性映射，
+/// 这里再下发一份「你能做什么」就会变成同一判定的第二份拷贝——而它的漂移方向是
+/// 「界面显示你能点、服务端 403」。角色是唯一事实，能力由两侧各自从角色推导。
+///
+/// ⚠️ **`avatarUrl` 仍然不下发**，因为它真的不存在：`users` 表只有 `nickname`
+/// （0001_init.sql），后台账号从来没有过头像字段。造一个空字段下发只会让下一个人
+/// 以为「接上了但没数据」。要加得先加列——那是产品决定，不是补一个 TODO。
+///
+/// 🔵 dev 引导登录（`POST /admin/dev-login`）签发的 `admin_dev` **在 `users` 表里没有行**，
+/// 本端点必须能活着回来：查不到时 `nickname` 为空、`status` 为 `unknown`，
+/// 而不是 404。否则 dev 联调时右上角会变成一个报错。
+async fn admin_me(
+    State(state): State<AppState>,
+    admin: AdminUser,
+) -> Result<Json<Value>, ApiError> {
+    let row = sqlx::query("SELECT nickname, status FROM users WHERE id = $1")
+        .bind(&admin.0.user_id)
+        .fetch_optional(&state.db)
+        .await?;
+    let (nickname, status) = match row {
+        Some(r) => (r.try_get::<String, _>("nickname")?, r.try_get::<String, _>("status")?),
+        None => (String::new(), "unknown".to_string()),
+    };
+    Ok(Json(json!({
+        "userId": admin.0.user_id,
+        // 🔴 角色取自 **token**（`AdminUser` 提取器已校验过它在后台角色集合内），
+        // 不取自 users 表：token 里的那个才是这次请求实际被授权的角色，
+        // 也是 audit_logs 会记下的那个。两者若漂开（改了库没重新登录），
+        // 界面必须显示**正在生效**的那个，否则运营会以为自己已经降权了而其实没有。
+        "role": admin.0.role,
+        "nickname": nickname,
+        "status": status,
+    })))
+}
+
+/// GET /admin/me/pending：**这个角色现在有多少事等着处理**。
+///
+/// ═══════════════════════════════════════════════════════════════════════════
+/// 它替换掉的是一个恒为 0 的假红点
+/// ═══════════════════════════════════════════════════════════════════════════
+/// 后台外壳右上角的铃铛此前挂着 `TODO(接口缺字段): 未读通知数`，
+/// 正式模式恒显示 0（design preview 里写死 12）。那条 TODO 的措辞其实指错了方向：
+/// **后台从来就没有「通知」这个概念**——`notification_outbox` 是玩家侧的
+/// （`user_id` + 日报 / 同意征询 / 邀请），运营从不收信。
+/// 所以正确的做法不是给后台造一套通知，而是回答铃铛真正被问的那个问题：
+/// **「有什么在等我？」**
+///
+/// ═══════════════════════════════════════════════════════════════════════════
+/// 🔴 只回**这个角色能处置**的队列
+/// ═══════════════════════════════════════════════════════════════════════════
+/// 每条队列的角色门与它自己的**处置端点**逐一对齐（不是另编一张表）：
+///
+/// | 队列 | 处置端点 | 角色门 |
+/// |---|---|---|
+/// | 内容审核 `audit_queue(status='open')` | `audit::approve` / `reject` | `reviewer` |
+/// | 审核申诉 `moderation_appeals(pending)` | `audit::resolve_appeal` | `reviewer` |
+/// | 处置申诉 `disposal_appeals(pending)` | `takedown::appeals::resolve_appeal` | `reviewer` |
+/// | 社交举报 `social_reports(pending)` | `social` 后台处置 | `reviewer` + `support` |
+/// | 数据请求 `data_requests(pending/running)` | `ops::run_data_request` | `support` |
+///
+/// 给一个角色报它打不开的队列，等于在催他做一件点进去就 403 的事。
+/// `admin` 是超级用户（与 `require_role` 同语义），看全部。
+///
+/// ⚠️ **刻意不含 `risk_events`**：那张表是**流水**不是队列——它没有「已处理」状态
+/// （`ops::list_risk_events` 只读、没有配对的处置端点），计数只会单调上涨，
+/// 挂上红点就是一个永远消不掉的角标，一周之后没人会再看它。
+/// 要把它变成队列得先加处置状态，那是产品决定。
+async fn admin_me_pending(
+    State(state): State<AppState>,
+    admin: AdminUser,
+) -> Result<Json<Value>, ApiError> {
+    let role = admin.0.role.as_str();
+    let is_admin = role == "admin";
+    let db = &state.db;
+
+    // (key, 中文名, 落地模块, 是否属于本角色, SQL)
+    let specs: [(&str, &str, &str, bool, &str); 5] = [
+        (
+            "audit",
+            "内容审核队列",
+            "audit",
+            is_admin || role == "reviewer",
+            "SELECT COUNT(*) AS n FROM audit_queue WHERE status = 'open'",
+        ),
+        (
+            "appeals",
+            "审核申诉",
+            "audit",
+            is_admin || role == "reviewer",
+            "SELECT COUNT(*) AS n FROM moderation_appeals WHERE status = 'pending'",
+        ),
+        (
+            "disposalAppeals",
+            "处置申诉",
+            "audit",
+            is_admin || role == "reviewer",
+            "SELECT COUNT(*) AS n FROM disposal_appeals WHERE status = 'pending'",
+        ),
+        (
+            "socialReports",
+            "社交举报",
+            "social",
+            is_admin || role == "reviewer" || role == "support",
+            "SELECT COUNT(*) AS n FROM social_reports WHERE status = 'pending'",
+        ),
+        (
+            "dataRequests",
+            "数据请求",
+            // 🔴 落地模块是**客服与工单**（`Tickets.tsx` 调 `/admin/data-requests`），不是风控。
+            // 第一版写成 `risk` —— 那样红点点进去会落到一个根本没有这条队列的页面，
+            // 而「点进去什么都没有」比不给红点更糟：它会让人以为队列已经被别人清掉了。
+            "tickets",
+            is_admin || role == "support",
+            "SELECT COUNT(*) AS n FROM data_requests WHERE status IN ('pending','running')",
+        ),
+    ];
+
+    let mut queues: Vec<Value> = Vec::new();
+    let mut total: i64 = 0;
+    for (key, label, module, mine, sql) in specs {
+        if !mine {
+            continue;
+        }
+        let n: i64 = sqlx::query_scalar(sql).fetch_one(db).await?;
+        total += n;
+        queues.push(json!({ "key": key, "label": label, "module": module, "count": n }));
+    }
+
+    Ok(Json(json!({ "total": total, "queues": queues })))
+}
+
 async fn dev_login(
     State(state): State<AppState>,
     Json(req): Json<DevLoginReq>,

@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "npm --prefix .. run test -- --run src/__tests__/admin-"
   },
   "dependencies": {
     "@ant-design/icons": "^6.2.3",

@@ -4669,3 +4669,179 @@ async fn attention_any_deduplicates_worlds_that_hit_several_rules() {
         "🔴 三条都命中的是**同一个世界**，attentionAny 必须去重（相加会得到 3）: {b}"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 后台外壳的两个「接口缺字段」：我是谁 / 有什么在等我
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// 这两条补的是 `admin/src/App.tsx` 里挂了很久的两条 `TODO(接口缺字段)`。
+// 其中「未读通知数」那条的措辞本身指错了方向——后台从来没有「通知」这个概念
+// （`notification_outbox` 是玩家侧的），铃铛真正被问的是「有什么在等我」。
+
+#[tokio::test]
+async fn admin_me_reports_the_role_the_token_actually_carries() {
+    let state = test_state().await;
+    seed_user(&state, "actor_reviewer", None, "reviewer", "active").await;
+    sqlx::query("UPDATE users SET nickname = $1 WHERE id = $2")
+        .bind("小审")
+        .bind("actor_reviewer")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let app = build_router(state.clone());
+
+    let (st, b) = get(&app, "/api/admin/me", Some(&role_token(&state, "reviewer"))).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(b["userId"], json!("actor_reviewer"));
+    assert_eq!(b["role"], json!("reviewer"));
+    assert_eq!(b["nickname"], json!("小审"));
+    // 🔴 不下发权限清单：能力由角色在两侧各自推导，下发一份就是同一判定的第二份拷贝，
+    // 而它的漂移方向是「界面显示你能点、服务端 403」。
+    assert!(b.get("permissions").is_none(), "不得下发权限清单：{b}");
+    // avatarUrl 真的不存在（users 表只有 nickname），不许造一个空字段让人以为「接上了但没数据」。
+    assert!(b.get("avatarUrl").is_none(), "不得下发不存在的字段：{b}");
+}
+
+#[tokio::test]
+async fn admin_me_survives_the_dev_bootstrap_account_that_has_no_users_row() {
+    // dev 引导登录签发的 admin_dev 在 users 表里没有行。右上角不该因此变成一个报错。
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let token = crate::auth::issue_access(&state.config.jwt_secret, "admin_dev", "admin", 3600).unwrap();
+
+    let (st, b) = get(&app, "/api/admin/me", Some(&token)).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["nickname"], json!(""));
+    assert_eq!(b["status"], json!("unknown"), "查不到行要说「不知道」，不是 404：{b}");
+}
+
+#[tokio::test]
+async fn admin_me_rejects_non_admin_roles() {
+    let state = test_state().await;
+    let app = build_router(state.clone());
+    let (st, _) = get(&app, "/api/admin/me", Some(&user_token(&state))).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, _) = get(&app, "/api/admin/me", None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+}
+
+/// 往五张队列表各塞一条待处理记录。
+async fn seed_pending_queues(state: &AppState) {
+    let t = now_ms();
+    sqlx::query(
+        "INSERT INTO audit_queue (id, subject_kind, subject_id, machine_verdict, machine_hits, status, created_at) \
+         VALUES ($1, 'character', 'cc1', 'pending', '[]', 'open', $2)",
+    )
+    .bind(new_id("aq"))
+    .bind(t)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO moderation_appeals (id, subject_kind, subject_id, owner_id, appeal_text, status, created_at) \
+         VALUES ($1, 'character', 'cc1', 'usr1', '再看看', 'pending', $2)",
+    )
+    .bind(new_id("apl"))
+    .bind(t)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO disposal_appeals (id, takedown_id, disposal_at, subject_kind, subject_id, owner_id, appeal_text, disposal_state, status, created_at) \
+         VALUES ($1, 'tkd1', $2, 'character', 'cc1', 'usr1', '再看看', 'removed', 'pending', $2)",
+    )
+    .bind(new_id("dap"))
+    .bind(t)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO social_reports (id, reporter_user_id, subject_user_id, subject_kind, subject_id, category, detail, status, created_at) \
+         VALUES ($1, 'usr1', 'usr2', 'message', 'm1', 'harassment', '', 'pending', $2)",
+    )
+    .bind(new_id("srp"))
+    .bind(t)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO data_requests (id, user_id, kind, status, created_at, updated_at) \
+         VALUES ($1, 'usr1', 'export', 'pending', $2, $2)",
+    )
+    .bind(new_id("dr"))
+    .bind(t)
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn pending_queues_only_include_what_this_role_can_actually_handle() {
+    let state = test_state().await;
+    seed_pending_queues(&state).await;
+    let app = build_router(state.clone());
+
+    let keys = |b: &Value| -> Vec<String> {
+        b["queues"].as_array().unwrap().iter().map(|q| q["key"].as_str().unwrap().to_string()).collect()
+    };
+
+    // reviewer：三条审核线 + 社交举报；**没有**数据请求（那是 support 的处置端点）。
+    let (st, b) = get(&app, "/api/admin/me/pending", Some(&role_token(&state, "reviewer"))).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(keys(&b), vec!["audit", "appeals", "disposalAppeals", "socialReports"], "{b}");
+    assert_eq!(b["total"], json!(4), "{b}");
+
+    // support：社交举报 + 数据请求；**没有**审核队列。
+    let (_st, b) = get(&app, "/api/admin/me/pending", Some(&role_token(&state, "support"))).await;
+    assert_eq!(keys(&b), vec!["socialReports", "dataRequests"], "{b}");
+    assert_eq!(b["total"], json!(2), "{b}");
+    // 🔴 每条队列的落地模块必须是**真的有这条队列的那一页**。
+    // 第一版把数据请求写成了 `risk`，红点点进去会落到一个没有这条队列的页面——
+    // 「点进去什么都没有」比不给红点更糟：它读起来像「别人已经清掉了」。
+    let module = |b: &Value, key: &str| -> String {
+        b["queues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|q| q["key"] == key)
+            .unwrap()["module"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(module(&b, "dataRequests"), "tickets", "数据请求归客服与工单（Tickets 页调 /admin/data-requests）");
+    assert_eq!(module(&b, "socialReports"), "social");
+
+    // 🔴 operator 一条都没有：给一个角色报它打不开的队列，等于催他做一件点进去就 403 的事。
+    let (_st, b) = get(&app, "/api/admin/me/pending", Some(&role_token(&state, "operator"))).await;
+    assert_eq!(keys(&b), Vec::<String>::new(), "{b}");
+    assert_eq!(b["total"], json!(0), "{b}");
+
+    // admin 是超级用户，看全部五条（与 require_role 同语义）。
+    let (_st, b) = get(&app, "/api/admin/me/pending", Some(&admin_token(&state))).await;
+    assert_eq!(b["queues"].as_array().unwrap().len(), 5, "{b}");
+    assert_eq!(b["total"], json!(5), "{b}");
+}
+
+#[tokio::test]
+async fn pending_queues_count_only_open_items_not_resolved_ones() {
+    // 反向配对：把队列里的东西都处理掉，计数必须回到 0——否则这个红点永远消不掉，
+    // 而一个消不掉的红点一周之后就没人看了（这正是 risk_events 被排除在外的理由）。
+    let state = test_state().await;
+    seed_pending_queues(&state).await;
+    for sql in [
+        "UPDATE audit_queue SET status = 'approved'",
+        "UPDATE moderation_appeals SET status = 'upheld'",
+        "UPDATE disposal_appeals SET status = 'upheld'",
+        "UPDATE social_reports SET status = 'resolved'",
+        "UPDATE data_requests SET status = 'done'",
+    ] {
+        sqlx::query(sql).execute(&state.db).await.unwrap();
+    }
+    let app = build_router(state.clone());
+    let (_st, b) = get(&app, "/api/admin/me/pending", Some(&admin_token(&state))).await;
+    assert_eq!(b["total"], json!(0), "处理完了红点必须消掉：{b}");
+    for q in b["queues"].as_array().unwrap() {
+        assert_eq!(q["count"], json!(0), "{q}");
+    }
+}
